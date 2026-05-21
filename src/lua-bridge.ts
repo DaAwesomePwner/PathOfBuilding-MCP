@@ -4,6 +4,7 @@ import path from 'path';
 import { deflateRawSync, inflateRawSync, inflateSync } from 'zlib';
 import { ResolvedPaths } from './paths.js';
 import { startTimer } from './timing.js';
+import { UserError } from './validation.js';
 
 export interface BuildInfo {
   class?: string;
@@ -41,7 +42,7 @@ export function encodeBuildCode(xml: string): string {
 
 export function decodeBuildCode(code: string): string {
   if (!code.trim()) {
-    throw new Error('Build code is empty');
+    throw new UserError('Build code is empty');
   }
 
   const normalized = code.trim().replace(/-/g, '+').replace(/_/g, '/');
@@ -58,12 +59,12 @@ export async function fetchBuildFromURL(url: string): Promise<string> {
   if (url.includes('pastebin.com')) {
     const id = url.split('/').filter(Boolean).pop();
     if (!id) {
-      throw new Error(`Unable to determine pastebin id from URL: ${url}`);
+      throw new UserError(`Unable to determine pastebin id from URL: ${url}`);
     }
     const rawUrl = `https://pastebin.com/raw/${id}`;
     const resp = await fetch(rawUrl);
     if (!resp.ok) {
-      throw new Error(`Failed to fetch pastebin build: ${resp.status} ${resp.statusText}`);
+      throw new UserError(`Failed to fetch pastebin build: ${resp.status} ${resp.statusText}`);
     }
     const code = await resp.text();
     return decodeBuildCode(code.trim());
@@ -72,13 +73,13 @@ export async function fetchBuildFromURL(url: string): Promise<string> {
   if (url.includes('pobb.in')) {
     const resp = await fetch(url, { headers: { Accept: 'text/plain' } });
     if (!resp.ok) {
-      throw new Error(`Failed to fetch pobb.in build: ${resp.status} ${resp.statusText}`);
+      throw new UserError(`Failed to fetch pobb.in build: ${resp.status} ${resp.statusText}`);
     }
     const code = await resp.text();
     return decodeBuildCode(code.trim());
   }
 
-  throw new Error(`Unsupported URL: ${url}`);
+  throw new UserError(`Unsupported URL: ${url}`);
 }
 
 export class LuaBridge {
@@ -95,6 +96,12 @@ export class LuaBridge {
   private stdoutBuffer = '';
   private crashCount = 0;
   private readonly maxCrashes = 3;
+  private successesSinceCrash = 0;
+  // After this many clean round-trips since the last crash, treat the
+  // process as healthy again and reset crashCount — otherwise a long-running
+  // session accumulates strikes from unrelated transient hiccups until it
+  // trips the breaker on a real problem.
+  private readonly successesToClearCrashes = 5;
 
   constructor(paths: ResolvedPaths, timeoutMs = 30_000) {
     this.pobPath = paths.pobPath;
@@ -166,6 +173,13 @@ export class LuaBridge {
       this.pending = {
         resolve: (value) => {
           stopTimer();
+          if (this.crashCount > 0) {
+            this.successesSinceCrash++;
+            if (this.successesSinceCrash >= this.successesToClearCrashes) {
+              this.crashCount = 0;
+              this.successesSinceCrash = 0;
+            }
+          }
           resolve(value as T);
         },
         reject: (reason) => {
@@ -283,33 +297,17 @@ export class LuaBridge {
       // Track unexpected exits (anything other than a clean shutdown).
       if (code !== 0 || signal) {
         this.crashCount++;
+        this.successesSinceCrash = 0;
       }
-      if (this.readyResolve) {
-        clearTimeout(this.readyResolve.timeout);
-        this.readyResolve.reject(new Error(`Lua bridge exited during init (code=${code}, signal=${signal}). Stderr:\n${this.getStderr()}`));
-        this.readyResolve = null;
-      }
-      if (this.pending) {
-        clearTimeout(this.pending.timeout);
-        this.pending.reject(new Error(`Lua bridge exited unexpectedly. Stderr:\n${this.getStderr()}`));
-        this.pending = null;
-      }
-      this.cleanupProcessReferences();
+      this.failPending(
+        new Error(`Lua bridge exited during init (code=${code}, signal=${signal}). Stderr:\n${this.getStderr()}`),
+        new Error(`Lua bridge exited unexpectedly. Stderr:\n${this.getStderr()}`),
+      );
     });
 
     proc.on('error', (error) => {
       if (this.process !== proc) return; // Stale process
-      if (this.readyResolve) {
-        clearTimeout(this.readyResolve.timeout);
-        this.readyResolve.reject(error);
-        this.readyResolve = null;
-      }
-      if (this.pending) {
-        clearTimeout(this.pending.timeout);
-        this.pending.reject(error);
-        this.pending = null;
-      }
-      this.cleanupProcessReferences();
+      this.failPending(error, error);
     });
 
     if (!proc.stdout) {
@@ -376,9 +374,9 @@ export class LuaBridge {
     try {
       const result = JSON.parse(line);
       if (result.error) {
-        // Strip lua source path/line prefixes like "...path/file.lua:123: " so
-        // surface-level error messages are user-readable.
-        const cleaned = String(result.error).replace(/^\.\.\.[^:]*\.lua:\d+:\s*/, '').replace(/^[^:]*\.lua:\d+:\s*/, '');
+        // The Lua side already strips its own source-path prefixes; this is a
+        // defensive fallback for any path that slips through (nested errors).
+        const cleaned = String(result.error).replace(/^[^:]*\.lua:\d+:\s*/, '');
         pending.reject(new Error(cleaned));
       } else {
         pending.resolve(result);
@@ -391,5 +389,19 @@ export class LuaBridge {
   private cleanupProcessReferences(): void {
     this.process = null;
     this.stdoutBuffer = '';
+  }
+
+  private failPending(readyErr: Error, pendingErr: Error): void {
+    if (this.readyResolve) {
+      clearTimeout(this.readyResolve.timeout);
+      this.readyResolve.reject(readyErr);
+      this.readyResolve = null;
+    }
+    if (this.pending) {
+      clearTimeout(this.pending.timeout);
+      this.pending.reject(pendingErr);
+      this.pending = null;
+    }
+    this.cleanupProcessReferences();
   }
 }

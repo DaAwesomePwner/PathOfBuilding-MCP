@@ -307,8 +307,9 @@ export class BuildSession {
     const result = await this.bridge.send<{ ok: true; input: Record<string, unknown> }>({
       cmd: 'getFullConfig',
     });
-    // Deep copy: PoB aliases input to active config set
-    return { input: JSON.parse(JSON.stringify(result.input ?? {})) as Record<string, unknown> };
+    // Bridge response is freshly JSON-parsed each send, so it cannot alias
+    // PoB's live tables — no extra clone needed.
+    return { input: result.input ?? {} };
   }
 
   async restoreConfig(snapshot: ConfigSnapshot): Promise<void> {
@@ -398,8 +399,8 @@ export class BuildSession {
   diffSnapshots(labelA: string, labelB: string): StatDiff {
     const a = this.snapshots.get(labelA)?.stats;
     const b = this.snapshots.get(labelB)?.stats;
-    if (!a) throw new Error(`Snapshot not found: ${labelA}`);
-    if (!b) throw new Error(`Snapshot not found: ${labelB}`);
+    if (!a) throw new UserError(`Snapshot not found: ${labelA}`);
+    if (!b) throw new UserError(`Snapshot not found: ${labelB}`);
     return computeDiff(a, b);
   }
 
@@ -639,7 +640,7 @@ export class BuildSession {
         name: ref,
       });
       if (!lookup.node) {
-        throw new Error(`Passive node not found: "${ref}"`);
+        throw new UserError(`Passive node not found: "${ref}"`);
       }
       ids.push(lookup.node.id);
     }
@@ -818,7 +819,7 @@ export class BuildSession {
       });
       const node = lookup.node;
       if (!node) throw new UserError(`Keystone not found: "${keystoneName}"`);
-      if (!node.isKeystone) throw new Error(`"${keystoneName}" is not a keystone`);
+      if (!node.isKeystone) throw new UserError(`"${keystoneName}" is not a keystone`);
 
       const isAllocated = node.alloc;
       const baselineStats = await this.bridge.getStats();
@@ -861,8 +862,9 @@ export class BuildSession {
     const result = await this.bridge.send<{ ok: true; snapshot: SkillsSnapshot }>({
       cmd: 'snapshotSkills',
     });
-    // Deep clone to defeat any aliasing.
-    return JSON.parse(JSON.stringify(result.snapshot)) as SkillsSnapshot;
+    // Bridge response is freshly JSON-parsed each send, so the snapshot object
+    // is already independent from any in-Lua state.
+    return result.snapshot;
   }
 
   async restoreSkills(snapshot: SkillsSnapshot): Promise<void> {
@@ -943,10 +945,10 @@ export class BuildSession {
         cmd: 'getSocketGroups',
       });
       const group = groupsRes.groups[skillGroupIndex - 1];
-      if (!group) throw new Error(`Skill group ${skillGroupIndex} not found`);
+      if (!group) throw new UserError(`Skill group ${skillGroupIndex} not found`);
       const supports = group.gems.filter((g) => g.isSupport && g.enabled);
       if (supports.length === 0) {
-        throw new Error(`Skill group ${skillGroupIndex} has no enabled support gems to swap`);
+        throw new UserError(`Skill group ${skillGroupIndex} has no enabled support gems to swap`);
       }
 
       const baselineStats = await this.bridge.getStats();
@@ -1031,9 +1033,9 @@ export class BuildSession {
         cmd: 'getSocketGroups',
       });
       const group = groupsRes.groups[skillGroupIndex - 1];
-      if (!group) throw new Error(`Skill group ${skillGroupIndex} not found`);
+      if (!group) throw new UserError(`Skill group ${skillGroupIndex} not found`);
       const gem = group.gems[gemIndex - 1];
-      if (!gem) throw new Error(`Gem ${gemIndex} not found in group ${skillGroupIndex}`);
+      if (!gem) throw new UserError(`Gem ${gemIndex} not found in group ${skillGroupIndex}`);
 
       const currentLevel = gem.level ?? 20;
       const baselineStats = await this.bridge.getStats();
@@ -1089,14 +1091,14 @@ export class BuildSession {
     constraints: string[] = [],
     options: { topN?: number; topAlternatives?: number } = {},
   ): Promise<OptimalLinksResult> {
-    if (availableSlots < 1) throw new Error('availableSlots must be >= 1');
+    if (availableSlots < 1) throw new UserError('availableSlots must be >= 1');
     return this.withLock(async () => {
       const skillInfo = await this.bridge.send<{ ok: true; gem: GemDataInfo }>({
         cmd: 'getGemByName',
         name: activeSkill,
       });
-      if (!skillInfo.gem) throw new Error(`Active skill not found: "${activeSkill}"`);
-      if (skillInfo.gem.isSupport) throw new Error(`"${activeSkill}" is a support gem, not an active skill`);
+      if (!skillInfo.gem) throw new UserError(`Active skill not found: "${activeSkill}"`);
+      if (skillInfo.gem.isSupport) throw new UserError(`"${activeSkill}" is a support gem, not an active skill`);
 
       const supportsRes = await this.bridge.send<{ ok: true; supports: GemDataInfo[] }>({
         cmd: 'getAvailableSupports',
@@ -1323,7 +1325,7 @@ export class BuildSession {
   async simulateScenario(scenario: string): Promise<ScenarioResult> {
     const preset = SCENARIO_PRESETS[scenario];
     if (!preset) {
-      throw new Error(
+      throw new UserError(
         `Unknown scenario: "${scenario}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`,
       );
     }
@@ -1337,10 +1339,10 @@ export class BuildSession {
   }
 
   async compareScenarios(scenarios: string[]): Promise<ScenarioComparison> {
-    if (scenarios.length === 0) throw new Error('compareScenarios requires at least one scenario');
+    if (scenarios.length === 0) throw new UserError('compareScenarios requires at least one scenario');
     for (const s of scenarios) {
       if (!SCENARIO_PRESETS[s]) {
-        throw new Error(`Unknown scenario: "${s}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`);
+        throw new UserError(`Unknown scenario: "${s}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`);
       }
     }
     return this.withLock(async () => {
@@ -1519,7 +1521,7 @@ export class BuildSession {
           return formatBuildSummary(info, stats);
         }
         default:
-          throw new Error(`Unknown format: "${format}". Valid: "xml", "code", "summary"`);
+          throw new UserError(`Unknown format: "${format}". Valid: "xml", "code", "summary"`);
       }
     });
   }

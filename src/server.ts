@@ -90,6 +90,27 @@ function textResponse(payload: unknown): { content: Array<{ type: 'text'; text: 
   };
 }
 
+const KEY_STAT_KEYS = ['CombinedDPS', 'Life', 'EnergyShield', 'TotalEHP'] as const;
+type KeyStatKey = (typeof KEY_STAT_KEYS)[number];
+
+function keyDeltas(diff: Record<string, { delta: number } | undefined>): Record<KeyStatKey, number> {
+  return {
+    CombinedDPS: diff.CombinedDPS?.delta ?? 0,
+    Life: diff.Life?.delta ?? 0,
+    EnergyShield: diff.EnergyShield?.delta ?? 0,
+    TotalEHP: diff.TotalEHP?.delta ?? 0,
+  };
+}
+
+function keyStats(stats: Stats): Record<KeyStatKey, number> {
+  return {
+    CombinedDPS: Number(stats.CombinedDPS ?? 0),
+    Life: Number(stats.Life ?? 0),
+    EnergyShield: Number(stats.EnergyShield ?? 0),
+    TotalEHP: Number(stats.TotalEHP ?? 0),
+  };
+}
+
 function errorResponse(error: unknown): {
   content: Array<{ type: 'text'; text: string }>;
   isError: true;
@@ -101,11 +122,12 @@ function errorResponse(error: unknown): {
     };
   }
   const message = error instanceof Error ? error.message : String(error);
-  // Heuristic: many Lua bridge errors are actually user-input failures
-  // (bad slot, bad gem name, etc.). Surface those verbatim instead of
-  // burying them under "Internal error".
+  // Errors thrown from Lua arrive as plain Error (no UserError flag survives
+  // the JSON boundary), so fall back to keyword sniffing to surface obvious
+  // user-input messages verbatim. "failed" is deliberately omitted — it shows
+  // up in genuine internal errors ("LoadModule() error", "SaveDB ... failed").
   if (
-    /\b(not found|invalid|must be|missing|unknown|empty|too short|out of range|unrecognised|unrecognized|failed|not allowed)\b/i.test(message) &&
+    /\b(not found|invalid|must be|missing|unknown|empty|too short|out of range|unrecognised|unrecognized|not allowed)\b/i.test(message) &&
     message.length < 240
   ) {
     return {
@@ -251,12 +273,7 @@ function summarizeStatDiff(result: StatDiffResult): unknown {
   }
   return {
     diff: summary,
-    keyDeltas: {
-      CombinedDPS: result.diff.CombinedDPS?.delta ?? 0,
-      Life: result.diff.Life?.delta ?? 0,
-      EnergyShield: result.diff.EnergyShield?.delta ?? 0,
-      TotalEHP: result.diff.TotalEHP?.delta ?? 0,
-    },
+    keyDeltas: keyDeltas(result.diff),
   };
 }
 
@@ -266,24 +283,12 @@ function summarizeComparison(result: ComparisonResult): unknown {
       slot: result.baseline.item.slot,
       itemId: result.baseline.item.itemId,
       hasItem: result.baseline.item.itemText !== null,
-      keyStats: {
-        CombinedDPS: result.baseline.stats.CombinedDPS ?? 0,
-        Life: result.baseline.stats.Life ?? 0,
-        EnergyShield: result.baseline.stats.EnergyShield ?? 0,
-        TotalEHP: result.baseline.stats.TotalEHP ?? 0,
-      },
+      keyStats: keyStats(result.baseline.stats),
     },
     candidates: result.candidates.map((c) => ({
       index: c.index,
       error: c.error,
-      keyDeltas: c.error
-        ? null
-        : {
-            CombinedDPS: c.diff.CombinedDPS?.delta ?? 0,
-            Life: c.diff.Life?.delta ?? 0,
-            EnergyShield: c.diff.EnergyShield?.delta ?? 0,
-            TotalEHP: c.diff.TotalEHP?.delta ?? 0,
-          },
+      keyDeltas: c.error ? null : keyDeltas(c.diff),
       stats: c.stats,
       diff: c.diff,
     })),
@@ -461,12 +466,7 @@ server.registerTool(
       return textResponse({
         valid: result.valid,
         validationErrors: result.validationErrors,
-        keyDeltas: {
-          CombinedDPS: result.statDiff.CombinedDPS?.delta ?? 0,
-          Life: result.statDiff.Life?.delta ?? 0,
-          EnergyShield: result.statDiff.EnergyShield?.delta ?? 0,
-          TotalEHP: result.statDiff.TotalEHP?.delta ?? 0,
-        },
+        keyDeltas: keyDeltas(result.statDiff),
         statDiff: result.statDiff,
       });
     } catch (error) {
@@ -549,12 +549,7 @@ server.registerTool(
         currentlyAllocated: result.currentlyAllocated,
         action: result.action,
         nodeStats: result.nodeStats,
-        keyDeltas: {
-          CombinedDPS: result.statDiff.CombinedDPS?.delta ?? 0,
-          Life: result.statDiff.Life?.delta ?? 0,
-          EnergyShield: result.statDiff.EnergyShield?.delta ?? 0,
-          TotalEHP: result.statDiff.TotalEHP?.delta ?? 0,
-        },
+        keyDeltas: keyDeltas(result.statDiff),
         statDiff: result.statDiff,
       });
     } catch (error) {
@@ -844,29 +839,13 @@ server.registerTool(
   async ({ scenarios }) => {
     try {
       const result = await session.compareScenarios(scenarios);
-      const baselineKey = {
-        CombinedDPS: result.baseline.CombinedDPS ?? 0,
-        Life: result.baseline.Life ?? 0,
-        EnergyShield: result.baseline.EnergyShield ?? 0,
-        TotalEHP: result.baseline.TotalEHP ?? 0,
-      };
       const rows = result.scenarios.map((s) => ({
         scenario: s.scenario,
         description: s.description,
-        keyDeltas: {
-          CombinedDPS: s.diff.CombinedDPS?.delta ?? 0,
-          Life: s.diff.Life?.delta ?? 0,
-          EnergyShield: s.diff.EnergyShield?.delta ?? 0,
-          TotalEHP: s.diff.TotalEHP?.delta ?? 0,
-        },
-        keyStats: {
-          CombinedDPS: s.after.CombinedDPS ?? 0,
-          Life: s.after.Life ?? 0,
-          EnergyShield: s.after.EnergyShield ?? 0,
-          TotalEHP: s.after.TotalEHP ?? 0,
-        },
+        keyDeltas: keyDeltas(s.diff),
+        keyStats: keyStats(s.after),
       }));
-      return textResponse({ baseline: baselineKey, scenarios: rows });
+      return textResponse({ baseline: keyStats(result.baseline), scenarios: rows });
     } catch (error) {
       return errorResponse(error);
     }
@@ -1064,7 +1043,10 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Pre-warm the Lua bridge so the first tool call is fast.
+  // Pre-warm the Lua bridge so the first tool call is fast. Must complete
+  // before MCP transport accepts requests — start()'s early-exit only checks
+  // that the subprocess is alive, not that init has finished, so a concurrent
+  // tool call would race with spawnProcess's end-of-init replay.
   await bridge.start();
 
   const transport = new StdioServerTransport();
