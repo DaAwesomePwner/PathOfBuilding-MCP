@@ -1,63 +1,103 @@
-# Path of Building Community
-## Welcome to Path of Building, an offline build planner for Path of Exile!
+# pob-mcp-server
 
-<p float="middle">
-  <img alt="Tree tab" src="https://github.com/user-attachments/assets/0826b7ab-84ba-440f-be52-2f216f13e75c" width="48%" />
-  <img alt="Items tab" src="https://github.com/user-attachments/assets/e5af1326-7e22-43d8-ab12-aa5500da611a" width="48%" />
-</p>
+An MCP server that exposes [Path of Building Community](https://pathofbuilding.community/)'s build-planning and calculation engine to LLM clients (Claude Desktop, Claude Code, and other [MCP](https://modelcontextprotocol.io/) hosts).
 
-### Features
-* Comprehensive offence + defence calculations:
-  * Calculate your skill DPS, damage over time, life/mana/ES totals and much more!
-  * Can factor in auras, buffs, charges, curses, monster resistances and more, to estimate your effective DPS
-  * Also calculates life/mana reservations
-  * Shows a summary of character stats in the side bar, as well as a detailed calculations breakdown tab which can show you how the stats were derived
-  * Supports all skills and support gems, and most passives and item modifiers
-    * Throughout the program, supported modifiers will show in blue and unsupported ones in red
-  * Full support for minions
-  * Support for party play and support builds
-* Passive skill tree planner:
-  * Support for jewels including most radius/conversion and timeless jewels
-  * Features alternate path tracing (mouse over a sequence of nodes while holding shift, then click to allocate them all)
-  * Fully integrated with the offence/defence calculations; see exactly how each node will affect your character!
-  * Can import PathOfExile.com and PoEPlanner.com passive tree links; links shortened with PoEURL.com also work
-* Skill planner:
-  * Add any number of main or supporting skills to your build
-  * Supporting skills (auras, curses, buffs) can be toggled on and off
-  * Automatically applies Socketed Gem modifiers from the item a skill is socketed into
-  * Automatically applies support gems granted by items
-* Item planner:
-  * Add items from in game by copying and pasting them straight into the program!
-  * Automatically adds quality to non-corrupted items
-  * Search the trade site for the most impactful items
-  * Fully integrated with the offence/defence calculations; see exactly how much of an upgrade a given item is!
-  * Contains a searchable database of all uniques that are currently in game (and some that aren't yet!)
-    * You can choose the modifier rolls when you add a unique to your build
-    * Includes all league-specific items and legacy variants
-  * Features an item crafting system:
-    * You can select from any of the game's base item types
-    * You can select prefix/suffix modifiers from lists
-    * Custom modifiers can be added, with Master and Essence modifiers available
-  * Also contains a database of rare item templates:
-    * Allows you to create rare items for your build to approximate the gear you will be using
-    * Choose which modifiers appear on each item, and the rolls for each modifier, to suit your needs
-    * Has templates that should cover the majority of builds
-* Other features:
-  * You can import passive tree, items, and skills from existing characters
-  * Share builds with other users by generating a share code
-  * Automatic updating; most updates will only take a couple of seconds to apply
+The server runs PoB's real Lua calculation engine in headless mode and surfaces 33 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," and comparing alternatives.
 
-## Download
-Head over to the [Releases](https://github.com/PathOfBuildingCommunity/PathOfBuilding/releases) page to download the install wizard or portable zip.
+## Prerequisites
 
-## Changelog
-You can find the full version history [here](CHANGELOG.md).
+1. **Path of Building Community** installed locally. On Windows the installer places it at `%APPDATA%\Path of Building Community\`. Download from <https://pathofbuilding.community/>.
+2. **Node.js >= 20**.
+3. **LuaJIT 5.1** — either bundled in your PoB install at `<POB_PATH>/runtime/luajit{,.exe}`, or on `PATH`, or pointed to by `LUAJIT_PATH`. PoB's own GUI uses an embedded `lua51.dll` and does **not** ship a standalone `luajit` executable on most platforms; you may need to install one:
+   - Windows (scoop): `scoop install luajit`
+   - Windows (winget): `winget install DEVCOM.LuaJIT`
+   - macOS (Homebrew): `brew install luajit`
+   - Linux (apt): `sudo apt-get install luajit`
 
-## Contribute
-You can find instructions on how to contribute code and bug reports [here](CONTRIBUTING.md).
+## Quick start
 
-## Licence
-[MIT](https://opensource.org/licenses/MIT)
+Run via npx (no install):
 
-For 3rd-party licences, see [LICENSE](LICENSE.md).
-The licencing information is considered to be part of the documentation.
+```bash
+npx -y pob-mcp-server
+```
+
+Then wire it into your MCP client. **Claude Desktop** — edit `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "pob": {
+      "command": "npx",
+      "args": ["-y", "pob-mcp-server"],
+      "env": {
+        "POB_PATH": "C:\\Users\\you\\AppData\\Roaming\\Path of Building Community"
+      }
+    }
+  }
+}
+```
+
+**Claude Code** — `claude mcp add pob -- npx -y pob-mcp-server` and set `POB_PATH` in your environment.
+
+If your PoB install is at the default `%APPDATA%\Path of Building Community\` location on Windows, the server auto-detects it and `POB_PATH` is optional.
+
+## Configuration
+
+| Env var       | Purpose                                                                                     | Default |
+|---------------|---------------------------------------------------------------------------------------------|---------|
+| `POB_PATH`    | Path to your PoB install. Validated by checking for `Launch.lua` (compiled install) or `src/Launch.lua` (source clone). | Auto-detected on Windows (`%APPDATA%\Path of Building Community`), macOS, and Linux. |
+| `LUAJIT_PATH` | Absolute path to a `luajit` binary. Overrides install/PATH detection.                       | Auto-detected. |
+| `POB_TIMING`  | When set to `1`, prints per-command timing to stderr (useful for debugging).                | unset |
+
+## Tools
+
+The server exposes 33 MCP tools across seven categories. See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for a narrative tour with examples. Highlights:
+
+- **Build I/O:** `load_build`, `export_build` (XML or PoB build code, round-trip lossless).
+- **Inspection:** `get_stats`, `get_items`, `get_skills`, `get_passive_summary`, `describe_build`.
+- **Item ops:** `swap_item`, `unequip_item`, `compare_items`, `find_optimal_links`.
+- **Gem ops:** `swap_gem`, `add_support_gem`, `find_optimal_support_links`.
+- **Tree ops:** `simulate_passive_change`, `find_path_to_node`.
+- **Config:** `get_config`, `set_config`, `evaluate_scenario`.
+- **State:** `snapshot_build`, `restore_build`, `undo_last_change`, `reset_build`.
+- **Analysis:** `diagnose_build`, `suggest_upgrades`.
+
+## Troubleshooting
+
+See [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md). Common issues:
+
+- **PoBInstallNotFoundError** — set `POB_PATH`.
+- **LuaJITNotFoundError** — install LuaJIT 5.1 or set `LUAJIT_PATH`.
+- **Bridge timeout / crash** — see the troubleshooting doc; the server includes a three-strike circuit breaker that requires a process restart on repeated crashes.
+
+## Development
+
+```bash
+git clone https://github.com/DaAwesomePwner/PathOfBuilding-MCP.git
+cd PathOfBuilding-MCP
+npm install
+npm run build
+```
+
+Run tests against your local PoB install:
+
+```bash
+# Windows PowerShell
+$env:POB_PATH = "$env:APPDATA\Path of Building Community"
+npm run test:all
+```
+
+If `POB_PATH` is unset and auto-detect fails, the integration tests print `SKIPPED:` and exit 0.
+
+Single test file:
+
+```bash
+tsx test/bridge-test.ts
+```
+
+CI: a GitHub Actions workflow is not yet wired up — contributions welcome.
+
+## License
+
+MIT — see [`LICENSE`](./LICENSE). Path of Building Community remains under its own license at your install.
