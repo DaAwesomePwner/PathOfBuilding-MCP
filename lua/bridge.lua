@@ -245,6 +245,15 @@ end
 
 local dkjson = require("dkjson")
 
+-- Mark an error as "user input" so the TS side surfaces it verbatim
+-- rather than wrapping it as "Internal error: ...". The marker is the
+-- magic prefix __USER__ on the message; the JSON dispatcher strips it
+-- and sets userError = true in the response.
+local USER_ERROR_PREFIX = "__USER__"
+local function userError(msg)
+  error(USER_ERROR_PREFIX .. msg)
+end
+
 dofile(SCRIPT_PATH .. "/Launch.lua")
 mainObject.continuousIntegrationMode = os.getenv("CI")
 runCallback("OnInit")
@@ -388,7 +397,7 @@ end
 local function getItemInSlot(slotName)
 	local slot = build.itemsTab.slots[slotName]
 	if not slot then
-		error("Unknown slot: " .. tostring(slotName))
+		userError("Unknown slot: " .. tostring(slotName))
 	end
 	local itemId = slot.selItemId or 0
 	if itemId == 0 then
@@ -411,11 +420,11 @@ end
 local function equipItemInSlot(slotName, itemRaw)
 	local slot = build.itemsTab.slots[slotName]
 	if not slot then
-		error("Unknown slot: " .. tostring(slotName))
+		userError("Unknown slot: " .. tostring(slotName))
 	end
 	build.itemsTab:CreateDisplayItemFromRaw(itemRaw)
 	if not build.itemsTab.displayItem then
-		error("Failed to parse item raw text")
+		userError("Failed to parse item raw text")
 	end
 	build.itemsTab:AddDisplayItem(true) -- noAutoEquip = true
 	-- The new item id is the highest in items map after AddDisplayItem.
@@ -433,7 +442,7 @@ end
 local function unequipSlot(slotName)
 	local slot = build.itemsTab.slots[slotName]
 	if not slot then
-		error("Unknown slot: " .. tostring(slotName))
+		userError("Unknown slot: " .. tostring(slotName))
 	end
 	slot:SetSelItemId(0)
 	build.buildFlag = true
@@ -454,7 +463,7 @@ end
 local function allocNodeById(nodeId)
 	local node = build.spec.nodes[nodeId]
 	if not node then
-		error("Unknown node id: " .. tostring(nodeId))
+		userError("Unknown node id: " .. tostring(nodeId))
 	end
 	build.spec:AllocNode(node)
 	build.buildFlag = true
@@ -464,7 +473,7 @@ end
 local function deallocNodeById(nodeId)
 	local node = build.spec.nodes[nodeId]
 	if not node then
-		error("Unknown node id: " .. tostring(nodeId))
+		userError("Unknown node id: " .. tostring(nodeId))
 	end
 	build.spec:DeallocNode(node)
 	build.buildFlag = true
@@ -610,7 +619,7 @@ local function getSkillBreakdown(skillIndex)
 	end
 	local group = list[index]
 	if not group then
-		error("No socket group at index " .. tostring(index))
+		userError("No socket group at index " .. tostring(index))
 	end
 
 	local gems = { }
@@ -773,7 +782,7 @@ local function allocNodesBatch(nodeIds)
 	for _, id in ipairs(nodeIds or { }) do
 		local node = build.spec.nodes[id]
 		if not node then
-			error("Unknown node id: " .. tostring(id))
+			userError("Unknown node id: " .. tostring(id))
 		end
 		build.spec:AllocNode(node)
 	end
@@ -785,7 +794,7 @@ local function deallocNodesBatch(nodeIds)
 	for _, id in ipairs(nodeIds or { }) do
 		local node = build.spec.nodes[id]
 		if not node then
-			error("Unknown node id: " .. tostring(id))
+			userError("Unknown node id: " .. tostring(id))
 		end
 		build.spec:DeallocNode(node)
 	end
@@ -1044,13 +1053,13 @@ local function getGroupAndGem(groupIndex, gemIndex)
 	end
 	local group = build.skillsTab.socketGroupList[groupIndex]
 	if not group then
-		error("Skill group not found at index " .. tostring(groupIndex))
+		userError("Skill group not found at index " .. tostring(groupIndex))
 	end
 	local gem = nil
 	if gemIndex then
 		gem = group.gemList and group.gemList[gemIndex]
 		if not gem then
-			error("Gem not found at index " .. tostring(gemIndex) .. " in group " .. tostring(groupIndex))
+			userError("Gem not found at index " .. tostring(gemIndex) .. " in group " .. tostring(groupIndex))
 		end
 	end
 	return group, gem
@@ -1060,7 +1069,7 @@ local function setGemImpl(groupIndex, gemIndex, gemName, level, quality)
 	local group, gem = getGroupAndGem(groupIndex, gemIndex)
 	local gemData, errMsg = findGemByName(gemName)
 	if not gemData then
-		error("Gem lookup failed: " .. tostring(errMsg))
+		userError("Gem lookup failed: " .. tostring(errMsg))
 	end
 	gem.gemId = gemData.id
 	gem.skillId = gemData.grantedEffectId
@@ -1097,7 +1106,7 @@ local function addGemImpl(groupIndex, gemName, level, quality, position)
 	local group, _ = getGroupAndGem(groupIndex, nil)
 	local gemData, errMsg = findGemByName(gemName)
 	if not gemData then
-		error("Gem lookup failed: " .. tostring(errMsg))
+		userError("Gem lookup failed: " .. tostring(errMsg))
 	end
 	local newGem = {
 		nameSpec = gemData.name,
@@ -1171,7 +1180,7 @@ local function setMainSocketGroupImpl(groupIndex)
 		error("Skills tab not available")
 	end
 	if not build.skillsTab.socketGroupList[groupIndex] then
-		error("Skill group not found at index " .. tostring(groupIndex))
+		userError("Skill group not found at index " .. tostring(groupIndex))
 	end
 	build.mainSocketGroup = groupIndex
 	build.buildFlag = true
@@ -1266,7 +1275,7 @@ local DISPATCH = {
 		handler = function(cmd)
 			local xmlText = cmd.xml or ""
 			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
-				error("Invalid Path of Building XML")
+				userError("Invalid Path of Building XML")
 			end
 			loadBuildFromXML(xmlText, cmd.name or "MCP Build")
 			return { info = getBuildInfo() }
@@ -1382,7 +1391,7 @@ local DISPATCH = {
 		handler = function(cmd)
 			local gem, errMsg = getGemByNameImpl(cmd.name)
 			if not gem then
-				error(errMsg or ("Gem not found: " .. tostring(cmd.name)))
+				userError(errMsg or ("Gem not found: " .. tostring(cmd.name)))
 			end
 			return { gem = gem }
 		end,
@@ -1440,7 +1449,7 @@ local function dispatch(cmd)
 	end
 	local entry = DISPATCH[cmd.cmd]
 	if not entry then
-		error("Unknown command: " .. tostring(cmd.cmd))
+		userError("Unknown command: " .. tostring(cmd.cmd))
 	end
 	local body = entry.handler(cmd)
 	if entry.mutating then
@@ -1462,11 +1471,22 @@ while true do
 		local ok, result = pcall(dispatch, cmd)
 		if not ok then
 			-- Strip Lua source path/line prefixes (e.g. ".../bridge.lua:411: ") so
-			-- the surface error message is user-friendly.
+			-- the surface error message is user-friendly. This MUST happen before
+			-- the userError prefix check because Lua wraps thrown errors with
+			-- source-location prefixes; after stripping, __USER__ appears at start.
 			local msg = tostring(result)
 			msg = msg:gsub("^%.%.%.[^:]*%.lua:%d+:%s*", "")
 			msg = msg:gsub("^[^:]*%.lua:%d+:%s*", "")
-			respond({ error = msg })
+			local userFlag = false
+			if msg:sub(1, #USER_ERROR_PREFIX) == USER_ERROR_PREFIX then
+				msg = msg:sub(#USER_ERROR_PREFIX + 1)
+				userFlag = true
+			end
+			if userFlag then
+				respond({ error = msg, userError = true })
+			else
+				respond({ error = msg })
+			end
 		else
 			respond(result)
 		end

@@ -122,20 +122,6 @@ function errorResponse(error: unknown): {
     };
   }
   const message = error instanceof Error ? error.message : String(error);
-  // Errors thrown from Lua arrive as plain Error (no UserError flag survives
-  // the JSON boundary), so fall back to keyword sniffing to surface obvious
-  // user-input messages verbatim. "failed" is deliberately omitted — it shows
-  // up in genuine internal errors ("LoadModule() error", "SaveDB ... failed").
-  if (
-    /\b(not found|invalid|must be|missing|unknown|empty|too short|out of range|unrecognised|unrecognized|not allowed)\b/i.test(message) &&
-    message.length < 240
-  ) {
-    return {
-      content: [{ type: 'text', text: message }],
-      isError: true,
-    };
-  }
-  // For unknown internal errors, hint at recovery without leaking stack traces.
   return {
     content: [
       {
