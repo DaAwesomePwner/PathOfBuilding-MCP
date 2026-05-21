@@ -124,13 +124,15 @@ export function resolveLuaJITPath(pobPath: string): string {
 export function resolvePaths(): ResolvedPaths {
   const pobPath = resolvePoBPath();
   const luajitPath = resolveLuaJITPath(pobPath);
-  // bridge.lua ships in this package at <pkg>/lua/bridge.lua. This module
-  // ends up at src/paths.ts in dev (tsx) and dist/src/paths.js when built,
-  // so probe both possibilities and prefer the one that exists.
+  // bridge.lua ships in this package at <pkg>/lua/bridge.lua. With the current
+  // tsconfig (rootDir: ./src), the module ends up at src/paths.ts in dev and
+  // dist/paths.js when built — both resolve `../lua/bridge.lua` to the right
+  // place. The second candidate is a defensive fallback in case rootDir ever
+  // changes back to "." (which would put the built module at dist/src/paths.js).
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
-    path.resolve(here, '..', 'lua', 'bridge.lua'),        // dev: src/paths.ts
-    path.resolve(here, '..', '..', 'lua', 'bridge.lua'),  // built: dist/src/paths.js
+    path.resolve(here, '..', 'lua', 'bridge.lua'),        // dev or flat dist
+    path.resolve(here, '..', '..', 'lua', 'bridge.lua'),  // nested dist/src fallback
   ];
   const bridgeLua = candidates.find((p) => existsSync(p)) ?? candidates[0];
   return { pobPath, luajitPath, bridgeLua };
