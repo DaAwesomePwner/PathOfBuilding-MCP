@@ -397,7 +397,9 @@ server.registerTool(
   async ({ slot, items }) => {
     try {
       validateSlot(slot);
-      items.forEach(validateItemText);
+      // Per-item validation is deliberately not run here; compareItems
+      // captures per-candidate failures into its results, which lets a
+      // partially-bad batch still surface useful diffs for the good entries.
       const result = await session.compareItems(slot, items);
       return textResponse(summarizeComparison(result));
     } catch (error) {
@@ -1052,16 +1054,25 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  const shutdown = async (signal: string): Promise<void> => {
+  let shuttingDown = false;
+  const shutdown = async (reason: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     try {
       await bridge.shutdown();
     } catch {
       bridge.killProcess();
     }
-    process.exit(signal === 'error' ? 1 : 0);
+    process.exit(reason === 'error' ? 1 : 0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  // Stdin EOF means the MCP client disconnected. On Windows there is no
+  // reliable SIGTERM from a parent on pipe close, so without this the lua
+  // subprocess leaks and keeps the parent's stdout pipe open — orphaning
+  // the whole process tree from the spawner's point of view.
+  process.stdin.on('end', () => void shutdown('stdin-eof'));
+  process.stdin.on('close', () => void shutdown('stdin-close'));
 }
 
 main().catch((error: unknown) => {
