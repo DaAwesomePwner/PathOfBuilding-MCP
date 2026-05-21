@@ -1,13 +1,43 @@
 # Troubleshooting
 
+## `PoBInstallNotFoundError`
+
+The server cannot find your Path of Building install. The error message lists every path that was probed. Fix it by setting `POB_PATH`:
+
+- **Windows PowerShell**: `$env:POB_PATH = "$env:APPDATA\Path of Building Community"`
+- **Windows cmd**: `set POB_PATH=%APPDATA%\Path of Building Community`
+- **MCP client config** (preferred for Claude Desktop/Code): add `POB_PATH` to the server's `env` block.
+
+Validate the install by checking for the headless entry point:
+
+```bash
+# Windows
+dir "%APPDATA%\Path of Building Community\src\HeadlessWrapper.lua"
+# macOS / Linux
+ls "$POB_PATH/src/HeadlessWrapper.lua"
+```
+
+If the file does not exist, your install is incomplete or it is a *source clone* (no compiled binaries). The standalone server expects a compiled PoB Community install.
+
+## `LuaJITNotFoundError`
+
+PoB Community ships an embedded `lua51.dll` for its own GUI but does not generally bundle a standalone `luajit` executable. Install one:
+
+- Windows (scoop): `scoop install luajit`
+- Windows (winget): `winget install LuaJIT.LuaJIT`
+- macOS (brew): `brew install luajit`
+- Linux (apt): `sudo apt-get install luajit`
+
+Or set `LUAJIT_PATH=/path/to/luajit` (the path must be a binary that exists, not just a directory).
+
 ## Lua engine fails to start
 
 **Symptoms:** server exits during startup with `Lua bridge exited during init`, or every tool call returns `Internal error: Lua bridge ...`.
 
 **Causes & fixes:**
-- LuaJIT not on `PATH`. Run `luajit -v` — if it errors, install LuaJIT 2.1+ (`brew install luajit`, `apt install luajit`, or download from luajit.org) and either add it to `PATH` or set `LUAJIT_PATH=/abs/path/to/luajit`.
-- `POB_PATH` not pointing at a PoB checkout. The directory must contain `src/Launch.lua`. Set `POB_PATH=/absolute/path/to/PathOfBuilding`.
-- Corrupted `runtime/` symlinks/files. Re-clone the PoB repo or run `git clean -xdf runtime/` and `git checkout runtime/`.
+- See `LuaJITNotFoundError` above if `paths.ts` couldn't locate a luajit binary.
+- See `PoBInstallNotFoundError` above if `POB_PATH` validation failed.
+- Corrupted PoB install. Re-run the PoB Community installer, or if you're using a source clone, run `git clean -xdf` inside it.
 
 ## "Lua engine has crashed N times — refusing to restart"
 
