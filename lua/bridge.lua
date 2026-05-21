@@ -1130,6 +1130,40 @@ local function addGemImpl(groupIndex, gemName, level, quality, position)
 	return #group.gemList
 end
 
+-- Replace all gems in a socket group atomically: wipes the existing gem list,
+-- inserts the new gems without triggering a per-gem recalc, then calls
+-- ProcessSocketGroup + OnFrame once. Used by testSupportCombinationLocked to
+-- avoid N_remove + N_add individual OnFrame calls (each ~55–65ms).
+-- cmd.gems is an array of { name, level, quality }.
+local function replaceSocketGroupImpl(groupIndex, gems)
+	local group, _ = getGroupAndGem(groupIndex, nil)
+	-- Wipe existing gem list in-place (mirrors what restoreSkills does per group)
+	for i = #group.gemList, 1, -1 do group.gemList[i] = nil end
+	-- Build new gems without triggering OnFrame
+	for _, gemSpec in ipairs(gems) do
+		local gemData, errMsg = findGemByName(gemSpec.name)
+		if not gemData then
+			userError("Gem lookup failed for '" .. tostring(gemSpec.name) .. "': " .. tostring(errMsg))
+		end
+		local newGem = {
+			nameSpec = gemData.name,
+			gemId = gemData.id,
+			skillId = gemData.grantedEffectId,
+			level = gemSpec.level or 20,
+			quality = gemSpec.quality or 0,
+			enabled = true,
+			enableGlobal1 = true,
+			enableGlobal2 = true,
+			count = 1,
+		}
+		table.insert(group.gemList, newGem)
+	end
+	-- Single recalc for the whole group
+	build.skillsTab:ProcessSocketGroup(group)
+	build.buildFlag = true
+	runCallback("OnFrame")
+end
+
 local function getGemByNameImpl(name)
 	local gemData, errMsg = findGemByName(name)
 	if not gemData then
@@ -1447,6 +1481,13 @@ local DISPATCH = {
 	},
 	restoreSkills = {
 		handler = function(cmd) restoreSkills(cmd.snapshot) return { } end,
+		mutating = true,
+	},
+	-- Atomically replace a socket group's gem list and recalculate once.
+	-- Saves (N_remove + N_add - 1) OnFrame calls compared to individual
+	-- removeGem/addGem round-trips. Used by testSupportCombinationLocked.
+	replaceSocketGroup = {
+		handler = function(cmd) replaceSocketGroupImpl(cmd.groupIndex, cmd.gems) return { } end,
 		mutating = true,
 	},
 
