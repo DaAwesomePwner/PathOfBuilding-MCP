@@ -31,8 +31,8 @@ async function withEnv(
 
 function makeFakePoBInstall(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'pob-fake-'));
-  mkdirSync(path.join(dir, 'src'), { recursive: true });
-  writeFileSync(path.join(dir, 'src', 'HeadlessWrapper.lua'), '-- fake');
+  // Mimic a compiled install: Launch.lua at the root.
+  writeFileSync(path.join(dir, 'Launch.lua'), '-- fake');
   return dir;
 }
 

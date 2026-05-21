@@ -41,7 +41,13 @@ function defaultPoBCandidates(): string[] {
 }
 
 function isValidPoBInstall(dir: string): boolean {
-  return existsSync(path.join(dir, 'src', 'HeadlessWrapper.lua'));
+  // Compiled install (Windows installer) has Launch.lua at the root; a source
+  // clone has it under src/. Either is acceptable — bridge.lua detects the
+  // layout and adjusts its package.path accordingly.
+  return (
+    existsSync(path.join(dir, 'Launch.lua')) ||
+    existsSync(path.join(dir, 'src', 'Launch.lua'))
+  );
 }
 
 export function resolvePoBPath(): string {
@@ -52,8 +58,8 @@ export function resolvePoBPath(): string {
     if (isValidPoBInstall(abs)) return abs;
     throw new PoBInstallNotFoundError(
       `POB_PATH=${process.env.POB_PATH} does not look like a Path of Building install ` +
-        `(missing src/HeadlessWrapper.lua at ${abs}). Point POB_PATH at the directory ` +
-        `containing src/HeadlessWrapper.lua.`,
+        `(no Launch.lua found at ${abs} or ${abs}/src). Point POB_PATH at your PoB ` +
+        `Community install directory (the one containing Launch.lua and Path of Building.exe).`,
     );
   }
 

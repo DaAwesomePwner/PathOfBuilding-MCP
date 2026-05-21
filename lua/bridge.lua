@@ -3,10 +3,35 @@
 io.stdout:setvbuf("line")
 io.stderr:setvbuf("line")
 
-local REPO_ROOT = arg[1] or "."
-local SCRIPT_PATH = REPO_ROOT .. "/src"
-package.path = REPO_ROOT .. "/runtime/lua/?.lua;" .. REPO_ROOT .. "/runtime/lua/?/init.lua;" .. package.path
-package.cpath = REPO_ROOT .. "/runtime/?.dll;" .. REPO_ROOT .. "/runtime/?.so;" .. package.cpath
+local POB_PATH = arg[1] or "."
+
+-- Detect install layout. A compiled Windows installer puts Launch.lua and
+-- Modules/ etc. directly under POB_PATH and ships its Lua libs in <pob>/lua/
+-- and native libs at the root. A source clone (cloned upstream PoB repo) puts
+-- Lua sources under src/ and its libs under runtime/lua/, runtime/?.dll. We
+-- look for Launch.lua to decide which one we have.
+local function fileExists(p)
+	local f = io.open(p, "r")
+	if f then f:close() return true end
+	return false
+end
+
+local IS_FLAT_INSTALL = fileExists(POB_PATH .. "/Launch.lua")
+local SCRIPT_PATH = IS_FLAT_INSTALL and POB_PATH or (POB_PATH .. "/src")
+local REPO_ROOT = POB_PATH  -- kept for the legacy GetWorkDir/GetUserPath/GetRuntimePath helpers below
+
+package.path = SCRIPT_PATH .. "/?.lua;"
+	.. SCRIPT_PATH .. "/?/init.lua;"
+	.. POB_PATH .. "/lua/?.lua;"
+	.. POB_PATH .. "/lua/?/init.lua;"
+	.. POB_PATH .. "/runtime/lua/?.lua;"
+	.. POB_PATH .. "/runtime/lua/?/init.lua;"
+	.. package.path
+package.cpath = POB_PATH .. "/?.dll;"
+	.. POB_PATH .. "/?.so;"
+	.. POB_PATH .. "/runtime/?.dll;"
+	.. POB_PATH .. "/runtime/?.so;"
+	.. package.cpath
 
 local function createUtf8Fallback()
 	local utf8Fallback = { }
@@ -220,7 +245,7 @@ end
 
 local dkjson = require("dkjson")
 
-dofile("Launch.lua")
+dofile(SCRIPT_PATH .. "/Launch.lua")
 mainObject.continuousIntegrationMode = os.getenv("CI")
 runCallback("OnInit")
 runCallback("OnFrame")

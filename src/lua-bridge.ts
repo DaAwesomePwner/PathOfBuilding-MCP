@@ -251,12 +251,15 @@ export class LuaBridge {
 
   private async spawnProcess(): Promise<void> {
     const bridgePath = this.bridgeLua;
-    const srcCwd = path.join(this.pobPath, 'src');
+    // Run from the install root. For a compiled install Launch.lua + Modules/
+    // live at the root; for a source clone bridge.lua sets package.path to
+    // resolve src/* relative to POB_PATH, so cwd at the root works either way.
+    const cwd = this.pobPath;
 
     this.stderrLines.length = 0;
     this.stdoutBuffer = '';
     const proc = spawn(this.luajitPath, [bridgePath, this.pobPath], {
-      cwd: srcCwd,
+      cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.process = proc;
