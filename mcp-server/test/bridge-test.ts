@@ -1,14 +1,8 @@
 import { Buffer } from 'buffer';
 import { readFileSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { deflateRawSync } from 'zlib';
 import { decodeBuildCode, LuaBridge } from '../src/lua-bridge.js';
-import { resolvePaths } from '../src/paths.js';
-
-const testDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(testDir, '..', '..');
-const fixturePath = path.join(repoRoot, 'spec', 'TestBuilds', '3.13', 'OccVortex.xml');
+import { setupTestEnv } from './_skip.js';
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -34,8 +28,7 @@ function log(msg: string): void {
 }
 
 async function main(): Promise<void> {
-  process.env.POB_PATH = process.env.POB_PATH ?? repoRoot;
-  const paths = resolvePaths();
+  const { paths, fixturePath } = setupTestEnv();
   const xml = readFileSync(fixturePath, 'utf8');
   const bridge = new LuaBridge(paths, 60000);
 

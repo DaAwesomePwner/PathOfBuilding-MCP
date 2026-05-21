@@ -1,13 +1,7 @@
 import { readFileSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { BuildSession } from '../src/build-session.js';
 import { LuaBridge } from '../src/lua-bridge.js';
-import { resolvePaths } from '../src/paths.js';
-
-const testDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(testDir, '..', '..');
-const fixturePath = path.join(repoRoot, 'spec', 'TestBuilds', '3.13', 'OccVortex.xml');
+import { setupTestEnv } from './_skip.js';
 
 const ALT_RING_RAW = `Rarity: RARE
 Gloom Hold
@@ -63,8 +57,7 @@ function statsClose(a: Record<string, unknown>, b: Record<string, unknown>, keys
 const COMPARE_KEYS = ['Life', 'Mana', 'EnergyShield', 'CombinedDPS', 'TotalEHP', 'FireResist', 'ColdResist', 'LightningResist'];
 
 async function main(): Promise<void> {
-  process.env.POB_PATH = process.env.POB_PATH ?? repoRoot;
-  const paths = resolvePaths();
+  const { paths, fixturePath } = setupTestEnv();
   const xml = readFileSync(fixturePath, 'utf8');
   const bridge = new LuaBridge(paths, 60_000);
   const session = new BuildSession(bridge);

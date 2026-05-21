@@ -11,15 +11,13 @@
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(testDir, '..', '..');
 const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
-const fixturePath = path.join(repoRoot, 'spec', 'TestBuilds', '3.13', 'OccVortex.xml');
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -27,11 +25,6 @@ function assert(cond: unknown, msg: string): asserts cond {
 
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-
-function findLuaJIT(): string {
-  if (process.env.LUAJIT_PATH) return process.env.LUAJIT_PATH;
-  return execFileSync('which', ['luajit'], { encoding: 'utf8' }).trim();
 }
 
 interface ToolTextContent { type: 'text'; text: string }
@@ -71,11 +64,12 @@ function assertStatsExact(label: string, before: KeyStats, after: KeyStats): voi
 }
 
 async function main(): Promise<void> {
+  const { paths, fixturePath } = setupTestEnv();
   const xml = readFileSync(fixturePath, 'utf8');
   const transport = new StdioClientTransport({
     command: 'npx',
     args: ['tsx', serverPath],
-    env: { ...process.env, POB_PATH: repoRoot, LUAJIT_PATH: findLuaJIT() } as Record<string, string>,
+    env: { ...process.env, POB_PATH: paths.pobPath, LUAJIT_PATH: paths.luajitPath } as Record<string, string>,
     stderr: 'inherit',
   });
   const client = new Client({ name: 'phase8-integrity', version: '0.0.0' });
