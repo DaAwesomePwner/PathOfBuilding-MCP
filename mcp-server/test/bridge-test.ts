@@ -1,10 +1,10 @@
 import { Buffer } from 'buffer';
-import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { deflateRawSync } from 'zlib';
 import { decodeBuildCode, LuaBridge } from '../src/lua-bridge.js';
+import { resolvePaths } from '../src/paths.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(testDir, '..', '..');
@@ -29,26 +29,15 @@ function encodeBuildCode(xml: string): string {
   return deflateRawSync(Buffer.from(xml, 'utf8')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-function findLuaJIT(): string {
-  const override = process.env.LUAJIT_PATH;
-  if (override) {
-    return override;
-  }
-  try {
-    return execFileSync('which', ['luajit'], { encoding: 'utf8' }).trim();
-  } catch {
-    throw new Error('luajit was not found on PATH. Set LUAJIT_PATH or install luajit.');
-  }
-}
-
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
 async function main(): Promise<void> {
-  const luajitPath = findLuaJIT();
+  process.env.POB_PATH = process.env.POB_PATH ?? repoRoot;
+  const paths = resolvePaths();
   const xml = readFileSync(fixturePath, 'utf8');
-  const bridge = new LuaBridge(repoRoot, luajitPath, 60000);
+  const bridge = new LuaBridge(paths, 60000);
 
   try {
     log('Test 1: Spawn and init');

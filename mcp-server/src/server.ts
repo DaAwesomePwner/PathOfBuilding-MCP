@@ -1,12 +1,10 @@
 #!/usr/bin/env node
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { existsSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { BuildSession, ComparisonResult, DiagnosticCheck, StatDiffResult, UpgradeSuggestion } from './build-session.js';
 import { LuaBridge, Stats } from './lua-bridge.js';
+import { LuaJITNotFoundError, PoBInstallNotFoundError, ResolvedPaths, resolvePaths } from './paths.js';
 import { startTimer } from './timing.js';
 import { UserError, validateBuildSource, validateItemText, validateSlot } from './validation.js';
 
@@ -14,31 +12,19 @@ import { UserError, validateBuildSource, validateItemText, validateSlot } from '
 // Path / config resolution
 // ---------------------------------------------------------------------------
 
-function resolveRepoRoot(): string {
-  const envPath = process.env.POB_PATH;
-  if (envPath) {
-    const abs = path.resolve(envPath);
-    if (existsSync(path.join(abs, 'src', 'Launch.lua'))) return abs;
-    throw new Error(
-      `POB_PATH=${envPath} does not contain src/Launch.lua. Set POB_PATH to your PathOfBuilding repo root.`,
-    );
+function resolvePathsOrExit(): ResolvedPaths {
+  try {
+    return resolvePaths();
+  } catch (e) {
+    if (e instanceof PoBInstallNotFoundError || e instanceof LuaJITNotFoundError) {
+      process.stderr.write(`pob-mcp-server: ${e.message}\n`);
+      process.exit(1);
+    }
+    throw e;
   }
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    path.resolve(here, '..', '..'), // dist/server.js -> repo root
-    path.resolve(here, '..'), // src/server.ts during dev -> mcp-server -> repo root walk
-    path.resolve(here, '..', '..', '..'),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(path.join(candidate, 'src', 'Launch.lua'))) return candidate;
-  }
-  throw new Error(
-    'Unable to auto-detect Path of Building repo root. Set POB_PATH environment variable.',
-  );
 }
 
-const REPO_ROOT = resolveRepoRoot();
-const LUAJIT_PATH = process.env.LUAJIT_PATH;
+const PATHS = resolvePathsOrExit();
 
 // ---------------------------------------------------------------------------
 // Stat categories
@@ -144,7 +130,7 @@ function errorResponse(error: unknown): {
 // Server wiring
 // ---------------------------------------------------------------------------
 
-const bridge = new LuaBridge(REPO_ROOT, LUAJIT_PATH, 60_000);
+const bridge = new LuaBridge(PATHS, 60_000);
 const session = new BuildSession(bridge);
 
 const server = new McpServer({

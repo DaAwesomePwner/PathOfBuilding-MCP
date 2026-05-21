@@ -1,9 +1,9 @@
-import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { BuildSession } from '../src/build-session.js';
 import { LuaBridge } from '../src/lua-bridge.js';
+import { resolvePaths } from '../src/paths.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(testDir, '..', '..');
@@ -37,12 +37,6 @@ async function expectRejects(fn: () => Promise<unknown>, msg: string): Promise<v
   throw new Error(msg);
 }
 
-function findLuaJIT(): string {
-  const override = process.env.LUAJIT_PATH;
-  if (override) return override;
-  return execFileSync('which', ['luajit'], { encoding: 'utf8' }).trim();
-}
-
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
@@ -69,9 +63,10 @@ function statsClose(a: Record<string, unknown>, b: Record<string, unknown>, keys
 const COMPARE_KEYS = ['Life', 'Mana', 'EnergyShield', 'CombinedDPS', 'TotalEHP', 'FireResist', 'ColdResist', 'LightningResist'];
 
 async function main(): Promise<void> {
-  const luajitPath = findLuaJIT();
+  process.env.POB_PATH = process.env.POB_PATH ?? repoRoot;
+  const paths = resolvePaths();
   const xml = readFileSync(fixturePath, 'utf8');
-  const bridge = new LuaBridge(repoRoot, luajitPath, 60_000);
+  const bridge = new LuaBridge(paths, 60_000);
   const session = new BuildSession(bridge);
 
   try {

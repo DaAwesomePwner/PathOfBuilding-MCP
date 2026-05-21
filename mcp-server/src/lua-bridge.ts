@@ -1,8 +1,8 @@
 import { Buffer } from 'buffer';
 import { ChildProcess, spawn } from 'child_process';
-import { existsSync } from 'fs';
 import path from 'path';
 import { deflateRawSync, inflateRawSync, inflateSync } from 'zlib';
+import { ResolvedPaths } from './paths.js';
 import { startTimer } from './timing.js';
 
 export interface BuildInfo {
@@ -83,8 +83,9 @@ export async function fetchBuildFromURL(url: string): Promise<string> {
 
 export class LuaBridge {
   private process: ChildProcess | null = null;
-  private readonly repoRoot: string;
+  private readonly pobPath: string;
   private readonly luajitPath: string;
+  private readonly bridgeLua: string;
   private readonly timeoutMs: number;
   private readonly stderrLines: string[] = [];
   private pending: PendingRequest | null = null;
@@ -95,9 +96,10 @@ export class LuaBridge {
   private crashCount = 0;
   private readonly maxCrashes = 3;
 
-  constructor(repoRoot: string, luajitPath?: string, timeoutMs = 30_000) {
-    this.repoRoot = repoRoot;
-    this.luajitPath = luajitPath ?? this.findLuaJITPath();
+  constructor(paths: ResolvedPaths, timeoutMs = 30_000) {
+    this.pobPath = paths.pobPath;
+    this.luajitPath = paths.luajitPath;
+    this.bridgeLua = paths.bridgeLua;
     this.timeoutMs = timeoutMs;
   }
 
@@ -248,12 +250,12 @@ export class LuaBridge {
   }
 
   private async spawnProcess(): Promise<void> {
-    const bridgePath = path.join(this.repoRoot, 'mcp-server', 'lua', 'bridge.lua');
-    const srcCwd = path.join(this.repoRoot, 'src');
+    const bridgePath = this.bridgeLua;
+    const srcCwd = path.join(this.pobPath, 'src');
 
     this.stderrLines.length = 0;
     this.stdoutBuffer = '';
-    const proc = spawn(this.luajitPath, [bridgePath, this.repoRoot], {
+    const proc = spawn(this.luajitPath, [bridgePath, this.pobPath], {
       cwd: srcCwd,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -386,21 +388,5 @@ export class LuaBridge {
   private cleanupProcessReferences(): void {
     this.process = null;
     this.stdoutBuffer = '';
-  }
-
-  private findLuaJITPath(): string {
-    const candidates = [
-      path.join(this.repoRoot, 'runtime', 'luajit'),
-      path.join(this.repoRoot, 'runtime', 'bin', 'luajit'),
-      path.join(this.repoRoot, 'runtime', 'win32', 'lua51.dll'),
-    ];
-
-    for (const candidate of candidates) {
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    }
-
-    return 'luajit';
   }
 }
