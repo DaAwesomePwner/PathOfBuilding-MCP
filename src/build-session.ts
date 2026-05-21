@@ -336,9 +336,14 @@ export class BuildSession {
   }
 
   private async snapshotAllUnlocked(): Promise<FullSnapshot> {
+    // One bridge round-trip for all tracked slots instead of N.
+    const batched = await this.bridge.send<{ ok: true; items: ItemSnapshot[] }>({
+      cmd: 'snapshotAllItems',
+      slots: this.trackedSlots,
+    });
     const items = new Map<string, ItemSnapshot>();
-    for (const slot of this.trackedSlots) {
-      items.set(slot, await this.snapshotSlotUnlocked(slot));
+    for (const snap of batched.items) {
+      items.set(snap.slot, snap);
     }
     const tree = await this.snapshotTreeUnlocked();
     const config = await this.snapshotConfigUnlocked();

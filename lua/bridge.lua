@@ -1339,6 +1339,26 @@ local DISPATCH = {
 		handler = function(cmd) unequipSlot(cmd.slot) return { } end,
 		mutating = true,
 	},
+	snapshotAllItems = {
+		handler = function(cmd)
+			if type(cmd.slots) ~= "table" then
+				userError("snapshotAllItems requires `slots` array")
+			end
+			local out = {}
+			for i = 1, #cmd.slots do
+				local slotName = cmd.slots[i]
+				local item = getItemInSlot(slotName)
+				-- Transform to ItemSnapshot shape: { slot, itemText, itemId }
+				-- (mirrors the logic in TS snapshotSlotUnlocked)
+				if item.itemId and item.itemId ~= 0 and item.raw then
+					out[i] = { slot = slotName, itemText = item.raw, itemId = item.itemId }
+				else
+					out[i] = { slot = slotName, itemText = dkjson.null, itemId = dkjson.null }
+				end
+			end
+			return { items = out }
+		end,
+	},
 
 	-- Passive tree
 	getAllocatedNodes = {
