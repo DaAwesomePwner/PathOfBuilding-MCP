@@ -19,9 +19,9 @@ Three layers, three responsibilities:
 
 | Layer | Lives in | Job |
 |---|---|---|
-| **Lua bridge** | `mcp-server/lua/bridge.lua` | Runs the real PoB engine in headless mode. Reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`, etc., and writes JSON responses to stdout. Knows nothing about MCP. |
-| **BuildSession** | `mcp-server/src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
-| **MCP server** | `mcp-server/src/server.ts` | Registers 33 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
+| **Lua bridge** | `lua/bridge.lua` | Runs the real PoB engine in headless mode (loading `<POB_PATH>/src/HeadlessWrapper.lua`). Reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`, etc., and writes JSON responses to stdout. Knows nothing about MCP. |
+| **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
+| **MCP server** | `src/server.ts` | Registers 33 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -80,69 +80,53 @@ Three layers, three responsibilities:
 
 ## Setup
 
-### Prerequisites
-- **LuaJIT** — `apt install luajit`, `brew install luajit`, or whatever your platform uses. The bundled `runtime/luajit` is auto-detected if present.
-- **Node.js 18+** with **npm**.
-- A clone of the PoB repo (this one).
+This server requires:
 
-### One-time install
+1. **Path of Building Community** installed locally (download from <https://pathofbuilding.community/>). On Windows the default install path is `%APPDATA%\Path of Building Community\`.
+2. **Node.js 20+**.
+3. **LuaJIT 5.1** on `PATH` or pointed to by `LUAJIT_PATH`. PoB Community does not always bundle a standalone `luajit` binary; if the server reports `LuaJITNotFoundError`, install LuaJIT (see [`README.md`](./README.md#prerequisites)).
 
-```bash
-cd mcp-server
-npm install
-npm run build      # transpiles src/ → dist/
-```
-
-### Verify
-
-```bash
-npm run test:bridge      # ~10s   — Lua bridge end-to-end
-npm run test:session     # ~12s   — BuildSession contract
-npm run test:server      # ~15s   — MCP scaffold
-npm run test:all         # ~3 min — every phase
-npm run test:integrity   # ~30s   — bit-exact restore guarantees
-npm run test:errors      # ~7s    — error path coverage
-```
-
-If `test:bridge` passes, the Lua engine is healthy. If `test:server` passes, the MCP layer is wired up correctly.
-
-### Environment variables
-
-| Var | Default | What it does |
-|---|---|---|
-| `POB_PATH` | autodetect | Absolute path to the PoB repo root (the dir containing `src/Launch.lua`). |
-| `LUAJIT_PATH` | autodetect | Path to the `luajit` binary. Helpful when bundled `runtime/luajit` isn't usable. |
-| `POB_TIMING` | unset | Set to `1` to log every Lua command's wall time to stderr (useful for performance debugging). |
-
-## Wiring it into Claude Desktop
-
-Edit your Claude Desktop MCP config:
-
-- **macOS / Linux**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-Add a server entry:
+To run the server in your MCP client, add this to `claude_desktop_config.json` (Claude Desktop) or run `claude mcp add` (Claude Code):
 
 ```json
 {
   "mcpServers": {
     "pob": {
-      "command": "node",
-      "args": [
-        "/absolute/path/to/PathOfBuilding/mcp-server/dist/src/server.js"
-      ],
+      "command": "npx",
+      "args": ["-y", "pob-mcp-server"],
       "env": {
-        "POB_PATH": "/absolute/path/to/PathOfBuilding",
-        "LUAJIT_PATH": "/usr/bin/luajit"
+        "POB_PATH": "C:\\Users\\you\\AppData\\Roaming\\Path of Building Community"
       }
     }
   }
 }
 ```
 
+`POB_PATH` is optional if your install is at the default Windows location — the server auto-detects it.
+
 Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 33 tools become callable.
 
-> If you prefer to run the dev (TypeScript) version, replace `command`/`args` with `npx tsx <path>/src/server.ts`. Slightly slower startup but no rebuild needed after edits.
+### Environment variables
+
+| Var | Default | What it does |
+|---|---|---|
+| `POB_PATH` | autodetect | Absolute path to your Path of Building Community install (the directory containing `src/HeadlessWrapper.lua`). |
+| `LUAJIT_PATH` | autodetect | Path to the `luajit` binary. Helpful when neither the install nor PATH provides one. |
+| `POB_TIMING` | unset | Set to `1` to log every Lua command's wall time to stderr (useful for performance debugging). |
+
+### Verify (local checkout)
+
+If you've cloned this repo for development:
+
+```bash
+npm install
+npm run build
+npm run test:paths       # unit tests, no PoB needed
+npm run test:bridge      # Lua bridge end-to-end (needs POB_PATH + luajit)
+npm run test:all         # full suite, ~3 min
+```
+
+Tests print `SKIPPED:` and exit 0 when no PoB install is found or luajit is missing.
 
 ## A typical session
 
