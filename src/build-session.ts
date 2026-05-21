@@ -386,6 +386,53 @@ export class BuildSession {
   }
 
   // ------------------------------------------------------------------
+  // Probe helpers (partial-snapshot what-if queries)
+  // ------------------------------------------------------------------
+
+  /**
+   * Probe helpers for what-if queries that mutate one subsystem and restore.
+   * Each MUST be called inside a withLock block already (they call the
+   * *Unlocked variants directly). Use them when only one snapshot domain
+   * is needed — withTemporaryChange snapshots everything and is overkill
+   * for a tree-only or skills-only probe.
+   */
+  private async withTreeProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
+    const snap = await this.snapshotTreeUnlocked();
+    try {
+      return await fn();
+    } finally {
+      await this.restoreTreeUnlocked(snap);
+    }
+  }
+
+  private async withSkillsProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
+    const snap = await this.snapshotSkillsUnlocked();
+    try {
+      return await fn();
+    } finally {
+      await this.restoreSkillsUnlocked(snap);
+    }
+  }
+
+  private async withConfigProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
+    const snap = await this.snapshotConfigUnlocked();
+    try {
+      return await fn();
+    } finally {
+      await this.restoreConfigUnlocked(snap);
+    }
+  }
+
+  private async withSlotProbeUnlocked<T>(slot: string, fn: () => Promise<T>): Promise<T> {
+    const snap = await this.snapshotSlotUnlocked(slot);
+    try {
+      return await fn();
+    } finally {
+      await this.restoreSlotUnlocked(snap);
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Labeled snapshots
   // ------------------------------------------------------------------
 
@@ -524,36 +571,30 @@ export class BuildSession {
 
   async compareItems(slot: string, candidates: string[]): Promise<ComparisonResult> {
     return this.withLock(async () => {
-      // Snapshot the slot's current item so we can restore exactly.
+      // Snapshot the slot's current item — still needed for the result's baseline.item field.
       const baselineItem = await this.snapshotSlotUnlocked(slot);
       const baselineStats = await this.bridge.getStats();
 
       const results: ComparisonCandidate[] = [];
-      try {
-        for (let i = 0; i < candidates.length; i++) {
-          const itemText = candidates[i];
-          let candidateStats: Stats | null = null;
-          let error: string | null = null;
+      for (let i = 0; i < candidates.length; i++) {
+        const itemText = candidates[i];
+        let candidateStats: Stats | null = null;
+        let error: string | null = null;
+        await this.withSlotProbeUnlocked(slot, async () => {
           try {
             await this.bridge.send({ cmd: 'equipItem', slot, itemText });
             candidateStats = await this.bridge.getStats();
           } catch (err) {
             error = err instanceof Error ? err.message : String(err);
-          } finally {
-            // Restore the original item before next candidate to keep diffs comparable
-            await this.restoreSlotUnlocked(baselineItem);
           }
-          results.push({
-            index: i,
-            itemText,
-            stats: candidateStats,
-            diff: candidateStats ? computeDiff(baselineStats, candidateStats) : {},
-            error,
-          });
-        }
-      } finally {
-        // Final restoration in case the very last iteration's restore failed
-        await this.restoreSlotUnlocked(baselineItem);
+        });
+        results.push({
+          index: i,
+          itemText,
+          stats: candidateStats,
+          diff: candidateStats ? computeDiff(baselineStats, candidateStats) : {},
+          error,
+        });
       }
 
       const bestForKey = (key: string): number | null => {
@@ -659,8 +700,6 @@ export class BuildSession {
     return this.withLock(async () => {
       const allocIds = await this.resolveNodeIds(allocate);
       const deallocIds = await this.resolveNodeIds(deallocate);
-
-      const treeSnap = await this.snapshotTreeUnlocked();
       const before = await this.bridge.getStats();
 
       let after: Stats = before;
@@ -669,7 +708,7 @@ export class BuildSession {
         orphanedNodes: [],
       };
 
-      try {
+      await this.withTreeProbeUnlocked(async () => {
         if (deallocIds.length > 0) {
           await this.bridge.send({ cmd: 'deallocNodes', nodeIds: deallocIds });
         }
@@ -682,9 +721,7 @@ export class BuildSession {
           result: { connected: boolean; orphanedNodes: number[] };
         }>({ cmd: 'isTreeConnected' });
         connectionResult = conn.result;
-      } finally {
-        await this.restoreTreeUnlocked(treeSnap);
-      }
+      });
 
       return {
         before,
@@ -715,36 +752,31 @@ export class BuildSession {
       const baselineStats = await this.bridge.getStats();
       const baselineValue = toNumber(baselineStats[optimizeFor]);
 
-      const treeSnap = await this.snapshotTreeUnlocked();
       const rankings: NodeRanking[] = [];
 
-      try {
-        for (const node of candidates) {
-          let nodeStats: Stats | null = null;
+      for (const node of candidates) {
+        let nodeStats: Stats | null = null;
+        await this.withTreeProbeUnlocked(async () => {
           try {
             await this.bridge.send({ cmd: 'allocNode', nodeId: node.id });
             nodeStats = await this.bridge.getStats();
-          } catch (err) {
+          } catch {
             // Skip nodes that fail to allocate (e.g., disallowed paths)
-            await this.restoreTreeUnlocked(treeSnap);
-            continue;
           }
-          const targetValue = toNumber(nodeStats[optimizeFor]);
-          rankings.push({
-            nodeId: node.id,
-            nodeName: node.name,
-            nodeType: node.type,
-            isKeystone: node.isKeystone,
-            isNotable: node.isNotable,
-            targetStat: optimizeFor,
-            delta: targetValue - baselineValue,
-            tradeoffs: identifyTradeoffs(baselineStats, nodeStats, optimizeFor),
-            stats: node.stats,
-          });
-          await this.restoreTreeUnlocked(treeSnap);
-        }
-      } finally {
-        await this.restoreTreeUnlocked(treeSnap);
+        });
+        if (!nodeStats) continue;
+        const targetValue = toNumber(nodeStats[optimizeFor]);
+        rankings.push({
+          nodeId: node.id,
+          nodeName: node.name,
+          nodeType: node.type,
+          isKeystone: node.isKeystone,
+          isNotable: node.isNotable,
+          targetStat: optimizeFor,
+          delta: targetValue - baselineValue,
+          tradeoffs: identifyTradeoffs(baselineStats, nodeStats, optimizeFor),
+          stats: node.stats,
+        });
       }
 
       rankings.sort((a, b) => b.delta - a.delta);
@@ -768,13 +800,12 @@ export class BuildSession {
       const baselineStats = await this.bridge.getStats();
       const baselineValue = toNumber(baselineStats[optimizeFor]);
 
-      const treeSnap = await this.snapshotTreeUnlocked();
       const rankings: NodeRanking[] = [];
 
-      try {
-        for (const node of testable) {
-          let nodeStats: Stats | null = null;
-          let stillConnected = true;
+      for (const node of testable) {
+        let nodeStats: Stats | null = null;
+        let stillConnected = true;
+        await this.withTreeProbeUnlocked(async () => {
           try {
             await this.bridge.send({ cmd: 'deallocNode', nodeId: node.id });
             const conn = await this.bridge.send<{
@@ -787,28 +818,24 @@ export class BuildSession {
             }
           } catch {
             // Skip on error
-          } finally {
-            await this.restoreTreeUnlocked(treeSnap);
           }
+        });
 
-          if (!nodeStats || !stillConnected) continue;
+        if (!nodeStats || !stillConnected) continue;
 
-          const targetValue = toNumber(nodeStats[optimizeFor]);
-          const loss = baselineValue - targetValue;
-          rankings.push({
-            nodeId: node.id,
-            nodeName: node.name,
-            nodeType: node.type,
-            isKeystone: node.isKeystone,
-            isNotable: node.isNotable,
-            targetStat: optimizeFor,
-            delta: -loss,
-            lossIfRemoved: loss,
-            stats: node.stats,
-          });
-        }
-      } finally {
-        await this.restoreTreeUnlocked(treeSnap);
+        const targetValue = toNumber(nodeStats[optimizeFor]);
+        const loss = baselineValue - targetValue;
+        rankings.push({
+          nodeId: node.id,
+          nodeName: node.name,
+          nodeType: node.type,
+          isKeystone: node.isKeystone,
+          isNotable: node.isNotable,
+          targetStat: optimizeFor,
+          delta: -loss,
+          lossIfRemoved: loss,
+          stats: node.stats,
+        });
       }
 
       rankings.sort((a, b) => (a.lossIfRemoved ?? 0) - (b.lossIfRemoved ?? 0));
@@ -828,19 +855,16 @@ export class BuildSession {
 
       const isAllocated = node.alloc;
       const baselineStats = await this.bridge.getStats();
-      const treeSnap = await this.snapshotTreeUnlocked();
 
       let after: Stats = baselineStats;
-      try {
+      await this.withTreeProbeUnlocked(async () => {
         if (isAllocated) {
           await this.bridge.send({ cmd: 'deallocNode', nodeId: node.id });
         } else {
           await this.bridge.send({ cmd: 'allocNode', nodeId: node.id });
         }
         after = await this.bridge.getStats();
-      } finally {
-        await this.restoreTreeUnlocked(treeSnap);
-      }
+      });
 
       return {
         keystone: node.name,
@@ -921,10 +945,9 @@ export class BuildSession {
     quality?: number,
   ): Promise<StatDiffResult> {
     return this.withLock(async () => {
-      const skillsSnap = await this.snapshotSkillsUnlocked();
       const before = await this.bridge.getStats();
       let after: Stats = before;
-      try {
+      await this.withSkillsProbeUnlocked(async () => {
         await this.bridge.send({
           cmd: 'setGem',
           groupIndex: skillGroupIndex,
@@ -934,9 +957,7 @@ export class BuildSession {
           quality,
         });
         after = await this.bridge.getStats();
-      } finally {
-        await this.restoreSkillsUnlocked(skillsSnap);
-      }
+      });
       return { before, after, diff: computeDiff(before, after) };
     });
   }
@@ -958,15 +979,14 @@ export class BuildSession {
 
       const baselineStats = await this.bridge.getStats();
       const baselineDPS = toNumber(baselineStats.CombinedDPS);
-      const skillsSnap = await this.snapshotSkillsUnlocked();
 
       // Phase 1: identify weakest support by simulating its removal.
       let weakestIdx = supports[0].index;
       let weakestName = supports[0].name;
       let weakestLoss = Infinity;
-      try {
-        for (const support of supports) {
-          let dpsWithout = baselineDPS;
+      for (const support of supports) {
+        let dpsWithout = baselineDPS;
+        await this.withSkillsProbeUnlocked(async () => {
           try {
             await this.bridge.send({
               cmd: 'removeGem',
@@ -975,22 +995,24 @@ export class BuildSession {
             });
             const stats = await this.bridge.getStats();
             dpsWithout = toNumber(stats.CombinedDPS);
-          } finally {
-            await this.restoreSkillsUnlocked(skillsSnap);
+          } catch {
+            // ignore — dpsWithout stays at baselineDPS
           }
-          const loss = baselineDPS - dpsWithout;
-          if (loss < weakestLoss) {
-            weakestLoss = loss;
-            weakestIdx = support.index;
-            weakestName = support.name;
-          }
+        });
+        const loss = baselineDPS - dpsWithout;
+        if (loss < weakestLoss) {
+          weakestLoss = loss;
+          weakestIdx = support.index;
+          weakestName = support.name;
         }
+      }
 
-        // Phase 2: test each candidate as a replacement for the weakest support.
-        const results: SupportCandidate[] = [];
-        for (const candidateName of candidates) {
-          let candidateStats: Stats | null = null;
-          let error: string | null = null;
+      // Phase 2: test each candidate as a replacement for the weakest support.
+      const results: SupportCandidate[] = [];
+      for (const candidateName of candidates) {
+        let candidateStats: Stats | null = null;
+        let error: string | null = null;
+        await this.withSkillsProbeUnlocked(async () => {
           try {
             await this.bridge.send({
               cmd: 'setGem',
@@ -1003,28 +1025,24 @@ export class BuildSession {
             candidateStats = await this.bridge.getStats();
           } catch (err) {
             error = err instanceof Error ? err.message : String(err);
-          } finally {
-            await this.restoreSkillsUnlocked(skillsSnap);
           }
-          results.push({
-            name: candidateName,
-            dps: candidateStats ? toNumber(candidateStats.CombinedDPS) : 0,
-            dpsDelta: candidateStats ? toNumber(candidateStats.CombinedDPS) - baselineDPS : 0,
-            error,
-          });
-        }
-        results.sort((a, b) => b.dps - a.dps);
-
-        return {
-          weakestCurrentSupport: { name: weakestName, gemIndex: weakestIdx, dpsContribution: weakestLoss },
-          slotTested: weakestIdx,
-          baselineDPS,
-          candidates: results,
-        };
-      } finally {
-        // Belt-and-suspenders restore in case the inner finally was skipped.
-        await this.restoreSkillsUnlocked(skillsSnap);
+        });
+        const cs = candidateStats as Stats | null;
+        results.push({
+          name: candidateName,
+          dps: cs ? toNumber(cs.CombinedDPS) : 0,
+          dpsDelta: cs ? toNumber(cs.CombinedDPS) - baselineDPS : 0,
+          error,
+        });
       }
+      results.sort((a, b) => b.dps - a.dps);
+
+      return {
+        weakestCurrentSupport: { name: weakestName, gemIndex: weakestIdx, dpsContribution: weakestLoss },
+        slotTested: weakestIdx,
+        baselineDPS,
+        candidates: results,
+      };
     });
   }
 
@@ -1056,12 +1074,11 @@ export class BuildSession {
             return arr;
           })();
 
-      const skillsSnap = await this.snapshotSkillsUnlocked();
       const results: GemLevelScaling[] = [];
-      try {
-        for (const level of testLevels) {
-          let dps = baselineDPS;
-          let error: string | null = null;
+      for (const level of testLevels) {
+        let dps = baselineDPS;
+        let error: string | null = null;
+        await this.withSkillsProbeUnlocked(async () => {
           try {
             await this.bridge.send({
               cmd: 'setGemLevel',
@@ -1073,18 +1090,14 @@ export class BuildSession {
             dps = toNumber(stats.CombinedDPS);
           } catch (err) {
             error = err instanceof Error ? err.message : String(err);
-          } finally {
-            await this.restoreSkillsUnlocked(skillsSnap);
           }
-          results.push({
-            level,
-            dps,
-            dpsDelta: dps - baselineDPS,
-            error,
-          });
-        }
-      } finally {
-        await this.restoreSkillsUnlocked(skillsSnap);
+        });
+        results.push({
+          level,
+          dps,
+          dpsDelta: dps - baselineDPS,
+          error,
+        });
       }
       return results;
     });
@@ -1314,15 +1327,12 @@ export class BuildSession {
     options: Record<string, unknown>,
   ): Promise<StatDiffResult> {
     return this.withLock(async () => {
-      const configSnap = await this.snapshotConfigUnlocked();
       const before = await this.bridge.getStats();
       let after: Stats = before;
-      try {
+      await this.withConfigProbeUnlocked(async () => {
         await this.bridge.setConfig(options);
         after = await this.bridge.getStats();
-      } finally {
-        await this.restoreConfigUnlocked(configSnap);
-      }
+      });
       return { before, after, diff: computeDiff(before, after) };
     });
   }
@@ -1351,31 +1361,27 @@ export class BuildSession {
       }
     }
     return this.withLock(async () => {
-      const configSnap = await this.snapshotConfigUnlocked();
       const baseline = await this.bridge.getStats();
       const results: ScenarioResult[] = [];
-      try {
-        for (const scenario of scenarios) {
-          const preset = SCENARIO_PRESETS[scenario];
-          let after: Stats = baseline;
+      for (const scenario of scenarios) {
+        const preset = SCENARIO_PRESETS[scenario];
+        let after: Stats = baseline;
+        await this.withConfigProbeUnlocked(async () => {
           try {
             await this.bridge.setConfig(preset.options);
             after = await this.bridge.getStats();
-          } finally {
-            await this.restoreConfigUnlocked(configSnap);
+          } catch {
+            // ignore — after stays at baseline
           }
-          results.push({
-            scenario,
-            description: preset.description,
-            options: preset.options,
-            before: baseline,
-            after,
-            diff: computeDiff(baseline, after),
-          });
-        }
-      } finally {
-        // Belt-and-suspenders restore in case any iteration's restore was skipped.
-        await this.restoreConfigUnlocked(configSnap);
+        });
+        results.push({
+          scenario,
+          description: preset.description,
+          options: preset.options,
+          before: baseline,
+          after,
+          diff: computeDiff(baseline, after),
+        });
       }
       return { baseline, scenarios: results };
     });
