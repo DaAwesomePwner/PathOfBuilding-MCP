@@ -9,7 +9,10 @@ import {
   resolveLuaJITPath,
 } from '../src/paths.js';
 
-function withEnv(env: Record<string, string | undefined>, fn: () => void): void {
+async function withEnv(
+  env: Record<string, string | undefined>,
+  fn: () => void | Promise<void>,
+): Promise<void> {
   const saved: Record<string, string | undefined> = {};
   for (const key of Object.keys(env)) saved[key] = process.env[key];
   try {
@@ -17,7 +20,7 @@ function withEnv(env: Record<string, string | undefined>, fn: () => void): void 
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fn();
+    await fn();
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
@@ -43,7 +46,7 @@ async function main(): Promise<void> {
   {
     const fake = makeFakePoBInstall();
     try {
-      withEnv({ POB_PATH: fake }, () => {
+      await withEnv({ POB_PATH: fake }, () => {
         const resolved = resolvePoBPath();
         assert.equal(resolved, path.resolve(fake));
       });
@@ -59,7 +62,7 @@ async function main(): Promise<void> {
   {
     const empty = mkdtempSync(path.join(os.tmpdir(), 'pob-empty-'));
     try {
-      withEnv({ POB_PATH: empty }, () => {
+      await withEnv({ POB_PATH: empty }, () => {
         assert.throws(() => resolvePoBPath(), PoBInstallNotFoundError);
       });
       log('Invalid POB_PATH throws PoBInstallNotFoundError', true);
@@ -76,7 +79,7 @@ async function main(): Promise<void> {
     const fake = path.join(dir, 'fake-luajit');
     writeFileSync(fake, '#!/bin/sh\n');
     try {
-      withEnv({ LUAJIT_PATH: fake }, () => {
+      await withEnv({ LUAJIT_PATH: fake }, () => {
         const resolved = resolveLuaJITPath(dir);
         assert.equal(resolved, fake);
       });
@@ -91,7 +94,7 @@ async function main(): Promise<void> {
   // Test: LUAJIT_PATH throws when file does not exist
   {
     try {
-      withEnv({ LUAJIT_PATH: '/nonexistent/luajit-xyz' }, () => {
+      await withEnv({ LUAJIT_PATH: '/nonexistent/luajit-xyz' }, () => {
         assert.throws(() => resolveLuaJITPath('/tmp'), LuaJITNotFoundError);
       });
       log('Nonexistent LUAJIT_PATH throws LuaJITNotFoundError', true);
@@ -103,7 +106,7 @@ async function main(): Promise<void> {
   // Test: error message lists probed paths and platform install hints
   {
     try {
-      withEnv(
+      await withEnv(
         { POB_PATH: undefined, APPDATA: '/nope/does/not/exist', HOME: '/nope/does/not/exist' },
         () => {
           try {
@@ -129,7 +132,7 @@ async function main(): Promise<void> {
     writeFileSync(fakeLua, '#!/bin/sh\n');
     try {
       const { resolvePaths } = await import('../src/paths.js');
-      withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, () => {
+      await withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, () => {
         const result = resolvePaths();
         assert.equal(result.pobPath, path.resolve(fake));
         assert.equal(result.luajitPath, fakeLua);
@@ -145,6 +148,30 @@ async function main(): Promise<void> {
     } finally {
       rmSync(fake, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // Test: setupTestEnv() returns paths and fixturePath
+  {
+    try {
+      const fake = makeFakePoBInstall();
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'lj-'));
+      const fakeLua = path.join(dir, process.platform === 'win32' ? 'luajit.exe' : 'luajit');
+      writeFileSync(fakeLua, '#!/bin/sh\n');
+      try {
+        await withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, async () => {
+          const { setupTestEnv } = await import('./_skip.js');
+          const env = setupTestEnv();
+          assert.equal(env.paths.pobPath, path.resolve(fake));
+          assert.ok(env.fixturePath.endsWith(path.join('fixtures', 'OccVortex.xml')));
+        });
+        log('setupTestEnv returns paths and fixturePath', true);
+      } finally {
+        rmSync(fake, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } catch (e) {
+      log('setupTestEnv returns paths and fixturePath', false, String(e));
     }
   }
 }
