@@ -74,8 +74,8 @@ See [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md). Common issues:
 ## Development
 
 ```bash
-git clone https://github.com/dap/pob-mcp-server.git
-cd pob-mcp-server
+git clone https://github.com/DaAwesomePwner/PathOfBuilding-MCP.git
+cd PathOfBuilding-MCP
 npm install
 npm run build
 ```

@@ -38,12 +38,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dap/pob-mcp-server.git"
+    "url": "git+https://github.com/DaAwesomePwner/PathOfBuilding-MCP.git"
   },
   "bugs": {
-    "url": "https://github.com/dap/pob-mcp-server/issues"
+    "url": "https://github.com/DaAwesomePwner/PathOfBuilding-MCP/issues"
   },
-  "homepage": "https://github.com/dap/pob-mcp-server#readme",
+  "homepage": "https://github.com/DaAwesomePwner/PathOfBuilding-MCP#readme",
   "license": "MIT",
   "keywords": [
     "mcp",
