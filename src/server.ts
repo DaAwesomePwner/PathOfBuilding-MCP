@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { BuildSession, ComparisonResult, DiagnosticCheck, StatDiffResult, UpgradeSuggestion } from './build-session.js';
+import { BuildSession, ComparisonResult, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
 import { LuaBridge, Stats } from './lua-bridge.js';
 import { LuaJITNotFoundError, PoBInstallNotFoundError, ResolvedPaths, resolvePaths } from './paths.js';
 import { startTimer } from './timing.js';
@@ -737,8 +737,7 @@ registerTool<{ scenario: string }>(
       "Temporarily apply a named combat scenario preset (e.g. 'mapping', 'pinnacle_boss') and return the stat diff vs the current config. Build state is fully restored after.",
     inputSchema: {
       scenario: z
-        .string()
-        .min(1)
+        .enum(SCENARIO_NAMES)
         .describe('Scenario preset name (see `list_scenarios`).'),
     },
   },
@@ -761,7 +760,7 @@ registerTool<{ scenarios: string[] }>(
       'Compare 2-6 named scenarios side-by-side. Each scenario is simulated independently with config restore between them. Returns baseline stats plus one entry per scenario with its diff.',
     inputSchema: {
       scenarios: z
-        .array(z.string().min(1))
+        .array(z.enum(SCENARIO_NAMES))
         .min(2)
         .max(6)
         .describe('Scenario preset names (e.g. ["mapping","pinnacle_boss","uber_boss"]).'),

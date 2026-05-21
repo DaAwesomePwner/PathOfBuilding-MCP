@@ -1611,6 +1611,9 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
   },
 };
 
+export const SCENARIO_NAMES = Object.keys(SCENARIO_PRESETS) as unknown as readonly [string, ...string[]];
+export type ScenarioName = (typeof SCENARIO_NAMES)[number];
+
 /**
  * Friendly buff names → PoB config keys. Unknown keys pass through
  * unchanged so callers can still pass raw config keys.
