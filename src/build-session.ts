@@ -1407,25 +1407,37 @@ export class BuildSession {
   }
 
   async diagnoseBuild(focus?: string): Promise<DiagnosticCheck[]> {
-    // Read-only: relies on already-locked public methods. No outer withLock.
-    const stats = await this.getStats();
-    const items = await this.listEquippedItems();
-    const groups = await this.listSkillGroups();
-    const tree = await this.getPassiveTree();
+    return this.withLock(async () => {
+      const snap = await this.bridge.send<{
+        ok: true;
+        stats: Stats;
+        items: EquippedItem[];
+        groups: SkillGroupInfo[];
+        allocatedNodes: TreeNodeInfo[];
+        passiveTreeSummary: PassiveTreeSummary;
+      }>({ cmd: 'diagnoseSnapshot' });
 
-    const checks: DiagnosticCheck[] = [];
-    const want = (cat: 'defense' | 'offense' | 'qol'): boolean => {
-      if (!focus || focus === 'balance') return true;
-      return focus === cat;
-    };
+      const tree: PassiveTreeInfo = {
+        allocatedNodes: snap.allocatedNodes,
+        keystones: snap.allocatedNodes.filter((n) => n.isKeystone),
+        notables: snap.allocatedNodes.filter((n) => n.isNotable),
+        summary: snap.passiveTreeSummary,
+      };
 
-    if (want('defense')) checks.push(...runDefenseDiagnostics(stats));
-    if (want('offense')) checks.push(...runOffenseDiagnostics(stats, groups, tree));
-    if (want('qol')) checks.push(...runQoLDiagnostics(groups, items));
+      const checks: DiagnosticCheck[] = [];
+      const want = (cat: 'defense' | 'offense' | 'qol'): boolean => {
+        if (!focus || focus === 'balance') return true;
+        return focus === cat;
+      };
 
-    const order: Record<DiagnosticCheck['severity'], number> = { critical: 0, warning: 1, info: 2 };
-    checks.sort((a, b) => order[a.severity] - order[b.severity]);
-    return checks;
+      if (want('defense')) checks.push(...runDefenseDiagnostics(snap.stats));
+      if (want('offense')) checks.push(...runOffenseDiagnostics(snap.stats, snap.groups, tree));
+      if (want('qol')) checks.push(...runQoLDiagnostics(snap.groups, snap.items));
+
+      const order: Record<DiagnosticCheck['severity'], number> = { critical: 0, warning: 1, info: 2 };
+      checks.sort((a, b) => order[a.severity] - order[b.severity]);
+      return checks;
+    });
   }
 
   async suggestUpgrades(

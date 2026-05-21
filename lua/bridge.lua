@@ -1450,6 +1450,25 @@ local DISPATCH = {
 		mutating = true,
 	},
 
+	-- Batched read-only snapshot for diagnoseBuild: assembles stats, items,
+	-- skill groups, allocated tree nodes, and passive-tree summary in a single
+	-- Lua call so the TS side needs only one bridge round-trip and one lock
+	-- acquisition instead of the previous 4+ sequential withLock calls.
+	-- All five helpers (getStats, listEquippedItems, getSocketGroups,
+	-- getAllocatedNodesDetailed, getPassiveTreeSummary) are already top-level
+	-- functions, so we call them directly — no duplication needed (option B).
+	diagnoseSnapshot = {
+		handler = function(_cmd)
+			return {
+				stats = getStats(),
+				items = listEquippedItems(),
+				groups = getSocketGroups(),
+				allocatedNodes = getAllocatedNodesDetailed(),
+				passiveTreeSummary = getPassiveTreeSummary(),
+			}
+		end,
+	},
+
 	-- Utility
 	ping = {
 		handler = function(_cmd) return { } end,
