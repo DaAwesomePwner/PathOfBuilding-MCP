@@ -10,7 +10,7 @@ The server runs PoB's real Lua calculation engine in headless mode and surfaces 
 2. **Node.js >= 20**.
 3. **LuaJIT 5.1** — either bundled in your PoB install at `<POB_PATH>/runtime/luajit{,.exe}`, or on `PATH`, or pointed to by `LUAJIT_PATH`. PoB's own GUI uses an embedded `lua51.dll` and does **not** ship a standalone `luajit` executable on most platforms; you may need to install one:
    - Windows (scoop): `scoop install luajit`
-   - Windows (winget): `winget install LuaJIT.LuaJIT`
+   - Windows (winget): `winget install DEVCOM.LuaJIT`
    - macOS (Homebrew): `brew install luajit`
    - Linux (apt): `sudo apt-get install luajit`
 

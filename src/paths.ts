@@ -89,7 +89,7 @@ export function resolveLuaJITPath(pobPath: string): string {
         `Unset LUAJIT_PATH to use auto-discovery, or point it at a valid luajit binary.\n\n` +
         `Install LuaJIT 5.1:\n` +
         `  Windows (scoop):  scoop install luajit\n` +
-        `  Windows (winget): winget install LuaJIT.LuaJIT\n` +
+        `  Windows (winget): winget install DEVCOM.LuaJIT\n` +
         `  macOS (brew):     brew install luajit\n` +
         `  Linux (apt):      sudo apt-get install luajit`,
     );
@@ -120,7 +120,7 @@ export function resolveLuaJITPath(pobPath: string): string {
       probed.map((p) => `  - ${p}`).join('\n') +
       `\n\nInstall LuaJIT 5.1:\n` +
       `  Windows (scoop):  scoop install luajit\n` +
-      `  Windows (winget): winget install LuaJIT.LuaJIT\n` +
+      `  Windows (winget): winget install DEVCOM.LuaJIT\n` +
       `  macOS (brew):     brew install luajit\n` +
       `  Linux (apt):      sudo apt-get install luajit\n` +
       `Or set LUAJIT_PATH to a luajit binary.`,

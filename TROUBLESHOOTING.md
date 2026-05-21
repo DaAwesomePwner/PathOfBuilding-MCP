@@ -24,7 +24,7 @@ If neither exists, your install is incomplete. Re-run the Path of Building Commu
 PoB Community ships an embedded `lua51.dll` for its own GUI but does not generally bundle a standalone `luajit` executable. Install one:
 
 - Windows (scoop): `scoop install luajit`
-- Windows (winget): `winget install LuaJIT.LuaJIT`
+- Windows (winget): `winget install DEVCOM.LuaJIT`
 - macOS (brew): `brew install luajit`
 - Linux (apt): `sudo apt-get install luajit`
 
