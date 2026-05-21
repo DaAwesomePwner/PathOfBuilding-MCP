@@ -372,12 +372,15 @@ export class LuaBridge {
     clearTimeout(pending.timeout);
 
     try {
-      const result = JSON.parse(line);
+      const result = JSON.parse(line) as {
+        error?: string;
+        userError?: boolean;
+      };
       if (result.error) {
         // The Lua side already strips its own source-path prefixes; this is a
         // defensive fallback for any path that slips through (nested errors).
         const cleaned = String(result.error).replace(/^[^:]*\.lua:\d+:\s*/, '');
-        pending.reject(new Error(cleaned));
+        pending.reject(result.userError ? new UserError(cleaned) : new Error(cleaned));
       } else {
         pending.resolve(result);
       }

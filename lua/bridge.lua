@@ -245,6 +245,15 @@ end
 
 local dkjson = require("dkjson")
 
+-- Mark an error as "user input" so the TS side surfaces it verbatim
+-- rather than wrapping it as "Internal error: ...". The marker is the
+-- magic prefix __USER__ on the message; the JSON dispatcher strips it
+-- and sets userError = true in the response.
+local USER_ERROR_PREFIX = "__USER__"
+local function userError(msg)
+  error(USER_ERROR_PREFIX .. msg)
+end
+
 dofile(SCRIPT_PATH .. "/Launch.lua")
 mainObject.continuousIntegrationMode = os.getenv("CI")
 runCallback("OnInit")
@@ -388,7 +397,7 @@ end
 local function getItemInSlot(slotName)
 	local slot = build.itemsTab.slots[slotName]
 	if not slot then
-		error("Unknown slot: " .. tostring(slotName))
+		userError("Unknown slot: " .. tostring(slotName))
 	end
 	local itemId = slot.selItemId or 0
 	if itemId == 0 then
@@ -411,11 +420,11 @@ end
 local function equipItemInSlot(slotName, itemRaw)
 	local slot = build.itemsTab.slots[slotName]
 	if not slot then
-		error("Unknown slot: " .. tostring(slotName))
+		userError("Unknown slot: " .. tostring(slotName))
 	end
 	build.itemsTab:CreateDisplayItemFromRaw(itemRaw)
 	if not build.itemsTab.displayItem then
-		error("Failed to parse item raw text")
+		userError("Failed to parse item raw text")
 	end
 	build.itemsTab:AddDisplayItem(true) -- noAutoEquip = true
 	-- The new item id is the highest in items map after AddDisplayItem.
@@ -433,7 +442,7 @@ end
 local function unequipSlot(slotName)
 	local slot = build.itemsTab.slots[slotName]
 	if not slot then
-		error("Unknown slot: " .. tostring(slotName))
+		userError("Unknown slot: " .. tostring(slotName))
 	end
 	slot:SetSelItemId(0)
 	build.buildFlag = true
@@ -454,7 +463,7 @@ end
 local function allocNodeById(nodeId)
 	local node = build.spec.nodes[nodeId]
 	if not node then
-		error("Unknown node id: " .. tostring(nodeId))
+		userError("Unknown node id: " .. tostring(nodeId))
 	end
 	build.spec:AllocNode(node)
 	build.buildFlag = true
@@ -464,7 +473,7 @@ end
 local function deallocNodeById(nodeId)
 	local node = build.spec.nodes[nodeId]
 	if not node then
-		error("Unknown node id: " .. tostring(nodeId))
+		userError("Unknown node id: " .. tostring(nodeId))
 	end
 	build.spec:DeallocNode(node)
 	build.buildFlag = true
@@ -610,7 +619,7 @@ local function getSkillBreakdown(skillIndex)
 	end
 	local group = list[index]
 	if not group then
-		error("No socket group at index " .. tostring(index))
+		userError("No socket group at index " .. tostring(index))
 	end
 
 	local gems = { }
@@ -773,7 +782,7 @@ local function allocNodesBatch(nodeIds)
 	for _, id in ipairs(nodeIds or { }) do
 		local node = build.spec.nodes[id]
 		if not node then
-			error("Unknown node id: " .. tostring(id))
+			userError("Unknown node id: " .. tostring(id))
 		end
 		build.spec:AllocNode(node)
 	end
@@ -785,7 +794,7 @@ local function deallocNodesBatch(nodeIds)
 	for _, id in ipairs(nodeIds or { }) do
 		local node = build.spec.nodes[id]
 		if not node then
-			error("Unknown node id: " .. tostring(id))
+			userError("Unknown node id: " .. tostring(id))
 		end
 		build.spec:DeallocNode(node)
 	end
@@ -1044,13 +1053,13 @@ local function getGroupAndGem(groupIndex, gemIndex)
 	end
 	local group = build.skillsTab.socketGroupList[groupIndex]
 	if not group then
-		error("Skill group not found at index " .. tostring(groupIndex))
+		userError("Skill group not found at index " .. tostring(groupIndex))
 	end
 	local gem = nil
 	if gemIndex then
 		gem = group.gemList and group.gemList[gemIndex]
 		if not gem then
-			error("Gem not found at index " .. tostring(gemIndex) .. " in group " .. tostring(groupIndex))
+			userError("Gem not found at index " .. tostring(gemIndex) .. " in group " .. tostring(groupIndex))
 		end
 	end
 	return group, gem
@@ -1060,7 +1069,7 @@ local function setGemImpl(groupIndex, gemIndex, gemName, level, quality)
 	local group, gem = getGroupAndGem(groupIndex, gemIndex)
 	local gemData, errMsg = findGemByName(gemName)
 	if not gemData then
-		error("Gem lookup failed: " .. tostring(errMsg))
+		userError("Gem lookup failed: " .. tostring(errMsg))
 	end
 	gem.gemId = gemData.id
 	gem.skillId = gemData.grantedEffectId
@@ -1097,7 +1106,7 @@ local function addGemImpl(groupIndex, gemName, level, quality, position)
 	local group, _ = getGroupAndGem(groupIndex, nil)
 	local gemData, errMsg = findGemByName(gemName)
 	if not gemData then
-		error("Gem lookup failed: " .. tostring(errMsg))
+		userError("Gem lookup failed: " .. tostring(errMsg))
 	end
 	local newGem = {
 		nameSpec = gemData.name,
@@ -1119,6 +1128,40 @@ local function addGemImpl(groupIndex, gemName, level, quality, position)
 	build.buildFlag = true
 	runCallback("OnFrame")
 	return #group.gemList
+end
+
+-- Replace all gems in a socket group atomically: wipes the existing gem list,
+-- inserts the new gems without triggering a per-gem recalc, then calls
+-- ProcessSocketGroup + OnFrame once. Used by testSupportCombinationLocked to
+-- avoid N_remove + N_add individual OnFrame calls (each ~55–65ms).
+-- cmd.gems is an array of { name, level, quality }.
+local function replaceSocketGroupImpl(groupIndex, gems)
+	local group, _ = getGroupAndGem(groupIndex, nil)
+	-- Wipe existing gem list in-place (mirrors what restoreSkills does per group)
+	for i = #group.gemList, 1, -1 do group.gemList[i] = nil end
+	-- Build new gems without triggering OnFrame
+	for _, gemSpec in ipairs(gems) do
+		local gemData, errMsg = findGemByName(gemSpec.name)
+		if not gemData then
+			userError("Gem lookup failed for '" .. tostring(gemSpec.name) .. "': " .. tostring(errMsg))
+		end
+		local newGem = {
+			nameSpec = gemData.name,
+			gemId = gemData.id,
+			skillId = gemData.grantedEffectId,
+			level = gemSpec.level or 20,
+			quality = gemSpec.quality or 0,
+			enabled = true,
+			enableGlobal1 = true,
+			enableGlobal2 = true,
+			count = 1,
+		}
+		table.insert(group.gemList, newGem)
+	end
+	-- Single recalc for the whole group
+	build.skillsTab:ProcessSocketGroup(group)
+	build.buildFlag = true
+	runCallback("OnFrame")
 end
 
 local function getGemByNameImpl(name)
@@ -1171,7 +1214,7 @@ local function setMainSocketGroupImpl(groupIndex)
 		error("Skills tab not available")
 	end
 	if not build.skillsTab.socketGroupList[groupIndex] then
-		error("Skill group not found at index " .. tostring(groupIndex))
+		userError("Skill group not found at index " .. tostring(groupIndex))
 	end
 	build.mainSocketGroup = groupIndex
 	build.buildFlag = true
@@ -1255,121 +1298,245 @@ local function restoreSkills(snap)
 	runCallback("OnFrame")
 end
 
+-- Each handler returns the body of the response, NOT including `ok = true`.
+-- The dispatcher adds `ok = true` automatically. If `mutating` is true the
+-- dispatcher also calls getStats() after the handler and merges the result
+-- into the response body — this encodes the pattern the old if/elseif chain
+-- used for equipItem, allocNode, etc.
+local DISPATCH = {
+	-- Build loading / info
+	loadXML = {
+		handler = function(cmd)
+			local xmlText = cmd.xml or ""
+			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
+				userError("Invalid Path of Building XML")
+			end
+			loadBuildFromXML(xmlText, cmd.name or "MCP Build")
+			return { info = getBuildInfo() }
+		end,
+	},
+	getBuildInfo = {
+		handler = function(_cmd) return { info = getBuildInfo() } end,
+	},
+	exportXML = {
+		handler = function(_cmd) return { xml = exportBuildXML() } end,
+	},
+	verifyData = {
+		handler = function(_cmd) return { data = verifyData() } end,
+	},
+
+	-- Stats / config
+	getStats = {
+		handler = function(_cmd) return { stats = getStats() } end,
+	},
+	getConfig = {
+		handler = function(_cmd) return { config = getConfig() } end,
+	},
+	getConfigMetadata = {
+		handler = function(_cmd) return { metadata = getConfigMetadata() } end,
+	},
+	getFullConfig = {
+		handler = function(_cmd) return { input = getFullConfigInput() } end,
+	},
+	setConfig = {
+		-- Inline mutation: options loop + rebuild before stats
+		handler = function(cmd)
+			for key, value in pairs(cmd.options or { }) do
+				build.configTab.input[key] = value
+			end
+			build.configTab:BuildModList()
+			build.buildFlag = true
+			runCallback("OnFrame")
+			return { stats = getStats() }
+		end,
+	},
+	restoreConfig = {
+		handler = function(cmd) restoreConfigInput(cmd.input or { }) return { } end,
+		mutating = true,
+	},
+
+	-- Items
+	getItemInSlot = {
+		handler = function(cmd) return { item = getItemInSlot(cmd.slot) } end,
+	},
+	listEquippedItems = {
+		handler = function(_cmd) return { items = listEquippedItems() } end,
+	},
+	getValidSlots = {
+		handler = function(_cmd) return { slots = getValidSlots() } end,
+	},
+	equipItem = {
+		handler = function(cmd) equipItemInSlot(cmd.slot, cmd.itemText or "") return { } end,
+		mutating = true,
+	},
+	unequipItem = {
+		handler = function(cmd) unequipSlot(cmd.slot) return { } end,
+		mutating = true,
+	},
+	snapshotAllItems = {
+		handler = function(cmd)
+			if type(cmd.slots) ~= "table" then
+				userError("snapshotAllItems requires `slots` array")
+			end
+			local out = {}
+			for i = 1, #cmd.slots do
+				local slotName = cmd.slots[i]
+				local item = getItemInSlot(slotName)
+				-- Transform to ItemSnapshot shape: { slot, itemText, itemId }
+				-- (mirrors the logic in TS snapshotSlotUnlocked)
+				if item.itemId and item.itemId ~= 0 and item.raw then
+					out[i] = { slot = slotName, itemText = item.raw, itemId = item.itemId }
+				else
+					out[i] = { slot = slotName, itemText = dkjson.null, itemId = dkjson.null }
+				end
+			end
+			return { items = out }
+		end,
+	},
+
+	-- Passive tree
+	getAllocatedNodes = {
+		handler = function(_cmd) return { nodeIds = getAllocatedNodeIds() } end,
+	},
+	getAllocatedNodesDetailed = {
+		handler = function(_cmd) return { nodes = getAllocatedNodesDetailed() } end,
+	},
+	getReachableNodes = {
+		handler = function(_cmd) return { nodes = getReachableNodesList() } end,
+	},
+	getNodeInfo = {
+		handler = function(cmd) return { node = getNodeInfo({ nodeId = cmd.nodeId, name = cmd.name }) } end,
+	},
+	isTreeConnected = {
+		handler = function(_cmd) return { result = isTreeConnected() } end,
+	},
+	getPassiveTreeSummary = {
+		handler = function(_cmd) return { summary = getPassiveTreeSummary() } end,
+	},
+	allocNode = {
+		handler = function(cmd) allocNodeById(cmd.nodeId) return { } end,
+		mutating = true,
+	},
+	deallocNode = {
+		handler = function(cmd) deallocNodeById(cmd.nodeId) return { } end,
+		mutating = true,
+	},
+	allocNodes = {
+		handler = function(cmd) allocNodesBatch(cmd.nodeIds or { }) return { } end,
+		mutating = true,
+	},
+	deallocNodes = {
+		handler = function(cmd) deallocNodesBatch(cmd.nodeIds or { }) return { } end,
+		mutating = true,
+	},
+	restoreTreeFromList = {
+		handler = function(cmd) restoreTreeFromIds(cmd.nodeIds or { }) return { } end,
+		mutating = true,
+	},
+
+	-- Skills / gems
+	getSkillBreakdown = {
+		handler = function(cmd) return { breakdown = getSkillBreakdown(cmd.index) } end,
+	},
+	getSocketGroups = {
+		handler = function(_cmd) return { groups = getSocketGroups() } end,
+	},
+	getGemByName = {
+		handler = function(cmd)
+			local gem, errMsg = getGemByNameImpl(cmd.name)
+			if not gem then
+				userError(errMsg or ("Gem not found: " .. tostring(cmd.name)))
+			end
+			return { gem = gem }
+		end,
+	},
+	getAvailableSupports = {
+		handler = function(cmd) return { supports = getAvailableSupports(cmd.activeSkillTags, cmd.includeAwakened) } end,
+	},
+	setGem = {
+		handler = function(cmd) setGemImpl(cmd.groupIndex, cmd.gemIndex, cmd.gemName, cmd.level, cmd.quality) return { } end,
+		mutating = true,
+	},
+	setGemLevel = {
+		handler = function(cmd) setGemLevelImpl(cmd.groupIndex, cmd.gemIndex, cmd.level, cmd.quality) return { } end,
+		mutating = true,
+	},
+	removeGem = {
+		handler = function(cmd) removeGemImpl(cmd.groupIndex, cmd.gemIndex) return { } end,
+		mutating = true,
+	},
+	addGem = {
+		-- Returns gemIndex alongside stats; inline the stats call to include both.
+		handler = function(cmd)
+			local newIndex = addGemImpl(cmd.groupIndex, cmd.gemName, cmd.level, cmd.quality, cmd.position)
+			return { stats = getStats(), gemIndex = newIndex }
+		end,
+	},
+	setMainSocketGroup = {
+		handler = function(cmd) setMainSocketGroupImpl(cmd.groupIndex) return { } end,
+		mutating = true,
+	},
+	snapshotSkills = {
+		handler = function(_cmd) return { snapshot = snapshotSkills() } end,
+	},
+	restoreSkills = {
+		handler = function(cmd) restoreSkills(cmd.snapshot) return { } end,
+		mutating = true,
+	},
+	-- Atomically replace a socket group's gem list and recalculate once.
+	-- Saves (N_remove + N_add - 1) OnFrame calls compared to individual
+	-- removeGem/addGem round-trips. Used by testSupportCombinationLocked.
+	replaceSocketGroup = {
+		handler = function(cmd) replaceSocketGroupImpl(cmd.groupIndex, cmd.gems) return { } end,
+		mutating = true,
+	},
+
+	-- Batched read-only snapshot for diagnoseBuild: assembles stats, items,
+	-- skill groups, allocated tree nodes, and passive-tree summary in a single
+	-- Lua call so the TS side needs only one bridge round-trip and one lock
+	-- acquisition instead of the previous 4+ sequential withLock calls.
+	-- All five helpers (getStats, listEquippedItems, getSocketGroups,
+	-- getAllocatedNodesDetailed, getPassiveTreeSummary) are already top-level
+	-- functions, so we call them directly — no duplication needed (option B).
+	diagnoseSnapshot = {
+		handler = function(_cmd)
+			return {
+				stats = getStats(),
+				items = listEquippedItems(),
+				groups = getSocketGroups(),
+				allocatedNodes = getAllocatedNodesDetailed(),
+				passiveTreeSummary = getPassiveTreeSummary(),
+			}
+		end,
+	},
+
+	-- Utility
+	ping = {
+		handler = function(_cmd) return { } end,
+	},
+	shutdown = {
+		-- Special: respond and exit immediately; dispatcher's ok=true injection never fires.
+		handler = function(_cmd)
+			respond({ ok = true })
+			os.exit(0)
+		end,
+	},
+}
+
 local function dispatch(cmd)
 	if type(cmd) ~= "table" then
 		error("Command must be a JSON object")
 	end
-	if cmd.cmd == "loadXML" then
-		local xmlText = cmd.xml or ""
-		if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
-			error("Invalid Path of Building XML")
-		end
-		loadBuildFromXML(xmlText, cmd.name or "MCP Build")
-		return { ok = true, info = getBuildInfo() }
-	elseif cmd.cmd == "getStats" then
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "getConfig" then
-		return { ok = true, config = getConfig() }
-	elseif cmd.cmd == "getConfigMetadata" then
-		return { ok = true, metadata = getConfigMetadata() }
-	elseif cmd.cmd == "setConfig" then
-		for key, value in pairs(cmd.options or { }) do
-			build.configTab.input[key] = value
-		end
-		build.configTab:BuildModList()
-		build.buildFlag = true
-		runCallback("OnFrame")
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "getFullConfig" then
-		return { ok = true, input = getFullConfigInput() }
-	elseif cmd.cmd == "restoreConfig" then
-		restoreConfigInput(cmd.input or { })
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "getBuildInfo" then
-		return { ok = true, info = getBuildInfo() }
-	elseif cmd.cmd == "getItemInSlot" then
-		return { ok = true, item = getItemInSlot(cmd.slot) }
-	elseif cmd.cmd == "equipItem" then
-		equipItemInSlot(cmd.slot, cmd.itemText or "")
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "unequipItem" then
-		unequipSlot(cmd.slot)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "getAllocatedNodes" then
-		return { ok = true, nodeIds = getAllocatedNodeIds() }
-	elseif cmd.cmd == "allocNode" then
-		allocNodeById(cmd.nodeId)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "deallocNode" then
-		deallocNodeById(cmd.nodeId)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "restoreTreeFromList" then
-		restoreTreeFromIds(cmd.nodeIds or { })
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "exportXML" then
-		return { ok = true, xml = exportBuildXML() }
-	elseif cmd.cmd == "getSkillBreakdown" then
-		return { ok = true, breakdown = getSkillBreakdown(cmd.index) }
-	elseif cmd.cmd == "listEquippedItems" then
-		return { ok = true, items = listEquippedItems() }
-	elseif cmd.cmd == "getValidSlots" then
-		return { ok = true, slots = getValidSlots() }
-	elseif cmd.cmd == "getAllocatedNodesDetailed" then
-		return { ok = true, nodes = getAllocatedNodesDetailed() }
-	elseif cmd.cmd == "getReachableNodes" then
-		return { ok = true, nodes = getReachableNodesList() }
-	elseif cmd.cmd == "getNodeInfo" then
-		return { ok = true, node = getNodeInfo({ nodeId = cmd.nodeId, name = cmd.name }) }
-	elseif cmd.cmd == "allocNodes" then
-		allocNodesBatch(cmd.nodeIds or { })
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "deallocNodes" then
-		deallocNodesBatch(cmd.nodeIds or { })
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "isTreeConnected" then
-		return { ok = true, result = isTreeConnected() }
-	elseif cmd.cmd == "getPassiveTreeSummary" then
-		return { ok = true, summary = getPassiveTreeSummary() }
-	elseif cmd.cmd == "getSocketGroups" then
-		return { ok = true, groups = getSocketGroups() }
-	elseif cmd.cmd == "setGem" then
-		setGemImpl(cmd.groupIndex, cmd.gemIndex, cmd.gemName, cmd.level, cmd.quality)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "setGemLevel" then
-		setGemLevelImpl(cmd.groupIndex, cmd.gemIndex, cmd.level, cmd.quality)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "removeGem" then
-		removeGemImpl(cmd.groupIndex, cmd.gemIndex)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "addGem" then
-		local newIndex = addGemImpl(cmd.groupIndex, cmd.gemName, cmd.level, cmd.quality, cmd.position)
-		return { ok = true, stats = getStats(), gemIndex = newIndex }
-	elseif cmd.cmd == "getGemByName" then
-		local gem, errMsg = getGemByNameImpl(cmd.name)
-		if not gem then
-			error(errMsg or ("Gem not found: " .. tostring(cmd.name)))
-		end
-		return { ok = true, gem = gem }
-	elseif cmd.cmd == "getAvailableSupports" then
-		return { ok = true, supports = getAvailableSupports(cmd.activeSkillTags, cmd.includeAwakened) }
-	elseif cmd.cmd == "setMainSocketGroup" then
-		setMainSocketGroupImpl(cmd.groupIndex)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "snapshotSkills" then
-		return { ok = true, snapshot = snapshotSkills() }
-	elseif cmd.cmd == "restoreSkills" then
-		restoreSkills(cmd.snapshot)
-		return { ok = true, stats = getStats() }
-	elseif cmd.cmd == "verifyData" then
-		return { ok = true, data = verifyData() }
-	elseif cmd.cmd == "ping" then
-		return { ok = true }
-	elseif cmd.cmd == "shutdown" then
-		respond({ ok = true })
-		os.exit(0)
-	else
-		error("Unknown command: " .. tostring(cmd.cmd))
+	local entry = DISPATCH[cmd.cmd]
+	if not entry then
+		userError("Unknown command: " .. tostring(cmd.cmd))
 	end
+	local body = entry.handler(cmd)
+	if entry.mutating then
+		body.stats = getStats()
+	end
+	body.ok = true
+	return body
 end
 
 respond({ ok = true, ready = true })
@@ -1384,11 +1551,22 @@ while true do
 		local ok, result = pcall(dispatch, cmd)
 		if not ok then
 			-- Strip Lua source path/line prefixes (e.g. ".../bridge.lua:411: ") so
-			-- the surface error message is user-friendly.
+			-- the surface error message is user-friendly. This MUST happen before
+			-- the userError prefix check because Lua wraps thrown errors with
+			-- source-location prefixes; after stripping, __USER__ appears at start.
 			local msg = tostring(result)
 			msg = msg:gsub("^%.%.%.[^:]*%.lua:%d+:%s*", "")
 			msg = msg:gsub("^[^:]*%.lua:%d+:%s*", "")
-			respond({ error = msg })
+			local userFlag = false
+			if msg:sub(1, #USER_ERROR_PREFIX) == USER_ERROR_PREFIX then
+				msg = msg:sub(#USER_ERROR_PREFIX + 1)
+				userFlag = true
+			end
+			if userFlag then
+				respond({ error = msg, userError = true })
+			else
+				respond({ error = msg })
+			end
 		else
 			respond(result)
 		end

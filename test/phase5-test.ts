@@ -283,8 +283,19 @@ async function main(): Promise<void> {
     assert(approxEq(afterOpt2.Life, baseline.Life), 'state restored after constrained find_optimal_links');
     log('PASS: constrained find_optimal_links');
 
+    // Test 12: find_optimal_links timing probe (topN=25, 6 slots) — for profiling
+    log('Test 12: find_optimal_links timing probe (Vortex, 6 slots, topN=25)');
+    const t0 = Date.now();
+    const timingResp = JSON.parse(extractText(await call(client, 'find_optimal_links', {
+      activeSkill: 'Vortex',
+      availableSlots: 6,
+      topN: 25,
+    }))) as { bestCombination: string[]; bestDPS: number };
+    const dt = Date.now() - t0;
+    log(`PASS: find_optimal_links (topN=25, 6-slot) returned in ${dt}ms, best=[${timingResp.bestCombination.join(', ')}] DPS=${timingResp.bestDPS.toFixed(0)}`);
+
     // Final integrity check
-    log('Test 12: final overall state integrity');
+    log('Test 13: final overall state integrity');
     const final = await getKeyStats(client);
     assert(
       approxEq(final.Life, baseline.Life)
@@ -292,7 +303,7 @@ async function main(): Promise<void> {
         && approxEq(final.TotalEHP, baseline.TotalEHP),
       `final state should match baseline: ${JSON.stringify({ baseline, final })}`,
     );
-    log('PASS: build pristine after all phase 5 operations');
+    log('PASS: build pristine after all phase 5 operations (Test 13)');
   } finally {
     try { await client.close(); } catch { /* ignore */ }
   }

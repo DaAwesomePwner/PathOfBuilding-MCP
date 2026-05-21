@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { BuildSession, ComparisonResult, DiagnosticCheck, StatDiffResult, UpgradeSuggestion } from './build-session.js';
+import { BuildSession, ComparisonResult, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
 import { LuaBridge, Stats } from './lua-bridge.js';
 import { LuaJITNotFoundError, PoBInstallNotFoundError, ResolvedPaths, resolvePaths } from './paths.js';
 import { startTimer } from './timing.js';
@@ -122,20 +122,6 @@ function errorResponse(error: unknown): {
     };
   }
   const message = error instanceof Error ? error.message : String(error);
-  // Errors thrown from Lua arrive as plain Error (no UserError flag survives
-  // the JSON boundary), so fall back to keyword sniffing to surface obvious
-  // user-input messages verbatim. "failed" is deliberately omitted — it shows
-  // up in genuine internal errors ("LoadModule() error", "SaveDB ... failed").
-  if (
-    /\b(not found|invalid|must be|missing|unknown|empty|too short|out of range|unrecognised|unrecognized|not allowed)\b/i.test(message) &&
-    message.length < 240
-  ) {
-    return {
-      content: [{ type: 'text', text: message }],
-      isError: true,
-    };
-  }
-  // For unknown internal errors, hint at recovery without leaking stack traces.
   return {
     content: [
       {
@@ -148,6 +134,43 @@ function errorResponse(error: unknown): {
     isError: true,
   };
 }
+
+/**
+ * Register a tool with consistent try/catch → errorResponse wrapping.
+ * The handler can throw UserError (surfaced verbatim) or any other Error
+ * (wrapped as Internal error). Returning a value short-circuits the
+ * wrapping; useful for handlers that already build a custom response shape.
+ */
+function registerTool<TArgs>(
+  name: string,
+  schema: {
+    description: string;
+    inputSchema: Record<string, z.ZodTypeAny>;
+  },
+  handler: (args: TArgs) => Promise<unknown>,
+): void {
+  server.registerTool(name, schema, async (args) => {
+    try {
+      const result = await handler(args as TArgs);
+      // If the handler returns a content-array response (e.g. multi-part
+      // text from diagnose_build), pass it through unchanged. Check for an
+      // array `content` rather than just key presence so a future handler
+      // returning a domain object with a string `content` field isn't
+      // silently misrouted as a multi-part response.
+      if (
+        result &&
+        typeof result === 'object' &&
+        Array.isArray((result as Record<string, unknown>).content)
+      ) {
+        return result as { content: Array<{ type: 'text'; text: string }> };
+      }
+      return textResponse(result);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Server wiring
 // ---------------------------------------------------------------------------
@@ -160,7 +183,7 @@ const server = new McpServer({
   version: '0.1.0',
 });
 
-server.registerTool(
+registerTool<{ source: string }>(
   'load_build',
   {
     description:
@@ -179,22 +202,20 @@ server.registerTool(
     try {
       const cleaned = validateBuildSource(source);
       const info = await session.loadBuild(cleaned);
-      return textResponse({
+      return {
         status: 'loaded',
         class: info.class,
         ascendancy: info.ascendancy,
         level: info.level,
         mainSkill: info.mainSkill,
-      });
-    } catch (error) {
-      return errorResponse(error);
+      };
     } finally {
       stop();
     }
   },
 );
 
-server.registerTool(
+registerTool<{ categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'> }>(
   'get_stats',
   {
     description:
@@ -207,16 +228,12 @@ server.registerTool(
     },
   },
   async ({ categories }) => {
-    try {
-      const stats = await session.getStats();
-      return textResponse(categorizeStats(stats, categories));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const stats = await session.getStats();
+    return categorizeStats(stats, categories);
   },
 );
 
-server.registerTool(
+registerTool<{ skillIndex?: number }>(
   'get_skill_breakdown',
   {
     description:
@@ -231,16 +248,11 @@ server.registerTool(
     },
   },
   async ({ skillIndex }) => {
-    try {
-      const breakdown = await session.getSkillBreakdown(skillIndex);
-      return textResponse(breakdown);
-    } catch (error) {
-      return errorResponse(error);
-    }
+    return session.getSkillBreakdown(skillIndex);
   },
 );
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'list_equipped_items',
   {
     description:
@@ -248,12 +260,8 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const items = await session.listEquippedItems();
-      return textResponse({ count: items.length, items });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const items = await session.listEquippedItems();
+    return { count: items.length, items };
   },
 );
 
@@ -298,7 +306,7 @@ function summarizeComparison(result: ComparisonResult): unknown {
   };
 }
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'list_valid_slots',
   {
     description:
@@ -306,16 +314,12 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const slots = await session.getValidSlots();
-      return textResponse({ count: slots.length, slots });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const slots = await session.getValidSlots();
+    return { count: slots.length, slots };
   },
 );
 
-server.registerTool(
+registerTool<{ slot: string }>(
   'get_item_in_slot',
   {
     description:
@@ -325,17 +329,13 @@ server.registerTool(
     },
   },
   async ({ slot }) => {
-    try {
-      const item = await session.getItemInSlot(slot);
-      if (!item) return textResponse({ slot, empty: true, item: null });
-      return textResponse({ slot, empty: false, item });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const item = await session.getItemInSlot(slot);
+    if (!item) return { slot, empty: true, item: null };
+    return { slot, empty: false, item };
   },
 );
 
-server.registerTool(
+registerTool<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
@@ -349,18 +349,14 @@ server.registerTool(
     },
   },
   async ({ slot, itemText }) => {
-    try {
-      validateSlot(slot);
-      validateItemText(itemText);
-      const result = await session.swapItemWithDiff(slot, itemText);
-      return textResponse(summarizeStatDiff(result));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    validateSlot(slot);
+    validateItemText(itemText);
+    const result = await session.swapItemWithDiff(slot, itemText);
+    return summarizeStatDiff(result);
   },
 );
 
-server.registerTool(
+registerTool<{ slot: string }>(
   'unequip_item',
   {
     description:
@@ -370,17 +366,13 @@ server.registerTool(
     },
   },
   async ({ slot }) => {
-    try {
-      validateSlot(slot);
-      const result = await session.unequipItemWithDiff(slot);
-      return textResponse(summarizeStatDiff(result));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    validateSlot(slot);
+    const result = await session.unequipItemWithDiff(slot);
+    return summarizeStatDiff(result);
   },
 );
 
-server.registerTool(
+registerTool<{ slot: string; items: string[] }>(
   'compare_items',
   {
     description:
@@ -395,20 +387,16 @@ server.registerTool(
     },
   },
   async ({ slot, items }) => {
-    try {
-      validateSlot(slot);
-      // Per-item validation is deliberately not run here; compareItems
-      // captures per-candidate failures into its results, which lets a
-      // partially-bad batch still surface useful diffs for the good entries.
-      const result = await session.compareItems(slot, items);
-      return textResponse(summarizeComparison(result));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    validateSlot(slot);
+    // Per-item validation is deliberately not run here; compareItems
+    // captures per-candidate failures into its results, which lets a
+    // partially-bad batch still surface useful diffs for the good entries.
+    const result = await session.compareItems(slot, items);
+    return summarizeComparison(result);
   },
 );
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'undo_last_change',
   {
     description:
@@ -416,12 +404,8 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const stats = await session.undoLastChange();
-      return textResponse({ status: 'reverted', stats });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const stats = await session.undoLastChange();
+    return { status: 'reverted', stats };
   },
 );
 
@@ -429,7 +413,7 @@ server.registerTool(
 // Phase 4 tools: passive tree analysis
 // ---------------------------------------------------------------------------
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'get_passive_tree',
   {
     description:
@@ -437,16 +421,11 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const tree = await session.getPassiveTree();
-      return textResponse(tree);
-    } catch (error) {
-      return errorResponse(error);
-    }
+    return session.getPassiveTree();
   },
 );
 
-server.registerTool(
+registerTool<{ allocate?: Array<string | number>; deallocate?: Array<string | number> }>(
   'simulate_passive_change',
   {
     description:
@@ -463,21 +442,17 @@ server.registerTool(
     },
   },
   async ({ allocate, deallocate }) => {
-    try {
-      const result = await session.simulatePassiveChange(allocate ?? [], deallocate ?? []);
-      return textResponse({
-        valid: result.valid,
-        validationErrors: result.validationErrors,
-        keyDeltas: keyDeltas(result.statDiff),
-        statDiff: result.statDiff,
-      });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.simulatePassiveChange(allocate ?? [], deallocate ?? []);
+    return {
+      valid: result.valid,
+      validationErrors: result.validationErrors,
+      keyDeltas: keyDeltas(result.statDiff),
+      statDiff: result.statDiff,
+    };
   },
 );
 
-server.registerTool(
+registerTool<{ count?: number; optimizeFor?: string; includeJewelSockets?: boolean }>(
   'find_best_next_nodes',
   {
     description:
@@ -495,20 +470,16 @@ server.registerTool(
     },
   },
   async ({ count, optimizeFor, includeJewelSockets }) => {
-    try {
-      const rankings = await session.findBestNextNodes(
-        count ?? 10,
-        optimizeFor ?? 'CombinedDPS',
-        includeJewelSockets ?? false,
-      );
-      return textResponse({ optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const rankings = await session.findBestNextNodes(
+      count ?? 10,
+      optimizeFor ?? 'CombinedDPS',
+      includeJewelSockets ?? false,
+    );
+    return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
   },
 );
 
-server.registerTool(
+registerTool<{ count?: number; optimizeFor?: string }>(
   'find_worst_allocated_nodes',
   {
     description:
@@ -522,16 +493,12 @@ server.registerTool(
     },
   },
   async ({ count, optimizeFor }) => {
-    try {
-      const rankings = await session.findWorstAllocatedNodes(count ?? 10, optimizeFor ?? 'CombinedDPS');
-      return textResponse({ optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const rankings = await session.findWorstAllocatedNodes(count ?? 10, optimizeFor ?? 'CombinedDPS');
+    return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
   },
 );
 
-server.registerTool(
+registerTool<{ keystone: string }>(
   'evaluate_keystone',
   {
     description:
@@ -544,19 +511,15 @@ server.registerTool(
     },
   },
   async ({ keystone }) => {
-    try {
-      const result = await session.evaluateKeystone(keystone);
-      return textResponse({
-        keystone: result.keystone,
-        currentlyAllocated: result.currentlyAllocated,
-        action: result.action,
-        nodeStats: result.nodeStats,
-        keyDeltas: keyDeltas(result.statDiff),
-        statDiff: result.statDiff,
-      });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.evaluateKeystone(keystone);
+    return {
+      keystone: result.keystone,
+      currentlyAllocated: result.currentlyAllocated,
+      action: result.action,
+      nodeStats: result.nodeStats,
+      keyDeltas: keyDeltas(result.statDiff),
+      statDiff: result.statDiff,
+    };
   },
 );
 
@@ -564,7 +527,7 @@ server.registerTool(
 // Phase 5 tools: skill gems
 // ---------------------------------------------------------------------------
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'list_skill_groups',
   {
     description:
@@ -572,25 +535,21 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const groups = await session.listSkillGroups();
-      const formatted = groups.map((g) => ({
-        index: g.index,
-        label: g.label,
-        slot: g.slotName,
-        enabled: g.enabled,
-        isMainSkill: g.isMainGroup,
-        activeGems: g.gems.filter((gem) => !gem.isSupport),
-        supportGems: g.gems.filter((gem) => gem.isSupport),
-      }));
-      return textResponse({ count: formatted.length, groups: formatted });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const groups = await session.listSkillGroups();
+    const formatted = groups.map((g) => ({
+      index: g.index,
+      label: g.label,
+      slot: g.slotName,
+      enabled: g.enabled,
+      isMainSkill: g.isMainGroup,
+      activeGems: g.gems.filter((gem) => !gem.isSupport),
+      supportGems: g.gems.filter((gem) => gem.isSupport),
+    }));
+    return { count: formatted.length, groups: formatted };
   },
 );
 
-server.registerTool(
+registerTool<{ name: string }>(
   'lookup_gem',
   {
     description:
@@ -600,16 +559,11 @@ server.registerTool(
     },
   },
   async ({ name }) => {
-    try {
-      const gem = await session.getGemByName(name);
-      return textResponse(gem);
-    } catch (error) {
-      return errorResponse(error);
-    }
+    return session.getGemByName(name);
   },
 );
 
-server.registerTool(
+registerTool<{ activeSkillTags?: string[]; includeAwakened?: boolean }>(
   'list_available_supports',
   {
     description:
@@ -623,16 +577,12 @@ server.registerTool(
     },
   },
   async ({ activeSkillTags, includeAwakened }) => {
-    try {
-      const supports = await session.getAvailableSupports(activeSkillTags, includeAwakened ?? false);
-      return textResponse({ count: supports.length, supports });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const supports = await session.getAvailableSupports(activeSkillTags, includeAwakened ?? false);
+    return { count: supports.length, supports };
   },
 );
 
-server.registerTool(
+registerTool<{ skillGroupIndex: number; gemIndex: number; newGemName: string; level?: number; quality?: number }>(
   'swap_gem',
   {
     description:
@@ -646,16 +596,12 @@ server.registerTool(
     },
   },
   async ({ skillGroupIndex, gemIndex, newGemName, level, quality }) => {
-    try {
-      const result = await session.swapGemWithDiff(skillGroupIndex, gemIndex, newGemName, level, quality);
-      return textResponse(summarizeStatDiff(result));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.swapGemWithDiff(skillGroupIndex, gemIndex, newGemName, level, quality);
+    return summarizeStatDiff(result);
   },
 );
 
-server.registerTool(
+registerTool<{ skillGroupIndex: number; candidates: string[] }>(
   'compare_supports',
   {
     description:
@@ -670,16 +616,11 @@ server.registerTool(
     },
   },
   async ({ skillGroupIndex, candidates }) => {
-    try {
-      const result = await session.compareSupports(skillGroupIndex, candidates);
-      return textResponse(result);
-    } catch (error) {
-      return errorResponse(error);
-    }
+    return session.compareSupports(skillGroupIndex, candidates);
   },
 );
 
-server.registerTool(
+registerTool<{ skillGroupIndex: number; gemIndex: number; levels?: number[] }>(
   'evaluate_gem_levels',
   {
     description:
@@ -694,16 +635,12 @@ server.registerTool(
     },
   },
   async ({ skillGroupIndex, gemIndex, levels }) => {
-    try {
-      const scaling = await session.evaluateGemLevels(skillGroupIndex, gemIndex, levels);
-      return textResponse({ count: scaling.length, scaling });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const scaling = await session.evaluateGemLevels(skillGroupIndex, gemIndex, levels);
+    return { count: scaling.length, scaling };
   },
 );
 
-server.registerTool(
+registerTool<{ activeSkill: string; availableSlots: number; constraints?: string[]; topN?: number }>(
   'find_optimal_links',
   {
     description:
@@ -724,17 +661,12 @@ server.registerTool(
     },
   },
   async ({ activeSkill, availableSlots, constraints, topN }) => {
-    try {
-      const result = await session.findOptimalLinks(
-        activeSkill,
-        availableSlots - 1, // active skill consumes one slot; remaining are supports
-        constraints ?? [],
-        { topN },
-      );
-      return textResponse(result);
-    } catch (error) {
-      return errorResponse(error);
-    }
+    return session.findOptimalLinks(
+      activeSkill,
+      availableSlots - 1, // active skill consumes one slot; remaining are supports
+      constraints ?? [],
+      { topN },
+    );
   },
 );
 
@@ -742,7 +674,7 @@ server.registerTool(
 // Phase 6 tools: configuration and combat scenarios
 // ---------------------------------------------------------------------------
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'get_config',
   {
     description:
@@ -750,16 +682,11 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const result = await session.getConfigOrganized();
-      return textResponse(result);
-    } catch (error) {
-      return errorResponse(error);
-    }
+    return session.getConfigOrganized();
   },
 );
 
-server.registerTool(
+registerTool<{ options: Record<string, boolean | number | string> }>(
   'set_config',
   {
     description:
@@ -771,16 +698,12 @@ server.registerTool(
     },
   },
   async ({ options }) => {
-    try {
-      const result = await session.setConfigWithUndo(options);
-      return textResponse(summarizeStatDiff(result));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.setConfigWithUndo(options);
+    return summarizeStatDiff(result);
   },
 );
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'list_scenarios',
   {
     description:
@@ -788,73 +711,60 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const scenarios = BuildSession.listScenarios();
-      return textResponse({ count: scenarios.length, scenarios });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const scenarios = BuildSession.listScenarios();
+    return { count: scenarios.length, scenarios };
   },
 );
 
-server.registerTool(
+registerTool<{ scenario: string }>(
   'simulate_scenario',
   {
     description:
       "Temporarily apply a named combat scenario preset (e.g. 'mapping', 'pinnacle_boss') and return the stat diff vs the current config. Build state is fully restored after.",
     inputSchema: {
       scenario: z
-        .string()
-        .min(1)
+        .enum(SCENARIO_NAMES)
         .describe('Scenario preset name (see `list_scenarios`).'),
     },
   },
   async ({ scenario }) => {
-    try {
-      const result = await session.simulateScenario(scenario);
-      const diffSummary = summarizeStatDiff({ before: result.before, after: result.after, diff: result.diff });
-      return textResponse({
-        scenario: result.scenario,
-        description: result.description,
-        appliedOptions: result.options,
-        ...(diffSummary as Record<string, unknown>),
-      });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.simulateScenario(scenario);
+    const diffSummary = summarizeStatDiff({ before: result.before, after: result.after, diff: result.diff });
+    return {
+      scenario: result.scenario,
+      description: result.description,
+      appliedOptions: result.options,
+      ...(diffSummary as Record<string, unknown>),
+    };
   },
 );
 
-server.registerTool(
+registerTool<{ scenarios: string[] }>(
   'compare_scenarios',
   {
     description:
       'Compare 2-6 named scenarios side-by-side. Each scenario is simulated independently with config restore between them. Returns baseline stats plus one entry per scenario with its diff.',
     inputSchema: {
       scenarios: z
-        .array(z.string().min(1))
+        .array(z.enum(SCENARIO_NAMES))
         .min(2)
         .max(6)
         .describe('Scenario preset names (e.g. ["mapping","pinnacle_boss","uber_boss"]).'),
     },
   },
   async ({ scenarios }) => {
-    try {
-      const result = await session.compareScenarios(scenarios);
-      const rows = result.scenarios.map((s) => ({
-        scenario: s.scenario,
-        description: s.description,
-        keyDeltas: keyDeltas(s.diff),
-        keyStats: keyStats(s.after),
-      }));
-      return textResponse({ baseline: keyStats(result.baseline), scenarios: rows });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.compareScenarios(scenarios);
+    const rows = result.scenarios.map((s) => ({
+      scenario: s.scenario,
+      description: s.description,
+      keyDeltas: keyDeltas(s.diff),
+      keyStats: keyStats(s.after),
+    }));
+    return { baseline: keyStats(result.baseline), scenarios: rows };
   },
 );
 
-server.registerTool(
+registerTool<{ buffs: Record<string, boolean | number | string> }>(
   'toggle_buffs',
   {
     description:
@@ -866,12 +776,8 @@ server.registerTool(
     },
   },
   async ({ buffs }) => {
-    try {
-      const result = await session.toggleBuffs(buffs);
-      return textResponse(summarizeStatDiff(result));
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const result = await session.toggleBuffs(buffs);
+    return summarizeStatDiff(result);
   },
 );
 
@@ -906,7 +812,7 @@ function formatUpgrades(suggestions: UpgradeSuggestion[]): string {
   return lines.join('\n').trimEnd();
 }
 
-server.registerTool(
+registerTool<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   'diagnose_build',
   {
     description:
@@ -919,21 +825,17 @@ server.registerTool(
     },
   },
   async ({ focus }) => {
-    try {
-      const checks = await session.diagnoseBuild(focus);
-      return {
-        content: [
-          { type: 'text', text: formatDiagnostics(checks) },
-          { type: 'text', text: JSON.stringify({ checks }, null, 2) },
-        ],
-      };
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const checks = await session.diagnoseBuild(focus);
+    return {
+      content: [
+        { type: 'text', text: formatDiagnostics(checks) },
+        { type: 'text', text: JSON.stringify({ checks }, null, 2) },
+      ],
+    };
   },
 );
 
-server.registerTool(
+registerTool<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   'suggest_upgrades',
   {
     description:
@@ -944,21 +846,17 @@ server.registerTool(
     },
   },
   async ({ slot, budget }) => {
-    try {
-      const suggestions = await session.suggestUpgrades(slot, budget);
-      return {
-        content: [
-          { type: 'text', text: formatUpgrades(suggestions) },
-          { type: 'text', text: JSON.stringify({ suggestions }, null, 2) },
-        ],
-      };
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const suggestions = await session.suggestUpgrades(slot, budget);
+    return {
+      content: [
+        { type: 'text', text: formatUpgrades(suggestions) },
+        { type: 'text', text: JSON.stringify({ suggestions }, null, 2) },
+      ],
+    };
   },
 );
 
-server.registerTool(
+registerTool<{ format?: 'summary' | 'xml' | 'code' }>(
   'export_build',
   {
     description:
@@ -968,16 +866,12 @@ server.registerTool(
     },
   },
   async ({ format }) => {
-    try {
-      const text = await session.exportBuild(format ?? 'summary');
-      return { content: [{ type: 'text', text }] };
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const text = await session.exportBuild(format ?? 'summary');
+    return { content: [{ type: 'text', text }] };
   },
 );
 
-server.registerTool(
+registerTool<{ action: 'take' | 'compare' | 'list'; label?: string; labelA?: string; labelB?: string }>(
   'snapshot_and_compare',
   {
     description:
@@ -990,34 +884,30 @@ server.registerTool(
     },
   },
   async ({ action, label, labelA, labelB }) => {
-    try {
-      switch (action) {
-        case 'take': {
-          if (!label) return errorResponse(new UserError('label required for action "take"'));
-          const stats = await session.takeSnapshot(label);
-          return textResponse({ status: 'saved', label, stats });
-        }
-        case 'list': {
-          return textResponse({ snapshots: session.listSnapshotLabels() });
-        }
-        case 'compare': {
-          if (!labelA || !labelB) return errorResponse(new UserError('labelA and labelB required for action "compare"'));
-          let bLabel = labelB;
-          if (labelB === 'current') {
-            bLabel = '__current_compare__';
-            await session.takeSnapshot(bLabel);
-          }
-          const diff = session.diffSnapshots(labelA, bLabel);
-          return textResponse({ from: labelA, to: labelB, diff });
-        }
+    switch (action) {
+      case 'take': {
+        if (!label) throw new UserError('label required for action "take"');
+        const stats = await session.takeSnapshot(label);
+        return { status: 'saved', label, stats };
       }
-    } catch (error) {
-      return errorResponse(error);
+      case 'list': {
+        return { snapshots: session.listSnapshotLabels() };
+      }
+      case 'compare': {
+        if (!labelA || !labelB) throw new UserError('labelA and labelB required for action "compare"');
+        let bLabel = labelB;
+        if (labelB === 'current') {
+          bLabel = '__current_compare__';
+          await session.takeSnapshot(bLabel);
+        }
+        const diff = session.diffSnapshots(labelA, bLabel);
+        return { from: labelA, to: labelB, diff };
+      }
     }
   },
 );
 
-server.registerTool(
+registerTool<Record<string, never>>(
   'reset_build',
   {
     description:
@@ -1025,18 +915,14 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
-    try {
-      const info = await session.resetBuild();
-      return textResponse({
-        status: 'reset',
-        class: info.class,
-        ascendancy: info.ascendancy,
-        level: info.level,
-        mainSkill: info.mainSkill,
-      });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    const info = await session.resetBuild();
+    return {
+      status: 'reset',
+      class: info.class,
+      ascendancy: info.ascendancy,
+      level: info.level,
+      mainSkill: info.mainSkill,
+    };
   },
 );
 

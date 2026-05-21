@@ -182,6 +182,19 @@ async function main(): Promise<void> {
     assertStatsExact('dual-undo', baseline, afterDualUndo);
     log('PASS: snapshot/diff + 2x undo returns to baseline');
 
+    // -----------------------------------------------------------------
+    // Test 7: batched snapshotAllItems via withTemporaryChange round-trip
+    // -----------------------------------------------------------------
+    log('Test 7: batched snapshotAllItems via withTemporaryChange round-trip');
+    // simulate_scenario uses withTemporaryChange which exercises the batched path.
+    const before = await getKeyStats(client);
+    await call(client, 'simulate_scenario', { scenario: 'uber_boss' });
+    const after = await getKeyStats(client);
+    assert(eq(after.Life, before.Life), 'batched snapshot path must restore Life exactly');
+    assert(eq(after.CombinedDPS, before.CombinedDPS), 'batched snapshot path must restore DPS exactly');
+    assert(eq(after.TotalEHP, before.TotalEHP), 'batched snapshot path must restore EHP exactly');
+    log('PASS: batched snapshot/restore preserves Life, DPS, EHP exactly');
+
     log('ALL PHASE 8 INTEGRITY TESTS PASSED');
   } finally {
     await client.close().catch(() => {});

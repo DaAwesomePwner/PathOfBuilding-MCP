@@ -150,6 +150,20 @@ async function main(): Promise<void> {
     post = await getKeyStats(client);
     assertStatsExact('after-bad-keystone', baseline, post);
 
+    log('Test 9b: Lua-side userError classification (unrecognised gem)');
+    const luaUserErrResp = await call(client, 'lookup_gem', { name: 'NotARealGem9999' });
+    assert(isError(luaUserErrResp), 'should error');
+    const luaMsg = errText(luaUserErrResp);
+    assert(
+      !luaMsg.startsWith('Internal error:'),
+      `Lua user error must not be wrapped as Internal error, got: ${luaMsg}`,
+    );
+    assert(
+      luaMsg.toLowerCase().includes('unrecognised') || luaMsg.toLowerCase().includes('not found'),
+      `Lua user error should mention the original failure, got: ${luaMsg}`,
+    );
+    log(`PASS: Lua userError surfaces verbatim: "${luaMsg}"`);
+
     // ----- undo on empty stack -----
     log('Test 10: undo_last_change with empty stack (after reset_build)');
     // Note: failed mutating tools (swap_item / unequip_item / swap_gem)
