@@ -49,7 +49,6 @@ export function resolvePoBPath(): string {
 
   if (process.env.POB_PATH) {
     const abs = path.resolve(process.env.POB_PATH);
-    probed.push(abs);
     if (isValidPoBInstall(abs)) return abs;
     throw new PoBInstallNotFoundError(
       `POB_PATH=${process.env.POB_PATH} does not look like a Path of Building install ` +
@@ -80,7 +79,13 @@ export function resolveLuaJITPath(pobPath: string): string {
   if (process.env.LUAJIT_PATH) {
     if (existsSync(process.env.LUAJIT_PATH)) return process.env.LUAJIT_PATH;
     throw new LuaJITNotFoundError(
-      `LUAJIT_PATH=${process.env.LUAJIT_PATH} does not exist.`,
+      `LUAJIT_PATH=${process.env.LUAJIT_PATH} does not exist. ` +
+        `Unset LUAJIT_PATH to use auto-discovery, or point it at a valid luajit binary.\n\n` +
+        `Install LuaJIT 5.1:\n` +
+        `  Windows (scoop):  scoop install luajit\n` +
+        `  Windows (winget): winget install LuaJIT.LuaJIT\n` +
+        `  macOS (brew):     brew install luajit\n` +
+        `  Linux (apt):      sudo apt-get install luajit`,
     );
   }
 
@@ -95,7 +100,7 @@ export function resolveLuaJITPath(pobPath: string): string {
 
   try {
     const which = isWin ? 'where' : 'which';
-    const out = execFileSync(which, [isWin ? 'luajit' : 'luajit'], { encoding: 'utf-8' })
+    const out = execFileSync(which, ['luajit'], { encoding: 'utf-8' })
       .trim()
       .split(/\r?\n/)[0];
     if (out && existsSync(out)) return out;
@@ -119,9 +124,14 @@ export function resolveLuaJITPath(pobPath: string): string {
 export function resolvePaths(): ResolvedPaths {
   const pobPath = resolvePoBPath();
   const luajitPath = resolveLuaJITPath(pobPath);
-  // bridge.lua is shipped with this package. From dev (src/paths.ts) or build
-  // (dist/paths.js), it sits at ../lua/bridge.lua relative to this module.
+  // bridge.lua ships in this package at <pkg>/lua/bridge.lua. This module
+  // ends up at src/paths.ts in dev (tsx) and dist/src/paths.js when built,
+  // so probe both possibilities and prefer the one that exists.
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const bridgeLua = path.resolve(here, '..', 'lua', 'bridge.lua');
+  const candidates = [
+    path.resolve(here, '..', 'lua', 'bridge.lua'),        // dev: src/paths.ts
+    path.resolve(here, '..', '..', 'lua', 'bridge.lua'),  // built: dist/src/paths.js
+  ];
+  const bridgeLua = candidates.find((p) => existsSync(p)) ?? candidates[0];
   return { pobPath, luajitPath, bridgeLua };
 }

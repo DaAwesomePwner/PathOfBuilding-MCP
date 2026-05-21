@@ -103,18 +103,48 @@ async function main(): Promise<void> {
   // Test: error message lists probed paths and platform install hints
   {
     try {
-      withEnv({ POB_PATH: undefined, APPDATA: '/nope/does/not/exist' }, () => {
-        try {
-          resolvePoBPath();
-          log('PoBInstallNotFoundError message contains POB_PATH hint', false, 'did not throw');
-        } catch (e) {
-          const msg = (e as Error).message;
-          const ok = msg.includes('POB_PATH') && msg.includes('Path of Building Community');
-          log('PoBInstallNotFoundError message contains POB_PATH hint', ok, ok ? '' : msg);
-        }
-      });
+      withEnv(
+        { POB_PATH: undefined, APPDATA: '/nope/does/not/exist', HOME: '/nope/does/not/exist' },
+        () => {
+          try {
+            resolvePoBPath();
+            log('PoBInstallNotFoundError message contains POB_PATH hint', false, 'did not throw');
+          } catch (e) {
+            const msg = (e as Error).message;
+            const ok = msg.includes('POB_PATH') && msg.includes('Path of Building Community');
+            log('PoBInstallNotFoundError message contains POB_PATH hint', ok, ok ? '' : msg);
+          }
+        },
+      );
     } catch (e) {
       log('PoBInstallNotFoundError message contains POB_PATH hint', false, String(e));
+    }
+  }
+
+  // Test: resolvePaths() returns a bridgeLua that exists on disk
+  {
+    const fake = makeFakePoBInstall();
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'lj-'));
+    const fakeLua = path.join(dir, 'fake-luajit');
+    writeFileSync(fakeLua, '#!/bin/sh\n');
+    try {
+      const { resolvePaths } = await import('../src/paths.js');
+      withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, () => {
+        const result = resolvePaths();
+        assert.equal(result.pobPath, path.resolve(fake));
+        assert.equal(result.luajitPath, fakeLua);
+        assert.ok(existsSync(result.bridgeLua), `bridgeLua should exist: ${result.bridgeLua}`);
+        assert.ok(
+          result.bridgeLua.endsWith(path.join('lua', 'bridge.lua')),
+          `bridgeLua should end with lua/bridge.lua, got ${result.bridgeLua}`,
+        );
+      });
+      log('resolvePaths() bridgeLua resolves to an existing file', true);
+    } catch (e) {
+      log('resolvePaths() bridgeLua resolves to an existing file', false, String(e));
+    } finally {
+      rmSync(fake, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   }
 }
