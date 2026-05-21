@@ -8,16 +8,16 @@ The server cannot find your Path of Building install. The error message lists ev
 - **Windows cmd**: `set POB_PATH=%APPDATA%\Path of Building Community`
 - **MCP client config** (preferred for Claude Desktop/Code): add `POB_PATH` to the server's `env` block.
 
-Validate the install by checking for the headless entry point:
+Validate the install by checking for `Launch.lua` (either at the install root for a compiled install, or under `src/` for a source clone):
 
 ```bash
-# Windows
-dir "%APPDATA%\Path of Building Community\src\HeadlessWrapper.lua"
-# macOS / Linux
-ls "$POB_PATH/src/HeadlessWrapper.lua"
+# Windows (compiled install)
+dir "%APPDATA%\Path of Building Community\Launch.lua"
+# macOS / Linux (source clone)
+ls "$POB_PATH/src/Launch.lua"
 ```
 
-If the file does not exist, your install is incomplete or it is a *source clone* (no compiled binaries). The standalone server expects a compiled PoB Community install.
+If neither exists, your install is incomplete. Re-run the Path of Building Community installer, or clone <https://github.com/PathOfBuildingCommunity/PathOfBuilding>.
 
 ## `LuaJITNotFoundError`
 

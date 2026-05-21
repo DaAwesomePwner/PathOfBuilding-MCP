@@ -6,7 +6,7 @@ Guidance for Claude Code (claude.ai/code) when working on this repository.
 
 `pob-mcp-server` — a TypeScript/Node MCP server that exposes the [Path of Building Community](https://pathofbuilding.community/) calculation engine to LLM clients. The server spawns a LuaJIT subprocess that runs PoB's real engine in headless mode and drives it via JSON over stdio.
 
-PoB itself is an **external runtime dependency**. The user's PoB install at `%APPDATA%\Path of Building Community\` (or platform equivalent) provides `src/HeadlessWrapper.lua`, the calculation modules, and the lua libraries. This repo owns only the Node server, the Lua bridge adapter, and tests.
+PoB itself is an **external runtime dependency**. The user's PoB install at `%APPDATA%\Path of Building Community\` (or platform equivalent) provides `Launch.lua`, the calculation modules, and the lua libraries. The compiled Windows installer flattens those into the install root (`Launch.lua`, `Modules/`, `Data/`, `lua/`); a source clone keeps them under `src/` and `runtime/lua/`. `bridge.lua` detects which layout it's looking at via `arg[1]` and sets `package.path` accordingly. This repo owns only the Node server, the Lua bridge adapter, and tests.
 
 ## Common commands
 
@@ -50,7 +50,7 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 | Layer | File | Job |
 |---|---|---|
 | Path resolution | `src/paths.ts` | `resolvePoBPath()` + `resolveLuaJITPath()` — env var, auto-detect, error. Single source of truth for install discovery. |
-| Lua bridge | `lua/bridge.lua` | Boots PoB via `HeadlessWrapper.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
+| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
 | BuildSession | `src/build-session.ts` | TS class owning the LuaJIT subprocess. Snapshot/restore, undo stack, `withTemporaryChange`, async mutex, build-code/URL/XML loading, higher-level workflows. |
 | MCP server | `src/server.ts` | Registers 33 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. |
 

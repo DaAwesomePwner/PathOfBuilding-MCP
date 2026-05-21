@@ -19,7 +19,7 @@ Three layers, three responsibilities:
 
 | Layer | Lives in | Job |
 |---|---|---|
-| **Lua bridge** | `lua/bridge.lua` | Runs the real PoB engine in headless mode (loading `<POB_PATH>/src/HeadlessWrapper.lua`). Reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`, etc., and writes JSON responses to stdout. Knows nothing about MCP. |
+| **Lua bridge** | `lua/bridge.lua` | Runs the real PoB engine in headless mode (stubs the graphics host and `dofile`s `<POB_PATH>/Launch.lua` or `<POB_PATH>/src/Launch.lua` depending on layout). Reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`, etc., and writes JSON responses to stdout. Knows nothing about MCP. |
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **MCP server** | `src/server.ts` | Registers 33 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
 
@@ -110,7 +110,7 @@ Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator a
 
 | Var | Default | What it does |
 |---|---|---|
-| `POB_PATH` | autodetect | Absolute path to your Path of Building Community install (the directory containing `src/HeadlessWrapper.lua`). |
+| `POB_PATH` | autodetect | Absolute path to your Path of Building Community install (the directory containing `Launch.lua`). |
 | `LUAJIT_PATH` | autodetect | Path to the `luajit` binary. Helpful when neither the install nor PATH provides one. |
 | `POB_TIMING` | unset | Set to `1` to log every Lua command's wall time to stderr (useful for performance debugging). |
 

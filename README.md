@@ -46,7 +46,7 @@ If your PoB install is at the default `%APPDATA%\Path of Building Community\` lo
 
 | Env var       | Purpose                                                                                     | Default |
 |---------------|---------------------------------------------------------------------------------------------|---------|
-| `POB_PATH`    | Path to your PoB install. Validated by checking for `src/HeadlessWrapper.lua` inside.        | Auto-detected on Windows (`%APPDATA%\Path of Building Community`), macOS, and Linux. |
+| `POB_PATH`    | Path to your PoB install. Validated by checking for `Launch.lua` (compiled install) or `src/Launch.lua` (source clone). | Auto-detected on Windows (`%APPDATA%\Path of Building Community`), macOS, and Linux. |
 | `LUAJIT_PATH` | Absolute path to a `luajit` binary. Overrides install/PATH detection.                       | Auto-detected. |
 | `POB_TIMING`  | When set to `1`, prints per-command timing to stderr (useful for debugging).                | unset |
 
