@@ -24,6 +24,9 @@ it plausible.
 
 ## What-if restore exactness
 
+The mastery and hash-override items touch `restoreTreeFromList`, which the
+launch-critical tree-restore fix rewrites; do them on top of that fix.
+
 - **Mastery selections lost on tree restore (confirmed).** The TS tree snapshot
   (`src/build-session.ts:17-19,260-276`) stores node ids only. Deallocating a node
   upstream of a mastery clears its selection, and the restore then skips that
@@ -36,8 +39,6 @@ it plausible.
   `itemsTab.displayItem.id` and return a user error when the item does not fit.
 - **Skills snapshot misses fields (confirmed).** `lua/bridge.lua:1224-1299` omits
   `imbuedSupport`, `groupCount`, `skillMinion*`, `skillMineCountCalcs`.
-- **Untraced Life mismatch.** `test/session-test.ts` test 3 logged
-  `Mismatch on Life: 6457 vs 6728` on a Ring 1 round-trip yet printed PASS.
 - **Hardcoded slot list (confirmed).** `DEFAULT_TRACKED_SLOTS`
   (`src/build-session.ts:45-63`) lacks `Ring 3`, `Graft 1`, `Graft 2`, jewel and
   abyss sockets; snapshots and undo skip them. Take slots from `getValidSlots`.
@@ -114,5 +115,8 @@ it plausible.
 - **No tests** for the crash breaker, timeout recovery, stdin-EOF shutdown, or
   that all tools are registered. `test/` is not type-checked.
 - **Nightly run against PoB's `dev` branch** to catch internal API changes early.
+
+## Licensing
+
 - **Attribution.** The host stub block in `lua/bridge.lua` is adapted from PoB's
   MIT-licensed `HeadlessWrapper.lua`; add an attribution line.
