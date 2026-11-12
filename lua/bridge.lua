@@ -1873,11 +1873,18 @@ local DISPATCH = {
 			local m = mainObject.main
 			if buildLoaded and m and (m.newMode or m.mode) == "BUILD" and build then
 				local okSave, prevXml = pcall(function() return build:SaveDB("mcp-restore") end)
-				if okSave and type(prevXml) == "string" then
+				-- SaveDB reports ComposeXML failures via launch:ShowErrMsg (promptMsg)
+				-- rather than throwing; that must not be blamed on the new load.
+				local saveErr = mainObject.promptMsg
+				if okSave and type(prevXml) == "string" and not saveErr then
 					previous = { xml = prevXml, name = build.buildName }
 				else
-					STDERR:write("[pob-mcp] could not capture current build before load: ", tostring(prevXml), "\n")
+					local reason = saveErr and stripColorCodes(saveErr):gsub("%s+", " ")
+						or (okSave and "SaveDB returned no XML" or tostring(prevXml))
+					STDERR:write("[pob-mcp] warning: could not capture current build before load (",
+						reason, "); a failed load will leave no build loaded\n")
 				end
+				clearPoBErrorState()
 			end
 			local failure = tryLoadBuild(xmlText, cmd.name or "MCP Build")
 			if failure then
