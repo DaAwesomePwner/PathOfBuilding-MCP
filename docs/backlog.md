@@ -61,6 +61,9 @@ for later.
 - **Registry and `where luajit` probes run synchronously** after connect.
 - **Unused `circuitOpen()`** in `src/engine-messages.ts`;
   `src/engine-manager.ts` is well past the ~200-line guideline.
+- **Breaker error text.** When the crash breaker is open the bridge's own error
+  says only to restart the server; it should also say that a Path of Building
+  update followed by `reload_engine` clears it.
 
 ## What-if restore exactness
 
@@ -74,9 +77,13 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 - **Item restore duplicates the item (confirmed).** `restoreSlotUnlocked`
   (`src/build-session.ts:219-229`) re-adds the item instead of re-selecting
   `snapshot.itemId`; exports grow and ids churn. Probe items are never deleted.
-- **Wrong item equipped on id gaps (confirmed).** `lua/bridge.lua:432-436` assumes
-  a new item gets the highest id; PoB assigns the lowest free id. Use
-  `itemsTab.displayItem.id` and return a user error when the item does not fit.
+- **Item that does not fit its slot (confirmed).** `equipItemInSlot` in
+  `lua/bridge.lua` does not check `IsItemValidForSlot`; PoB silently empties the
+  slot. Return a user error instead. (The related wrong-item-on-id-gap bug was
+  fixed in `8477d676`.)
+- **Stale display item on parse failure.** `CreateDisplayItemFromRaw` leaves the
+  previous display item in place when parsing fails; clear `displayItem` before
+  calling it.
 - **Skills snapshot misses fields (confirmed).** `lua/bridge.lua:1224-1299` omits
   `imbuedSupport`, `groupCount`, `skillMinion*`, `skillMineCountCalcs`.
 - **Hardcoded slot list (confirmed).** `DEFAULT_TRACKED_SLOTS`
