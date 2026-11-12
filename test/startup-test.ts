@@ -74,9 +74,11 @@ class FakeBridge {
     this.crashCount = this.initialCrashCount = opts.initialCrashCount;
     FakeBridge.instances.push(this);
   }
+  starts = 0;
   async start() {
     if (this.disposed) throw new UserError('engine replaced — retry');
     if (this.running) return;
+    this.starts++;
     if (this.crashCount >= 3) throw new Error(`Lua engine has crashed ${this.crashCount} times — refusing to restart.`);
     if (FakeBridge.crashOnStart) {
       this.crashCount++;
@@ -373,6 +375,147 @@ async function part1(): Promise<void> {
     await mk.shutdown();
   }
   log('PASS 1j');
+
+  // ---- review round 2 -----------------------------------------------------
+  log('1l [r2 item 1]: crash x3 → PoB updates on disk → reload_engine succeeds with a fresh count');
+  {
+    const pobL = makeFakePoB('8.0.0');
+    const ml = fresh(pobL);
+    FakeBridge.crashOnStart = true;
+    try {
+      for (let i = 1; i <= 3; i++) await rejectsWith(ml.ensureReady(), EngineNotReadyError, /failed to start/);
+      FakeBridge.crashOnStart = false;
+      setManifestVersion(pobL, '8.0.1'); // the update happens AFTER the crashes, with no swap in between
+      const r = await ml.reload();
+      assert.equal(r.newVersion, '8.0.1');
+      const last = FakeBridge.instances[FakeBridge.instances.length - 1];
+      assert.equal(last.initialCrashCount, 0, 'fresh count after the install changed');
+      await ml.ensureReady();
+    } finally {
+      FakeBridge.crashOnStart = false;
+      await ml.shutdown();
+    }
+    // Same, but a tool call hits the open breaker after the update and before reload.
+    const pobL2 = makeFakePoB('8.1.0');
+    const ml2 = fresh(pobL2);
+    FakeBridge.crashOnStart = true;
+    try {
+      for (let i = 1; i <= 3; i++) await rejectsWith(ml2.ensureReady(), EngineNotReadyError, /failed to start/);
+      FakeBridge.crashOnStart = false;
+      setManifestVersion(pobL2, '8.1.1');
+      await rejectsWith(ml2.ensureReady(), EngineNotReadyError, /crashed 3 times/);
+      const r = await ml2.reload();
+      assert.equal(r.newVersion, '8.1.1');
+      await ml2.ensureReady();
+    } finally {
+      FakeBridge.crashOnStart = false;
+      await ml2.shutdown();
+    }
+    // Without an install change the breaker stays open across reload.
+    const pobL3 = makeFakePoB('8.2.0');
+    const ml3 = fresh(pobL3);
+    FakeBridge.crashOnStart = true;
+    try {
+      for (let i = 1; i <= 3; i++) await rejectsWith(ml3.ensureReady(), EngineNotReadyError, /failed to start/);
+      FakeBridge.crashOnStart = false;
+      await rejectsWith(ml3.reload(), EngineNotReadyError, /crashed 3 times/);
+    } finally {
+      FakeBridge.crashOnStart = false;
+      await ml3.shutdown();
+    }
+  }
+  log('PASS 1l');
+
+  log('1m [r2 item 4]: get_engine_info never starts or respawns the engine');
+  {
+    const mm = fresh(makeFakePoB('9.0.0'));
+    await mm.run((s) => s.loadBuild(BUILD_XML));
+    const bridge = FakeBridge.instances[FakeBridge.instances.length - 1];
+    const startsBefore = bridge.starts;
+    let info = await mm.info();
+    assert.equal((info.build as { class?: string } | null)?.class, 'Witch', 'build shown while the engine is up');
+    bridge.running = false; // LuaJIT died
+    info = await mm.info();
+    assert.equal(info.build, null, 'build info omitted while the engine is down');
+    assert.equal(bridge.starts, startsBefore, 'info() must not respawn the engine');
+    assert.equal(bridge.running, false);
+    await mm.shutdown();
+  }
+  log('PASS 1m');
+
+  log('1n [r2 item 5]: a non-"no build" getBuildInfo error is reported, not "no build loaded"');
+  {
+    const mn = fresh(makeFakePoB('9.1.0'));
+    const session = await mn.ensureReady();
+    (session as unknown as { getBuildInfo: () => Promise<unknown> }).getBuildInfo = async () => {
+      throw new Error('Lua bridge exited unexpectedly');
+    };
+    const r = await mn.reload();
+    assert.equal(r.buildReloaded, false);
+    assert.match(String(r.buildExportError), /exited unexpectedly/);
+    assert.match(String(r.buildNote), /NOT carried over/);
+    await mn.shutdown();
+    const mn2 = fresh(makeFakePoB('9.1.1'));
+    await mn2.ensureReady();
+    const r2 = await mn2.reload();
+    assert.equal(r2.buildExportError, undefined, 'no build loaded is not an error');
+    assert.match(String(r2.buildNote), /No build was loaded/);
+    await mn2.shutdown();
+  }
+  log('PASS 1n');
+
+  log('1o [r2 item 9]: a saved luajitPath that fails the tool-argument rules is ignored');
+  {
+    const R = String.raw;
+    const good = makeFakePoB('9.2.0');
+    const badFile = path.join(tmp('bad-lj-'), process.platform === 'win32' ? 'calc.exe' : 'sh');
+    writeFileSync(badFile, '');
+    for (const bad of [badFile, R`\\fake-host\share\luajit.exe`]) {
+      const cfg = tmp('cfg-');
+      write(path.join(cfg, 'config.json'), JSON.stringify({ pobPath: good, luajitPath: bad }));
+      const logs: string[] = [];
+      const mo = new EngineManager({
+        env: { POB_MCP_CONFIG_DIR: cfg },
+        bridgeFactory: (p, o) => new FakeBridge(p, o) as unknown as LuaBridge,
+        log: (l) => logs.push(l),
+        resolveOptions: { pobCandidates: [], luajitCandidates: [{ label: luajit, resolve: () => luajit }] },
+      });
+      mo.init();
+      await mo.ensureReady();
+      const info = await mo.info();
+      assert.equal(info.luajitPath, luajit, `fell back to auto-detect for ${bad}`);
+      assert.equal(info.luajitPathSource, 'auto-detect');
+      assert.ok(logs.some((l) => /ignoring saved luajitPath/.test(l)), logs.join('\n'));
+      await mo.shutdown();
+    }
+  }
+  log('PASS 1o');
+
+  log('1p [r2 item 3]: network/device paths refused via configure (incl. elicitation path)');
+  {
+    const R = String.raw;
+    const cfg = tmp('cfg-');
+    const mp = fakeManager({ POB_MCP_CONFIG_DIR: cfg });
+    const good = makeFakePoB('9.3.0');
+    for (const unc of [R`\\fake-host\share\pob`, '//fake-host/share/pob', R`\\?\C:\pob`, R`\\.\pipe\pob`]) {
+      await rejectsWith(mp.configure(unc, luajit), UserError, /network and device paths/, /POB_PATH/);
+      await rejectsWith(mp.configure(good, unc + '\\luajit.exe'), UserError, /network and device paths/, /LUAJIT_PATH/);
+    }
+    let prompted = 0;
+    mp.setPathPrompt(async () => {
+      prompted++;
+      try {
+        await mp.configure(R`\\fake-host\share\pob`);
+        return { configured: true };
+      } catch (e) {
+        return { configured: false, message: (e as Error).message };
+      }
+    });
+    await rejectsWith(mp.ensureReady(), EngineNotReadyError, /network and device paths/);
+    assert.equal(prompted, 1);
+    assert.ok(!existsSync(path.join(cfg, 'config.json')));
+  }
+  log('PASS 1p');
 }
 
 /**
@@ -511,6 +654,17 @@ async function part2(): Promise<void> {
     assert.equal((leak as ToolResult).isError, true);
     assert.ok(textOf(leak).includes('%POB_SECRET_TEST%'), textOf(leak));
     assert.ok(!textOf(leak).includes(secret), 'env value leaked through configure_pob_path');
+    // Round 2 item 3: network/device paths are refused at the MCP boundary.
+    for (const args of [
+      { pobPath: String.raw`\\no-such-host-pobmcp\share\pob` },
+      { pobPath: makeFakePoB('1.2.3'), luajitPath: String.raw`\\no-such-host-pobmcp\share\luajit.exe` },
+      { pobPath: '//no-such-host-pobmcp/share/pob' },
+    ]) {
+      const unc = await client.callTool({ name: 'configure_pob_path', arguments: args });
+      assert.equal((unc as ToolResult).isError, true);
+      assert.match(textOf(unc), /network and device paths/, textOf(unc));
+    }
+    assert.ok(!existsSync(path.join(cfgDir, 'config.json')), 'refused paths must not be saved');
     const names = (await client.listTools()).tools.map((t) => t.name);
     for (const n of ['configure_pob_path', 'get_engine_info', 'reload_engine', 'load_build', 'get_stats']) {
       assert.ok(names.includes(n), `tool ${n} missing`);

@@ -51,7 +51,7 @@ claude mcp add --env POB_PATH="C:\Users\you\AppData\Roaming\Path of Building Com
 
 `POB_PATH` and `LUAJIT_PATH` are optional. If the server cannot find PoB or LuaJIT it **still starts**: every engine tool returns an error telling the assistant to ask you for your PoB folder and call `configure_pob_path`. Clients that support MCP elicitation show you a prompt for the folder directly. The chosen path is saved and reused on the next start.
 
-> **`configure_pob_path({ pobPath, luajitPath? })` — the `luajitPath` you give is executed by the server.** As a tool argument it must be the full path of an existing file named like `luajit` (`luajit.exe` on Windows; scripts such as `.bat`/`.cmd`/`.sh` are refused). Tool arguments are taken literally: `~` is expanded but environment variables (`%VAR%`, `$VAR`) are not. `POB_PATH` / `LUAJIT_PATH` env values keep their more lenient handling (env-var expansion, `LUAJIT_PATH` may be a folder).
+> **`configure_pob_path({ pobPath, luajitPath? })` — the `luajitPath` you give is executed by the server.** As a tool argument it must be the full path of an existing file named like `luajit` (`luajit.exe` on Windows; scripts such as `.bat`/`.cmd`/`.sh` are refused). Tool arguments are taken literally: `~` is expanded but environment variables (`%VAR%`, `$VAR`) are not, and network/device paths (`\\host\share`, `//host/share`, `\\?\…`, `\\.\…`) are refused — set `POB_PATH` / `LUAJIT_PATH` in the server's environment if you really need one. `POB_PATH` / `LUAJIT_PATH` env values keep their more lenient handling (env-var expansion, `LUAJIT_PATH` may be a folder).
 
 ## Configuration
 

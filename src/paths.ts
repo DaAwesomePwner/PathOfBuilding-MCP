@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homeDir, normalizeUserPath } from './path-utils.js';
+import { homeDir, isNetworkOrDevicePath, networkPathMessage, normalizeUserPath } from './path-utils.js';
 import { resolveLuaJIT } from './luajit-paths.js';
 import { inspectPoBInstall, PoBInstallInfo } from './pob-install.js';
 
@@ -116,10 +116,17 @@ export function validatePoBPath(
   raw: string,
   label: string,
   env = process.env,
-  options: { expandEnv?: boolean } = {},
+  options: { expandEnv?: boolean; rejectNetwork?: boolean } = {},
 ): PoBInstallInfo {
-  const abs = normalizeUserPath(raw, env, options);
+  // Network/device check happens on the strings only, before any filesystem access.
+  if (options.rejectNetwork && isNetworkOrDevicePath(raw)) {
+    throw new PoBInstallNotFoundError(networkPathMessage(label, raw));
+  }
+  const abs = normalizeUserPath(raw, env, { expandEnv: options.expandEnv });
   if (!abs) throw new PoBInstallNotFoundError(`${label} is empty.`);
+  if (options.rejectNetwork && isNetworkOrDevicePath(abs)) {
+    throw new PoBInstallNotFoundError(networkPathMessage(label, raw));
+  }
   const result = inspectPoBInstall(abs);
   if (result.ok) return result.info;
   throw new PoBInstallNotFoundError(`${label}=${raw}: ${result.message}`);

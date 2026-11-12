@@ -1,5 +1,5 @@
 import { BuildSession } from './build-session.js';
-import { configFilePath, loadConfig, saveConfig } from './config-store.js';
+import { configFilePath, loadConfig, saveConfig, SavedConfig } from './config-store.js';
 import { CrashLedger } from './crash-ledger.js';
 import { EngineGate } from './engine-gate.js';
 import * as msg from './engine-messages.js';
@@ -81,6 +81,8 @@ export class EngineManager {
   private resolveError: string | null = null;
   private bridge: LuaBridge | null = null;
   private bridgePaths: ResolvedPaths | null = null;
+  /** Install fingerprint when the current bridge last attempted a start (its crashes belong to it). */
+  private bridgeBootFingerprint: InstallFingerprint | null = null;
   private session: BuildSession | null = null;
   private booting: Promise<void> | null = null;
   private bootError: string | null = null;
@@ -111,7 +113,7 @@ export class EngineManager {
     if (this.initDone) return;
     this.initDone = true;
     if (this.paths || this.gate.busy) return; // configure_pob_path already ran
-    const saved = loadConfig(this.env);
+    const saved = this.loadVettedConfig();
     const opts: ResolveOptions = {
       env: this.env,
       savedPoBPath: saved.pobPath,
@@ -138,6 +140,24 @@ export class EngineManager {
     }
   }
 
+  /**
+   * Saved config with its luajitPath re-checked by the same rules as the tool
+   * argument (it is executed). A failing value is ignored with a warning, so
+   * resolution falls back to auto-detect.
+   */
+  private loadVettedConfig(): SavedConfig {
+    const saved = loadConfig(this.env);
+    if (saved.luajitPath) {
+      try {
+        saved.luajitPath = validateLuajitArgument(saved.luajitPath, this.env);
+      } catch (e) {
+        this.log(`ignoring saved luajitPath (${(e as Error).message}); falling back to auto-detect`);
+        delete saved.luajitPath;
+      }
+    }
+    return saved;
+  }
+
   // ------------------------------------------------------------------ boot / stop
 
   private boot(): Promise<void> {
@@ -150,13 +170,16 @@ export class EngineManager {
         throw new EngineNotReadyError(msg.updating(paths.pobPath));
       }
       if (!this.bridge) {
-        this.bridge = this.bridgeFactory(paths, {
-          initialCrashCount: this.ledger.initialCount(paths.pobPath, paths.luajitPath),
-        });
+        const inherited = this.ledger.initial(paths.pobPath, paths.luajitPath);
+        this.bridge = this.bridgeFactory(paths, { initialCrashCount: inherited.count });
         this.bridgePaths = paths;
+        this.bridgeBootFingerprint = inherited.fingerprint;
         this.session = new BuildSession(this.bridge);
       }
       const fp = fingerprintInstall(paths.pobPath); // before start, so an update mid-boot is caught
+      // Only a real start attempt (breaker closed) ties future crashes to this install state;
+      // a refused start after a PoB update must not re-stamp the old crashes as "current".
+      if (!this.bridge.isCircuitOpen()) this.bridgeBootFingerprint = fp;
       await this.bridge.start();
       this.startFingerprint = fp;
       this.startedAt = new Date().toISOString();
@@ -195,13 +218,17 @@ export class EngineManager {
     if (this.booting) await this.booting.catch(() => undefined);
     const bridge = this.bridge;
     const bp = this.bridgePaths;
+    const bootFp = this.bridgeBootFingerprint;
     this.bridge = null;
     this.bridgePaths = null;
+    this.bridgeBootFingerprint = null;
     this.session = null;
     this.startFingerprint = null;
     this.startedAt = null;
     if (!bridge) return;
-    if (bp) this.ledger.record(bp.pobPath, bp.luajitPath, bridge.getCrashCount());
+    if (bp) {
+      this.ledger.record(bp.pobPath, bp.luajitPath, bridge.getCrashCount(), bootFp ?? fingerprintInstall(bp.pobPath));
+    }
     this.retiring.add(bridge);
     try {
       await bridge.dispose();
@@ -271,9 +298,12 @@ export class EngineManager {
     if (this.carryXML) return { xml: this.carryXML };
     if (!this.session || !this.startFingerprint) return { xml: null };
     try {
-      await this.session.getBuildInfo(); // throws UserError when no build is loaded
-    } catch {
-      return { xml: null };
+      await this.session.getBuildInfo(); // throws UserError("No build loaded …") when none is loaded
+    } catch (e) {
+      if (e instanceof UserError && /no build loaded/i.test(e.message)) return { xml: null };
+      const error = (e as Error).message;
+      this.log(`could not read the current build before restart: ${error}`);
+      return { xml: null, error };
     }
     try {
       return { xml: await this.session.exportXML() };
@@ -353,7 +383,7 @@ export class EngineManager {
     return this.gate.exclusive(async () => {
       let info: PoBInstallInfo;
       try {
-        info = validatePoBPath(pobPathRaw, 'pobPath', this.env, { expandEnv: false });
+        info = validatePoBPath(pobPathRaw, 'pobPath', this.env, { expandEnv: false, rejectNetwork: true });
       } catch (e) {
         throw new UserError((e as Error).message);
       }
@@ -368,7 +398,7 @@ export class EngineManager {
         luajitSource = 'argument';
       } else {
         try {
-          const saved = loadConfig(this.env);
+          const saved = this.loadVettedConfig();
           const lj = resolveLuaJIT(info.dir, { env: this.env, savedLuaJITPath: saved.luajitPath, ...this.resolveOptions });
           luajitPath = lj.luajitPath;
           luajitSource = lj.source;
@@ -437,8 +467,11 @@ export class EngineManager {
     else if (this.bootError) status = 'failed';
     else status = 'stopped';
 
+    // Never start or respawn the engine from here: only ask for build info when the
+    // process is up and no boot/swap is in progress; otherwise omit it.
     let build: unknown = null;
-    if (this.session && this.startFingerprint) {
+    const engineUp = !!(this.bridge?.isRunning() && this.startFingerprint && !this.booting && !this.gate.busy);
+    if (this.session && engineUp) {
       try {
         build = await this.session.getBuildInfo();
       } catch {

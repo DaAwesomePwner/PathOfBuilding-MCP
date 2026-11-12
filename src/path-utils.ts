@@ -60,3 +60,23 @@ export function homeDir(env: NodeJS.ProcessEnv = process.env): string {
   const preferred = process.platform === 'win32' ? env.USERPROFILE || env.HOME : env.HOME;
   return preferred || os.homedir();
 }
+
+/**
+ * String-only check (never touches the filesystem — even a stat of a UNC path
+ * opens an SMB connection): does this look like a network or device path?
+ * Matches `\\host\share`, `//host/share`, `\\?\…` and `\\.\…` (any mix of two
+ * leading slashes/backslashes), with optional surrounding quotes/whitespace.
+ */
+export function isNetworkOrDevicePath(p: string): boolean {
+  return /^\s*["']?\s*[\\/]{2}/.test(p);
+}
+
+/** Error text for a network/device path supplied as a tool argument. */
+export function networkPathMessage(label: string, raw: string): string {
+  return (
+    `${label}=${raw}: network and device paths (${String.raw`\\host\share`}, //host/share, ` +
+    `${String.raw`\\?\…`}, ${String.raw`\\.\…`}) are not ` +
+    `accepted via configure_pob_path. Use a local folder, or set POB_PATH / LUAJIT_PATH in the MCP ` +
+    `server's environment instead.`
+  );
+}

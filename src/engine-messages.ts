@@ -6,9 +6,10 @@ import type { InstallFingerprint } from './pob-install.js';
 
 export const ASK_USER =
   'Ask the user for their Path of Building Community install folder (the folder containing ' +
-  'Launch.lua — on Windows usually %APPDATA%\\Path of Building Community), then call ' +
-  'configure_pob_path with { pobPath } (add luajitPath if LuaJIT is not on PATH; the Windows ' +
-  'PoB installer does not include luajit.exe).';
+  'Launch.lua — on Windows usually C:\\Users\\<name>\\AppData\\Roaming\\Path of Building Community), then call ' +
+  'configure_pob_path with { pobPath } as a full local path — environment variables like %APPDATA% are not ' +
+  'expanded and network paths are refused (add luajitPath, the full path of luajit.exe, if LuaJIT is not on ' +
+  'PATH; the Windows PoB installer does not include luajit.exe).';
 
 export function unconfigured(resolveError: string | null, extra?: string): string {
   return [

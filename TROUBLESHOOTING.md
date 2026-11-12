@@ -38,7 +38,7 @@ PoB Community embeds `lua51.dll` for its own GUI. The Windows installer does **n
 - macOS (brew): `brew install luajit`
 - Linux (apt): `sudo apt-get install luajit`
 
-Then pass `luajitPath` to `configure_pob_path`, or set `LUAJIT_PATH`. **The server executes this file.** As a `configure_pob_path` argument it must be the full path of an existing file named like `luajit` (`luajit.exe` on Windows; `.bat`/`.cmd`/`.sh` scripts are refused), and environment variables in it are not expanded. `LUAJIT_PATH` may also be a folder containing `luajit[.exe]` or `bin/luajit[.exe]`. Auto-detect also checks `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop shims and apps, Homebrew, `/usr/local/bin`, `/usr/bin` and `PATH`.
+Then pass `luajitPath` to `configure_pob_path`, or set `LUAJIT_PATH`. **The server executes this file.** As a `configure_pob_path` argument it must be the full path of an existing file named like `luajit` (`luajit.exe` on Windows; `.bat`/`.cmd`/`.sh` scripts are refused), and environment variables in it are not expanded. Network/device paths (`\\host\share`, `//host/share`, `\\?\…`, `\\.\…`) are refused for both `pobPath` and `luajitPath` — use `POB_PATH` / `LUAJIT_PATH` in the server's environment for those. A saved `luajitPath` that no longer passes these checks is ignored at startup (with a stderr warning) and LuaJIT is auto-detected instead. `LUAJIT_PATH` may also be a folder containing `luajit[.exe]` or `bin/luajit[.exe]`. Auto-detect also checks `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop shims and apps, Homebrew, `/usr/local/bin`, `/usr/bin` and `PATH`.
 
 ## "Path of Building was updated on disk from X to Y"
 

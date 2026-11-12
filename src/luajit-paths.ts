@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { homeDir, normalizeUserPath } from './path-utils.js';
+import { homeDir, isNetworkOrDevicePath, networkPathMessage, normalizeUserPath } from './path-utils.js';
 import type { PathSource, ProbeCandidate, ResolveOptions } from './paths.js';
 
 /** LuaJIT discovery: LUAJIT_PATH env → saved config → probe table → PATH. */
@@ -131,13 +131,16 @@ export const LUAJIT_BASENAME = /^luajit[\w.-]*(\.exe)?$/i;
 /**
  * Validate a LuaJIT path supplied as a TOOL ARGUMENT (configure_pob_path /
  * elicitation). That binary is executed by the server, so this is stricter
- * than env/config values: no environment-variable expansion, it must be an
+ * than env/config values: no network/device paths, no environment-variable expansion, it must be an
  * existing regular file, and its basename must look like luajit.
  * Throws LuaJITNotFoundError with a reason.
  */
 export function validateLuajitArgument(raw: string, env: NodeJS.ProcessEnv = process.env): string {
+  // Network/device check happens on the strings only, before any filesystem access.
+  if (isNetworkOrDevicePath(raw)) throw new LuaJITNotFoundError(networkPathMessage('luajitPath', raw));
   const abs = normalizeUserPath(raw, env, { expandEnv: false });
   if (!abs) throw new LuaJITNotFoundError('luajitPath is empty.');
+  if (isNetworkOrDevicePath(abs)) throw new LuaJITNotFoundError(networkPathMessage('luajitPath', raw));
   let isFile = false;
   try {
     isFile = statSync(abs).isFile();

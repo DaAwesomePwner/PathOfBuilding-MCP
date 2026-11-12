@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import os from 'node:os';
 import path from 'node:path';
 import { configDir, configFilePath, loadConfig, saveConfig } from '../src/config-store.js';
-import { normalizeUserPath } from '../src/path-utils.js';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { CrashLedger } from '../src/crash-ledger.js';
+import { isNetworkOrDevicePath, normalizeUserPath } from '../src/path-utils.js';
 import {
   LuaJITNotFoundError,
   luajitProbeCandidates,
@@ -380,6 +382,93 @@ async function main(): Promise<void> {
     assert.deepEqual(loadConfig(env), { pobPath: '/p', luajitPath: '/l', pobVersion: '1.2.3' });
     writeFileSync(file, '{not json');
     assert.deepEqual(loadConfig(env), {});
+  });
+
+  // ---------------------------------------------------------------- round 2: ledger keys / network paths
+  await test('CrashLedger: case and trailing-separator variants share one count', () => {
+    const pob = makeFakePoB({ version: '7.0.0' });
+    const ljDir = tmp('lj-ledger-');
+    const lj = path.join(ljDir, EXE);
+    writeFileSync(lj, '');
+    const ledger = new CrashLedger();
+    ledger.record(pob, lj, 3, fingerprintInstall(pob));
+    const variants: Array<[string, string]> = [
+      [pob + path.sep, lj],
+      [pob + path.sep + path.sep, lj],
+      [path.join(pob, '.', 'Modules', '..'), lj],
+    ];
+    if (IS_WIN) {
+      variants.push([pob.toUpperCase(), lj.toLowerCase()], [pob.toLowerCase() + path.sep, lj.toUpperCase()]);
+    }
+    for (const [p, l] of variants) assert.equal(ledger.initialCount(p, l), 3, `variant ${p} | ${l}`);
+    // Unresolvable paths still canonicalise via path.resolve (+ lower-case on Windows).
+    const ghost = path.join(os.tmpdir(), 'no-such-ledger-dir');
+    ledger.record(ghost, lj, 2, fingerprintInstall(ghost));
+    assert.equal(ledger.initialCount(ghost + path.sep, lj), 2);
+    if (IS_WIN) assert.equal(ledger.initialCount(ghost.toUpperCase(), lj), 2);
+    // Fingerprint recorded at engine start: an install change since then → fresh count.
+    write(path.join(pob, 'manifest.xml'), '<PoBVersion><Version number="7.0.1"/></PoBVersion>');
+    assert.equal(ledger.initialCount(pob, lj), 0);
+  });
+
+  await test('isNetworkOrDevicePath: UNC, //, device prefixes (quoted too); local paths are not', () => {
+    const R = String.raw;
+    for (const p of [R`\\host\share\pob`, '//host/share/pob', R`\\?\C:\pob`, R`\\.\pipe\x`, R`"\\host\s"`, "  '//h/s'", R`/\host\s`]) {
+      assert.equal(isNetworkOrDevicePath(p), true, p);
+    }
+    for (const p of [R`C:\pob`, '/opt/pob', '~/pob', R`relative\pob`, R`"C:\pob"`, R`\pob`]) {
+      assert.equal(isNetworkOrDevicePath(p), false, p);
+    }
+  });
+
+  await test('network/device tool arguments are rejected before any filesystem access', () => {
+    const require = createRequire(import.meta.url);
+    const fsMod = require('node:fs') as Record<string, unknown>;
+    const names = ['statSync', 'lstatSync', 'existsSync', 'openSync', 'realpathSync', 'accessSync', 'readdirSync', 'readFileSync'];
+    const originals = new Map<string, unknown>();
+    const touched: string[] = [];
+    for (const n of names) {
+      const orig = fsMod[n] as (...a: unknown[]) => unknown;
+      originals.set(n, orig);
+      const spy = function (this: unknown, ...a: unknown[]) {
+        if (typeof a[0] === 'string' && /fs-spy-host/i.test(a[0])) touched.push(`${n}(${a[0]})`);
+        return orig.apply(this, a);
+      };
+      if (n === 'realpathSync') Object.assign(spy, { native: (orig as unknown as { native: unknown }).native });
+      fsMod[n] = spy;
+    }
+    syncBuiltinESMExports();
+    try {
+      // Control: a LOCAL path containing the marker is stat'ed → the spy sees ESM imports.
+      const local = path.join(os.tmpdir(), 'fs-spy-host-local', EXE);
+      assert.throws(() => validateLuajitArgument(local), LuaJITNotFoundError);
+      assert.ok(touched.length > 0, 'spy did not observe the control stat — test would be vacuous');
+      touched.length = 0;
+      const env = { ...process.env };
+      const R = String.raw;
+      for (const raw of [
+        R`\\fs-spy-host\share\luajit.exe`,
+        '//fs-spy-host/share/luajit.exe',
+        R`\\?\UNC\fs-spy-host\s\luajit.exe`,
+        R`\\.\fs-spy-host\luajit.exe`,
+        R`"\\fs-spy-host\s\luajit.exe"`,
+      ]) {
+        assert.throws(
+          () => validateLuajitArgument(raw, env),
+          (e: unknown) => e instanceof LuaJITNotFoundError && /network and device paths/.test(e.message) && /LUAJIT_PATH/.test(e.message),
+          raw,
+        );
+        assert.throws(
+          () => validatePoBPath(raw.replace('luajit.exe', 'pob'), 'pobPath', env, { expandEnv: false, rejectNetwork: true }),
+          (e: unknown) => e instanceof PoBInstallNotFoundError && /network and device paths/.test(e.message) && /POB_PATH/.test(e.message),
+          raw,
+        );
+      }
+      assert.deepEqual(touched, [], `filesystem touched for a network path: ${touched.join(', ')}`);
+    } finally {
+      for (const [n, f] of originals) fsMod[n] = f;
+      syncBuiltinESMExports();
+    }
   });
 
   // ---------------------------------------------------------------- update state / fingerprint

@@ -83,7 +83,9 @@ export function createPathPrompt(server: McpServer, engine: EngineManager): Path
         mode: 'form',
         message:
           'The Path of Building MCP server could not find your Path of Building Community (Path of Exile 1) install. ' +
-          'Enter the folder that contains Launch.lua (on Windows usually %APPDATA%\\Path of Building Community).',
+          'Enter the full folder path that contains Launch.lua, for example ' +
+          'C:\\Users\\<your name>\\AppData\\Roaming\\Path of Building Community (type the real path: environment ' +
+          'variables like %APPDATA% are not expanded, and network paths are not accepted).',
         requestedSchema: {
           type: 'object',
           properties: {
