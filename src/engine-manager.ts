@@ -95,6 +95,8 @@ export class EngineManager {
   private prompted = false;
   private promptMessage: string | undefined;
   private initDone = false;
+  /** Saved luajitPath values already reported as invalid (warn once each). */
+  private readonly warnedSavedLuajit = new Set<string>();
   private shuttingDown = false;
 
   constructor(opts: EngineManagerOptions = {}) {
@@ -151,7 +153,10 @@ export class EngineManager {
       try {
         saved.luajitPath = validateLuajitArgument(saved.luajitPath, this.env);
       } catch (e) {
-        this.log(`ignoring saved luajitPath (${(e as Error).message}); falling back to auto-detect`);
+        if (!this.warnedSavedLuajit.has(saved.luajitPath)) {
+          this.warnedSavedLuajit.add(saved.luajitPath); // once per invalid saved value
+          this.log(`ignoring saved luajitPath (${(e as Error).message}); falling back to auto-detect`);
+        }
         delete saved.luajitPath;
       }
     }
@@ -300,6 +305,8 @@ export class EngineManager {
     try {
       await this.session.getBuildInfo(); // throws UserError("No build loaded …") when none is loaded
     } catch (e) {
+      // Text match on BuildSession.getBuildInfo()'s UserError('No build loaded — call load_build first')
+      // (src/build-session.ts); BuildSession has no public "is loaded" accessor. Keep in sync if that text changes.
       if (e instanceof UserError && /no build loaded/i.test(e.message)) return { xml: null };
       const error = (e as Error).message;
       this.log(`could not read the current build before restart: ${error}`);

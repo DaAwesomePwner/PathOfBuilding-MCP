@@ -391,6 +391,13 @@ async function part1(): Promise<void> {
       const last = FakeBridge.instances[FakeBridge.instances.length - 1];
       assert.equal(last.initialCrashCount, 0, 'fresh count after the install changed');
       await ml.ensureReady();
+      // Bounded reset: three new crashes on the UPDATED install open the breaker again.
+      FakeBridge.crashOnStart = true;
+      for (let i = 1; i <= 3; i++) await rejectsWith(ml.reload(), EngineNotReadyError, /failed to start/);
+      FakeBridge.crashOnStart = false;
+      await rejectsWith(ml.reload(), EngineNotReadyError, /crashed 3 times/);
+      await rejectsWith(ml.ensureReady(), EngineNotReadyError, /crashed 3 times/);
+      assert.equal(FakeBridge.instances[FakeBridge.instances.length - 1].initialCrashCount, 3);
     } finally {
       FakeBridge.crashOnStart = false;
       await ml.shutdown();
@@ -488,6 +495,21 @@ async function part1(): Promise<void> {
       assert.ok(logs.some((l) => /ignoring saved luajitPath/.test(l)), logs.join('\n'));
       await mo.shutdown();
     }
+    // Warn once per invalid saved value, even across repeated configure_pob_path calls
+    // (here LuaJIT can't be auto-detected, so configure fails and the bad config stays).
+    const cfg = tmp('cfg-');
+    write(path.join(cfg, 'config.json'), JSON.stringify({ pobPath: good, luajitPath: badFile }));
+    const logs: string[] = [];
+    const mw = new EngineManager({
+      env: { POB_MCP_CONFIG_DIR: cfg },
+      bridgeFactory: (p, o) => new FakeBridge(p, o) as unknown as LuaBridge,
+      log: (l) => logs.push(l),
+      resolveOptions: { pobCandidates: [], luajitCandidates: [] },
+    });
+    mw.init();
+    for (let i = 0; i < 3; i++) await rejectsWith(mw.configure(good), UserError, /luajit/i);
+    assert.equal(logs.filter((l) => /ignoring saved luajitPath/.test(l)).length, 1, logs.join('\n'));
+    await mw.shutdown();
   }
   log('PASS 1o');
 
