@@ -1262,6 +1262,10 @@ export class BuildSession {
     });
     const map = new Map<string, ConfigVarMetadata>();
     for (const entry of result.metadata ?? []) map.set(entry.var, entry);
+    if (map.size === 0) {
+      // Don't cache a failed load: that would reject every key until the next build load.
+      throw new Error('could not load PoB config metadata (engine returned no options); retry, or reset_build if it persists');
+    }
     this.configMetaCache = map;
     return map;
   }
@@ -1277,7 +1281,7 @@ export class BuildSession {
     const meta = await this.getConfigMetaMapUnlocked();
     const where = context ? ` (${context})` : '';
     const unknown = Object.keys(options).filter(
-      (k) => !meta.has(k) && !EXTRA_CONFIG_KEYS[k],
+      (k) => !meta.has(k) && !Object.hasOwn(EXTRA_CONFIG_KEYS, k),
     );
     if (unknown.length > 0) {
       const lines = unknown.map((k) => {
@@ -1291,7 +1295,10 @@ export class BuildSession {
     }
     for (const [key, value] of Object.entries(options)) {
       if (value === null || value === undefined) continue;
-      const problem = describeConfigValueProblem(meta.get(key) ?? EXTRA_CONFIG_KEYS[key], value);
+      const problem = describeConfigValueProblem(
+        meta.get(key) ?? (Object.hasOwn(EXTRA_CONFIG_KEYS, key) ? EXTRA_CONFIG_KEYS[key] : undefined),
+        value,
+      );
       if (problem) throw new UserError(`Invalid value for config key "${key}"${where}: ${problem}`);
     }
   }
@@ -1379,7 +1386,7 @@ export class BuildSession {
   }
 
   async simulateScenario(scenario: string): Promise<ScenarioResult> {
-    const preset = SCENARIO_PRESETS[scenario];
+    const preset = Object.hasOwn(SCENARIO_PRESETS, scenario) ? SCENARIO_PRESETS[scenario] : undefined;
     if (!preset) {
       throw new UserError(
         `Unknown scenario: "${scenario}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`,
@@ -1397,7 +1404,7 @@ export class BuildSession {
   async compareScenarios(scenarios: string[]): Promise<ScenarioComparison> {
     if (scenarios.length === 0) throw new UserError('compareScenarios requires at least one scenario');
     for (const s of scenarios) {
-      if (!SCENARIO_PRESETS[s]) {
+      if (!Object.hasOwn(SCENARIO_PRESETS, s)) {
         throw new UserError(`Unknown scenario: "${s}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`);
       }
     }
@@ -1433,9 +1440,10 @@ export class BuildSession {
   }
 
   async toggleBuffs(buffs: Record<string, boolean | number | string>): Promise<StatDiffResult> {
-    const options: Record<string, unknown> = {};
+    // Null-prototype so a "__proto__" key stays an own property (and gets rejected by validation).
+    const options: Record<string, unknown> = Object.create(null);
     for (const [key, value] of Object.entries(buffs)) {
-      const mapped = BUFF_KEY_MAP[key] ?? key;
+      const mapped = Object.hasOwn(BUFF_KEY_MAP, key) ? BUFF_KEY_MAP[key] : key;
       options[mapped] = value;
     }
     return this.simulateConfig(options);

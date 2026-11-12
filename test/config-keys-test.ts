@@ -86,6 +86,33 @@ async function main(): Promise<void> {
     assert(JSON.stringify(afterCfg) === JSON.stringify(baseCfg), 'config must be unchanged after rejected calls');
     log('PASS: unknown keys rejected, state + undo stack untouched');
 
+    log('Test 3b: inherited/prototype property names are not valid keys');
+    const protoOpts: Array<[string, Record<string, unknown>]> = [
+      ['constructor', { constructor: 1 }],
+      ['toString', { toString: true }],
+      ['valueOf', { valueOf: 1 }],
+      ['__proto__', JSON.parse('{"__proto__": 1}') as Record<string, unknown>],
+    ];
+    for (const [name, opts] of protoOpts) {
+      await expectUserError(() => session.setConfigWithUndo(opts), [name], `setConfigWithUndo(${name})`);
+      await expectUserError(() => session.setConfig(opts), [name], `setConfig(${name})`);
+      await expectUserError(() => session.simulateConfig(opts), [name], `simulateConfig(${name})`);
+    }
+    await expectUserError(() => session.toggleBuffs(JSON.parse('{"__proto__": true}')), ['__proto__'], 'toggleBuffs(__proto__)');
+    await expectUserError(() => session.toggleBuffs({ constructor: true }), ['constructor'], 'toggleBuffs(constructor)');
+    await expectUserError(() => session.simulateScenario('constructor'), ['Unknown scenario'], 'simulateScenario(constructor)');
+    await expectUserError(() => session.compareScenarios(['mapping', 'toString']), ['Unknown scenario'], 'compareScenarios(toString)');
+    assert(session.undoStackDepth() === baseDepth, 'undo depth unchanged after prototype-name rejections');
+    assert(sameStats(await session.getStats(), baseStats), 'stats unchanged after prototype-name rejections');
+    assert(JSON.stringify(await session.snapshotConfig()) === JSON.stringify(baseCfg), 'config unchanged after prototype-name rejections');
+    log('PASS: prototype property names rejected, state untouched');
+
+    log('Test 3c: customMods (legacy text option) is still accepted');
+    assert(!validKeys.has('customMods'), 'customMods is expected to be absent from ConfigOptions metadata');
+    await session.simulateConfig({ customMods: '+10 to Maximum Life' });
+    await expectUserError(() => session.simulateConfig({ customMods: 5 }), ['customMods', 'string'], 'customMods wrong type');
+    log('PASS: customMods accepted as text');
+
     log('Test 4: wrong value types rejected');
     await expectUserError(() => session.setConfigWithUndo({ usePowerCharges: 'yes' }), ['usePowerCharges'], 'check with string');
     await expectUserError(() => session.setConfigWithUndo({ enemyIsBoss: 'Nope' }), ['enemyIsBoss', 'Pinnacle'], 'list with bad value');
@@ -114,12 +141,41 @@ async function main(): Promise<void> {
     assert(sameStats(await session.getStats(), baseStats), 'probe operations must leave stats unchanged');
     log('PASS: aliases + scenarios apply and restore');
 
-    log('Test 7: metadata cache refreshes on build reload');
+    log('Test 7: metadata cache is invalidated on build load/reset and refilled lazily');
+    const cacheOf = (): unknown => (session as unknown as { configMetaCache: unknown }).configMetaCache;
+    assert(cacheOf() !== null, 'cache should be populated by earlier validation');
     await session.loadBuild(xml);
+    assert(cacheOf() === null, 'loadBuild must invalidate the config metadata cache');
     const metadata2 = await session.getConfigMetadata();
     assert(metadata2.length === metadata.length, 'metadata should be available after reload');
+    assert(cacheOf() !== null, 'cache should refill after reload');
+    await session.resetBuild();
+    assert(cacheOf() === null, 'resetBuild must invalidate the config metadata cache');
     await expectUserError(() => session.setConfig({ bogusAfterReload: 1 }), ['bogusAfterReload'], 'validation after reload');
-    log('PASS: validation works after reload');
+    log('PASS: validation works after reload; cache invalidation verified');
+
+    log('Test 8: empty metadata is not cached and does not reject every key forever');
+    await session.loadBuild(xml);
+    const realSend = bridge.send.bind(bridge) as (...a: unknown[]) => Promise<unknown>;
+    let failNext = true;
+    (bridge as unknown as { send: (...a: unknown[]) => Promise<unknown> }).send = async (...a: unknown[]) => {
+      const cmd = (a[0] as { cmd?: string } | undefined)?.cmd;
+      if (failNext && cmd === 'getConfigMetadata') {
+        failNext = false;
+        return { ok: true, metadata: [] };
+      }
+      return realSend(...a);
+    };
+    try {
+      await session.setConfig({ usePowerCharges: true });
+      throw new Error('expected failure when metadata is empty');
+    } catch (e) {
+      assert(!(e instanceof UserError), 'empty metadata must not be reported as a UserError');
+      assert(e instanceof Error && e.message.includes('could not load PoB config metadata'), `unexpected error: ${e}`);
+    }
+    assert(cacheOf() === null, 'empty metadata must not be cached');
+    await session.setConfig({ usePowerCharges: true });
+    log('PASS: empty metadata surfaces a non-user error and is retried');
   } finally {
     bridge.killProcess();
   }
