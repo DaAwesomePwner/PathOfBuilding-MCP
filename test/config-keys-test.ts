@@ -156,25 +156,34 @@ async function main(): Promise<void> {
 
     log('Test 8: empty metadata is not cached and does not reject every key forever');
     await session.loadBuild(xml);
-    const realSend = bridge.send.bind(bridge) as (...a: unknown[]) => Promise<unknown>;
-    let failNext = true;
-    (bridge as unknown as { send: (...a: unknown[]) => Promise<unknown> }).send = async (...a: unknown[]) => {
-      const cmd = (a[0] as { cmd?: string } | undefined)?.cmd;
-      if (failNext && cmd === 'getConfigMetadata') {
-        failNext = false;
-        return { ok: true, metadata: [] };
-      }
-      return realSend(...a);
-    };
+    const bridgeAny = bridge as unknown as { send: (...a: unknown[]) => Promise<unknown> };
+    const hadOwnSend = Object.hasOwn(bridge, 'send');
+    const originalSend = bridgeAny.send;
+    const realSend = originalSend.bind(bridge);
     try {
+      let failNext = true;
+      bridgeAny.send = async (...a: unknown[]) => {
+        const cmd = (a[0] as { cmd?: string } | undefined)?.cmd;
+        if (failNext && cmd === 'getConfigMetadata') {
+          failNext = false;
+          return { ok: true, metadata: [] };
+        }
+        return realSend(...a);
+      };
+      try {
+        await session.setConfig({ usePowerCharges: true });
+        throw new Error('expected failure when metadata is empty');
+      } catch (e) {
+        assert(!(e instanceof UserError), 'empty metadata must not be reported as a UserError');
+        assert(e instanceof Error && e.message.includes('could not load PoB config metadata'), `unexpected error: ${e}`);
+      }
+      assert(cacheOf() === null, 'empty metadata must not be cached');
       await session.setConfig({ usePowerCharges: true });
-      throw new Error('expected failure when metadata is empty');
-    } catch (e) {
-      assert(!(e instanceof UserError), 'empty metadata must not be reported as a UserError');
-      assert(e instanceof Error && e.message.includes('could not load PoB config metadata'), `unexpected error: ${e}`);
+    } finally {
+      // Restore the real bridge so any later test runs unpatched.
+      if (hadOwnSend) bridgeAny.send = originalSend;
+      else delete (bridgeAny as { send?: unknown }).send;
     }
-    assert(cacheOf() === null, 'empty metadata must not be cached');
-    await session.setConfig({ usePowerCharges: true });
     log('PASS: empty metadata surfaces a non-user error and is retried');
   } finally {
     bridge.killProcess();
