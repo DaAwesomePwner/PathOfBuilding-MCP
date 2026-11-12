@@ -513,6 +513,36 @@ async function part1(): Promise<void> {
   }
   log('PASS 1o');
 
+  log('1q [PR #3 review]: a saved luajitPath survives configure_pob_path without luajitPath');
+  {
+    const good = makeFakePoB('9.3.0');
+    const custom = path.join(tmp('custom-lj-'), process.platform === 'win32' ? 'luajit.exe' : 'luajit');
+    writeFileSync(custom, '');
+    const cfg = tmp('cfg-');
+    const opts = () => ({
+      env: { POB_MCP_CONFIG_DIR: cfg },
+      bridgeFactory: (p: unknown, o: unknown) => new FakeBridge(p as never, o as never) as unknown as LuaBridge,
+      log: () => {},
+      resolveOptions: { pobCandidates: [], luajitCandidates: [] }, // not auto-detectable
+    });
+    const readSaved = () => JSON.parse(readFileSync(path.join(cfg, 'config.json'), 'utf8'));
+    const mq = new EngineManager(opts());
+    mq.init();
+    await mq.configure(good, custom);
+    const first = readSaved().luajitPath;
+    assert.ok(first, 'explicit luajitPath is saved');
+    await mq.configure(good); // reuses the saved binary
+    assert.equal((await mq.info()).luajitPathSource, 'config');
+    assert.equal(readSaved().luajitPath, first, 'saved luajitPath kept after a configure without it');
+    await mq.shutdown();
+    const mq2 = new EngineManager(opts()); // next server start still finds LuaJIT
+    mq2.init();
+    await mq2.ensureReady();
+    assert.equal((await mq2.info()).luajitPathSource, 'config');
+    await mq2.shutdown();
+  }
+  log('PASS 1q');
+
   log('1p [r2 item 3]: network/device paths refused via configure (incl. elicitation path)');
   {
     const R = String.raw;
