@@ -50,6 +50,9 @@ async function main(): Promise<void> {
     assert(info.class === 'Witch', `Expected Witch, got ${info.class}`);
     assert(info.ascendancy === 'Occultist', `Expected Occultist, got ${info.ascendancy}`);
     assert(info.level === 99, `Expected level 99, got ${info.level}`);
+    const versions = info as unknown as { treeVersion?: unknown; latestTreeVersion?: unknown };
+    assert(versions.treeVersion === '3_13', `Expected treeVersion 3_13, got ${versions.treeVersion}`);
+    assert(typeof versions.latestTreeVersion === 'string', 'latestTreeVersion should be reported');
     log('PASS: XML loaded');
 
     log('Test 4: Get stats');
@@ -67,6 +70,15 @@ async function main(): Promise<void> {
     log('Test 6: Error handling');
     await expectRejects(() => bridge.loadBuildCode(''), 'Empty build code should reject');
     await expectRejects(() => bridge.loadBuildXML('<not-valid'), 'Malformed XML should reject');
+    // Passes the bridge's shape check but PoB itself fails to parse it.
+    await expectRejects(
+      () => bridge.loadBuildXML('<PathOfBuilding><Build level="1"></PathOfBuilding>'),
+      'XML that PoB cannot parse should reject',
+    );
+    await expectRejects(
+      () => bridge.loadBuildXML(xml.replace(/treeVersion="3_13"/g, 'treeVersion="9_99"')),
+      'A tree version this PoB does not know should reject',
+    );
     log('PASS: Error handling');
 
     log('Test 7: Auto-restart');

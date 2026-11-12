@@ -33,6 +33,328 @@ package.cpath = POB_PATH .. "/?.dll;"
 	.. POB_PATH .. "/runtime/?.so;"
 	.. package.cpath
 
+-- ---------------------------------------------------------------------------
+-- Protocol stream protection. stdout carries exactly one JSON object per line
+-- and nothing else. Anything PoB (or a library) prints goes to stderr instead.
+-- ---------------------------------------------------------------------------
+local STDOUT = io.stdout
+local STDERR = io.stderr
+function print(...)
+	local n = select("#", ...)
+	local parts = { }
+	for i = 1, n do
+		parts[i] = tostring((select(i, ...)))
+	end
+	STDERR:write(table.concat(parts, "\t"), "\n")
+end
+io.output(STDERR)
+
+local ffiOk, ffi = pcall(require, "ffi")
+if not ffiOk then ffi = nil end
+local IS_WINDOWS = (ffi and ffi.os == "Windows") or package.config:sub(1, 1) == "\\"
+
+-- ---------------------------------------------------------------------------
+-- Install write guard. The bridge must never modify the user's PoB install:
+-- io.open in any write/append/update mode, os.remove and os.rename are refused
+-- for paths that resolve inside POB_PATH. Reads are untouched. Installed before
+-- Launch.lua so every PoB module (and any locals they cache) sees the guard.
+-- ---------------------------------------------------------------------------
+local raw_io_open, raw_os_remove, raw_os_rename, raw_io_output = io.open, os.remove, os.rename, io.output
+local GUARD_MSG = "read-only: pob-mcp bridge never writes inside the Path of Building install"
+local guardStats = { blockedWrites = 0, lastBlocked = nil }
+
+local function getCwd()
+	if ffi then
+		local ok, cwd = pcall(function()
+			local buf = ffi.new("char[?]", 4096)
+			if IS_WINDOWS then
+				ffi.cdef("uint32_t GetCurrentDirectoryA(uint32_t nBufferLength, char *lpBuffer);")
+				local n = ffi.C.GetCurrentDirectoryA(4096, buf)
+				if n > 0 and n < 4096 then return ffi.string(buf, n) end
+			else
+				ffi.cdef("char *getcwd(char *buf, size_t size);")
+				if ffi.C.getcwd(buf, 4096) ~= nil then return ffi.string(buf) end
+			end
+		end)
+		if ok and cwd then return cwd end
+	end
+	return os.getenv("PWD")
+end
+-- Lua cannot change directory and SetWorkDir is stubbed, so the cwd is fixed.
+local CWD = getCwd()
+
+-- Canonical absolute form of a path: forward slashes, "." / ".." resolved,
+-- and on Windows lower-cased with trailing dots/spaces trimmed per segment
+-- (Win32 ignores them). Returns nil when the path cannot be resolved.
+local function canonPath(p)
+	if type(p) ~= "string" or p == "" then return nil end
+	p = p:gsub("\\", "/"):gsub("^//[%?%.]/", "")
+	local head, rest
+	if p:match("^%a:/") then
+		head, rest = p:sub(1, 2), p:sub(4)
+	elseif p:sub(1, 2) == "//" then
+		head, rest = "/", p:sub(3)
+	elseif p:sub(1, 1) == "/" then
+		head, rest = "", p:sub(2)
+	elseif p:match("^%a:") then
+		return nil -- drive-relative ("C:foo"): depends on per-drive cwd
+	else
+		if not CWD then return nil end
+		return canonPath(CWD .. "/" .. p)
+	end
+	local parts = { }
+	for seg in rest:gmatch("[^/]+") do
+		if IS_WINDOWS and seg ~= "." and seg ~= ".." then
+			seg = seg:gsub("[%. ]+$", "")
+		end
+		if seg == ".." then
+			if #parts > 0 then parts[#parts] = nil end
+		elseif seg ~= "." and seg ~= "" then
+			parts[#parts + 1] = seg
+		end
+	end
+	local out = head .. "/" .. table.concat(parts, "/")
+	if IS_WINDOWS then out = out:lower() end
+	return out
+end
+
+local INSTALL_ROOT = canonPath(POB_PATH)
+
+-- True when `path` is inside the install, or cannot be resolved (fail closed).
+local function isProtectedPath(path)
+	if not INSTALL_ROOT then return true end
+	local c = canonPath(path)
+	if not c then return true end
+	return c == INSTALL_ROOT or c:sub(1, #INSTALL_ROOT + 1) == INSTALL_ROOT .. "/"
+end
+
+local function isWriteMode(mode)
+	if mode == nil then return false end
+	return type(mode) ~= "string" or mode:find("[wa+]") ~= nil
+end
+
+-- Files the bridge pretends not to see. Launch.lua treats an existing
+-- `first.run` as a fresh install: it deletes it and runs the online updater.
+local HIDDEN_INSTALL_FILES = { }
+if INSTALL_ROOT then
+	HIDDEN_INSTALL_FILES[INSTALL_ROOT .. "/first.run"] = true
+end
+
+local function noteBlocked(op, path)
+	guardStats.blockedWrites = guardStats.blockedWrites + 1
+	guardStats.lastBlocked = op .. " " .. tostring(path)
+	STDERR:write("[pob-mcp] blocked ", op, " inside PoB install: ", tostring(path), "\n")
+end
+
+function io.open(path, mode, ...)
+	if isWriteMode(mode) and isProtectedPath(path) then
+		noteBlocked("io.open(" .. tostring(mode) .. ")", path)
+		return nil, tostring(path) .. ": " .. GUARD_MSG, 13
+	end
+	local c = canonPath(path)
+	if c and HIDDEN_INSTALL_FILES[c] then
+		return nil, tostring(path) .. ": No such file or directory", 2
+	end
+	return raw_io_open(path, mode, ...)
+end
+
+function os.remove(path)
+	if isProtectedPath(path) then
+		noteBlocked("os.remove", path)
+		return nil, tostring(path) .. ": " .. GUARD_MSG, 13
+	end
+	return raw_os_remove(path)
+end
+
+function os.rename(src, dst)
+	if isProtectedPath(src) or isProtectedPath(dst) then
+		noteBlocked("os.rename", tostring(src) .. " -> " .. tostring(dst))
+		return nil, tostring(src) .. ": " .. GUARD_MSG, 13
+	end
+	return raw_os_rename(src, dst)
+end
+
+function io.output(file)
+	if type(file) == "string" and isProtectedPath(file) then
+		noteBlocked("io.output", file)
+		error(file .. ": " .. GUARD_MSG, 2)
+	end
+	if file == nil then return raw_io_output() end
+	return raw_io_output(file)
+end
+
+-- ---------------------------------------------------------------------------
+-- Native helpers PoB normally gets from SimpleGraphic: zlib Inflate/Deflate
+-- and NewFileSearch. Implemented with LuaJIT FFI; each degrades gracefully
+-- (nil result) when the native library is unavailable.
+-- ---------------------------------------------------------------------------
+local zlib = nil
+local zlibInfo = { available = false }
+do
+	local candidates = IS_WINDOWS
+		and { POB_PATH .. "/zlib1.dll", POB_PATH .. "/runtime/zlib1.dll", "zlib1", "zlib" }
+		or { "z", "libz.so.1", "libz.dylib" }
+	if ffi then
+		local ok = pcall(ffi.cdef, [[
+			typedef struct pobmcp_z_stream {
+				const unsigned char *next_in; unsigned int avail_in; unsigned long total_in;
+				unsigned char *next_out; unsigned int avail_out; unsigned long total_out;
+				const char *msg; void *state; void *zalloc; void *zfree; void *opaque;
+				int data_type; unsigned long adler; unsigned long reserved;
+			} pobmcp_z_stream;
+			const char *zlibVersion(void);
+			int inflateInit2_(pobmcp_z_stream *strm, int windowBits, const char *version, int stream_size);
+			int inflate(pobmcp_z_stream *strm, int flush);
+			int inflateEnd(pobmcp_z_stream *strm);
+			unsigned long compressBound(unsigned long sourceLen);
+			int compress2(unsigned char *dest, unsigned long *destLen, const unsigned char *source, unsigned long sourceLen, int level);
+		]])
+		if ok then
+			for _, name in ipairs(candidates) do
+				local okLoad, lib = pcall(ffi.load, name)
+				if okLoad then
+					local okVer, ver = pcall(function() return ffi.string(lib.zlibVersion()) end)
+					if okVer then
+						zlib = lib
+						zlibInfo = { available = true, version = ver, library = name }
+						break
+					end
+				end
+			end
+		end
+	end
+	if not zlib then
+		STDERR:write("[pob-mcp] zlib not available; timeless/abyss jewel data and Inflate/Deflate are disabled\n")
+	end
+end
+
+local Z_OK, Z_STREAM_END = 0, 1
+
+local function zInflate(data, windowBits)
+	local strm = ffi.new("pobmcp_z_stream")
+	strm.next_in = ffi.cast("const unsigned char *", data)
+	strm.avail_in = #data
+	if zlib.inflateInit2_(strm, windowBits, zlib.zlibVersion(), ffi.sizeof("pobmcp_z_stream")) ~= Z_OK then
+		return nil
+	end
+	local chunk = math.min(math.max(#data * 4, 65536), 16 * 1024 * 1024)
+	local out = ffi.new("unsigned char[?]", chunk)
+	local parts = { }
+	local ret
+	repeat
+		strm.next_out = out
+		strm.avail_out = chunk
+		ret = zlib.inflate(strm, 0)
+		if ret ~= Z_OK and ret ~= Z_STREAM_END then
+			zlib.inflateEnd(strm)
+			return nil
+		end
+		parts[#parts + 1] = ffi.string(out, chunk - strm.avail_out)
+	until ret == Z_STREAM_END
+	zlib.inflateEnd(strm)
+	-- keep `data` alive until here (next_in points into it)
+	local _ = data
+	return table.concat(parts)
+end
+
+function Inflate(data)
+	if not zlib or type(data) ~= "string" or data == "" then
+		return nil
+	end
+	-- 15+32: zlib or gzip header (what PoB's Deflate emits); -15: raw deflate.
+	return zInflate(data, 15 + 32) or zInflate(data, -15)
+end
+
+function Deflate(data)
+	if not zlib or type(data) ~= "string" then
+		return nil
+	end
+	local bound = zlib.compressBound(#data)
+	local dest = ffi.new("unsigned char[?]", bound)
+	local destLen = ffi.new("unsigned long[1]", bound)
+	if zlib.compress2(dest, destLen, ffi.cast("const unsigned char *", data), #data, 9) ~= Z_OK then
+		return nil
+	end
+	return ffi.string(dest, destLen[0])
+end
+
+-- NewFileSearch(pattern, dirOnly): SimpleGraphic's directory iterator. Returns
+-- nil when nothing matches, else a handle with NextFile/GetFileName/
+-- GetFileSize/GetFileModifiedTime. Windows uses FindFirstFile (supports
+-- wildcards and real mtimes). Elsewhere only exact paths are found and the
+-- mtime is reported as 0, which makes PoB prefer its compressed data.
+local fileSearchClass = { }
+fileSearchClass.__index = fileSearchClass
+function fileSearchClass:GetFileName() return self.entries[self.index].name end
+function fileSearchClass:GetFileSize() return self.entries[self.index].size end
+function fileSearchClass:GetFileModifiedTime() return self.entries[self.index].modified end
+function fileSearchClass:NextFile()
+	if self.index < #self.entries then
+		self.index = self.index + 1
+		return true
+	end
+	return false
+end
+
+local findFirst = nil
+if ffi and IS_WINDOWS then
+	local ok = pcall(ffi.cdef, [[
+		typedef struct pobmcp_find_data {
+			uint32_t dwFileAttributes;
+			uint32_t ftCreationTime[2]; uint32_t ftLastAccessTime[2]; uint32_t ftLastWriteTime[2];
+			uint32_t nFileSizeHigh; uint32_t nFileSizeLow; uint32_t dwReserved0; uint32_t dwReserved1;
+			char cFileName[260]; char cAlternateFileName[14];
+		} pobmcp_find_data;
+		void *FindFirstFileA(const char *lpFileName, pobmcp_find_data *lpFindFileData);
+		int FindNextFileA(void *hFindFile, pobmcp_find_data *lpFindFileData);
+		int FindClose(void *hFindFile);
+	]])
+	if ok then
+		local INVALID = ffi.cast("void *", -1)
+		findFirst = function(pattern, dirOnly)
+			local fd = ffi.new("pobmcp_find_data")
+			local h = ffi.C.FindFirstFileA(pattern, fd)
+			if h == INVALID or h == nil then return { } end
+			local entries = { }
+			repeat
+				local name = ffi.string(fd.cFileName)
+				local isDir = bit.band(fd.dwFileAttributes, 0x10) ~= 0
+				if name ~= "." and name ~= ".." and isDir == (dirOnly and true or false) then
+					local wt = fd.ftLastWriteTime
+					local ticks = wt[1] * 4294967296 + wt[0]
+					entries[#entries + 1] = {
+						name = name,
+						size = fd.nFileSizeHigh * 4294967296 + fd.nFileSizeLow,
+						modified = ticks / 1e7 - 11644473600,
+					}
+				end
+			until ffi.C.FindNextFileA(h, fd) == 0
+			ffi.C.FindClose(h)
+			return entries
+		end
+	end
+end
+
+function NewFileSearch(pattern, dirOnly)
+	if type(pattern) ~= "string" then return nil end
+	local entries
+	if findFirst then
+		entries = findFirst(pattern, dirOnly)
+	else
+		entries = { }
+		if not dirOnly and not pattern:find("[%*%?]") then
+			local f = raw_io_open(pattern, "rb")
+			if f then
+				local size = f:seek("end")
+				f:close()
+				entries[1] = { name = pattern:match("([^/\\]+)$") or pattern, size = size or 0, modified = 0 }
+			end
+		end
+	end
+	if #entries == 0 then return nil end
+	return setmetatable({ entries = entries, index = 1 }, fileSearchClass)
+end
+
 local function createUtf8Fallback()
 	local utf8Fallback = { }
 	utf8Fallback.reverse = function(str)
@@ -135,9 +457,6 @@ function GetAsyncCount()
 	return 0
 end
 
--- Search Handles
-function NewFileSearch() end
-
 -- General Functions
 function SetWindowTitle(title) end
 function GetCursorPos()
@@ -148,12 +467,6 @@ function ShowCursor(doShow) end
 function IsKeyDown(keyName) end
 function Copy(text) end
 function Paste() end
-function Deflate(data)
-	return ""
-end
-function Inflate(data)
-	return ""
-end
 function GetTime()
 	return 0
 end
@@ -254,24 +567,63 @@ local function userError(msg)
   error(USER_ERROR_PREFIX .. msg)
 end
 
+local function encodeJSON(obj)
+	local ok, encoded = pcall(dkjson.encode, obj)
+	if ok and type(encoded) == "string" then
+		return encoded
+	end
+	local fallbackOk, fallback = pcall(dkjson.encode, {
+		error = "Failed to encode bridge response as JSON: " .. tostring(ok and "encoder returned no string" or encoded),
+	})
+	if fallbackOk and type(fallback) == "string" then
+		return fallback
+	end
+	return '{"error":"Failed to encode bridge response as JSON"}'
+end
+
+local function respond(obj)
+	STDOUT:write(encodeJSON(obj) .. "\n")
+	STDOUT:flush()
+end
+
+-- PoB colour escapes (^7, ^xRRGGBB) are noise in an error message.
+local function stripColorCodes(text)
+	return (tostring(text):gsub("%^x%x%x%x%x%x%x", ""):gsub("%^%d", ""))
+end
+
 dofile(SCRIPT_PATH .. "/Launch.lua")
 mainObject.continuousIntegrationMode = os.getenv("CI")
 runCallback("OnInit")
 runCallback("OnFrame")
 
 if mainObject.promptMsg then
-	error(mainObject.promptMsg)
+	respond({ error = "Path of Building failed to initialise: " .. stripColorCodes(mainObject.promptMsg) })
+	os.exit(1)
 end
 
 build = mainObject.main.modes["BUILD"]
 
+-- A build whose load aborted part-way leaves a TreeTab with no active spec on
+-- the (reused) Build module. The next Build:Init constructs ConfigTab before
+-- replacing TreeTab, and ConfigTab -> SyncLoadouts indexes the stale tab and
+-- crashes. Drop such a tab so Init starts from a clean slate.
+local function scrubStaleBuildState()
+	local b = mainObject.main and mainObject.main.modes and mainObject.main.modes["BUILD"]
+	local tab = b and b.treeTab
+	if tab and not (type(tab.specList) == "table" and tab.activeSpec and tab.specList[tab.activeSpec]) then
+		b.treeTab = nil
+	end
+end
+
 function newBuild()
+	scrubStaleBuildState()
 	mainObject.main:SetMode("BUILD", false, "Help, I'm stuck in Path of Building!")
 	runCallback("OnFrame")
 	build = mainObject.main.modes["BUILD"]
 end
 
 function loadBuildFromXML(xmlText, name)
+	scrubStaleBuildState()
 	mainObject.main:SetMode("BUILD", false, name or "", xmlText)
 	runCallback("OnFrame")
 	build = mainObject.main.modes["BUILD"]
@@ -284,11 +636,6 @@ function loadBuildFromXML(xmlText, name)
 		build.buildFlag = true
 		runCallback("OnFrame")
 	end
-end
-
-local function respond(obj)
-	io.stdout:write(dkjson.encode(obj) .. "\n")
-	io.stdout:flush()
 end
 
 local function tableHasAny(tbl)
@@ -311,11 +658,15 @@ local function getMainSkillName()
 end
 
 local function getBuildInfo()
+	local treeVersion = build.spec and build.spec.treeVersion
+	local latest = rawget(_G, "latestTreeVersion")
 	return {
 		class = build.className or (build.spec and build.spec.curClassName),
 		ascendancy = build.ascendClassName or (build.spec and build.spec.curAscendClassName),
 		level = build.characterLevel,
 		mainSkill = getMainSkillName(),
+		treeVersion = treeVersion ~= nil and tostring(treeVersion) or nil,
+		latestTreeVersion = latest ~= nil and tostring(latest) or nil,
 	}
 end
 
@@ -480,28 +831,92 @@ local function deallocNodeById(nodeId)
 	runCallback("OnFrame")
 end
 
+local function shallowCopy(tbl)
+	local out = { }
+	for k, v in pairs(tbl or { }) do out[k] = v end
+	return out
+end
+
+-- Number of declared parameters of a Lua function (including `self` for
+-- methods), or nil when it cannot be determined.
+local function functionArity(fn)
+	if type(fn) ~= "function" or not debug or not debug.getinfo then return nil end
+	local ok, info = pcall(debug.getinfo, fn, "u")
+	if ok and info and type(info.nparams) == "number" then
+		return info.nparams
+	end
+	return nil
+end
+
+-- Replace the allocated passive set with `nodeIds`, keeping class, ascendancy,
+-- bloodline, hash overrides, mastery selections and tree version. Prefers
+-- PoB's own undo-state API (keyed by field name, so robust to positional
+-- signature changes) and falls back to ImportFromNodeList with arity
+-- detection. Throws a clear internal error naming the PoB symbol that
+-- changed instead of a nil-index trace.
 local function restoreTreeFromIds(nodeIds)
-	-- Use ImportFromNodeList to atomically replace the tree with the snapshot.
+	local spec = build.spec
+	if type(spec) ~= "table" then
+		error("Tree restore failed: build.spec is unavailable (PoB Build module changed?)")
+	end
 	local hashList = { }
 	for _, id in ipairs(nodeIds) do
-		table.insert(hashList, id)
+		hashList[#hashList + 1] = tonumber(id) or id
 	end
-	-- Preserve current mastery selections (deep copy)
-	local masteryEffects = { }
-	if build.spec.masterySelections then
-		for k, v in pairs(build.spec.masterySelections) do
-			masteryEffects[k] = v
+	local state = {
+		classId = spec.curClassId,
+		ascendClassId = spec.curAscendClassId,
+		secondaryAscendClassId = spec.curSecondaryAscendClassId,
+		hashList = hashList,
+		hashOverrides = shallowCopy(spec.hashOverrides),
+		masteryEffects = shallowCopy(spec.masterySelections),
+		treeVersion = spec.treeVersion,
+	}
+	if state.classId == nil then
+		error("Tree restore failed: PassiveSpec.curClassId is missing (PoB PassiveSpec changed)")
+	end
+
+	local api, ok, err
+	if type(spec.RestoreUndoState) == "function" and type(spec.CreateUndoState) == "function" then
+		api = "PassiveSpec:RestoreUndoState"
+		ok, err = pcall(spec.RestoreUndoState, spec, state, state.treeVersion)
+	elseif type(spec.ImportFromNodeList) == "function" then
+		local arity = functionArity(spec.ImportFromNodeList)
+		api = "PassiveSpec:ImportFromNodeList/" .. tostring(arity)
+		if arity == 9 then
+			-- PoB >= 2.66: (self, className, classId, ascendClassId, secondaryAscendClassId, hashList, hashOverrides, masteryEffects, treeVersion)
+			ok, err = pcall(spec.ImportFromNodeList, spec, nil, state.classId, state.ascendClassId,
+				state.secondaryAscendClassId, hashList, state.hashOverrides, state.masteryEffects, state.treeVersion)
+		elseif arity == 8 then
+			-- Older PoB: (self, classId, ascendClassId, secondaryAscendClassId, hashList, hashOverrides, masteryEffects, treeVersion)
+			ok, err = pcall(spec.ImportFromNodeList, spec, state.classId, state.ascendClassId,
+				state.secondaryAscendClassId, hashList, state.hashOverrides, state.masteryEffects, state.treeVersion)
+		else
+			error("Tree restore failed: unsupported PassiveSpec:ImportFromNodeList signature ("
+				.. tostring(arity) .. " params); PoB changed this API")
+		end
+	else
+		error("Tree restore failed: PoB PassiveSpec has neither RestoreUndoState nor ImportFromNodeList")
+	end
+	if not ok then
+		error("Tree restore failed in " .. api .. " (PoB API may have changed): " .. tostring(err))
+	end
+
+	-- Verify: every requested node that exists (masteries only with a
+	-- selection) must now be allocated.
+	local missing = { }
+	for _, id in ipairs(hashList) do
+		local node = spec.nodes and spec.nodes[id]
+		if node and not (spec.allocNodes and spec.allocNodes[id])
+			and (node.type ~= "Mastery" or (spec.masterySelections and spec.masterySelections[id])) then
+			missing[#missing + 1] = tostring(id)
+			if #missing >= 10 then break end
 		end
 	end
-	build.spec:ImportFromNodeList(
-		build.spec.curClassId,
-		build.spec.curAscendClassId,
-		build.spec.curSecondaryAscendClassId,
-		hashList,
-		build.spec.hashOverrides or { },
-		masteryEffects,
-		build.spec.treeVersion
-	)
+	if #missing > 0 then
+		error("Tree restore via " .. api .. " left nodes unallocated (" .. table.concat(missing, ", ")
+			.. "); PoB PassiveSpec behaviour changed")
+	end
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
@@ -1298,6 +1713,101 @@ local function restoreSkills(snap)
 	runCallback("OnFrame")
 end
 
+-- Commands that do not need a loaded build (everything else requires PoB to
+-- be in BUILD mode before and after the command).
+local NO_BUILD_REQUIRED = {
+	ping = true, shutdown = true, verifyData = true, getConfigMetadata = true, engineSelfTest = true,
+	-- loadXML runs its own post-load checks (and may start from LIST mode).
+	loadXML = true,
+}
+
+local function currentPopups()
+	local m = mainObject.main
+	local set = { }
+	if m and type(m.popups) == "table" then
+		for _, p in ipairs(m.popups) do set[p] = true end
+	end
+	return set
+end
+
+local function describePopup(popup)
+	local lines = { }
+	if type(popup) == "table" then
+		if type(popup.title) == "string" and popup.title ~= "" then
+			lines[#lines + 1] = popup.title
+		end
+		if type(popup.controls) == "table" then
+			for _, control in ipairs(popup.controls) do
+				if type(control) == "table" and type(control.label) == "string" and control.label:match("%S") then
+					lines[#lines + 1] = control.label
+				end
+			end
+		end
+	end
+	if #lines == 0 then return "(untitled dialog)" end
+	return stripColorCodes(table.concat(lines, " | "))
+end
+
+-- Inspect PoB's own error channels after a command: Launch.lua catches
+-- OnFrame errors into launch.promptMsg, PoB reports load problems via
+-- popups, and a crash during initial build load drops it to LIST mode.
+-- Returns a message when something went wrong, else nil.
+local function detectPoBFailure(popupsBefore, expectBuild)
+	if mainObject.promptMsg then
+		-- Launch.lua's prompt is "Error:\n\n<msg>\n<version>\nPress ... to dismiss ...":
+		-- keep the message and version, drop the GUI key hints.
+		local lines = { }
+		for line in (stripColorCodes(mainObject.promptMsg) .. "\n"):gmatch("([^\n]*)\n") do
+			line = line:gsub("^%s+", ""):gsub("%s+$", "")
+			if line ~= "" and line ~= "Error:" and not line:match("^Press ") then
+				lines[#lines + 1] = line
+			end
+		end
+		return "Path of Building error: " .. table.concat(lines, " | ")
+	end
+	local m = mainObject.main
+	if m and type(m.popups) == "table" then
+		for _, p in ipairs(m.popups) do
+			if not popupsBefore[p] then
+				return "Path of Building opened a blocking dialog: " .. describePopup(p)
+			end
+		end
+	end
+	if expectBuild and m then
+		local mode = m.newMode or m.mode
+		if mode ~= "BUILD" then
+			return "Path of Building is no longer in BUILD mode (mode=" .. tostring(mode)
+				.. "); the build failed to load or crashed"
+		end
+	end
+	return nil
+end
+
+-- Reset PoB's error channels so the next command starts clean.
+local function clearPoBErrorState()
+	mainObject.promptMsg = nil
+	mainObject.promptFunc = nil
+	local m = mainObject.main
+	if m and type(m.popups) == "table" then
+		for i = #m.popups, 1, -1 do m.popups[i] = nil end
+	end
+end
+
+-- Return the engine to a known-good (empty) build after a failed load, so a
+-- half-initialised build or LIST mode never leaks into later commands.
+local function recoverBlankBuild()
+	clearPoBErrorState()
+	local ok, err = pcall(newBuild)
+	if not ok then
+		STDERR:write("[pob-mcp] failed to reset to blank build: ", tostring(err), "\n")
+	end
+	local after = detectPoBFailure({ }, true)
+	if after then
+		STDERR:write("[pob-mcp] could not reset to a blank build: ", (after:gsub("\n", " ")), "\n")
+	end
+	clearPoBErrorState()
+end
+
 -- Each handler returns the body of the response, NOT including `ok = true`.
 -- The dispatcher adds `ok = true` automatically. If `mutating` is true the
 -- dispatcher also calls getStats() after the handler and merges the result
@@ -1311,7 +1821,22 @@ local DISPATCH = {
 			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
 				userError("Invalid Path of Building XML")
 			end
-			loadBuildFromXML(xmlText, cmd.name or "MCP Build")
+			local popupsBefore = currentPopups()
+			local ok, err = pcall(loadBuildFromXML, xmlText, cmd.name or "MCP Build")
+			local failure = detectPoBFailure(popupsBefore, true)
+			if not failure and not ok then
+				failure = "Path of Building failed to load the build: " .. tostring(err)
+			end
+			if not failure then
+				local spec = build and build.spec
+				if not (spec and spec.tree and spec.nodes and build.calcsTab and build.calcsTab.mainOutput) then
+					failure = "Path of Building did not finish loading the build (no passive tree or calculation output)"
+				end
+			end
+			if failure then
+				recoverBlankBuild()
+				error(failure, 0)
+			end
 			return { info = getBuildInfo() }
 		end,
 	},
@@ -1514,6 +2039,88 @@ local DISPATCH = {
 	ping = {
 		handler = function(_cmd) return { } end,
 	},
+	-- Diagnostics for the engine-safety test suite. Every operation is either
+	-- read-only or targets a path inside the PoB install, where the write
+	-- guard must refuse it; paths outside the install are rejected up front
+	-- so this command can never write anywhere.
+	engineSelfTest = {
+		handler = function(cmd)
+			local op = cmd.op
+			if op == "guard" then
+				for _, p in ipairs({ cmd.path, cmd.to }) do
+					if p ~= nil and not isProtectedPath(p) then
+						userError("engineSelfTest guard probes only accept paths inside the PoB install")
+					end
+				end
+				local r1, r2
+				if cmd.action == "open" then
+					local f, msg = io.open(cmd.path, cmd.mode or "r")
+					if f then
+						if isWriteMode(cmd.mode) then
+							f:close()
+							return { opened = true }
+						end
+						local content = f:read(cmd.readBytes or 16) or ""
+						f:close()
+						return { opened = true, bytesRead = #content }
+					end
+					r1, r2 = nil, msg
+				elseif cmd.action == "remove" then
+					r1, r2 = os.remove(cmd.path)
+				elseif cmd.action == "rename" then
+					r1, r2 = os.rename(cmd.path, cmd.to)
+				else
+					userError("Unknown guard action: " .. tostring(cmd.action))
+				end
+				return { opened = false, result = r1 and true or false, message = r2 and tostring(r2) or dkjson.null }
+			elseif op == "zlib" then
+				local result = { available = zlibInfo.available, version = zlibInfo.version }
+				if not zlibInfo.available then return result end
+				if cmd.text then
+					local packed = Deflate(cmd.text)
+					result.deflatedSize = packed and #packed or dkjson.null
+					result.roundTrip = packed ~= nil and Inflate(packed) == cmd.text
+				end
+				if cmd.file then
+					if not isProtectedPath(cmd.file) then
+						userError("engineSelfTest zlib probes only read files inside the PoB install")
+					end
+					local f = io.open(cmd.file, "rb")
+					if not f then userError("Cannot read " .. tostring(cmd.file)) end
+					local compressed = f:read("*a")
+					f:close()
+					local inflated = Inflate(compressed)
+					result.inflatedSize = inflated and #inflated or dkjson.null
+					result.inflatedHead = inflated and inflated:sub(1, 64):gsub(".", function(c)
+						return string.format("%02x", c:byte())
+					end) or dkjson.null
+				end
+				return result
+			elseif op == "fileSearch" then
+				local h = NewFileSearch(cmd.pattern, cmd.dirOnly)
+				local found = { }
+				while h do
+					found[#found + 1] = { name = h:GetFileName(), size = h:GetFileSize(), modified = h:GetFileModifiedTime() }
+					if not h:NextFile() then break end
+				end
+				return { files = found }
+			elseif op == "print" then
+				print(cmd.text or "pob-mcp print probe")
+				io.write(cmd.text or "pob-mcp io.write probe", "\n")
+				ConPrintf("%s", cmd.text or "pob-mcp ConPrintf probe")
+				return { }
+			elseif op == "status" then
+				return {
+					installRoot = INSTALL_ROOT,
+					cwd = CWD,
+					blockedWrites = guardStats.blockedWrites,
+					lastBlocked = guardStats.lastBlocked or dkjson.null,
+					zlib = zlibInfo.available,
+				}
+			end
+			userError("Unknown engineSelfTest op: " .. tostring(op))
+		end,
+	},
 	shutdown = {
 		-- Special: respond and exit immediately; dispatcher's ok=true injection never fires.
 		handler = function(_cmd)
@@ -1531,12 +2138,48 @@ local function dispatch(cmd)
 	if not entry then
 		userError("Unknown command: " .. tostring(cmd.cmd))
 	end
-	local body = entry.handler(cmd)
-	if entry.mutating then
-		body.stats = getStats()
+	local expectBuild = not NO_BUILD_REQUIRED[cmd.cmd]
+	-- Any leftover state from an earlier command must not be attributed to
+	-- this one.
+	clearPoBErrorState()
+	if expectBuild then
+		local m = mainObject.main
+		local mode = m and (m.newMode or m.mode)
+		if mode ~= "BUILD" or not build then
+			error("No build is active in Path of Building (mode=" .. tostring(mode) .. "); load a build first")
+		end
+	end
+	local popupsBefore = currentPopups()
+	local ok, body = pcall(function()
+		local b = entry.handler(cmd)
+		if entry.mutating then
+			b.stats = getStats()
+		end
+		return b
+	end)
+	local failure = detectPoBFailure(popupsBefore, expectBuild)
+	if failure then
+		clearPoBErrorState()
+		local detail = (not ok) and (" [" .. tostring(body) .. "]") or ""
+		error(failure .. detail, 0)
+	end
+	if not ok then
+		error(body, 0)
 	end
 	body.ok = true
 	return body
+end
+
+-- Boot may leave informational popups (settings/cloud warnings) open; they
+-- would swallow input and be misattributed to the first command.
+do
+	local m = mainObject.main
+	if m and type(m.popups) == "table" then
+		for _, p in ipairs(m.popups) do
+			STDERR:write("[pob-mcp] dismissing PoB dialog at startup: ", describePopup(p), "\n")
+		end
+	end
+	clearPoBErrorState()
 end
 
 respond({ ok = true, ready = true })
