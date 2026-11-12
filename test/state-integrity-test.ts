@@ -91,15 +91,20 @@ async function main(): Promise<void> {
       { usePowerCharges: true },
       { useFrenzyCharges: true },
       { useEnduranceCharges: true },
-      { conditionOnslaught: true },
-      { conditionFortify: true },
-      { customMods: '+100 to Maximum Life' },
-      { customMods: '+200 to Maximum Life' },
+      { buffOnslaught: true },
+      { buffFortification: true },
+      { buffMassiveShrine: true },
+      { buffLesserMassiveShrine: true },
       { conditionFullLife: true },
       { conditionLowLife: true },
     ];
     for (const opts of cycle) {
       await call(client, 'set_config', { options: opts });
+    }
+    // Guard against silent no-ops: every key must have landed in PoB's config.
+    const rawCfg = (JSON.parse(extractText(await call(client, 'get_config'))) as { raw: Record<string, unknown> }).raw;
+    for (const [key, value] of Object.entries(Object.assign({}, ...cycle) as Record<string, unknown>)) {
+      assert(rawCfg[key] === value, `set_config ${key} did not take effect: expected ${JSON.stringify(value)}, got ${JSON.stringify(rawCfg[key])}`);
     }
     for (let i = 0; i < cycle.length; i++) {
       await call(client, 'undo_last_change');
@@ -113,7 +118,7 @@ async function main(): Promise<void> {
     // -----------------------------------------------------------------
     log('Test 2: diverse mutations + reset_build');
     await call(client, 'set_config', { options: { enemyIsBoss: 'Pinnacle' } });
-    await call(client, 'set_config', { options: { customMods: '+500 to Maximum Life' } });
+    await call(client, 'set_config', { options: { buffMassiveShrine: true } });
     await call(client, 'unequip_item', { slot: 'Ring 1' });
     const afterDiverse = await getKeyStats(client);
     assert(
@@ -166,8 +171,8 @@ async function main(): Promise<void> {
     // -----------------------------------------------------------------
     log('Test 6: snapshot_and_compare across multiple changes');
     await call(client, 'snapshot_and_compare', { action: 'take', label: 'pre' });
-    await call(client, 'set_config', { options: { customMods: '+1000 to Maximum Life' } });
-    await call(client, 'set_config', { options: { customMods: '+2000 to Maximum Life' } });
+    await call(client, 'set_config', { options: { buffMassiveShrine: true } });
+    await call(client, 'set_config', { options: { buffLesserMassiveShrine: true } });
     await call(client, 'snapshot_and_compare', { action: 'take', label: 'post' });
     const cmpResp = JSON.parse(
       extractText(await call(client, 'snapshot_and_compare', { action: 'compare', labelA: 'pre', labelB: 'post' })),

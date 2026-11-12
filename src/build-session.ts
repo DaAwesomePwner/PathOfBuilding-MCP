@@ -117,6 +117,7 @@ export class BuildSession {
   private readonly undoStack: UndoEntry[] = [];
   private readonly trackedSlots: string[];
   private readonly maxUndo: number;
+  private configMetaCache: Map<string, ConfigVarMetadata> | null = null;
   private originalXML: string | null = null;
   private buildInfo: BuildInfo | null = null;
 
@@ -161,6 +162,7 @@ export class BuildSession {
       const info = await this.bridge.loadBuildXML(xml);
       this.originalXML = xml;
       this.buildInfo = info;
+      this.configMetaCache = null;
       this.undoStack.length = 0;
       this.snapshots.clear();
       return info;
@@ -173,6 +175,7 @@ export class BuildSession {
     return this.withLock(async () => {
       const info = await this.bridge.loadBuildXML(xml);
       this.buildInfo = info;
+      this.configMetaCache = null;
       this.undoStack.length = 0;
       this.snapshots.clear();
       return info;
@@ -324,7 +327,10 @@ export class BuildSession {
   }
 
   async setConfig(options: Record<string, unknown>): Promise<Stats> {
-    return this.withLock(() => this.bridge.setConfig(options));
+    return this.withLock(async () => {
+      await this.validateConfigOptionsUnlocked(options);
+      return this.bridge.setConfig(options);
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1241,12 +1247,60 @@ export class BuildSession {
   // ------------------------------------------------------------------
 
   async getConfigMetadata(): Promise<ConfigVarMetadata[]> {
-    return this.withLock(async () => {
-      const result = await this.bridge.send<{ ok: true; metadata: ConfigVarMetadata[] }>({
-        cmd: 'getConfigMetadata',
-      });
-      return result.metadata ?? [];
+    return this.withLock(async () => [...(await this.getConfigMetaMapUnlocked()).values()]);
+  }
+
+  /**
+   * Config metadata keyed by option var, fetched from the running engine and
+   * cached until the next build load/reset (the engine's ConfigOptions can
+   * differ between PoB installs, never within one loaded build).
+   */
+  private async getConfigMetaMapUnlocked(): Promise<Map<string, ConfigVarMetadata>> {
+    if (this.configMetaCache) return this.configMetaCache;
+    const result = await this.bridge.send<{ ok: true; metadata: ConfigVarMetadata[] }>({
+      cmd: 'getConfigMetadata',
     });
+    const map = new Map<string, ConfigVarMetadata>();
+    for (const entry of result.metadata ?? []) map.set(entry.var, entry);
+    if (map.size === 0) {
+      // Don't cache a failed load: that would reject every key until the next build load.
+      throw new Error('could not load PoB config metadata (engine returned no options); retry, or reset_build if it persists');
+    }
+    this.configMetaCache = map;
+    return map;
+  }
+
+  /**
+   * Reject config options PoB does not know (they would silently no-op) or
+   * whose value type is clearly wrong. Pure check — mutates nothing.
+   */
+  private async validateConfigOptionsUnlocked(
+    options: Record<string, unknown>,
+    context?: string,
+  ): Promise<void> {
+    const meta = await this.getConfigMetaMapUnlocked();
+    const where = context ? ` (${context})` : '';
+    const unknown = Object.keys(options).filter(
+      (k) => !meta.has(k) && !Object.hasOwn(EXTRA_CONFIG_KEYS, k),
+    );
+    if (unknown.length > 0) {
+      const lines = unknown.map((k) => {
+        const near = closestConfigKeys(k, [...meta.keys()]);
+        return near.length > 0 ? `"${k}" (closest: ${near.join(', ')})` : `"${k}"`;
+      });
+      throw new UserError(
+        `Unknown config key${unknown.length > 1 ? 's' : ''}${where}: ${lines.join('; ')}. ` +
+          `Use get_config to list valid keys.`,
+      );
+    }
+    for (const [key, value] of Object.entries(options)) {
+      if (value === null || value === undefined) continue;
+      const problem = describeConfigValueProblem(
+        meta.get(key) ?? (Object.hasOwn(EXTRA_CONFIG_KEYS, key) ? EXTRA_CONFIG_KEYS[key] : undefined),
+        value,
+      );
+      if (problem) throw new UserError(`Invalid value for config key "${key}"${where}: ${problem}`);
+    }
   }
 
   async getConfigOrganized(): Promise<OrganizedConfig> {
@@ -1298,6 +1352,8 @@ export class BuildSession {
     options: Record<string, unknown>,
   ): Promise<StatDiffResult> {
     return this.withLock(async () => {
+      // Validate before the undo push so a rejected call changes nothing.
+      await this.validateConfigOptionsUnlocked(options);
       const configSnap = await this.snapshotConfigUnlocked();
       this.undoStack.push({ kind: 'config', snapshot: configSnap });
       while (this.undoStack.length > this.maxUndo) {
@@ -1318,6 +1374,7 @@ export class BuildSession {
     options: Record<string, unknown>,
   ): Promise<StatDiffResult> {
     return this.withLock(async () => {
+      await this.validateConfigOptionsUnlocked(options);
       const before = await this.bridge.getStats();
       let after: Stats = before;
       await this.withConfigProbeUnlocked(async () => {
@@ -1329,7 +1386,7 @@ export class BuildSession {
   }
 
   async simulateScenario(scenario: string): Promise<ScenarioResult> {
-    const preset = SCENARIO_PRESETS[scenario];
+    const preset = Object.hasOwn(SCENARIO_PRESETS, scenario) ? SCENARIO_PRESETS[scenario] : undefined;
     if (!preset) {
       throw new UserError(
         `Unknown scenario: "${scenario}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`,
@@ -1347,11 +1404,15 @@ export class BuildSession {
   async compareScenarios(scenarios: string[]): Promise<ScenarioComparison> {
     if (scenarios.length === 0) throw new UserError('compareScenarios requires at least one scenario');
     for (const s of scenarios) {
-      if (!SCENARIO_PRESETS[s]) {
+      if (!Object.hasOwn(SCENARIO_PRESETS, s)) {
         throw new UserError(`Unknown scenario: "${s}". Valid: ${Object.keys(SCENARIO_PRESETS).join(', ')}`);
       }
     }
     return this.withLock(async () => {
+      // Fail loudly (before any probe) if a preset uses a key PoB doesn't have.
+      for (const scenario of scenarios) {
+        await this.validateConfigOptionsUnlocked(SCENARIO_PRESETS[scenario].options, `scenario "${scenario}"`);
+      }
       const baseline = await this.bridge.getStats();
       const results: ScenarioResult[] = [];
       for (const scenario of scenarios) {
@@ -1379,9 +1440,10 @@ export class BuildSession {
   }
 
   async toggleBuffs(buffs: Record<string, boolean | number | string>): Promise<StatDiffResult> {
-    const options: Record<string, unknown> = {};
+    // Null-prototype so a "__proto__" key stays an own property (and gets rejected by validation).
+    const options: Record<string, unknown> = Object.create(null);
     for (const [key, value] of Object.entries(buffs)) {
-      const mapped = BUFF_KEY_MAP[key] ?? key;
+      const mapped = Object.hasOwn(BUFF_KEY_MAP, key) ? BUFF_KEY_MAP[key] : key;
       options[mapped] = value;
     }
     return this.simulateConfig(options);
@@ -1558,9 +1620,8 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
       usePowerCharges: true,
       useFrenzyCharges: true,
       useEnduranceCharges: true,
-      conditionOnslaught: true,
       buffOnslaught: true,
-      buffFortify: true,
+      buffFortification: true,
     },
   },
   map_boss: {
@@ -1570,9 +1631,8 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
       usePowerCharges: true,
       useFrenzyCharges: true,
       useEnduranceCharges: true,
-      conditionOnslaught: true,
       buffOnslaught: true,
-      buffFortify: true,
+      buffFortification: true,
     },
   },
   pinnacle_boss: {
@@ -1582,9 +1642,8 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
       usePowerCharges: true,
       useFrenzyCharges: false,
       useEnduranceCharges: true,
-      conditionOnslaught: false,
       buffOnslaught: false,
-      buffFortify: true,
+      buffFortification: true,
     },
   },
   uber_boss: {
@@ -1594,9 +1653,8 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
       usePowerCharges: true,
       useFrenzyCharges: false,
       useEnduranceCharges: true,
-      conditionOnslaught: false,
       buffOnslaught: false,
-      buffFortify: true,
+      buffFortification: true,
     },
   },
   no_buffs: {
@@ -1606,9 +1664,8 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
       usePowerCharges: false,
       useFrenzyCharges: false,
       useEnduranceCharges: false,
-      conditionOnslaught: false,
       buffOnslaught: false,
-      buffFortify: false,
+      buffFortification: false,
     },
   },
   delirium: {
@@ -1618,9 +1675,8 @@ const SCENARIO_PRESETS: Record<string, ScenarioPreset> = {
       usePowerCharges: true,
       useFrenzyCharges: true,
       useEnduranceCharges: true,
-      conditionOnslaught: true,
       buffOnslaught: true,
-      buffFortify: true,
+      buffFortification: true,
     },
   },
 };
@@ -1630,22 +1686,83 @@ export type ScenarioName = (typeof SCENARIO_NAMES)[number];
 
 /**
  * Friendly buff names → PoB config keys. Unknown keys pass through
- * unchanged so callers can still pass raw config keys.
+ * unchanged so callers can still pass raw config keys; every resulting key
+ * is validated against the engine's config metadata before it is applied.
+ * (No alias for "pinned": PoB has no player-pinned config option.)
  */
-const BUFF_KEY_MAP: Record<string, string> = {
+export const BUFF_KEY_MAP: Record<string, string> = {
   powerCharges: 'usePowerCharges',
   frenzyCharges: 'useFrenzyCharges',
   enduranceCharges: 'useEnduranceCharges',
-  onslaught: 'conditionOnslaught',
-  fortify: 'buffFortify',
-  flasks: 'buffFlasks',
-  flasksActive: 'buffFlasks',
-  unholyMight: 'conditionUnholy',
-  pinned: 'conditionPinned',
+  onslaught: 'buffOnslaught',
+  fortify: 'buffFortification',
+  flasks: 'conditionUsingFlask',
+  flasksActive: 'conditionUsingFlask',
+  unholyMight: 'buffUnholyMight',
   shocked: 'conditionShocked',
   chilled: 'conditionChilled',
   bossEnemy: 'enemyIsBoss',
 };
+
+/**
+ * Keys PoB's config tab honours that are absent from ConfigOptions.lua.
+ * `customMods` is the legacy free-text mod box (ConfigTab:BuildModList reads
+ * input.customMods as a headless fallback).
+ */
+const EXTRA_CONFIG_KEYS: Record<string, ConfigVarMetadata> = {
+  customMods: { var: 'customMods', type: 'text', label: 'Custom modifiers', section: 'Custom' },
+};
+
+/** A few valid keys resembling `key` (case-insensitive prefix/substring match). */
+function closestConfigKeys(key: string, valid: string[], max = 5): string[] {
+  const k = key.toLowerCase();
+  const strip = (v: string): string => v.toLowerCase().replace(/^(condition|buff|use|override|multiplier)/, '');
+  const core = strip(key);
+  const scored: Array<{ v: string; score: number }> = [];
+  for (const v of valid) {
+    const lv = v.toLowerCase();
+    let score = 0;
+    if (lv === k) score = 100;
+    else if (core.length >= 3 && strip(v) === core) score = 90;
+    else if (lv.startsWith(k) || k.startsWith(lv)) score = 70;
+    else if (lv.includes(k) || k.includes(lv)) score = 50;
+    else if (core.length >= 4 && (lv.includes(core) || (strip(v).length >= 4 && core.includes(strip(v))))) score = 30;
+    else {
+      const sv = strip(v);
+      let n = 0;
+      while (n < core.length && n < sv.length && core[n] === sv[n]) n++;
+      if (n >= 5) score = 10 + n;
+    }
+    if (score > 0) scored.push({ v, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.v.length - b.v.length);
+  return scored.slice(0, max).map((x) => x.v);
+}
+
+/** Returns a description of a clearly wrong value type for the option, or null. */
+function describeConfigValueProblem(meta: ConfigVarMetadata | undefined, value: unknown): string | null {
+  if (!meta) return null;
+  switch (meta.type) {
+    case 'check':
+      return typeof value === 'boolean' ? null : `expected true/false, got ${JSON.stringify(value)}`;
+    case 'count':
+    case 'countAllowZero':
+    case 'integer':
+    case 'float':
+      return typeof value === 'number' && Number.isFinite(value)
+        ? null
+        : `expected a number, got ${JSON.stringify(value)}`;
+    case 'text':
+      return typeof value === 'string' ? null : `expected a string, got ${JSON.stringify(value)}`;
+    case 'list': {
+      if (!meta.list || meta.list.length === 0) return null;
+      if (meta.list.some((c) => c.val === value)) return null;
+      return `expected one of ${meta.list.map((c) => JSON.stringify(c.val)).join(', ')}, got ${JSON.stringify(value)}`;
+    }
+    default:
+      return null;
+  }
+}
 
 function identifyTradeoffs(before: Stats, after: Stats, primaryStat: string): string[] {
   const tradeoffs: string[] = [];
