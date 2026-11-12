@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   33 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   36 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -21,17 +21,25 @@ Three layers, three responsibilities:
 |---|---|---|
 | **Lua bridge** | `lua/bridge.lua` | Runs the real PoB engine in headless mode (stubs the graphics host and `dofile`s `<POB_PATH>/Launch.lua` or `<POB_PATH>/src/Launch.lua` depending on layout). Reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`, etc., and writes JSON responses to stdout. Knows nothing about MCP. |
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
-| **MCP server** | `src/server.ts` | Registers 33 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
+| **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
+| **MCP server** | `src/server.ts` | Registers 36 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
 
 ### Key design choices
 
-- **One LuaJIT process per session.** Booting the PoB engine takes ~2 seconds (loads 2820 tree nodes, all gems, all bases). The server pre-warms it on startup so the first tool call is fast.
+- **One LuaJIT process per session.** Booting the PoB engine takes ~2 seconds (loads 2820 tree nodes, all gems, all bases). The server connects to the MCP client first, then pre-warms the engine in the background; tool calls wait for it.
+- **Never exits for a missing install.** If PoB or LuaJIT can't be found the server still starts; engine tools return an error asking for the PoB folder (`configure_pob_path`), or ask you directly via MCP elicitation when the client supports it.
+- **Version-aware.** If PoB updates itself on disk (new league), tools refuse to run on the stale in-memory engine and point at `reload_engine`.
 - **Serial execution.** A mutex guarantees only one operation runs at a time. PoB is fundamentally a single-threaded singleton with shared global state.
 - **Snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `suggest_upgrades`, etc. all wrap their probes in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly 3 times, the server refuses further restarts and forces you to restart the whole MCP server. Prevents silent respawn loops eating your session.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 33 tools
+## The 36 tools
+
+### Engine setup (3)
+- `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
+- `get_engine_info` — status (`unconfigured` / `starting` / `ready` / `failed` / `stale` / `updating`), PoB version, paths and where they came from, layout, whether PoB changed on disk, config file location, loaded-build info.
+- `reload_engine` — restart LuaJIT against the PoB currently on disk (after a PoB update); reloads the current build, clears undo history, reports old → new version.
 
 ### Loading and inspection (5)
 - `load_build` — accepts a base64 PoB code, pastebin/pobb.in URL, or raw XML. Must be called first.
@@ -82,11 +90,11 @@ Three layers, three responsibilities:
 
 This server requires:
 
-1. **Path of Building Community** installed locally (download from <https://pathofbuilding.community/>). On Windows the default install path is `%APPDATA%\Path of Building Community\`.
+1. **Path of Building Community (Path of Exile 1)** installed locally (download from <https://pathofbuilding.community/>). On Windows the default install path is `%APPDATA%\Path of Building Community\`. The PoE2 edition is not supported.
 2. **Node.js 20+**.
-3. **LuaJIT 5.1** on `PATH` or pointed to by `LUAJIT_PATH`. PoB Community does not always bundle a standalone `luajit` binary; if the server reports `LuaJITNotFoundError`, install LuaJIT (see [`README.md`](./README.md#prerequisites)).
+3. **LuaJIT (5.1 ABI)**, installed separately — the Windows PoB installer does **not** include `luajit.exe` (see [`README.md`](./README.md#prerequisites) for install commands).
 
-To run the server in your MCP client, add this to `claude_desktop_config.json` (Claude Desktop) or run `claude mcp add` (Claude Code):
+To run the server in your MCP client, add this to `claude_desktop_config.json` (Claude Desktop), or for Claude Code run `claude mcp add pob -- npx -y pob-mcp-server` (env vars go before the name: `claude mcp add --env POB_PATH=... pob -- npx -y pob-mcp-server`):
 
 ```json
 {
@@ -102,16 +110,17 @@ To run the server in your MCP client, add this to `claude_desktop_config.json` (
 }
 ```
 
-`POB_PATH` is optional if your install is at the default Windows location — the server auto-detects it.
+`POB_PATH` is optional. Paths resolve as **env var → saved config → auto-detect** (standard install folder, the installer's registry entry, common LuaJIT locations, `PATH`). If nothing is found the server still starts: just tell Claude where PoB is installed and it calls `configure_pob_path`, which saves the path to `%APPDATA%\pob-mcp-server\config.json` (macOS `~/Library/Application Support/pob-mcp-server/`, Linux `~/.config/pob-mcp-server/`).
 
-Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 33 tools become callable.
+Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 36 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
 
 ### Environment variables
 
 | Var | Default | What it does |
 |---|---|---|
-| `POB_PATH` | autodetect | Absolute path to your Path of Building Community install (the directory containing `Launch.lua`). |
-| `LUAJIT_PATH` | autodetect | Path to the `luajit` binary. Helpful when neither the install nor PATH provides one. |
+| `POB_PATH` | saved config, then autodetect | Your Path of Building Community install (the directory containing `Launch.lua` and `Modules/Build.lua`, or a source clone with them under `src/`). |
+| `LUAJIT_PATH` | saved config, then autodetect | The `luajit` binary, or a folder containing it. |
+| `POB_MCP_CONFIG_DIR` | per-user config dir | Where `config.json` lives (tests point it at a temp dir). |
 | `POB_TIMING` | unset | Set to `1` to log every Lua command's wall time to stderr (useful for performance debugging). |
 
 ### Verify (local checkout)
@@ -121,7 +130,9 @@ If you've cloned this repo for development:
 ```bash
 npm install
 npm run build
+npm run typecheck        # tsc --noEmit
 npm run test:paths       # unit tests, no PoB needed
+npm run test:startup     # starts dist/server.js unconfigured, then configure_pob_path / reload_engine (needs PoB for the last part)
 npm run test:bridge      # Lua bridge end-to-end (needs POB_PATH + luajit)
 npm run test:all         # full suite, ~3 min
 ```
@@ -154,25 +165,30 @@ For an interactive iteration loop:
 - **Build code round-trip is lossless.** `export_build({ format: "code" })` produces a string you can paste back into PoB-the-app or back into `load_build`. Same for `format: "xml"`.
 - **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; full-tree scans 16-26s.
 - **Crash circuit breaker.** After 3 unexpected exits the server refuses to respawn LuaJIT and tells you to restart Claude Desktop. Prevents respawn loops.
+- **PoB updates.** When PoB updates itself (new league), tools stop with *"Path of Building was updated on disk from X to Y"*. `reload_engine` restarts the engine and reloads your build; undo history is cleared.
 
 ## Troubleshooting quick reference
 
 | Symptom | Fix |
 |---|---|
+| `Path of Building is not configured yet` | Tell Claude your PoB folder (it calls `configure_pob_path`), or set `POB_PATH`. |
+| `Could not find a luajit executable` | Install LuaJIT separately, then `configure_pob_path` with `luajitPath`, or set `LUAJIT_PATH`. |
+| `… is Path of Building for Path of Exile 2` | Use the PoE1 install (folder without "(PoE2)"). |
+| `Path of Building was updated on disk from X to Y` | Call `reload_engine`. |
 | `Lua engine has crashed 3 times` | Restart Claude Desktop. Check stderr (visible in Claude logs) for the cause. |
 | `Lua bridge timeout after 60000ms` | A command stuck. The `cmd` name is in the error message; check Lua side for bugs. |
 | `Build code is too short to be a real PoB build` | You probably pasted only the URL prefix or a fragment. |
 | `Item text must start with a "Rarity: ..." line` | Use the PoB *Copy* button (right-click → Copy item) — gives the exact format. |
 | Stats look wrong after lots of mutations | Run `reset_build` to revert to the originally loaded state. |
-| MCP server doesn't appear in Claude | Check the JSON config syntax, the absolute paths, and that `dist/src/server.js` exists (`npm run build`). Then restart Claude Desktop. |
+| MCP server doesn't appear in Claude | Check the JSON config syntax, the absolute paths, and that `dist/server.js` exists (`npm run build`). Then restart Claude Desktop. |
 
 Full troubleshooting guide: [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md)
 
 ## Where to go next
 
-- **Add a new tool**: extend `bridge.lua` with a new dispatch case → expose it in `BuildSession` (preferably routed through `withLock`) → register a Zod-validated entry in `server.ts`. Pattern is identical for all 33 existing tools.
+- **Add a new tool**: extend `bridge.lua` with a new dispatch case → expose it in `BuildSession` (preferably routed through `withLock`) → register a Zod-validated entry in `server.ts` with `tools.engine(...)` (the handler receives the live `BuildSession`). Pattern is identical for all engine-backed tools.
 - **Add a scenario preset**: append to `SCENARIO_PRESETS` in `build-session.ts` — `simulate_scenario` and `list_scenarios` pick it up automatically.
 - **Tune performance**: set `POB_TIMING=1` and inspect the per-command histogram. `bridge.getStats` and `bridge.exportXML` dominate; everything else is sub-100ms typically.
 - **Pull upstream PoB updates**: `git fetch upstream && git merge upstream/dev`. `bridge.lua` only depends on stable PoB internals (`build.itemsTab`, `build.spec:CountAllocNodes`, etc.), so upstream churn rarely breaks anything.
 
-That's the whole picture: 33 tools, three layers, deterministic state, and a real PoB engine behind every number.
+That's the whole picture: 36 tools, three layers, deterministic state, and a real PoB engine behind every number.

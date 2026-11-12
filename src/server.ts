@@ -3,28 +3,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { BuildSession, ComparisonResult, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
-import { LuaBridge, Stats } from './lua-bridge.js';
-import { LuaJITNotFoundError, PoBInstallNotFoundError, ResolvedPaths, resolvePaths } from './paths.js';
+import { createPathPrompt, registerEngineTools } from './engine-tools.js';
+import { EngineManager } from './engine-manager.js';
+import type { Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
+import { createToolRegistrar } from './tool-registry.js';
 import { UserError, validateBuildSource, validateItemText, validateSlot } from './validation.js';
-
-// ---------------------------------------------------------------------------
-// Path / config resolution
-// ---------------------------------------------------------------------------
-
-function resolvePathsOrExit(): ResolvedPaths {
-  try {
-    return resolvePaths();
-  } catch (e) {
-    if (e instanceof PoBInstallNotFoundError || e instanceof LuaJITNotFoundError) {
-      process.stderr.write(`pob-mcp-server: ${e.message}\n`);
-      process.exit(1);
-    }
-    throw e;
-  }
-}
-
-const PATHS = resolvePathsOrExit();
 
 // ---------------------------------------------------------------------------
 // Stat categories
@@ -84,12 +68,6 @@ function categorizeStats(stats: Stats, categories?: string[]): Record<string, Re
   return result;
 }
 
-function textResponse(payload: unknown): { content: Array<{ type: 'text'; text: string }> } {
-  return {
-    content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-  };
-}
-
 const KEY_STAT_KEYS = ['CombinedDPS', 'Life', 'EnergyShield', 'TotalEHP'] as const;
 type KeyStatKey = (typeof KEY_STAT_KEYS)[number];
 
@@ -111,79 +89,24 @@ function keyStats(stats: Stats): Record<KeyStatKey, number> {
   };
 }
 
-function errorResponse(error: unknown): {
-  content: Array<{ type: 'text'; text: string }>;
-  isError: true;
-} {
-  if (error instanceof UserError) {
-    return {
-      content: [{ type: 'text', text: error.message }],
-      isError: true,
-    };
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  return {
-    content: [
-      {
-        type: 'text',
-        text:
-          `Internal error: ${message}. ` +
-          `If this persists the build state may be corrupted — try \`reset_build\` or reload the build.`,
-      },
-    ],
-    isError: true,
-  };
-}
-
-/**
- * Register a tool with consistent try/catch → errorResponse wrapping.
- * The handler can throw UserError (surfaced verbatim) or any other Error
- * (wrapped as Internal error). Returning a value short-circuits the
- * wrapping; useful for handlers that already build a custom response shape.
- */
-function registerTool<TArgs>(
-  name: string,
-  schema: {
-    description: string;
-    inputSchema: Record<string, z.ZodTypeAny>;
-  },
-  handler: (args: TArgs) => Promise<unknown>,
-): void {
-  server.registerTool(name, schema, async (args) => {
-    try {
-      const result = await handler(args as TArgs);
-      // If the handler returns a content-array response (e.g. multi-part
-      // text from diagnose_build), pass it through unchanged. Check for an
-      // array `content` rather than just key presence so a future handler
-      // returning a domain object with a string `content` field isn't
-      // silently misrouted as a multi-part response.
-      if (
-        result &&
-        typeof result === 'object' &&
-        Array.isArray((result as Record<string, unknown>).content)
-      ) {
-        return result as { content: Array<{ type: 'text'; text: string }> };
-      }
-      return textResponse(result);
-    } catch (error) {
-      return errorResponse(error);
-    }
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Server wiring
 // ---------------------------------------------------------------------------
 
-const bridge = new LuaBridge(PATHS, 60_000);
-const session = new BuildSession(bridge);
+// The engine (LuaJIT + PoB) is resolved and booted lazily/in the background so
+// the MCP transport always comes up — even when PoB or LuaJIT cannot be found.
+const engine = new EngineManager();
 
 const server = new McpServer({
   name: 'pob-mcp',
   version: '0.1.0',
 });
 
-registerTool<{ source: string }>(
+const tools = createToolRegistrar(server, engine);
+
+registerEngineTools(tools, engine);
+
+tools.engine<{ source: string }>(
   'load_build',
   {
     description:
@@ -197,7 +120,7 @@ registerTool<{ source: string }>(
         ),
     },
   },
-  async ({ source }) => {
+  async ({ source }, session) => {
     const stop = startTimer('tool.load_build');
     try {
       const cleaned = validateBuildSource(source);
@@ -215,7 +138,7 @@ registerTool<{ source: string }>(
   },
 );
 
-registerTool<{ categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'> }>(
+tools.engine<{ categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'> }>(
   'get_stats',
   {
     description:
@@ -227,13 +150,13 @@ registerTool<{ categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' 
         .describe('Optional category filter. Omit for all categories.'),
     },
   },
-  async ({ categories }) => {
+  async ({ categories }, session) => {
     const stats = await session.getStats();
     return categorizeStats(stats, categories);
   },
 );
 
-registerTool<{ skillIndex?: number }>(
+tools.engine<{ skillIndex?: number }>(
   'get_skill_breakdown',
   {
     description:
@@ -247,19 +170,19 @@ registerTool<{ skillIndex?: number }>(
         .describe('1-based index of the socket group. Omit to use the main skill group.'),
     },
   },
-  async ({ skillIndex }) => {
+  async ({ skillIndex }, session) => {
     return session.getSkillBreakdown(skillIndex);
   },
 );
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'list_equipped_items',
   {
     description:
       'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets.',
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     const items = await session.listEquippedItems();
     return { count: items.length, items };
   },
@@ -306,20 +229,20 @@ function summarizeComparison(result: ComparisonResult): unknown {
   };
 }
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'list_valid_slots',
   {
     description:
       'List all currently valid equipment slot names (including any active jewel slots) along with whether each slot is occupied.',
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     const slots = await session.getValidSlots();
     return { count: slots.length, slots };
   },
 );
 
-registerTool<{ slot: string }>(
+tools.engine<{ slot: string }>(
   'get_item_in_slot',
   {
     description:
@@ -328,14 +251,14 @@ registerTool<{ slot: string }>(
       slot: z.string().min(1).describe('Equipment slot name (e.g. "Ring 1", "Body Armour").'),
     },
   },
-  async ({ slot }) => {
+  async ({ slot }, session) => {
     const item = await session.getItemInSlot(slot);
     if (!item) return { slot, empty: true, item: null };
     return { slot, empty: false, item };
   },
 );
 
-registerTool<{ slot: string; itemText: string }>(
+tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
@@ -348,7 +271,7 @@ registerTool<{ slot: string; itemText: string }>(
         .describe('Full item text in PoB format (rarity, name, base, mods).'),
     },
   },
-  async ({ slot, itemText }) => {
+  async ({ slot, itemText }, session) => {
     validateSlot(slot);
     validateItemText(itemText);
     const result = await session.swapItemWithDiff(slot, itemText);
@@ -356,7 +279,7 @@ registerTool<{ slot: string; itemText: string }>(
   },
 );
 
-registerTool<{ slot: string }>(
+tools.engine<{ slot: string }>(
   'unequip_item',
   {
     description:
@@ -365,14 +288,14 @@ registerTool<{ slot: string }>(
       slot: z.string().min(1).describe('Equipment slot name to clear.'),
     },
   },
-  async ({ slot }) => {
+  async ({ slot }, session) => {
     validateSlot(slot);
     const result = await session.unequipItemWithDiff(slot);
     return summarizeStatDiff(result);
   },
 );
 
-registerTool<{ slot: string; items: string[] }>(
+tools.engine<{ slot: string; items: string[] }>(
   'compare_items',
   {
     description:
@@ -386,7 +309,7 @@ registerTool<{ slot: string; items: string[] }>(
         .describe('Array of 2-5 item texts to compare (PoB format).'),
     },
   },
-  async ({ slot, items }) => {
+  async ({ slot, items }, session) => {
     validateSlot(slot);
     // Per-item validation is deliberately not run here; compareItems
     // captures per-candidate failures into its results, which lets a
@@ -396,14 +319,14 @@ registerTool<{ slot: string; items: string[] }>(
   },
 );
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
       'Undo the most recent build mutation (swap_item, unequip_item, allocate_node, etc.). Returns the stats after undo.',
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     const stats = await session.undoLastChange();
     return { status: 'reverted', stats };
   },
@@ -413,19 +336,19 @@ registerTool<Record<string, never>>(
 // Phase 4 tools: passive tree analysis
 // ---------------------------------------------------------------------------
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'get_passive_tree',
   {
     description:
       'Return the full passive tree state: all allocated nodes with stats, active keystones, allocated notables, point counts, and class info.',
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     return session.getPassiveTree();
   },
 );
 
-registerTool<{ allocate?: Array<string | number>; deallocate?: Array<string | number> }>(
+tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | number> }>(
   'simulate_passive_change',
   {
     description:
@@ -441,7 +364,7 @@ registerTool<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
         .describe('Node names or numeric node IDs to deallocate.'),
     },
   },
-  async ({ allocate, deallocate }) => {
+  async ({ allocate, deallocate }, session) => {
     const result = await session.simulatePassiveChange(allocate ?? [], deallocate ?? []);
     return {
       valid: result.valid,
@@ -452,7 +375,7 @@ registerTool<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   },
 );
 
-registerTool<{ count?: number; optimizeFor?: string; includeJewelSockets?: boolean }>(
+tools.engine<{ count?: number; optimizeFor?: string; includeJewelSockets?: boolean }>(
   'find_best_next_nodes',
   {
     description:
@@ -469,7 +392,7 @@ registerTool<{ count?: number; optimizeFor?: string; includeJewelSockets?: boole
         .describe('Include jewel sockets (default false — they have global radius effects).'),
     },
   },
-  async ({ count, optimizeFor, includeJewelSockets }) => {
+  async ({ count, optimizeFor, includeJewelSockets }, session) => {
     const rankings = await session.findBestNextNodes(
       count ?? 10,
       optimizeFor ?? 'CombinedDPS',
@@ -479,7 +402,7 @@ registerTool<{ count?: number; optimizeFor?: string; includeJewelSockets?: boole
   },
 );
 
-registerTool<{ count?: number; optimizeFor?: string }>(
+tools.engine<{ count?: number; optimizeFor?: string }>(
   'find_worst_allocated_nodes',
   {
     description:
@@ -492,13 +415,13 @@ registerTool<{ count?: number; optimizeFor?: string }>(
         .describe('Stat key to evaluate value by (default "CombinedDPS").'),
     },
   },
-  async ({ count, optimizeFor }) => {
+  async ({ count, optimizeFor }, session) => {
     const rankings = await session.findWorstAllocatedNodes(count ?? 10, optimizeFor ?? 'CombinedDPS');
     return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
   },
 );
 
-registerTool<{ keystone: string }>(
+tools.engine<{ keystone: string }>(
   'evaluate_keystone',
   {
     description:
@@ -510,7 +433,7 @@ registerTool<{ keystone: string }>(
         .describe('Keystone name (e.g. "Resolute Technique", "Chaos Inoculation", "Mind Over Matter").'),
     },
   },
-  async ({ keystone }) => {
+  async ({ keystone }, session) => {
     const result = await session.evaluateKeystone(keystone);
     return {
       keystone: result.keystone,
@@ -527,14 +450,14 @@ registerTool<{ keystone: string }>(
 // Phase 5 tools: skill gems
 // ---------------------------------------------------------------------------
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'list_skill_groups',
   {
     description:
       'List every socket group (skill setup) with active gems, support gems, slot, label, and which group is the main skill.',
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     const groups = await session.listSkillGroups();
     const formatted = groups.map((g) => ({
       index: g.index,
@@ -549,7 +472,7 @@ registerTool<Record<string, never>>(
   },
 );
 
-registerTool<{ name: string }>(
+tools.engine<{ name: string }>(
   'lookup_gem',
   {
     description:
@@ -558,12 +481,12 @@ registerTool<{ name: string }>(
       name: z.string().min(1).describe('Gem name. Fuzzy abbreviations supported (e.g. "Mlts" → Multistrike).'),
     },
   },
-  async ({ name }) => {
+  async ({ name }, session) => {
     return session.getGemByName(name);
   },
 );
 
-registerTool<{ activeSkillTags?: string[]; includeAwakened?: boolean }>(
+tools.engine<{ activeSkillTags?: string[]; includeAwakened?: boolean }>(
   'list_available_supports',
   {
     description:
@@ -576,13 +499,13 @@ registerTool<{ activeSkillTags?: string[]; includeAwakened?: boolean }>(
       includeAwakened: z.boolean().optional().describe('Include Awakened variants (default false).'),
     },
   },
-  async ({ activeSkillTags, includeAwakened }) => {
+  async ({ activeSkillTags, includeAwakened }, session) => {
     const supports = await session.getAvailableSupports(activeSkillTags, includeAwakened ?? false);
     return { count: supports.length, supports };
   },
 );
 
-registerTool<{ skillGroupIndex: number; gemIndex: number; newGemName: string; level?: number; quality?: number }>(
+tools.engine<{ skillGroupIndex: number; gemIndex: number; newGemName: string; level?: number; quality?: number }>(
   'swap_gem',
   {
     description:
@@ -595,13 +518,13 @@ registerTool<{ skillGroupIndex: number; gemIndex: number; newGemName: string; le
       quality: z.number().int().min(0).max(40).optional().describe('Gem quality (default keeps current).'),
     },
   },
-  async ({ skillGroupIndex, gemIndex, newGemName, level, quality }) => {
+  async ({ skillGroupIndex, gemIndex, newGemName, level, quality }, session) => {
     const result = await session.swapGemWithDiff(skillGroupIndex, gemIndex, newGemName, level, quality);
     return summarizeStatDiff(result);
   },
 );
 
-registerTool<{ skillGroupIndex: number; candidates: string[] }>(
+tools.engine<{ skillGroupIndex: number; candidates: string[] }>(
   'compare_supports',
   {
     description:
@@ -615,12 +538,12 @@ registerTool<{ skillGroupIndex: number; candidates: string[] }>(
         .describe('1-10 candidate support gem names (e.g. ["Brutality","Melee Physical Damage"]).'),
     },
   },
-  async ({ skillGroupIndex, candidates }) => {
+  async ({ skillGroupIndex, candidates }, session) => {
     return session.compareSupports(skillGroupIndex, candidates);
   },
 );
 
-registerTool<{ skillGroupIndex: number; gemIndex: number; levels?: number[] }>(
+tools.engine<{ skillGroupIndex: number; gemIndex: number; levels?: number[] }>(
   'evaluate_gem_levels',
   {
     description:
@@ -634,13 +557,13 @@ registerTool<{ skillGroupIndex: number; gemIndex: number; levels?: number[] }>(
         .describe('Explicit list of levels to test.'),
     },
   },
-  async ({ skillGroupIndex, gemIndex, levels }) => {
+  async ({ skillGroupIndex, gemIndex, levels }, session) => {
     const scaling = await session.evaluateGemLevels(skillGroupIndex, gemIndex, levels);
     return { count: scaling.length, scaling };
   },
 );
 
-registerTool<{ activeSkill: string; availableSlots: number; constraints?: string[]; topN?: number }>(
+tools.engine<{ activeSkill: string; availableSlots: number; constraints?: string[]; topN?: number }>(
   'find_optimal_links',
   {
     description:
@@ -660,7 +583,7 @@ registerTool<{ activeSkill: string; availableSlots: number; constraints?: string
       topN: z.number().int().min(5).max(40).optional().describe('Pool size for single-support phase (default 25).'),
     },
   },
-  async ({ activeSkill, availableSlots, constraints, topN }) => {
+  async ({ activeSkill, availableSlots, constraints, topN }, session) => {
     return session.findOptimalLinks(
       activeSkill,
       availableSlots - 1, // active skill consumes one slot; remaining are supports
@@ -674,19 +597,19 @@ registerTool<{ activeSkill: string; availableSlots: number; constraints?: string
 // Phase 6 tools: configuration and combat scenarios
 // ---------------------------------------------------------------------------
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'get_config',
   {
     description:
-      "Return all of PoB's config / scenario options organized by section, with each option's type, label, current value, and (for list options) valid choices. Common keys: enemyIsBoss, usePowerCharges, useFrenzyCharges, useEnduranceCharges, conditionOnslaught, customMods.",
+      "Return all of PoB's config / scenario options organized by section, with each option's type, label, current value, and (for list options) valid choices. Common keys: enemyIsBoss, usePowerCharges, useFrenzyCharges, useEnduranceCharges, buffOnslaught, customMods.",
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     return session.getConfigOrganized();
   },
 );
 
-registerTool<{ options: Record<string, boolean | number | string> }>(
+tools.engine<{ options: Record<string, boolean | number | string> }>(
   'set_config',
   {
     description:
@@ -697,13 +620,13 @@ registerTool<{ options: Record<string, boolean | number | string> }>(
         .describe('Map of config key → value (boolean / number / string).'),
     },
   },
-  async ({ options }) => {
+  async ({ options }, session) => {
     const result = await session.setConfigWithUndo(options);
     return summarizeStatDiff(result);
   },
 );
 
-registerTool<Record<string, never>>(
+tools.plain<Record<string, never>>(
   'list_scenarios',
   {
     description:
@@ -716,7 +639,7 @@ registerTool<Record<string, never>>(
   },
 );
 
-registerTool<{ scenario: string }>(
+tools.engine<{ scenario: string }>(
   'simulate_scenario',
   {
     description:
@@ -727,7 +650,7 @@ registerTool<{ scenario: string }>(
         .describe('Scenario preset name (see `list_scenarios`).'),
     },
   },
-  async ({ scenario }) => {
+  async ({ scenario }, session) => {
     const result = await session.simulateScenario(scenario);
     const diffSummary = summarizeStatDiff({ before: result.before, after: result.after, diff: result.diff });
     return {
@@ -739,7 +662,7 @@ registerTool<{ scenario: string }>(
   },
 );
 
-registerTool<{ scenarios: string[] }>(
+tools.engine<{ scenarios: string[] }>(
   'compare_scenarios',
   {
     description:
@@ -752,7 +675,7 @@ registerTool<{ scenarios: string[] }>(
         .describe('Scenario preset names (e.g. ["mapping","pinnacle_boss","uber_boss"]).'),
     },
   },
-  async ({ scenarios }) => {
+  async ({ scenarios }, session) => {
     const result = await session.compareScenarios(scenarios);
     const rows = result.scenarios.map((s) => ({
       scenario: s.scenario,
@@ -764,7 +687,7 @@ registerTool<{ scenarios: string[] }>(
   },
 );
 
-registerTool<{ buffs: Record<string, boolean | number | string> }>(
+tools.engine<{ buffs: Record<string, boolean | number | string> }>(
   'toggle_buffs',
   {
     description:
@@ -775,7 +698,7 @@ registerTool<{ buffs: Record<string, boolean | number | string> }>(
         .describe('Map of buff name → desired value (e.g. {"powerCharges":true,"onslaught":false}).'),
     },
   },
-  async ({ buffs }) => {
+  async ({ buffs }, session) => {
     const result = await session.toggleBuffs(buffs);
     return summarizeStatDiff(result);
   },
@@ -812,7 +735,7 @@ function formatUpgrades(suggestions: UpgradeSuggestion[]): string {
   return lines.join('\n').trimEnd();
 }
 
-registerTool<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
+tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   'diagnose_build',
   {
     description:
@@ -824,7 +747,7 @@ registerTool<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
         .describe('Limit checks to a specific category. Defaults to all.'),
     },
   },
-  async ({ focus }) => {
+  async ({ focus }, session) => {
     const checks = await session.diagnoseBuild(focus);
     return {
       content: [
@@ -835,7 +758,7 @@ registerTool<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   },
 );
 
-registerTool<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
+tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   'suggest_upgrades',
   {
     description:
@@ -845,7 +768,7 @@ registerTool<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
       budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),
     },
   },
-  async ({ slot, budget }) => {
+  async ({ slot, budget }, session) => {
     const suggestions = await session.suggestUpgrades(slot, budget);
     return {
       content: [
@@ -856,7 +779,7 @@ registerTool<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   },
 );
 
-registerTool<{ format?: 'summary' | 'xml' | 'code' }>(
+tools.engine<{ format?: 'summary' | 'xml' | 'code' }>(
   'export_build',
   {
     description:
@@ -865,13 +788,13 @@ registerTool<{ format?: 'summary' | 'xml' | 'code' }>(
       format: z.enum(['summary', 'xml', 'code']).optional().describe('Export format. Defaults to "summary".'),
     },
   },
-  async ({ format }) => {
+  async ({ format }, session) => {
     const text = await session.exportBuild(format ?? 'summary');
     return { content: [{ type: 'text', text }] };
   },
 );
 
-registerTool<{ action: 'take' | 'compare' | 'list'; label?: string; labelA?: string; labelB?: string }>(
+tools.engine<{ action: 'take' | 'compare' | 'list'; label?: string; labelA?: string; labelB?: string }>(
   'snapshot_and_compare',
   {
     description:
@@ -883,7 +806,7 @@ registerTool<{ action: 'take' | 'compare' | 'list'; label?: string; labelA?: str
       labelB: z.string().optional().describe('Second snapshot label for "compare". Use "current" for live stats.'),
     },
   },
-  async ({ action, label, labelA, labelB }) => {
+  async ({ action, label, labelA, labelB }, session) => {
     switch (action) {
       case 'take': {
         if (!label) throw new UserError('label required for action "take"');
@@ -907,14 +830,14 @@ registerTool<{ action: 'take' | 'compare' | 'list'; label?: string; labelA?: str
   },
 );
 
-registerTool<Record<string, never>>(
+tools.engine<Record<string, never>>(
   'reset_build',
   {
     description:
       'Reset the build to its original state (as it was when first loaded). All session mutations (item swaps, tree changes, gem swaps, config changes) are reverted.',
     inputSchema: {},
   },
-  async () => {
+  async (_args, session) => {
     const info = await session.resetBuild();
     return {
       status: 'reset',
@@ -931,24 +854,25 @@ registerTool<Record<string, never>>(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Pre-warm the Lua bridge so the first tool call is fast. Must complete
-  // before MCP transport accepts requests — start()'s early-exit only checks
-  // that the subprocess is alive, not that init has finished, so a concurrent
-  // tool call would race with spawnProcess's end-of-init replay.
-  await bridge.start();
-
+  // Connect the MCP transport FIRST so the client always sees a working server
+  // (with configure_pob_path / get_engine_info), even when PoB or LuaJIT can't
+  // be found. Engine-backed tools await the background boot via
+  // engine.ensureReady(), so no tool call can race the end-of-init replay.
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  engine.setPathPrompt(createPathPrompt(server, engine));
+  setImmediate(() => engine.init());
 
   let shuttingDown = false;
   const shutdown = async (reason: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     try {
-      await bridge.shutdown();
+      await Promise.race([engine.shutdown(), new Promise((resolve) => setTimeout(resolve, 5_000))]);
     } catch {
-      bridge.killProcess();
+      // fall through to the hard kill
     }
+    engine.killProcess();
     process.exit(reason === 'error' ? 1 : 0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
@@ -964,6 +888,6 @@ async function main(): Promise<void> {
 main().catch((error: unknown) => {
   // eslint-disable-next-line no-console
   console.error('pob-mcp failed to start:', error);
-  bridge.killProcess();
+  engine.killProcess();
   process.exit(1);
 });
