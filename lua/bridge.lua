@@ -795,14 +795,14 @@ local function equipItemInSlot(slotName, itemRaw)
 	if not build.itemsTab.displayItem then
 		userError("Failed to parse item raw text")
 	end
+	-- AddItem gives the item the lowest free id (not the highest), and
+	-- AddDisplayItem clears displayItem, so keep the object to read its id.
+	local newItem = build.itemsTab.displayItem
 	build.itemsTab:AddDisplayItem(true) -- noAutoEquip = true
-	-- The new item id is the highest in items map after AddDisplayItem.
-	-- AddItem assigns the next free id, so find it.
-	local maxId = 0
-	for id, _ in pairs(build.itemsTab.items) do
-		if id > maxId then maxId = id end
+	if not newItem.id or build.itemsTab.items[newItem.id] ~= newItem then
+		error("Path of Building did not add the item (ItemsTab:AddDisplayItem changed)")
 	end
-	slot:SetSelItemId(maxId)
+	slot:SetSelItemId(newItem.id)
 	build.buildFlag = true
 	build.itemsTab:PopulateSlots()
 	runCallback("OnFrame")
