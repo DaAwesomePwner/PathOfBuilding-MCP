@@ -90,6 +90,26 @@ async function main(): Promise<void> {
     assert(Number(restartedStats.Life ?? 0) > 0, 'Auto-restart should reload build and return stats');
     log('PASS: Auto-restart');
 
+    // The fixture's item ids have a gap (1-7, 9-19), and PoB gives a new item
+    // the lowest free id. The first equip after a fresh load must select the
+    // item it just added, not the one with the highest id (a jewel, which the
+    // Helmet slot rejects and so ends up empty).
+    log('Test 7b: equipItem selects the item it added (id gap in fixture)');
+    type SlotItem = { itemId: number; raw?: string | null; baseName?: string };
+    const getHelmet = async (): Promise<SlotItem> =>
+      (await bridge.send<{ ok: true; item: SlotItem }>({ cmd: 'getItemInSlot', slot: 'Helmet' })).item;
+    const helmetBefore = await getHelmet();
+    assert(helmetBefore.itemId !== 0 && !!helmetBefore.raw, 'Fixture should have a helmet equipped');
+    await bridge.send({ cmd: 'equipItem', slot: 'Helmet', itemText: helmetBefore.raw });
+    const helmetAfter = await getHelmet();
+    assert(helmetAfter.itemId !== 0, 'Helmet slot should not be empty after equipItem');
+    assert(helmetAfter.itemId !== helmetBefore.itemId, 'equipItem should select the newly added item');
+    assert(
+      helmetAfter.baseName === helmetBefore.baseName && helmetAfter.raw === helmetBefore.raw,
+      `Helmet slot should hold the equipped item, got ${helmetAfter.baseName}`,
+    );
+    log(`PASS: equipItem selected new item id ${helmetAfter.itemId} (was ${helmetBefore.itemId})`);
+
     log('Test 8: Shutdown');
     await bridge.shutdown();
     assert(!bridge.isRunning(), 'Bridge should not be running after shutdown');
