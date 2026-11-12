@@ -22,6 +22,46 @@ it plausible.
   relative to `src/`. Spawn from the script path and set
   `main.disableDevAutoSave = true` (dev mode autosaves `~~temp~~.xml`).
 
+## Found during the launch-critical fixes
+
+Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
+for later.
+
+- **Jewel-supported nodes lost on undo (confirmed).** `restoreAllUnlocked`
+  (`src/build-session.ts`) restores the tree before items and ignores the
+  bridge's `missingNodeIds`. Undo after unequipping an Intuitive Leap, Thread
+  of Hope or Impossible Escape leaves the nodes it supported unallocated.
+  Restore the tree again once items are back.
+- **`zlib1.dll` is held open in the install**, in addition to
+  `lua-utf8.dll` (see "Do first").
+- **Rejected build recorded for respawn.** `LuaBridge.lastLoadedXML` is set
+  before the load succeeds, so a crash restart replays a build the engine
+  refused.
+- **`allocExtendedNodes` extras** re-allocated by PoB on restore are not
+  detected; only missing nodes are reported.
+- **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
+  install are not normalised. Network-path installs get no zlib.
+- **Source-clone dev autosave** is blocked by the write guard, PoB opens a
+  popup and the next load is reported as failed.
+- **`__proto__` dropped by the input schema.** `z.record` removes the key
+  before `set_config`/`toggle_buffs` validate it, so the call quietly does
+  nothing.
+- **Preset descriptions mention flasks** but set no flask key; the `flasks`
+  alias only sets `conditionUsingFlask`.
+- **`reload_engine` result size.** The returned `buildCode` has no size cap.
+- **Reload and reconfigure wait** behind long calls such as
+  `find_optimal_links`.
+- **Manifest read hiccup looks like an install change**, which lets a later
+  `reload_engine` reset the crash count.
+- **Mapped network drive letters** are accepted by `configure_pob_path`.
+- **"No build loaded" is matched by message text** in
+  `src/engine-manager.ts`; add a `hasBuild()` accessor to `BuildSession`.
+- **After `reload_engine`, `reset_build` returns to the reloaded build**, not
+  the originally loaded one.
+- **Registry and `where luajit` probes run synchronously** after connect.
+- **Unused `circuitOpen()`** in `src/engine-messages.ts`;
+  `src/engine-manager.ts` is well past the ~200-line guideline.
+
 ## What-if restore exactness
 
 The mastery and hash-override items touch `restoreTreeFromList`, which the
