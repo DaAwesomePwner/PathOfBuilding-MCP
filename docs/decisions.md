@@ -5,8 +5,8 @@ decisions, one line each, current state only.
 
 ## Scope
 
-- Only the launch-critical fix set shipped for the new-league PoB update; every other 2026-11-12 review finding lives in `docs/backlog.md`. Why: the league launched the next day and the user chose to postpone the rest. (2026-11-12, launch-critical-fixes, docs/backlog.md)
-- Postponed by the user, not rejected: `convert_tree_to_latest` tool, what-if restore exactness (masteries, items, skills, jewel-supported nodes), URL-loading hardening, crash-breaker tuning, the install DLL locks, tests/CI and docs polish. Why: outside the launch-critical set. (2026-11-12, launch-critical-fixes, docs/backlog.md)
+- Only the launch-critical fix set shipped for the new-league PoB update; every other 2026-11-12 review finding lives in `docs/backlog.md`. Why: the user said a new Path of Exile 1 update was due the next day and chose to postpone the rest. (2026-11-12, launch-critical-fixes, docs/backlog.md)
+- Postponed by the user, not rejected: `convert_tree_to_latest` tool, what-if restore exactness (masteries, items, skills), URL-loading hardening, crash-breaker tuning, the install DLL locks, tests/CI and docs polish. Why: outside the launch-critical set. (2026-11-12, launch-critical-fixes, docs/backlog.md)
 
 ## Engine and PoB install
 
