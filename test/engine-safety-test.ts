@@ -140,7 +140,8 @@ async function main(): Promise<void> {
     ];
     if (process.platform === 'win32') writeTargets.push(probeFiles[0].toUpperCase());
     for (const target of writeTargets) {
-      for (const mode of ['w', 'wb+', 'a', 'r+']) {
+      // rD = MSVC CRT delete-on-close: a read-looking mode that still mutates.
+      for (const mode of ['w', 'wb+', 'a', 'r+', 'rD']) {
         const r = await guard({ action: 'open', path: target, mode });
         assert(!r.opened, `io.open(${target}, ${mode}) must be blocked`);
         assert(String(r.message).includes('read-only'), `io.open(${target}, ${mode}) message: ${r.message}`);
@@ -150,11 +151,11 @@ async function main(): Promise<void> {
     assert(!removed.result && String(removed.message).includes('read-only'), `os.remove must be blocked: ${removed.message}`);
     const renamed = await guard({ action: 'rename', path: probeFiles[0], to: probeFiles[1] });
     assert(!renamed.result && String(renamed.message).includes('read-only'), `os.rename must be blocked: ${renamed.message}`);
-    const read = await guard({ action: 'open', path: path.join(install, 'Launch.lua'), mode: 'r' });
+    const read = await guard({ action: 'read', path: path.join(install, 'Launch.lua') });
     assert(read.opened && (read.bytesRead ?? 0) > 0, 'Reading Launch.lua must still work');
     const anyBin = [...jewelBefore.keys()].find((n) => n.endsWith('.bin'));
     if (anyBin) {
-      const binRead = await guard({ action: 'open', path: path.join(jewelDir, anyBin), mode: 'rb' });
+      const binRead = await guard({ action: 'read', path: path.join(jewelDir, anyBin) });
       assert(binRead.opened && (binRead.bytesRead ?? 0) > 0, `Reading ${anyBin} must still work`);
     }
     const outside = await expectError(
@@ -162,6 +163,11 @@ async function main(): Promise<void> {
       'Guard probe outside the install must be refused',
     );
     assert(outside instanceof UserError, `Outside-install probe should be a UserError, got ${outside.message}`);
+    const outsideSearch = await expectError(
+      () => selfTest({ op: 'fileSearch', pattern: path.join(os.tmpdir(), '*') }),
+      'fileSearch outside the install must be refused',
+    );
+    assert(outsideSearch instanceof UserError, `Outside-install fileSearch should be a UserError, got ${outsideSearch.message}`);
     for (const p of probeFiles) assert(!existsSync(p), `Guard failed: ${p} was created`);
     log('PASS: io.open(write)/os.remove/os.rename blocked, reads work');
 
@@ -207,6 +213,14 @@ async function main(): Promise<void> {
       }
     }
     log(`PASS: NewFileSearch found ${search.files.length} .bin files`);
+
+    log('Test 5b: Failed load with no previous build says so');
+    const bootFailure = await expectError(
+      () => bridge.loadBuildXML(xml.replace(/treeVersion="3_13"/g, 'treeVersion="9_99"'), 'future'),
+      'Unknown tree version must fail',
+    );
+    assert(/no build loaded/.test(bootFailure.message), `Expected "no build loaded" in: ${bootFailure.message}`);
+    log('PASS: failure without a previous build reports that no build is loaded');
 
     log('Test 6: getBuildInfo exposes tree versions');
     const info = (await bridge.loadBuildXML(xml, 'OccVortex')) as Record<string, unknown>;
@@ -254,6 +268,42 @@ async function main(): Promise<void> {
     assert(restoredInfo.class === 'Witch' && restoredInfo.ascendancy === 'Occultist', 'Class/ascendancy must survive restore');
     log(`PASS: alloc ${toAlloc.id} + dealloc ${removedId} restored exactly (${baseIds.length} nodes, Life=${baseStats.Life})`);
 
+    log('Test 7b: Restore with a node PoB cannot allocate is non-fatal');
+    // A neighbour of a reachable node is two steps from the tree: listed alone
+    // it is disconnected, so PoB prunes it during the restore.
+    const reachableIds = new Set(reachable.map((n) => n.id));
+    const baseSet = new Set(baseIds);
+    let orphanId: number | null = null;
+    for (const r of reachable) {
+      const nodeInfo = (await bridge.send<{ node: { linked: number[] } | null }>({ cmd: 'getNodeInfo', nodeId: r.id })).node;
+      const cand = nodeInfo?.linked.find((id) => !baseSet.has(id) && !reachableIds.has(id));
+      if (cand !== undefined) {
+        const candInfo = (await bridge.send<{ node: TreeNode | null }>({ cmd: 'getNodeInfo', nodeId: cand })).node;
+        if (candInfo && (candInfo.type === 'Normal' || candInfo.type === 'Notable') && !candInfo.isAscendancy) {
+          orphanId = cand;
+          break;
+        }
+      }
+    }
+    assert(orphanId !== null, 'Expected a node two steps away from the tree');
+    const partial = await bridge.send<{ ok: boolean; missingNodeIds?: number[]; stats: Stats }>({
+      cmd: 'restoreTreeFromList',
+      nodeIds: [...baseIds, orphanId],
+    });
+    assert(partial.ok === true, 'Restore with an unallocatable node must still succeed');
+    assert(
+      Array.isArray(partial.missingNodeIds) && partial.missingNodeIds.includes(orphanId),
+      `missingNodeIds should report ${orphanId}, got ${JSON.stringify(partial.missingNodeIds)}`,
+    );
+    const partialIds = (await bridge.send<{ nodeIds: number[] }>({ cmd: 'getAllocatedNodes' })).nodeIds.slice().sort((a, b) => a - b);
+    assert(JSON.stringify(partialIds) === JSON.stringify(baseIds), 'The rest of the tree must be restored');
+    for (const k of EXACT_KEYS) {
+      assert(partial.stats[k] === baseStats[k], `${k} after partial restore: ${partial.stats[k]} vs ${baseStats[k]}`);
+    }
+    const clean = await bridge.send<{ missingNodeIds?: number[] }>({ cmd: 'restoreTreeFromList', nodeIds: baseIds });
+    assert(clean.missingNodeIds === undefined, 'A full restore must not report missing nodes');
+    log(`PASS: node ${orphanId} reported in missingNodeIds, rest of tree restored`);
+
     log('Test 8: Timeless jewel data loads without touching the install');
     const blockedBefore = (await selfTest<{ blockedWrites: number }>({ op: 'status' })).blockedWrites;
     const emptyStats = (await bridge.send<{ stats: Stats }>({ cmd: 'unequipItem', slot: JEWEL_SLOT })).stats;
@@ -276,6 +326,11 @@ async function main(): Promise<void> {
     log('Test 9: Failing loads return errors and the engine recovers');
     await bridge.loadBuildXML(xml, 'OccVortex');
     const goodStats = await bridge.getStats();
+    // Mutate build A so we can tell "A as the caller left it" from a fresh A.
+    await bridge.send({ cmd: 'unequipItem', slot: 'Ring 1' });
+    const stateA = await bridge.getStats();
+    const infoA = (await bridge.send<{ info: Record<string, unknown> }>({ cmd: 'getBuildInfo' })).info;
+    assert(stateA.Life !== goodStats.Life, 'Unequipping Ring 1 should change Life');
     const malformed = await expectError(
       () => bridge.loadBuildXML('<PathOfBuilding><Build level="1"></PathOfBuilding>', 'bad'),
       'Malformed XML must fail',
@@ -288,9 +343,18 @@ async function main(): Promise<void> {
     );
     assert(!(unknownTree instanceof UserError), 'PoB load failures are internal errors');
     assert(/tree/i.test(unknownTree.message), `Unexpected unknown-tree error: ${unknownTree.message}`);
+    for (const err of [malformed, unknownTree]) {
+      assert(/previously loaded build is still active/.test(err.message), `Error should say A is still active: ${err.message}`);
+    }
     await bridge.send({ cmd: 'ping' });
     const afterFailure = await bridge.getStats();
-    assert(Number(afterFailure.Life) > 0, 'Engine should be usable (blank build) after a failed load');
+    for (const k of EXACT_KEYS) {
+      assert(afterFailure[k] === stateA[k], `${k} after failed loads: ${afterFailure[k]} vs build A ${stateA[k]}`);
+    }
+    const infoAfter = (await bridge.send<{ info: Record<string, unknown> }>({ cmd: 'getBuildInfo' })).info;
+    assert(JSON.stringify(infoAfter) === JSON.stringify(infoA), `Build info changed: ${JSON.stringify(infoAfter)} vs ${JSON.stringify(infoA)}`);
+    const ring = (await bridge.send<{ item: { itemId: number } }>({ cmd: 'getItemInSlot', slot: 'Ring 1' })).item;
+    assert(ring.itemId === 0, 'The unequipped Ring 1 must stay unequipped (A restored as left)');
     await bridge.loadBuildXML(xml, 'OccVortex');
     const recovered = await bridge.getStats();
     for (const k of EXACT_KEYS) {

@@ -128,9 +128,12 @@ local function isProtectedPath(path)
 	return c == INSTALL_ROOT or c:sub(1, #INSTALL_ROOT + 1) == INSTALL_ROOT .. "/"
 end
 
+-- Allowlist: only plain read modes count as reads. Anything else ("w", "a",
+-- "+", MSVC extensions such as "rD" delete-on-close, non-strings) is a write.
+local READ_MODES = { r = true, rb = true }
 local function isWriteMode(mode)
 	if mode == nil then return false end
-	return type(mode) ~= "string" or mode:find("[wa+]") ~= nil
+	return not READ_MODES[mode]
 end
 
 -- Files the bridge pretends not to see. Launch.lua treats an existing
@@ -191,9 +194,24 @@ end
 local zlib = nil
 local zlibInfo = { available = false }
 do
-	local candidates = IS_WINDOWS
-		and { POB_PATH .. "/zlib1.dll", POB_PATH .. "/runtime/zlib1.dll", "zlib1", "zlib" }
-		or { "z", "libz.so.1", "libz.dylib" }
+	-- Windows: only the install's own zlib1.dll, by absolute path (a bare name
+	-- would let LoadLibrary search the cwd and PATH). Elsewhere: the system
+	-- zlib by its standard soname.
+	local candidates = { }
+	if IS_WINDOWS then
+		if INSTALL_ROOT and INSTALL_ROOT:match("^%a:/") then
+			for _, rel in ipairs({ "/zlib1.dll", "/runtime/zlib1.dll" }) do
+				local full = INSTALL_ROOT .. rel
+				local f = raw_io_open(full, "rb")
+				if f then
+					f:close()
+					candidates[#candidates + 1] = (full:gsub("/", "\\"))
+				end
+			end
+		end
+	else
+		candidates = { "libz.so.1", "z", "libz.1.dylib", "libz.dylib" }
+	end
 	if ffi then
 		local ok = pcall(ffi.cdef, [[
 			typedef struct pobmcp_z_stream {
@@ -902,23 +920,29 @@ local function restoreTreeFromIds(nodeIds)
 		error("Tree restore failed in " .. api .. " (PoB API may have changed): " .. tostring(err))
 	end
 
-	-- Verify: every requested node that exists (masteries only with a
-	-- selection) must now be allocated.
+	build.buildFlag = true
+	runCallback("OnFrame")
+
+	-- Report (never fail on) requested nodes PoB did not allocate. This is
+	-- legitimate, e.g. nodes supported by an Intuitive Leap-like jewel are
+	-- pruned while the tree is restored before that jewel is re-equipped.
+	-- Ids PoB does not know (cluster subgraph nodes built later) and masteries
+	-- without a selection are not counted.
 	local missing = { }
 	for _, id in ipairs(hashList) do
 		local node = spec.nodes and spec.nodes[id]
 		if node and not (spec.allocNodes and spec.allocNodes[id])
 			and (node.type ~= "Mastery" or (spec.masterySelections and spec.masterySelections[id])) then
-			missing[#missing + 1] = tostring(id)
-			if #missing >= 10 then break end
+			missing[#missing + 1] = id
 		end
 	end
 	if #missing > 0 then
-		error("Tree restore via " .. api .. " left nodes unallocated (" .. table.concat(missing, ", ")
-			.. "); PoB PassiveSpec behaviour changed")
+		local shown = { }
+		for i = 1, math.min(#missing, 20) do shown[i] = tostring(missing[i]) end
+		STDERR:write("[pob-mcp] warning: tree restore via ", api, " left ", tostring(#missing),
+			" node(s) unallocated: ", table.concat(shown, ", "), (#missing > 20 and ", ..." or ""), "\n")
 	end
-	build.buildFlag = true
-	runCallback("OnFrame")
+	return missing
 end
 
 local function getFullConfigInput()
@@ -1808,6 +1832,28 @@ local function recoverBlankBuild()
 	clearPoBErrorState()
 end
 
+-- True once a loadXML has succeeded and the active build came from it (the
+-- boot-time "Unnamed build" and the blank recovery build do not count).
+local buildLoaded = false
+
+-- Load XML into PoB and verify it actually loaded. Returns nil on success or
+-- a failure message (PoB's own error text when it reported one).
+local function tryLoadBuild(xmlText, name)
+	local popupsBefore = currentPopups()
+	local ok, err = pcall(loadBuildFromXML, xmlText, name)
+	local failure = detectPoBFailure(popupsBefore, true)
+	if not failure and not ok then
+		failure = "Path of Building failed to load the build: " .. tostring(err)
+	end
+	if not failure then
+		local spec = build and build.spec
+		if not (spec and spec.tree and spec.nodes and build.calcsTab and build.calcsTab.mainOutput) then
+			failure = "Path of Building did not finish loading the build (no passive tree or calculation output)"
+		end
+	end
+	return failure
+end
+
 -- Each handler returns the body of the response, NOT including `ok = true`.
 -- The dispatcher adds `ok = true` automatically. If `mutating` is true the
 -- dispatcher also calls getStats() after the handler and merges the result
@@ -1821,22 +1867,33 @@ local DISPATCH = {
 			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
 				userError("Invalid Path of Building XML")
 			end
-			local popupsBefore = currentPopups()
-			local ok, err = pcall(loadBuildFromXML, xmlText, cmd.name or "MCP Build")
-			local failure = detectPoBFailure(popupsBefore, true)
-			if not failure and not ok then
-				failure = "Path of Building failed to load the build: " .. tostring(err)
-			end
-			if not failure then
-				local spec = build and build.spec
-				if not (spec and spec.tree and spec.nodes and build.calcsTab and build.calcsTab.mainOutput) then
-					failure = "Path of Building did not finish loading the build (no passive tree or calculation output)"
+			-- Capture the current build (including unsaved mutations) so a failed
+			-- load can put the engine back exactly where the caller left it.
+			local previous = nil
+			local m = mainObject.main
+			if buildLoaded and m and (m.newMode or m.mode) == "BUILD" and build then
+				local okSave, prevXml = pcall(function() return build:SaveDB("mcp-restore") end)
+				if okSave and type(prevXml) == "string" then
+					previous = { xml = prevXml, name = build.buildName }
+				else
+					STDERR:write("[pob-mcp] could not capture current build before load: ", tostring(prevXml), "\n")
 				end
 			end
+			local failure = tryLoadBuild(xmlText, cmd.name or "MCP Build")
 			if failure then
+				if previous then
+					clearPoBErrorState()
+					local restoreFailure = tryLoadBuild(previous.xml, previous.name)
+					if not restoreFailure then
+						error(failure .. " (the previously loaded build is still active)", 0)
+					end
+					STDERR:write("[pob-mcp] failed to restore previous build: ", (restoreFailure:gsub("\n", " ")), "\n")
+				end
 				recoverBlankBuild()
-				error(failure, 0)
+				buildLoaded = false
+				error(failure .. " (the engine now has no build loaded; load a build before continuing)", 0)
 			end
+			buildLoaded = true
 			return { info = getBuildInfo() }
 		end,
 	},
@@ -1955,7 +2012,13 @@ local DISPATCH = {
 		mutating = true,
 	},
 	restoreTreeFromList = {
-		handler = function(cmd) restoreTreeFromIds(cmd.nodeIds or { }) return { } end,
+		handler = function(cmd)
+			local missing = restoreTreeFromIds(cmd.nodeIds or { })
+			if #missing > 0 then
+				return { missingNodeIds = missing }
+			end
+			return { }
+		end,
 		mutating = true,
 	},
 
@@ -2039,38 +2102,62 @@ local DISPATCH = {
 	ping = {
 		handler = function(_cmd) return { } end,
 	},
-	-- Diagnostics for the engine-safety test suite. Every operation is either
-	-- read-only or targets a path inside the PoB install, where the write
-	-- guard must refuse it; paths outside the install are rejected up front
-	-- so this command can never write anywhere.
+	-- Diagnostics for the engine-safety test suite. Every path must be inside
+	-- the PoB install (anything else is refused up front). "read" opens an
+	-- existing file in "rb" only; write probes (open/remove/rename) only
+	-- accept targets that do NOT exist, with a fixed set of modes, so even a
+	-- broken guard could not modify an existing install file.
 	engineSelfTest = {
 		handler = function(cmd)
 			local op = cmd.op
 			if op == "guard" then
-				for _, p in ipairs({ cmd.path, cmd.to }) do
-					if p ~= nil and not isProtectedPath(p) then
+				local function requireInside(p)
+					if type(p) ~= "string" or not isProtectedPath(p) then
 						userError("engineSelfTest guard probes only accept paths inside the PoB install")
 					end
 				end
+				local function requireAbsent(p)
+					local f = raw_io_open(p, "rb")
+					if f then f:close() end
+					if f or NewFileSearch(p, true) or NewFileSearch(p) then
+						userError("engineSelfTest write probes only accept non-existent targets: " .. p)
+					end
+				end
+				local action = cmd.action
+				if action == "read" then
+					requireInside(cmd.path)
+					local f = io.open(cmd.path, "rb")
+					if not f then return { opened = false } end
+					local content = f:read(16) or ""
+					f:close()
+					return { opened = true, bytesRead = #content }
+				end
+				local PROBE_MODES = { w = true, ["wb+"] = true, a = true, ["r+"] = true, rD = true, rbD = true }
 				local r1, r2
-				if cmd.action == "open" then
-					local f, msg = io.open(cmd.path, cmd.mode or "r")
+				if action == "open" then
+					requireInside(cmd.path)
+					requireAbsent(cmd.path)
+					if not PROBE_MODES[cmd.mode] then
+						userError("Unsupported probe mode: " .. tostring(cmd.mode))
+					end
+					local f, msg = io.open(cmd.path, cmd.mode)
 					if f then
-						if isWriteMode(cmd.mode) then
-							f:close()
-							return { opened = true }
-						end
-						local content = f:read(cmd.readBytes or 16) or ""
 						f:close()
-						return { opened = true, bytesRead = #content }
+						return { opened = true }
 					end
 					r1, r2 = nil, msg
-				elseif cmd.action == "remove" then
+				elseif action == "remove" then
+					requireInside(cmd.path)
+					requireAbsent(cmd.path)
 					r1, r2 = os.remove(cmd.path)
-				elseif cmd.action == "rename" then
+				elseif action == "rename" then
+					requireInside(cmd.path)
+					requireInside(cmd.to)
+					requireAbsent(cmd.path)
+					requireAbsent(cmd.to)
 					r1, r2 = os.rename(cmd.path, cmd.to)
 				else
-					userError("Unknown guard action: " .. tostring(cmd.action))
+					userError("Unknown guard action: " .. tostring(action))
 				end
 				return { opened = false, result = r1 and true or false, message = r2 and tostring(r2) or dkjson.null }
 			elseif op == "zlib" then
@@ -2097,6 +2184,9 @@ local DISPATCH = {
 				end
 				return result
 			elseif op == "fileSearch" then
+				if type(cmd.pattern) ~= "string" or not isProtectedPath(cmd.pattern) then
+					userError("engineSelfTest fileSearch only accepts patterns inside the PoB install")
+				end
 				local h = NewFileSearch(cmd.pattern, cmd.dirOnly)
 				local found = { }
 				while h do
