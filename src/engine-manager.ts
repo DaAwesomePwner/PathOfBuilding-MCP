@@ -472,8 +472,12 @@ export class EngineManager {
     else if (updateState === 'applying') status = 'updating';
     else if (changed) status = 'stale';
     else if (this.booting || this.gate.busy) status = 'starting';
-    else if (this.startFingerprint) status = 'ready';
-    else if (this.bootError) status = 'failed';
+    else if (this.startFingerprint) {
+      // Booted once is not the same as running now: report the process's real state.
+      if (this.bridge?.isCircuitOpen()) status = 'failed';
+      else if (this.bridge?.isRunning()) status = 'ready';
+      else status = 'stopped';
+    } else if (this.bootError) status = 'failed';
     else status = 'stopped';
 
     // Never start or respawn the engine from here: only ask for build info when the
@@ -507,6 +511,9 @@ export class EngineManager {
       ...(this.bootError && !this.startFingerprint ? { startError: this.bootError } : {}),
       ...(status === 'unconfigured' ? { hint: msg.ASK_USER } : {}),
       ...(status === 'stale' ? { hint: 'Call reload_engine to switch to the updated Path of Building.' } : {}),
+      ...(status === 'stopped' && this.startFingerprint
+        ? { hint: 'The engine process is not running; the next engine tool call restarts it.' }
+        : {}),
     };
   }
 
