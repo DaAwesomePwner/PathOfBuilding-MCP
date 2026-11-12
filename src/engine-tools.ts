@@ -39,7 +39,7 @@ export function registerEngineTools(tools: ToolRegistrar, engine: EngineManager)
     'get_engine_info',
     {
       description:
-        'Report the engine state: status (unconfigured/starting/ready/failed/stale/updating), Path of Building version, ' +
+        'Report the engine state: status (unconfigured/starting/ready/stopped/failed/stale/updating), Path of Building version, ' +
         'PoB and LuaJIT paths and where they came from, install layout, whether PoB was updated on disk since the engine ' +
         'started, the config file location, and basic info (incl. tree version fields when available) about the loaded build. ' +
         'Never starts the engine.',

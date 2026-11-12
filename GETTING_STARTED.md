@@ -38,7 +38,7 @@ Three layers, three responsibilities:
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
-- `get_engine_info` — status (`unconfigured` / `starting` / `ready` / `failed` / `stale` / `updating`), PoB version, paths and where they came from, layout, whether PoB changed on disk, config file location, loaded-build info.
+- `get_engine_info` — status (`unconfigured` / `starting` / `ready` / `stopped` / `failed` / `stale` / `updating`), PoB version, paths and where they came from, layout, whether PoB changed on disk, config file location, loaded-build info.
 - `reload_engine` — restart LuaJIT against the PoB currently on disk (after a PoB update); reloads the current build, clears undo history, reports old → new version.
 
 ### Loading and inspection (5)

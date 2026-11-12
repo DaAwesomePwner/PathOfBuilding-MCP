@@ -444,6 +444,12 @@ async function part1(): Promise<void> {
     bridge.running = false; // LuaJIT died
     info = await mm.info();
     assert.equal(info.build, null, 'build info omitted while the engine is down');
+    assert.equal(info.status, 'stopped', 'a dead engine is not reported as ready');
+    bridge.crashCount = 3; // third crash opened the breaker
+    info = await mm.info();
+    assert.equal(info.status, 'failed', 'an open breaker is not reported as ready');
+    assert.equal(info.circuitOpen, true);
+    assert.match(String(info.hint), /crashed 3 times.*reload_engine.*restart the MCP server/, 'breaker-open hint says how to recover');
     assert.equal(bridge.starts, startsBefore, 'info() must not respawn the engine');
     assert.equal(bridge.running, false);
     await mm.shutdown();
