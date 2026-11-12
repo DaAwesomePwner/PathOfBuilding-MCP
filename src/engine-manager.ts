@@ -436,7 +436,9 @@ export class EngineManager {
       const configFile = saveConfig(
         {
           pobPath: info.dir,
-          ...(luajitSource === 'argument' ? { luajitPath } : {}),
+          // Keep a user-supplied binary whether it came in this call or from
+          // the saved config; dropping it would lose it on the next start.
+          ...(luajitSource === 'argument' || luajitSource === 'config' ? { luajitPath } : {}),
           pobVersion: this.startFingerprint?.version ?? info.version,
           savedAt: new Date().toISOString(),
         },
