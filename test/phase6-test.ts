@@ -203,14 +203,18 @@ async function main(): Promise<void> {
     assert(approxEq(afterUndo.CombinedDPS, baseline.CombinedDPS), `DPS should restore via undo (baseline=${baseline.CombinedDPS}, after=${afterUndo.CombinedDPS})`);
     log('PASS: set_config + undo round-trip');
 
-    // Test 9: set_config with nonsense key (silently accepted but should not crash)
+    // Test 9: set_config with an unknown key is rejected (a silent no-op hides typos)
     log('Test 9: set_config with unknown key');
-    const noopResp = await call(client, 'set_config', {
+    const cfgBeforeBad = await getRawConfig(client);
+    const badResp = await call(client, 'set_config', {
       options: { someUnknownConfigKey: 'value' },
     });
-    assert(!isError(noopResp), 'unknown keys should be tolerated');
-    await call(client, 'undo_last_change');
-    log('PASS: unknown config key tolerated');
+    assert(isError(badResp), 'unknown config keys should be rejected');
+    const badText = (badResp as { content?: ToolTextContent[] }).content?.[0]?.text ?? '';
+    assert(badText.includes('someUnknownConfigKey'), `error should name the bad key, got: ${badText}`);
+    const cfgAfterBad = await getRawConfig(client);
+    assert(JSON.stringify(cfgBeforeBad) === JSON.stringify(cfgAfterBad), 'rejected set_config must not change config');
+    log('PASS: unknown config key rejected without side effects');
 
     // Test 10: compare_scenarios with too few scenarios — Zod should reject
     log('Test 10: compare_scenarios with 1 scenario (should reject)');

@@ -194,6 +194,32 @@ async function main(): Promise<void> {
     }
     await session.restoreSlot({ slot: 'Ring 1', itemText: ringSnap.itemText, itemId: null });
     log(`PASS: ${diffKeys.length} stats changed`);
+
+    log('Test 10: Passive tree snapshot/restore is bit-exact');
+    await session.resetBuild();
+    const treeBaseStats = await session.getStats();
+    const treeSnap = await session.snapshotTree();
+    const reachable = await bridge.send<{ nodes: Array<{ id: number; type: string }> }>({ cmd: 'getReachableNodes' });
+    const target = reachable.nodes.find((n) => n.type === 'Notable') ?? reachable.nodes[0];
+    assert(target, 'Expected at least one reachable node');
+    await session.allocNode(target.id);
+    const grownTree = await session.snapshotTree();
+    assert(grownTree.allocatedNodeIds.includes(target.id), 'allocNode should allocate the target');
+    await session.restoreTree(treeSnap);
+    const restoredTree = await session.snapshotTree();
+    const sortIds = (ids: number[]) => JSON.stringify([...ids].sort((a, b) => a - b));
+    assert(
+      sortIds(restoredTree.allocatedNodeIds) === sortIds(treeSnap.allocatedNodeIds),
+      'Allocated node set must match the snapshot after restoreTree',
+    );
+    const treeRestoredStats = await session.getStats();
+    for (const key of ['Life', 'CombinedDPS', 'TotalEHP']) {
+      assert(
+        treeRestoredStats[key] === treeBaseStats[key],
+        `${key} must be bit-exact after restoreTree: ${treeRestoredStats[key]} vs ${treeBaseStats[key]}`,
+      );
+    }
+    log(`PASS: tree restored exactly after allocating ${target.id}`);
   } finally {
     bridge.killProcess();
   }

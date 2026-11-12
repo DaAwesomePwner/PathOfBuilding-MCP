@@ -1,18 +1,39 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { configDir, configFilePath, loadConfig, saveConfig } from '../src/config-store.js';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { CrashLedger } from '../src/crash-ledger.js';
+import { isNetworkOrDevicePath, normalizeUserPath } from '../src/path-utils.js';
 import {
-  PoBInstallNotFoundError,
   LuaJITNotFoundError,
-  resolvePoBPath,
+  luajitProbeCandidates,
+  PoBInstallNotFoundError,
+  pobProbeCandidates,
+  resolveLuaJIT,
   resolveLuaJITPath,
+  resolvePaths,
+  resolvePoB,
+  resolvePoBPath,
+  validateLuajitArgument,
+  validatePoBPath,
 } from '../src/paths.js';
+import { detectUpdateState, fingerprintInstall, inspectPoBInstall, installChanged } from '../src/pob-install.js';
 
-async function withEnv(
-  env: Record<string, string | undefined>,
-  fn: () => void | Promise<void>,
-): Promise<void> {
+const IS_WIN = process.platform === 'win32';
+const EXE = IS_WIN ? 'luajit.exe' : 'luajit';
+const REAL_POE1 = process.env.APPDATA ? path.join(process.env.APPDATA, 'Path of Building Community') : '';
+const REAL_POE2 = process.env.APPDATA ? path.join(process.env.APPDATA, 'Path of Building Community (PoE2)') : '';
+const tmpDirs: string[] = [];
+
+function tmp(prefix: string): string {
+  const d = mkdtempSync(path.join(os.tmpdir(), prefix));
+  tmpDirs.push(d);
+  return d;
+}
+
+async function withEnv(env: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
   const saved: Record<string, string | undefined> = {};
   for (const key of Object.keys(env)) saved[key] = process.env[key];
   try {
@@ -29,154 +50,463 @@ async function withEnv(
   }
 }
 
-function makeFakePoBInstall(): string {
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'pob-fake-'));
-  // Mimic a compiled install: Launch.lua at the root.
-  writeFileSync(path.join(dir, 'Launch.lua'), '-- fake');
+function write(file: string, content: string): void {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, content);
+}
+
+/** Fake PoE1 install. layout 'installed' = flattened (Windows installer); 'source' = git clone. */
+function makeFakePoB(opts: { layout?: 'installed' | 'source'; version?: string; manifestExtra?: string } = {}): string {
+  const dir = tmp('pob-fake-');
+  const base = opts.layout === 'source' ? path.join(dir, 'src') : dir;
+  write(path.join(base, 'Launch.lua'), '-- fake');
+  write(path.join(base, 'Modules', 'Build.lua'), '-- fake');
+  write(path.join(base, 'GameVersions.lua'), 'liveTargetVersion = "3_0"\n');
+  write(
+    path.join(dir, 'manifest.xml'),
+    `<?xml version="1.0" encoding="UTF-8"?>\n<PoBVersion>\n\t<Version platform="win32" branch="master" number="${opts.version ?? '9.8.7'}"/>\n${opts.manifestExtra ?? ''}</PoBVersion>\n`,
+  );
   return dir;
 }
 
-function log(name: string, ok: boolean, msg = ''): void {
-  console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}${msg ? ` (${msg})` : ''}`);
-  if (!ok) process.exitCode = 1;
+let failures = 0;
+async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
+  try {
+    await fn();
+    console.log(`PASS: ${name}`);
+  } catch (e) {
+    failures++;
+    console.log(`FAIL: ${name} (${e instanceof Error ? e.message : String(e)})`);
+  }
 }
 
 async function main(): Promise<void> {
-  // Test: POB_PATH override wins when valid
-  {
-    const fake = makeFakePoBInstall();
-    try {
-      await withEnv({ POB_PATH: fake }, () => {
-        const resolved = resolvePoBPath();
-        assert.equal(resolved, path.resolve(fake));
+  // ---------------------------------------------------------------- PoB validation
+  await test('POB_PATH override accepted when valid (installed layout, version read)', async () => {
+    const fake = makeFakePoB();
+    await withEnv({ POB_PATH: fake }, () => {
+      const r = resolvePoB();
+      assert.equal(r.info.dir, path.resolve(fake));
+      assert.equal(r.source, 'env');
+      assert.equal(r.info.layout, 'installed');
+      assert.equal(r.info.version, '9.8.7');
+      assert.equal(resolvePoBPath(), path.resolve(fake));
+    });
+  });
+
+  await test('source-clone layout (src/Launch.lua + src/Modules/Build.lua) accepted', () => {
+    const fake = makeFakePoB({ layout: 'source', version: '2.0.0' });
+    const r = inspectPoBInstall(fake);
+    assert.ok(r.ok);
+    assert.equal(r.ok && r.info.layout, 'source');
+    assert.equal(r.ok && r.info.version, '2.0.0');
+  });
+
+  await test('Launch.lua without Modules/Build.lua is rejected', () => {
+    const dir = tmp('pob-launch-only-');
+    write(path.join(dir, 'Launch.lua'), '-- fake');
+    const r = inspectPoBInstall(dir);
+    assert.equal(r.ok, false);
+    assert.ok(!r.ok && r.reason === 'not-pob' && r.message.includes('Modules/Build.lua'), JSON.stringify(r));
+  });
+
+  await test('invalid POB_PATH throws without falling back to auto-detect', async () => {
+    const empty = tmp('pob-empty-');
+    await withEnv({ POB_PATH: empty }, () => {
+      assert.throws(() => resolvePoBPath(), (e: unknown) => {
+        assert.ok(e instanceof PoBInstallNotFoundError);
+        assert.match(e.message, /POB_PATH/);
+        assert.match(e.message, /auto-detection was skipped/);
+        assert.match(e.message, /configure_pob_path/);
+        return true;
       });
-      log('POB_PATH override accepted when valid', true);
-    } catch (e) {
-      log('POB_PATH override accepted when valid', false, String(e));
-    } finally {
-      rmSync(fake, { recursive: true, force: true });
-    }
-  }
+    });
+  });
 
-  // Test: POB_PATH throws PoBInstallNotFoundError when invalid
-  {
-    const empty = mkdtempSync(path.join(os.tmpdir(), 'pob-empty-'));
+  await test('PoE2 marker in manifest.xml is rejected with a PoE2-specific message', () => {
+    const fake = makeFakePoB({
+      manifestExtra: '\t<Source part="default" url="https://raw.githubusercontent.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/{branch}/"/>\n',
+    });
+    const r = inspectPoBInstall(fake);
+    assert.ok(!r.ok && r.reason === 'poe2' && /Path of Exile 2/.test(r.message), JSON.stringify(r));
+  });
+
+  await test('PoE2 GameVersions.lua ("0_x" tree versions) is rejected', () => {
+    const fake = makeFakePoB({ layout: 'source' });
+    write(path.join(fake, 'src', 'GameVersions.lua'), 'legacyTargetVersion = "0_0"\nliveTargetVersion = "0_1"\n');
+    const r = inspectPoBInstall(fake);
+    assert.ok(!r.ok && r.reason === 'poe2', JSON.stringify(r));
+  });
+
+  await test('real PoE2 install (if present) is rejected; real PoE1 install (if present) accepted', () => {
+    if (REAL_POE2 && existsSync(REAL_POE2)) {
+      const r = inspectPoBInstall(REAL_POE2);
+      assert.ok(!r.ok && r.reason === 'poe2', `PoE2 dir not rejected: ${JSON.stringify(r)}`);
+    } else console.log('  (no PoE2 install here — skipped)');
+    if (REAL_POE1 && existsSync(REAL_POE1)) {
+      const r = inspectPoBInstall(REAL_POE1);
+      assert.ok(r.ok, `PoE1 dir rejected: ${JSON.stringify(r)}`);
+      assert.match(r.ok ? r.info.version ?? '' : '', /^\d+\.\d+\.\d+/);
+    } else console.log('  (no PoE1 install here — skipped)');
+  });
+
+  // ---------------------------------------------------------------- env-value edge cases
+  await test('normalizeUserPath: quotes, trailing separators, ~, %VAR% and $VAR', () => {
+    const base = path.resolve(tmp('pob-norm-'));
+    const env = { ...process.env, POBTESTVAR: base, HOME: base, USERPROFILE: base };
+    assert.equal(normalizeUserPath(`"${base}${path.sep}"`, env), base);
+    assert.equal(normalizeUserPath(`'${base}${path.sep}${path.sep}'`, env), base);
+    assert.equal(normalizeUserPath(`  ${base}  `, env), base);
+    assert.equal(normalizeUserPath('%POBTESTVAR%/sub', env), path.join(base, 'sub'));
+    assert.equal(normalizeUserPath('$POBTESTVAR/sub', env), path.join(base, 'sub'));
+    assert.equal(normalizeUserPath('${POBTESTVAR}/sub', env), path.join(base, 'sub'));
+    assert.equal(normalizeUserPath('~/sub', env), path.join(base, 'sub'));
+    assert.equal(normalizeUserPath('~', env), base);
+    assert.equal(normalizeUserPath('""', env), null);
+    const root = path.parse(base).root;
+    assert.equal(normalizeUserPath(root, env), root);
+  });
+
+  await test('expandEnv:false keeps env references literal (tool arguments)', () => {
+    const env = { ...process.env, POBTESTSECRET: 'hidden-value-123' };
+    for (const raw of ['%POBTESTSECRET%', '$POBTESTSECRET', '${POBTESTSECRET}']) {
+      const out = normalizeUserPath(raw, env, { expandEnv: false })!;
+      assert.ok(out.endsWith(raw), `${raw} → ${out}`);
+      assert.ok(!out.includes('hidden-value-123'));
+    }
     try {
-      await withEnv({ POB_PATH: empty }, () => {
-        assert.throws(() => resolvePoBPath(), PoBInstallNotFoundError);
+      validatePoBPath('%POBTESTSECRET%', 'pobPath', env, { expandEnv: false });
+      assert.fail('did not throw');
+    } catch (e) {
+      assert.ok(e instanceof PoBInstallNotFoundError);
+      assert.ok(e.message.includes('%POBTESTSECRET%') && !e.message.includes('hidden-value-123'), e.message);
+    }
+  });
+
+  await test('validateLuajitArgument: luajit-named existing file only', () => {
+    const dir = tmp('lj-arg-');
+    const okNames = IS_WIN
+      ? ['luajit.exe', 'LuaJIT.EXE', 'luajit-2.1.0-beta3.exe']
+      : ['luajit', 'luajit-2.1.0-beta3', 'luajit2.1'];
+    for (const name of okNames) {
+      const f = path.join(dir, name);
+      writeFileSync(f, '');
+      assert.equal(validateLuajitArgument(f), f, name);
+      assert.equal(validateLuajitArgument(`"${f}"`), f, `quoted ${name}`);
+    }
+    const bad = (raw: string, re: RegExp) =>
+      assert.throws(() => validateLuajitArgument(raw), (e: unknown) => e instanceof LuaJITNotFoundError && re.test(e.message));
+    const badNames = ['calc.exe', 'node.exe', 'sh', 'myluajit.exe', 'luajit.exe.bat', 'luajit.cmd', 'luajit.ps1', 'luajit.sh'];
+    if (IS_WIN) badNames.push('luajit', 'luajit2.1');
+    for (const name of badNames) {
+      const f = path.join(dir, name);
+      writeFileSync(f, '');
+      bad(f, /must start with "luajit"/);
+    }
+    bad(dir, /not a file/);
+    bad(path.join(dir, 'luajit-nope.exe'), /does not exist/);
+    const env = { ...process.env, LJDIR: dir };
+    assert.throws(() => validateLuajitArgument('%LJDIR%/luajit.exe', env), LuaJITNotFoundError, 'no env expansion');
+  });
+
+  await test('quoted POB_PATH with trailing separator resolves', async () => {
+    const fake = makeFakePoB();
+    await withEnv({ POB_PATH: `"${fake}${path.sep}"` }, () => {
+      assert.equal(resolvePoBPath(), path.resolve(fake));
+    });
+  });
+
+  // ---------------------------------------------------------------- resolution order / probes
+  await test('saved config path used when POB_PATH is unset', () => {
+    const fake = makeFakePoB();
+    const r = resolvePoB({ env: {}, savedPoBPath: fake, pobCandidates: [] });
+    assert.equal(r.source, 'config');
+    assert.equal(r.info.dir, path.resolve(fake));
+  });
+
+  await test('POB_PATH wins over saved config', () => {
+    const a = makeFakePoB({ version: '1.0.0' });
+    const b = makeFakePoB({ version: '2.0.0' });
+    const r = resolvePoB({ env: { POB_PATH: a }, savedPoBPath: b, pobCandidates: [] });
+    assert.equal(r.info.version, '1.0.0');
+    assert.equal(r.source, 'env');
+  });
+
+  await test('stale saved path falls through to auto-detect probes', () => {
+    const fake = makeFakePoB();
+    const r = resolvePoB({
+      env: {},
+      savedPoBPath: path.join(os.tmpdir(), 'definitely-not-here-pob'),
+      pobCandidates: [{ label: fake, resolve: () => fake }],
+    });
+    assert.equal(r.source, 'auto-detect');
+  });
+
+  await test('not-found error lists every probe (saved, fixed, registry-style)', () => {
+    const missing = path.join(os.tmpdir(), 'nope-pob-probe');
+    try {
+      resolvePoB({
+        env: {},
+        savedPoBPath: path.join(os.tmpdir(), 'nope-saved'),
+        pobCandidates: [
+          { label: missing, resolve: () => missing },
+          { label: 'registry HKCU\\Fake InstallLocation', resolve: () => null },
+        ],
       });
-      log('Invalid POB_PATH throws PoBInstallNotFoundError', true);
+      assert.fail('did not throw');
     } catch (e) {
-      log('Invalid POB_PATH throws PoBInstallNotFoundError', false, String(e));
-    } finally {
-      rmSync(empty, { recursive: true, force: true });
+      assert.ok(e instanceof PoBInstallNotFoundError, String(e));
+      for (const needle of ['nope-saved', missing, 'registry HKCU\\Fake InstallLocation', 'configure_pob_path', 'POB_PATH', 'Path of Building Community']) {
+        assert.ok(e.message.includes(needle), `message missing "${needle}":\n${e.message}`);
+      }
     }
-  }
+  });
 
-  // Test: LUAJIT_PATH override accepted when file exists
-  {
-    const dir = mkdtempSync(path.join(os.tmpdir(), 'lj-'));
-    const fake = path.join(dir, 'fake-luajit');
-    writeFileSync(fake, '#!/bin/sh\n');
+  await test('probe tables cover the documented locations', () => {
+    const lin = pobProbeCandidates('linux', { HOME: '/h' }).map((c) => c.label);
+    assert.ok(lin.includes(path.join('/h', '.local', 'share', 'Path of Building Community')), lin.join('|'));
+    assert.ok(lin.some((l) => l.includes('community.pathofbuilding.PathOfBuilding')), lin.join('|'));
+    assert.ok(lin.includes('/opt/path-of-building'));
+    const mac = pobProbeCandidates('darwin', { HOME: '/h' }).map((c) => c.label);
+    assert.ok(mac[0].includes(path.join('Library', 'Application Support', 'Path of Building Community')));
+    const winEnv = { APPDATA: 'C:\\A', ProgramData: 'C:\\PD', LOCALAPPDATA: 'C:\\L', USERPROFILE: 'C:\\U' };
+    const win = pobProbeCandidates('win32', winEnv).map((c) => c.label);
+    assert.ok(win[0].endsWith('Path of Building Community'));
+    assert.ok(win.some((l) => l.startsWith('registry HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Path of Building Community')));
+    assert.ok(win.some((l) => l.startsWith('registry HKLM\\')));
+    assert.ok(win.some((l) => l.endsWith('Path of Building') && l.includes('PD')));
+    assert.ok(win.some((l) => l.includes(path.join('Programs', 'Path of Building Community'))));
+    const lj = luajitProbeCandidates('C:\\pob', 'win32', winEnv).map((c) => c.label);
+    assert.ok(lj.some((l) => l.includes(path.join('Programs', 'LuaJIT', 'bin', 'luajit.exe'))), lj.join('|'));
+    assert.ok(lj.some((l) => l.includes(path.join('scoop', 'shims', 'luajit.exe'))), lj.join('|'));
+    assert.ok(lj.some((l) => l.includes('PATH')));
+  });
+
+  await test('Windows registry probe finds the installer location (if installed)', () => {
+    if (!IS_WIN) return console.log('  (not Windows — skipped)');
+    const reg = pobProbeCandidates('win32', process.env).find((c) => c.label.startsWith('registry HKCU'));
+    const found = reg?.resolve() ?? null;
+    if (!found) return console.log('  (no HKCU uninstall key — skipped)');
+    assert.ok(inspectPoBInstall(found).ok, `registry location not a valid install: ${found}`);
+  });
+
+  // ---------------------------------------------------------------- LuaJIT
+  await test('LUAJIT_PATH file, folder, folder/bin, quoted forms accepted', async () => {
+    const dir = tmp('lj-');
+    const exe = path.join(dir, EXE);
+    writeFileSync(exe, '');
+    const binDir = tmp('lj-bin-');
+    write(path.join(binDir, 'bin', EXE), '');
+    for (const [value, expected] of [
+      [exe, exe],
+      [dir, exe],
+      [`"${dir}${path.sep}"`, exe],
+      [binDir, path.join(binDir, 'bin', EXE)],
+    ] as const) {
+      const r = resolveLuaJIT('/nowhere', { env: { LUAJIT_PATH: value } });
+      assert.equal(r.luajitPath, path.resolve(expected), `LUAJIT_PATH=${value}`);
+      assert.equal(r.source, 'env');
+    }
+  });
+
+  await test('nonexistent LUAJIT_PATH throws LuaJITNotFoundError', async () => {
+    await withEnv({ LUAJIT_PATH: '/nonexistent/luajit-xyz' }, () => {
+      assert.throws(() => resolveLuaJITPath('/tmp'), LuaJITNotFoundError);
+    });
+  });
+
+  await test('LuaJIT not-found error lists probes and says the installer has no luajit.exe', () => {
     try {
-      await withEnv({ LUAJIT_PATH: fake }, () => {
-        const resolved = resolveLuaJITPath(dir);
-        assert.equal(resolved, fake);
+      resolveLuaJIT('/nowhere', {
+        env: {},
+        savedLuaJITPath: '/saved/luajit',
+        luajitCandidates: [{ label: '/probe/luajit', resolve: () => '/probe/luajit' }],
       });
-      log('LUAJIT_PATH override accepted when file exists', true);
+      assert.fail('did not throw');
     } catch (e) {
-      log('LUAJIT_PATH override accepted when file exists', false, String(e));
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
+      assert.ok(e instanceof LuaJITNotFoundError);
+      for (const needle of ['/saved/luajit', '/probe/luajit', 'does NOT include luajit.exe', 'configure_pob_path']) {
+        assert.ok(e.message.includes(needle), `missing "${needle}"`);
+      }
     }
-  }
+  });
 
-  // Test: LUAJIT_PATH throws when file does not exist
-  {
-    try {
-      await withEnv({ LUAJIT_PATH: '/nonexistent/luajit-xyz' }, () => {
-        assert.throws(() => resolveLuaJITPath('/tmp'), LuaJITNotFoundError);
-      });
-      log('Nonexistent LUAJIT_PATH throws LuaJITNotFoundError', true);
-    } catch (e) {
-      log('Nonexistent LUAJIT_PATH throws LuaJITNotFoundError', false, String(e));
-    }
-  }
+  await test('saved LuaJIT path used before probes', () => {
+    const dir = tmp('lj-saved-');
+    writeFileSync(path.join(dir, EXE), '');
+    const r = resolveLuaJIT('/nowhere', { env: {}, savedLuaJITPath: dir, luajitCandidates: [] });
+    assert.equal(r.source, 'config');
+  });
 
-  // Test: error message lists probed paths and platform install hints
-  {
-    try {
-      await withEnv(
-        { POB_PATH: undefined, APPDATA: '/nope/does/not/exist', HOME: '/nope/does/not/exist' },
-        () => {
-          try {
-            resolvePoBPath();
-            log('PoBInstallNotFoundError message contains POB_PATH hint', false, 'did not throw');
-          } catch (e) {
-            const msg = (e as Error).message;
-            const ok = msg.includes('POB_PATH') && msg.includes('Path of Building Community');
-            log('PoBInstallNotFoundError message contains POB_PATH hint', ok, ok ? '' : msg);
-          }
-        },
-      );
-    } catch (e) {
-      log('PoBInstallNotFoundError message contains POB_PATH hint', false, String(e));
-    }
-  }
-
-  // Test: resolvePaths() returns a bridgeLua that exists on disk
-  {
-    const fake = makeFakePoBInstall();
-    const dir = mkdtempSync(path.join(os.tmpdir(), 'lj-'));
+  // ---------------------------------------------------------------- combined
+  await test('resolvePaths() bridgeLua resolves to an existing file', async () => {
+    const fake = makeFakePoB();
+    const dir = tmp('lj-');
     const fakeLua = path.join(dir, 'fake-luajit');
     writeFileSync(fakeLua, '#!/bin/sh\n');
-    try {
-      const { resolvePaths } = await import('../src/paths.js');
-      await withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, () => {
-        const result = resolvePaths();
-        assert.equal(result.pobPath, path.resolve(fake));
-        assert.equal(result.luajitPath, fakeLua);
-        assert.ok(existsSync(result.bridgeLua), `bridgeLua should exist: ${result.bridgeLua}`);
-        assert.ok(
-          result.bridgeLua.endsWith(path.join('lua', 'bridge.lua')),
-          `bridgeLua should end with lua/bridge.lua, got ${result.bridgeLua}`,
-        );
-      });
-      log('resolvePaths() bridgeLua resolves to an existing file', true);
-    } catch (e) {
-      log('resolvePaths() bridgeLua resolves to an existing file', false, String(e));
-    } finally {
-      rmSync(fake, { recursive: true, force: true });
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }
+    await withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, () => {
+      const result = resolvePaths();
+      assert.equal(result.pobPath, path.resolve(fake));
+      assert.equal(result.luajitPath, path.resolve(fakeLua));
+      assert.ok(existsSync(result.bridgeLua), `bridgeLua should exist: ${result.bridgeLua}`);
+      assert.ok(result.bridgeLua.endsWith(path.join('lua', 'bridge.lua')));
+    });
+  });
 
-  // Test: setupTestEnv() returns paths and fixturePath
-  {
-    try {
-      const fake = makeFakePoBInstall();
-      const dir = mkdtempSync(path.join(os.tmpdir(), 'lj-'));
-      const fakeLua = path.join(dir, process.platform === 'win32' ? 'luajit.exe' : 'luajit');
-      writeFileSync(fakeLua, '#!/bin/sh\n');
-      try {
-        await withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, async () => {
-          const { setupTestEnv } = await import('./_skip.js');
-          const env = setupTestEnv();
-          assert.equal(env.paths.pobPath, path.resolve(fake));
-          assert.ok(env.fixturePath.endsWith(path.join('fixtures', 'OccVortex.xml')));
-        });
-        log('setupTestEnv returns paths and fixturePath', true);
-      } finally {
-        rmSync(fake, { recursive: true, force: true });
-        rmSync(dir, { recursive: true, force: true });
-      }
-    } catch (e) {
-      log('setupTestEnv returns paths and fixturePath', false, String(e));
+  await test('setupTestEnv returns paths and fixturePath', async () => {
+    const fake = makeFakePoB();
+    const dir = tmp('lj-');
+    const fakeLua = path.join(dir, EXE);
+    writeFileSync(fakeLua, '');
+    await withEnv({ POB_PATH: fake, LUAJIT_PATH: fakeLua }, async () => {
+      const { setupTestEnv } = await import('./_skip.js');
+      const env = setupTestEnv();
+      assert.equal(env.paths.pobPath, path.resolve(fake));
+      assert.ok(env.fixturePath.endsWith(path.join('fixtures', 'OccVortex.xml')));
+    });
+  });
+
+  // ---------------------------------------------------------------- config store
+  await test('config dir: override env, per-platform default, save/load round-trip, corrupt file', () => {
+    const d = tmp('cfg-');
+    assert.equal(configDir({ POB_MCP_CONFIG_DIR: d }), path.resolve(d));
+    if (IS_WIN) assert.equal(configDir({ APPDATA: 'C:\\A' }), path.join('C:\\A', 'pob-mcp-server'));
+    else if (process.platform === 'linux') {
+      assert.equal(configDir({ XDG_CONFIG_HOME: '/x', HOME: '/h' }), path.join('/x', 'pob-mcp-server'));
+      assert.equal(configDir({ HOME: '/h' }), path.join('/h', '.config', 'pob-mcp-server'));
     }
-  }
+    const env = { POB_MCP_CONFIG_DIR: path.join(d, 'nested') };
+    assert.deepEqual(loadConfig(env), {});
+    const file = saveConfig({ pobPath: '/p', luajitPath: '/l', pobVersion: '1.2.3' }, env);
+    assert.equal(file, configFilePath(env));
+    assert.deepEqual(loadConfig(env), { pobPath: '/p', luajitPath: '/l', pobVersion: '1.2.3' });
+    writeFileSync(file, '{not json');
+    assert.deepEqual(loadConfig(env), {});
+  });
+
+  // ---------------------------------------------------------------- round 2: ledger keys / network paths
+  await test('CrashLedger: case and trailing-separator variants share one count', () => {
+    const pob = makeFakePoB({ version: '7.0.0' });
+    const ljDir = tmp('lj-ledger-');
+    const lj = path.join(ljDir, EXE);
+    writeFileSync(lj, '');
+    const ledger = new CrashLedger();
+    ledger.record(pob, lj, 3, fingerprintInstall(pob));
+    const variants: Array<[string, string]> = [
+      [pob + path.sep, lj],
+      [pob + path.sep + path.sep, lj],
+      [path.join(pob, '.', 'Modules', '..'), lj],
+    ];
+    if (IS_WIN) {
+      variants.push([pob.toUpperCase(), lj.toLowerCase()], [pob.toLowerCase() + path.sep, lj.toUpperCase()]);
+    }
+    for (const [p, l] of variants) assert.equal(ledger.initialCount(p, l), 3, `variant ${p} | ${l}`);
+    // Unresolvable paths still canonicalise via path.resolve (+ lower-case on Windows).
+    const ghost = path.join(os.tmpdir(), 'no-such-ledger-dir');
+    ledger.record(ghost, lj, 2, fingerprintInstall(ghost));
+    assert.equal(ledger.initialCount(ghost + path.sep, lj), 2);
+    if (IS_WIN) assert.equal(ledger.initialCount(ghost.toUpperCase(), lj), 2);
+    // Fingerprint recorded at engine start: an install change since then → fresh count.
+    write(path.join(pob, 'manifest.xml'), '<PoBVersion><Version number="7.0.1"/></PoBVersion>');
+    assert.equal(ledger.initialCount(pob, lj), 0);
+  });
+
+  await test('isNetworkOrDevicePath: UNC, //, device prefixes (quoted too); local paths are not', () => {
+    const R = String.raw;
+    for (const p of [R`\\host\share\pob`, '//host/share/pob', R`\\?\C:\pob`, R`\\.\pipe\x`, R`"\\host\s"`, "  '//h/s'", R`/\host\s`]) {
+      assert.equal(isNetworkOrDevicePath(p), true, p);
+    }
+    for (const p of [R`C:\pob`, '/opt/pob', '~/pob', R`relative\pob`, R`"C:\pob"`, R`\pob`]) {
+      assert.equal(isNetworkOrDevicePath(p), false, p);
+    }
+  });
+
+  await test('network/device tool arguments are rejected before any filesystem access', () => {
+    const require = createRequire(import.meta.url);
+    const fsMod = require('node:fs') as Record<string, unknown>;
+    const names = ['statSync', 'lstatSync', 'existsSync', 'openSync', 'realpathSync', 'accessSync', 'readdirSync', 'readFileSync'];
+    const originals = new Map<string, unknown>();
+    const touched: string[] = [];
+    for (const n of names) {
+      const orig = fsMod[n] as (...a: unknown[]) => unknown;
+      originals.set(n, orig);
+      const spy = function (this: unknown, ...a: unknown[]) {
+        if (typeof a[0] === 'string' && /fs-spy-host/i.test(a[0])) touched.push(`${n}(${a[0]})`);
+        return orig.apply(this, a);
+      };
+      if (n === 'realpathSync') Object.assign(spy, { native: (orig as unknown as { native: unknown }).native });
+      fsMod[n] = spy;
+    }
+    syncBuiltinESMExports();
+    try {
+      // Control: a LOCAL path containing the marker is stat'ed → the spy sees ESM imports.
+      const local = path.join(os.tmpdir(), 'fs-spy-host-local', EXE);
+      assert.throws(() => validateLuajitArgument(local), LuaJITNotFoundError);
+      assert.ok(touched.length > 0, 'spy did not observe the control stat — test would be vacuous');
+      touched.length = 0;
+      const env = { ...process.env };
+      const R = String.raw;
+      for (const raw of [
+        R`\\fs-spy-host\share\luajit.exe`,
+        '//fs-spy-host/share/luajit.exe',
+        R`\\?\UNC\fs-spy-host\s\luajit.exe`,
+        R`\\.\fs-spy-host\luajit.exe`,
+        R`"\\fs-spy-host\s\luajit.exe"`,
+      ]) {
+        assert.throws(
+          () => validateLuajitArgument(raw, env),
+          (e: unknown) => e instanceof LuaJITNotFoundError && /network and device paths/.test(e.message) && /LUAJIT_PATH/.test(e.message),
+          raw,
+        );
+        assert.throws(
+          () => validatePoBPath(raw.replace('luajit.exe', 'pob'), 'pobPath', env, { expandEnv: false, rejectNetwork: true }),
+          (e: unknown) => e instanceof PoBInstallNotFoundError && /network and device paths/.test(e.message) && /POB_PATH/.test(e.message),
+          raw,
+        );
+      }
+      assert.deepEqual(touched, [], `filesystem touched for a network path: ${touched.join(', ')}`);
+    } finally {
+      for (const [n, f] of originals) fsMod[n] = f;
+      syncBuiltinESMExports();
+    }
+  });
+
+  // ---------------------------------------------------------------- update state / fingerprint
+  await test('update state: none / staged (opFile.txt) / applying (Update/manifest.xml only)', () => {
+    const fake = makeFakePoB();
+    assert.equal(detectUpdateState(fake), 'none');
+    write(path.join(fake, 'Update', 'manifest.xml'), '<PoBVersion/>');
+    write(path.join(fake, 'Update', 'opFile.txt'), 'move "a" "b"');
+    assert.equal(detectUpdateState(fake), 'staged');
+    rmSync(path.join(fake, 'Update', 'opFile.txt'));
+    assert.equal(detectUpdateState(fake), 'applying');
+    rmSync(path.join(fake, 'Update', 'manifest.xml'));
+    write(path.join(fake, 'Update', 'opFileRuntime.txt'), 'start "x"');
+    assert.equal(detectUpdateState(fake), 'applying');
+  });
+
+  await test('fingerprint changes when manifest.xml version changes', () => {
+    const fake = makeFakePoB({ version: '1.0.0' });
+    const a = fingerprintInstall(fake);
+    assert.equal(a.version, '1.0.0');
+    assert.equal(installChanged(a, fingerprintInstall(fake)), false);
+    write(path.join(fake, 'manifest.xml'), '<PoBVersion><Version number="1.0.1"/></PoBVersion>');
+    const b = fingerprintInstall(fake);
+    assert.equal(b.version, '1.0.1');
+    assert.equal(installChanged(a, b), true);
+  });
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .catch((e) => {
+    console.error(e);
+    failures++;
+  })
+  .finally(() => {
+    for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+    if (failures > 0) {
+      console.log(`${failures} test(s) FAILED`);
+      process.exit(1);
+    }
+    console.log('ALL PATHS TESTS PASSED');
+  });
