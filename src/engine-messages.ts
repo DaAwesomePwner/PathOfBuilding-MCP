@@ -67,3 +67,17 @@ export function envOverride(pobEnv: string): string {
     `config on the next server start — remove it from your MCP client config to use the saved path.`
   );
 }
+
+export function exportFailedNote(error: string): string {
+  return (
+    `The current build was NOT carried over: exporting it from the old engine failed (${error}). ` +
+    `The engine was restarted anyway; load the build again with load_build.`
+  );
+}
+
+export function carryLoadFailedNote(error: string): string {
+  return (
+    `The build was exported but could not be loaded into the new engine (${error}). Its PoB import ` +
+    `code is in buildCode: pass it to load_build to retry, or import it into Path of Building.`
+  );
+}

@@ -51,6 +51,8 @@ claude mcp add --env POB_PATH="C:\Users\you\AppData\Roaming\Path of Building Com
 
 `POB_PATH` and `LUAJIT_PATH` are optional. If the server cannot find PoB or LuaJIT it **still starts**: every engine tool returns an error telling the assistant to ask you for your PoB folder and call `configure_pob_path`. Clients that support MCP elicitation show you a prompt for the folder directly. The chosen path is saved and reused on the next start.
 
+> **`configure_pob_path({ pobPath, luajitPath? })` — the `luajitPath` you give is executed by the server.** As a tool argument it must be the full path of an existing file named like `luajit` (`luajit.exe` on Windows; scripts such as `.bat`/`.cmd`/`.sh` are refused). Tool arguments are taken literally: `~` is expanded but environment variables (`%VAR%`, `$VAR`) are not. `POB_PATH` / `LUAJIT_PATH` env values keep their more lenient handling (env-var expansion, `LUAJIT_PATH` may be a folder).
+
 ## Configuration
 
 Paths are resolved in this order: **environment variable → saved config → auto-detect**.
@@ -79,7 +81,7 @@ Errors list every location that was probed.
 
 ### PoB updates (new leagues)
 
-PoB updates itself in place. The server reads the PoB version from `manifest.xml` when the engine starts (logged to stderr, reported by `get_engine_info`). If PoB is updated on disk while the server is running, engine tools return an error saying *"Path of Building was updated on disk from X to Y"* rather than quietly keep using the old engine. Call `reload_engine` to restart against the new version: the loaded build is carried over, and undo history is cleared. While PoB is applying an update, engine tools report "not ready" until it finishes.
+PoB updates itself in place. The server reads the PoB version from `manifest.xml` when the engine starts (logged to stderr, reported by `get_engine_info`). If PoB is updated on disk while the server is running, engine tools return an error saying *"Path of Building was updated on disk from X to Y"* rather than quietly keep using the old engine. Call `reload_engine` to restart against the new version: it waits for running tool calls to finish, the loaded build is carried over, and undo history is cleared. If the build can't be exported from the old engine, or can't be loaded by the new PoB, the result says so (in the second case it includes the build as a PoB import code). While PoB is applying an update, engine tools report "not ready" until it finishes.
 
 ## Tools
 
@@ -101,7 +103,7 @@ See [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md). Common issues:
 - **"Path of Building is not configured"**: give the assistant your PoB folder (it calls `configure_pob_path`), or set `POB_PATH`.
 - **LuaJIT not found**: install LuaJIT separately (the Windows PoB installer has no `luajit.exe`), then pass `luajitPath` to `configure_pob_path` or set `LUAJIT_PATH`.
 - **"Path of Building was updated on disk"**: call `reload_engine`.
-- **Bridge timeout / crash**: see the troubleshooting doc. The server includes a three-strike circuit breaker that requires a process restart (or a different path via `configure_pob_path`) on repeated crashes.
+- **Bridge timeout / crash**: see the troubleshooting doc. The server includes a three-strike circuit breaker per PoB/LuaJIT path pair; it survives `reload_engine` and failed `configure_pob_path` attempts and clears only on a server restart, a different path pair, or PoB changing on disk.
 
 ## Development
 

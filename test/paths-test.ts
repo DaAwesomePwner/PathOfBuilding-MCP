@@ -14,6 +14,8 @@ import {
   resolvePaths,
   resolvePoB,
   resolvePoBPath,
+  validateLuajitArgument,
+  validatePoBPath,
 } from '../src/paths.js';
 import { detectUpdateState, fingerprintInstall, inspectPoBInstall, installChanged } from '../src/pob-install.js';
 
@@ -163,6 +165,48 @@ async function main(): Promise<void> {
     assert.equal(normalizeUserPath(root, env), root);
   });
 
+  await test('expandEnv:false keeps env references literal (tool arguments)', () => {
+    const env = { ...process.env, POBTESTSECRET: 'hidden-value-123' };
+    for (const raw of ['%POBTESTSECRET%', '$POBTESTSECRET', '${POBTESTSECRET}']) {
+      const out = normalizeUserPath(raw, env, { expandEnv: false })!;
+      assert.ok(out.endsWith(raw), `${raw} → ${out}`);
+      assert.ok(!out.includes('hidden-value-123'));
+    }
+    try {
+      validatePoBPath('%POBTESTSECRET%', 'pobPath', env, { expandEnv: false });
+      assert.fail('did not throw');
+    } catch (e) {
+      assert.ok(e instanceof PoBInstallNotFoundError);
+      assert.ok(e.message.includes('%POBTESTSECRET%') && !e.message.includes('hidden-value-123'), e.message);
+    }
+  });
+
+  await test('validateLuajitArgument: luajit-named existing file only', () => {
+    const dir = tmp('lj-arg-');
+    const okNames = IS_WIN
+      ? ['luajit.exe', 'LuaJIT.EXE', 'luajit-2.1.0-beta3.exe']
+      : ['luajit', 'luajit-2.1.0-beta3', 'luajit2.1'];
+    for (const name of okNames) {
+      const f = path.join(dir, name);
+      writeFileSync(f, '');
+      assert.equal(validateLuajitArgument(f), f, name);
+      assert.equal(validateLuajitArgument(`"${f}"`), f, `quoted ${name}`);
+    }
+    const bad = (raw: string, re: RegExp) =>
+      assert.throws(() => validateLuajitArgument(raw), (e: unknown) => e instanceof LuaJITNotFoundError && re.test(e.message));
+    const badNames = ['calc.exe', 'node.exe', 'sh', 'myluajit.exe', 'luajit.exe.bat', 'luajit.cmd', 'luajit.ps1', 'luajit.sh'];
+    if (IS_WIN) badNames.push('luajit', 'luajit2.1');
+    for (const name of badNames) {
+      const f = path.join(dir, name);
+      writeFileSync(f, '');
+      bad(f, /must start with "luajit"/);
+    }
+    bad(dir, /not a file/);
+    bad(path.join(dir, 'luajit-nope.exe'), /does not exist/);
+    const env = { ...process.env, LJDIR: dir };
+    assert.throws(() => validateLuajitArgument('%LJDIR%/luajit.exe', env), LuaJITNotFoundError, 'no env expansion');
+  });
+
   await test('quoted POB_PATH with trailing separator resolves', async () => {
     const fake = makeFakePoB();
     await withEnv({ POB_PATH: `"${fake}${path.sep}"` }, () => {
@@ -210,7 +254,7 @@ async function main(): Promise<void> {
       assert.fail('did not throw');
     } catch (e) {
       assert.ok(e instanceof PoBInstallNotFoundError, String(e));
-      for (const needle of ['nope-saved', missing, 'registry HKCU\\Fake InstallLocation', 'configure_pob_path', 'Path of Building Community']) {
+      for (const needle of ['nope-saved', missing, 'registry HKCU\\Fake InstallLocation', 'configure_pob_path', 'POB_PATH', 'Path of Building Community']) {
         assert.ok(e.message.includes(needle), `message missing "${needle}":\n${e.message}`);
       }
     }

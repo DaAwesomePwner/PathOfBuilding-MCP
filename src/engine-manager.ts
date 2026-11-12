@@ -1,11 +1,12 @@
 import { BuildSession } from './build-session.js';
 import { configFilePath, loadConfig, saveConfig } from './config-store.js';
+import { CrashLedger } from './crash-ledger.js';
+import { EngineGate } from './engine-gate.js';
 import * as msg from './engine-messages.js';
-import { BuildInfo, LuaBridge } from './lua-bridge.js';
+import { BuildInfo, encodeBuildCode, LuaBridge } from './lua-bridge.js';
 import {
   bridgeLuaPath,
   FullyResolvedPaths,
-  luajitAt,
   LuaJITNotFoundError,
   PathSource,
   PoBInstallNotFoundError,
@@ -13,6 +14,7 @@ import {
   resolvePoB,
   ResolveOptions,
   ResolvedPaths,
+  validateLuajitArgument,
   validatePoBPath,
 } from './paths.js';
 import {
@@ -35,51 +37,67 @@ export class EngineNotReadyError extends UserError {
 
 export type EngineStatus = 'unconfigured' | 'stopped' | 'starting' | 'ready' | 'failed' | 'stale' | 'updating';
 
-/** Asks the user for a path (MCP elicitation). Resolves to an error message, or null on success. */
+/** Asks the user for a path (MCP elicitation). */
 export type PathPrompt = () => Promise<{ configured: boolean; message?: string }>;
+
+export type BridgeFactory = (paths: ResolvedPaths, opts: { initialCrashCount: number }) => LuaBridge;
 
 export interface EngineManagerOptions {
   env?: NodeJS.ProcessEnv;
-  bridgeFactory?: (paths: ResolvedPaths) => LuaBridge;
+  bridgeFactory?: BridgeFactory;
   log?: (line: string) => void;
   /** Extra resolve options (tests inject probe tables). */
   resolveOptions?: Partial<ResolveOptions>;
 }
 
-export interface ReloadResult {
+/** What happened to the loaded build across an engine swap. */
+export interface CarryResult {
+  buildReloaded: boolean;
+  build: BuildInfo | null;
+  buildNote?: string;
+  buildExportError?: string;
+  buildError?: string;
+  /** PoB import code of a build that could not be loaded into the new engine (pass to load_build). */
+  buildCode?: string;
+}
+
+export interface ReloadResult extends CarryResult {
   oldVersion: string | null;
   newVersion: string | null;
   pobPath: string;
   luajitPath: string;
-  buildReloaded: boolean;
-  build: BuildInfo | null;
-  buildError?: string;
 }
 
 export class EngineManager {
   private readonly env: NodeJS.ProcessEnv;
-  private readonly bridgeFactory: (paths: ResolvedPaths) => LuaBridge;
+  private readonly bridgeFactory: BridgeFactory;
   private readonly log: (line: string) => void;
   private readonly resolveOptions: Partial<ResolveOptions>;
+  private readonly gate = new EngineGate();
+  private readonly ledger = new CrashLedger();
+  private readonly retiring = new Set<LuaBridge>();
 
   private paths: FullyResolvedPaths | null = null;
   private resolveError: string | null = null;
   private bridge: LuaBridge | null = null;
+  private bridgePaths: ResolvedPaths | null = null;
   private session: BuildSession | null = null;
   private booting: Promise<void> | null = null;
   private bootError: string | null = null;
   private startFingerprint: InstallFingerprint | null = null;
   private startedAt: string | null = null;
   private carryXML: string | null = null;
-  private lastCarry: { info: BuildInfo | null; error?: string } | null = null;
-  private transition: Promise<unknown> | null = null;
+  private lastExport: { xml: string | null; error?: string } | null = null;
+  private lastCarry: { info: BuildInfo | null; error?: string; xml?: string } | null = null;
   private pathPrompt: PathPrompt | null = null;
   private prompted = false;
+  private promptMessage: string | undefined;
   private initDone = false;
+  private shuttingDown = false;
 
   constructor(opts: EngineManagerOptions = {}) {
     this.env = opts.env ?? process.env;
-    this.bridgeFactory = opts.bridgeFactory ?? ((p) => new LuaBridge(p, 60_000));
+    this.bridgeFactory = opts.bridgeFactory ?? ((p, o) => new LuaBridge(p, 60_000, o));
     this.log = opts.log ?? ((line) => process.stderr.write(`pob-mcp-server: ${line}\n`));
     this.resolveOptions = opts.resolveOptions ?? {};
   }
@@ -92,7 +110,7 @@ export class EngineManager {
   init(): void {
     if (this.initDone) return;
     this.initDone = true;
-    if (this.paths || this.transition) return; // configure_pob_path already ran
+    if (this.paths || this.gate.busy) return; // configure_pob_path already ran
     const saved = loadConfig(this.env);
     const opts: ResolveOptions = {
       env: this.env,
@@ -105,7 +123,10 @@ export class EngineManager {
       const pob = resolvePoB(opts);
       pobNote = `Found Path of Building ${pob.info.version ?? '(unknown version)'} at ${pob.info.dir}, but LuaJIT is missing.\n`;
       const lj = resolveLuaJIT(pob.info.dir, opts);
-      this.setPaths(pob.info.dir, lj.luajitPath, pob.source, lj.source);
+      this.paths = {
+        pobPath: pob.info.dir, luajitPath: lj.luajitPath, bridgeLua: bridgeLuaPath(),
+        pobSource: pob.source, luajitSource: lj.source, pobInfo: pob.info,
+      };
       this.log(`using PoB at ${pob.info.dir} (${pob.source}), LuaJIT ${lj.luajitPath} (${lj.source})`);
       void this.boot().catch(() => undefined); // failure recorded in bootError
     } catch (e) {
@@ -117,23 +138,22 @@ export class EngineManager {
     }
   }
 
-  private setPaths(pobPath: string, luajitPath: string, pobSource: PathSource, luajitSource: PathSource): void {
-    const r = inspectPoBInstall(pobPath);
-    if (!r.ok) throw new PoBInstallNotFoundError(r.message);
-    this.paths = { pobPath, luajitPath, bridgeLua: bridgeLuaPath(), pobSource, luajitSource, pobInfo: r.info };
-    this.resolveError = null;
-  }
+  // ------------------------------------------------------------------ boot / stop
 
   private boot(): Promise<void> {
     if (this.booting) return this.booting;
     const paths = this.paths;
     if (!paths) return Promise.reject(new EngineNotReadyError(msg.unconfigured(this.resolveError)));
+    if (this.shuttingDown) return Promise.reject(new EngineNotReadyError('The server is shutting down.'));
     const run = (async () => {
       if (detectUpdateState(paths.pobPath) === 'applying') {
         throw new EngineNotReadyError(msg.updating(paths.pobPath));
       }
       if (!this.bridge) {
-        this.bridge = this.bridgeFactory(paths);
+        this.bridge = this.bridgeFactory(paths, {
+          initialCrashCount: this.ledger.initialCount(paths.pobPath, paths.luajitPath),
+        });
+        this.bridgePaths = paths;
         this.session = new BuildSession(this.bridge);
       }
       const fp = fingerprintInstall(paths.pobPath); // before start, so an update mid-boot is caught
@@ -151,7 +171,8 @@ export class EngineManager {
         try {
           this.lastCarry = { info: await this.session.loadBuild(xml) };
         } catch (e) {
-          this.lastCarry = { info: null, error: (e as Error).message };
+          // Keep the build: returned as a PoB import code in the swap result.
+          this.lastCarry = { info: null, error: (e as Error).message, xml };
           this.log(`could not reload the previous build into the new engine: ${(e as Error).message}`);
         }
       }
@@ -169,21 +190,60 @@ export class EngineManager {
     return run;
   }
 
-  /** Gate for every engine-backed tool. Returns the live session or throws EngineNotReadyError. */
-  async ensureReady(): Promise<BuildSession> {
-    this.init(); // no-op after the first call
-    if (this.transition) await this.transition.catch(() => undefined);
-    if (!this.paths) {
-      let extra: string | undefined;
-      if (this.pathPrompt && !this.prompted) {
-        this.prompted = true;
-        const r = await this.pathPrompt().catch((e: unknown) => ({ configured: false, message: String(e) }));
-        if (r.configured && this.paths) return this.ensureReady();
-        extra = r.message;
-      }
-      throw new EngineNotReadyError(msg.unconfigured(this.resolveError, extra));
+  /** Retire the current bridge: crash count goes to the ledger, the process is always killed. */
+  private async stopEngine(): Promise<void> {
+    if (this.booting) await this.booting.catch(() => undefined);
+    const bridge = this.bridge;
+    const bp = this.bridgePaths;
+    this.bridge = null;
+    this.bridgePaths = null;
+    this.session = null;
+    this.startFingerprint = null;
+    this.startedAt = null;
+    if (!bridge) return;
+    if (bp) this.ledger.record(bp.pobPath, bp.luajitPath, bridge.getCrashCount());
+    this.retiring.add(bridge);
+    try {
+      await bridge.dispose();
+    } finally {
+      this.retiring.delete(bridge);
     }
-    const paths: FullyResolvedPaths = this.paths;
+  }
+
+  // ------------------------------------------------------------------ tool-call gate
+
+  /**
+   * Run an engine-backed tool call. Holds a shared gate slot for the whole
+   * call, so engine swaps wait for it and it never sees a half-swapped engine.
+   */
+  async run<T>(fn: (session: BuildSession) => Promise<T>): Promise<T> {
+    this.init(); // no-op after the first call
+    if (!this.paths && !this.gate.busy) await this.promptOnce();
+    const release = await this.gate.enterShared();
+    try {
+      return await fn(await this.readySession());
+    } finally {
+      release();
+    }
+  }
+
+  /** Readiness check without running anything (tests, diagnostics). */
+  async ensureReady(): Promise<BuildSession> {
+    return this.run(async (session) => session);
+  }
+
+  private async promptOnce(): Promise<void> {
+    if (!this.pathPrompt || this.prompted) return;
+    this.prompted = true;
+    const r = await this.pathPrompt().catch((e: unknown) => ({ configured: false, message: String(e) }));
+    if (!r.configured) this.promptMessage = r.message;
+  }
+
+  /** Must be called while holding a shared gate slot. */
+  private async readySession(): Promise<BuildSession> {
+    const paths = this.paths;
+    if (!paths) throw new EngineNotReadyError(msg.unconfigured(this.resolveError, this.promptMessage));
+    if (this.shuttingDown) throw new EngineNotReadyError('The server is shutting down.');
     if (detectUpdateState(paths.pobPath) === 'applying') {
       throw new EngineNotReadyError(msg.updating(paths.pobPath));
     }
@@ -200,102 +260,111 @@ export class EngineManager {
         throw new EngineNotReadyError(msg.bootFailed(paths, (e as Error).message));
       }
     }
-    if (!this.session) throw new EngineNotReadyError(msg.unconfigured(this.resolveError));
+    if (!this.session) throw new EngineNotReadyError(msg.bootFailed(paths, this.bootError ?? 'engine not started'));
     return this.session;
   }
 
-  /** Serialize engine swaps; tool calls wait for an in-progress swap in ensureReady. */
-  private async runTransition<T>(fn: () => Promise<T>): Promise<T> {
-    const prev = this.transition ?? Promise.resolve();
-    const run = prev.catch(() => undefined).then(fn);
-    this.transition = run;
-    try {
-      return await run;
-    } finally {
-      if (this.transition === run) this.transition = null;
-    }
-  }
+  // ------------------------------------------------------------------ swaps
 
   /** Export the loaded build (if any) from the current engine so it survives a restart. */
-  private async exportCurrentBuild(): Promise<string | null> {
-    if (this.carryXML) return this.carryXML;
-    if (!this.session || !this.startFingerprint) return null;
+  private async exportCurrentBuild(): Promise<{ xml: string | null; error?: string }> {
+    if (this.carryXML) return { xml: this.carryXML };
+    if (!this.session || !this.startFingerprint) return { xml: null };
     try {
       await this.session.getBuildInfo(); // throws UserError when no build is loaded
     } catch {
-      return null;
+      return { xml: null };
     }
     try {
-      return await this.session.exportXML();
+      return { xml: await this.session.exportXML() };
     } catch (e) {
-      this.log(`could not export the current build before restart: ${(e as Error).message}`);
-      return null;
+      const error = (e as Error).message;
+      this.log(`could not export the current build before restart: ${error}`);
+      return { xml: null, error };
     }
   }
 
-  private async stopEngine(): Promise<void> {
-    if (this.booting) await this.booting.catch(() => undefined);
-    const bridge = this.bridge;
-    this.bridge = null;
-    this.session = null;
-    this.startFingerprint = null;
-    this.startedAt = null;
-    if (bridge) await bridge.dispose();
-  }
-
-  private async restartWith(next: FullyResolvedPaths | null): Promise<void> {
-    const xml = await this.exportCurrentBuild();
+  /** Must run inside gate.exclusive(). */
+  private async restartWith(next: FullyResolvedPaths): Promise<void> {
+    const exp = await this.exportCurrentBuild();
     await this.stopEngine();
-    if (next) this.paths = next;
-    this.carryXML = xml;
+    this.paths = next;
+    this.carryXML = exp.xml;
+    this.lastExport = exp;
     this.lastCarry = null;
     await this.boot();
   }
 
-  private carryResult(): Pick<ReloadResult, 'buildReloaded' | 'build' | 'buildError'> {
+  private carryResult(): CarryResult {
+    const exp = this.lastExport;
     const c = this.lastCarry;
-    return { buildReloaded: !!c?.info, build: c?.info ?? null, ...(c?.error ? { buildError: c.error } : {}) };
+    if (exp?.error) {
+      return {
+        buildReloaded: false,
+        build: null,
+        buildExportError: exp.error,
+        buildNote: msg.exportFailedNote(exp.error),
+      };
+    }
+    if (c?.error) {
+      return {
+        buildReloaded: false,
+        build: null,
+        buildError: c.error,
+        ...(c.xml ? { buildCode: encodeBuildCode(c.xml) } : {}),
+        buildNote: msg.carryLoadFailedNote(c.error),
+      };
+    }
+    if (c?.info) return { buildReloaded: true, build: c.info };
+    return { buildReloaded: false, build: null, buildNote: 'No build was loaded, so none was carried over.' };
   }
 
   /** Restart LuaJIT against the on-disk install, carrying the current build over. */
   async reload(): Promise<ReloadResult> {
-    return this.runTransition(async () => {
-      if (!this.paths) throw new EngineNotReadyError(msg.unconfigured(this.resolveError));
-      if (this.bridge?.isCircuitOpen()) throw new UserError(msg.circuitOpen());
-      const r = inspectPoBInstall(this.paths.pobPath);
+    return this.gate.exclusive(async () => {
+      const paths = this.paths;
+      if (!paths) throw new EngineNotReadyError(msg.unconfigured(this.resolveError));
+      const r = inspectPoBInstall(paths.pobPath);
       if (!r.ok) throw new UserError(`Cannot reload: ${r.message}`);
-      if (detectUpdateState(this.paths.pobPath) === 'applying') throw new EngineNotReadyError(msg.updating(this.paths.pobPath));
+      if (detectUpdateState(paths.pobPath) === 'applying') throw new EngineNotReadyError(msg.updating(paths.pobPath));
       const oldVersion = this.startFingerprint?.version ?? null;
       try {
-        await this.restartWith({ ...this.paths, pobInfo: r.info });
+        await this.restartWith({ ...paths, pobInfo: r.info });
       } catch (e) {
-        throw new EngineNotReadyError(msg.bootFailed(this.paths, (e as Error).message));
+        const exportErr = this.lastExport?.error ? `\n${msg.exportFailedNote(this.lastExport.error)}` : '';
+        throw new EngineNotReadyError(msg.bootFailed(paths, (e as Error).message) + exportErr);
       }
       return {
         oldVersion,
         newVersion: this.startFingerprint?.version ?? null,
-        pobPath: this.paths.pobPath,
-        luajitPath: this.paths.luajitPath,
+        pobPath: paths.pobPath,
+        luajitPath: paths.luajitPath,
         ...this.carryResult(),
       };
     });
   }
 
-  /** Validate + switch to a user-supplied PoB (and optional LuaJIT) path, then persist it. */
+  /**
+   * Validate + switch to a user-supplied PoB (and optional LuaJIT) path, then
+   * persist it. Tool arguments are never env-expanded, and a luajitPath must
+   * be an existing file named luajit* — that binary is executed.
+   */
   async configure(pobPathRaw: string, luajitPathRaw?: string) {
-    return this.runTransition(async () => {
+    return this.gate.exclusive(async () => {
       let info: PoBInstallInfo;
       try {
-        info = validatePoBPath(pobPathRaw, 'pobPath', this.env);
+        info = validatePoBPath(pobPathRaw, 'pobPath', this.env, { expandEnv: false });
       } catch (e) {
         throw new UserError((e as Error).message);
       }
       let luajitPath: string;
       let luajitSource: PathSource;
       if (luajitPathRaw && luajitPathRaw.trim()) {
-        const found = luajitAt(luajitPathRaw, process.platform, this.env);
-        if (!found) throw new UserError(`luajitPath=${luajitPathRaw} is not a luajit binary or a folder containing one.`);
-        luajitPath = found;
+        try {
+          luajitPath = validateLuajitArgument(luajitPathRaw, this.env);
+        } catch (e) {
+          throw new UserError((e as Error).message);
+        }
         luajitSource = 'argument';
       } else {
         try {
@@ -307,8 +376,6 @@ export class EngineManager {
           throw new UserError(`Path of Building ${info.version ?? ''} found at ${info.dir}, but: ${(e as Error).message}`);
         }
       }
-      const samePaths = this.paths?.pobPath === info.dir && this.paths?.luajitPath === luajitPath;
-      if (samePaths && this.bridge?.isCircuitOpen()) throw new UserError(msg.circuitOpen());
 
       const previous = this.paths;
       const next: FullyResolvedPaths = {
@@ -319,7 +386,8 @@ export class EngineManager {
       try {
         await this.restartWith(next);
       } catch (e) {
-        // Leave the previous configuration in place (booted lazily on next use) and save nothing.
+        // Keep the previous configuration (booted lazily on next use, with its
+        // crash count from the ledger) and the build; save nothing.
         const keep = this.carryXML;
         await this.stopEngine();
         this.paths = previous;
@@ -352,6 +420,8 @@ export class EngineManager {
     });
   }
 
+  // ------------------------------------------------------------------ info / shutdown
+
   /** Snapshot for get_engine_info. Never throws, never starts the engine. */
   async info(): Promise<Record<string, unknown>> {
     const p = this.paths;
@@ -362,7 +432,7 @@ export class EngineManager {
     if (!p) status = 'unconfigured';
     else if (updateState === 'applying') status = 'updating';
     else if (changed) status = 'stale';
-    else if (this.booting || this.transition) status = 'starting';
+    else if (this.booting || this.gate.busy) status = 'starting';
     else if (this.startFingerprint) status = 'ready';
     else if (this.bootError) status = 'failed';
     else status = 'stopped';
@@ -388,6 +458,7 @@ export class EngineManager {
       luajitPathSource: p?.luajitSource ?? null,
       engineStartedAt: this.startedAt,
       crashCount: this.bridge?.getCrashCount() ?? 0,
+      circuitOpen: this.bridge?.isCircuitOpen() ?? false,
       configFile: configFilePath(this.env),
       build,
       ...(this.resolveError ? { configurationError: this.resolveError } : {}),
@@ -397,12 +468,15 @@ export class EngineManager {
     };
   }
 
+  /** Server shutdown: no new boots; in-flight calls get the retry error; the process is killed. */
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
     await this.stopEngine();
   }
 
-  /** Synchronous last-resort kill (startup failure paths). */
+  /** Synchronous last-resort kill of every LuaJIT process this manager owns (live or retiring). */
   killProcess(): void {
-    this.bridge?.killProcess();
+    this.bridge?.forceKill();
+    for (const b of this.retiring) b.forceKill();
   }
 }

@@ -601,7 +601,7 @@ tools.engine<Record<string, never>>(
   'get_config',
   {
     description:
-      "Return all of PoB's config / scenario options organized by section, with each option's type, label, current value, and (for list options) valid choices. Common keys: enemyIsBoss, usePowerCharges, useFrenzyCharges, useEnduranceCharges, conditionOnslaught, customMods.",
+      "Return all of PoB's config / scenario options organized by section, with each option's type, label, current value, and (for list options) valid choices. Common keys: enemyIsBoss, usePowerCharges, useFrenzyCharges, useEnduranceCharges, buffOnslaught, customMods.",
     inputSchema: {},
   },
   async (_args, session) => {

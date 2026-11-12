@@ -112,8 +112,13 @@ const POB_HINT =
  * Validate a user-supplied PoB folder. Throws PoBInstallNotFoundError with a
  * specific message (missing / not PoB / PoE2 edition).
  */
-export function validatePoBPath(raw: string, label: string, env = process.env): PoBInstallInfo {
-  const abs = normalizeUserPath(raw, env);
+export function validatePoBPath(
+  raw: string,
+  label: string,
+  env = process.env,
+  options: { expandEnv?: boolean } = {},
+): PoBInstallInfo {
+  const abs = normalizeUserPath(raw, env, options);
   if (!abs) throw new PoBInstallNotFoundError(`${label} is empty.`);
   const result = inspectPoBInstall(abs);
   if (result.ok) return result.info;
@@ -171,6 +176,7 @@ export {
   luajitProbeCandidates,
   resolveLuaJIT,
   resolveLuaJITPath,
+  validateLuajitArgument,
 } from './luajit-paths.js';
 
 // ---------------------------------------------------------------------------

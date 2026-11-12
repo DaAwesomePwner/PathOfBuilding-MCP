@@ -21,11 +21,15 @@ export function registerEngineTools(tools: ToolRegistrar, engine: EngineManager)
         pobPath: z
           .string()
           .min(1)
-          .describe('PoB install folder, e.g. C:\\Users\\me\\AppData\\Roaming\\Path of Building Community. ~ and %VAR% are expanded.'),
+          .describe('PoB install folder, e.g. C:\\Users\\me\\AppData\\Roaming\\Path of Building Community. Pass the literal path: ~ is expanded, environment variables (%VAR%, $VAR) are not.'),
         luajitPath: z
           .string()
           .optional()
-          .describe('Optional luajit binary (or folder containing it). Needed on Windows when LuaJIT is not on PATH — the PoB installer does not ship luajit.exe.'),
+          .describe(
+            'Optional full path to the luajit binary itself: an existing file whose name starts with "luajit" (e.g. luajit.exe). ' +
+              'THE SERVER EXECUTES THIS FILE — only pass a path the user gave you. Needed on Windows when LuaJIT is not on PATH ' +
+              '(the PoB installer does not ship luajit.exe). Environment variables are not expanded.',
+          ),
       },
     },
     async ({ pobPath, luajitPath }) => engine.configure(pobPath, luajitPath),
@@ -87,7 +91,7 @@ export function createPathPrompt(server: McpServer, engine: EngineManager): Path
             luajitPath: {
               type: 'string',
               title: 'LuaJIT binary (optional)',
-              description: 'Only needed if luajit is not on PATH.',
+              description: 'Full path to luajit.exe / luajit — only needed if it is not on PATH. This program will be run.',
             },
           },
           required: ['pobPath'],

@@ -5,7 +5,9 @@ import path from 'node:path';
  * Normalise a user-supplied path (env var, saved config, tool argument):
  *  - trims whitespace and one pair of surrounding quotes ("..." or '...'),
  *  - expands a leading `~` to the home directory,
- *  - expands `%VAR%` (any platform) and `$VAR` / `${VAR}` references,
+ *  - expands `%VAR%` (any platform) and `$VAR` / `${VAR}` references — only when
+ *    `expandEnv` is true (env-var / saved-config values). Tool arguments must
+ *    pass false so a model can't read the server's environment through error text,
  *  - strips trailing separators (but never reduces a root like `C:\` or `/`),
  *  - resolves to an absolute path.
  * Returns null for an empty value.
@@ -13,6 +15,7 @@ import path from 'node:path';
 export function normalizeUserPath(
   raw: string | undefined | null,
   env: NodeJS.ProcessEnv = process.env,
+  options: { expandEnv?: boolean } = {},
 ): string | null {
   if (raw === undefined || raw === null) return null;
   let value = raw.trim();
@@ -25,7 +28,7 @@ export function normalizeUserPath(
   }
   if (value.length === 0) return null;
 
-  value = expandEnvVars(value, env);
+  if (options.expandEnv !== false) value = expandEnvVars(value, env);
 
   if (value === '~' || value.startsWith('~/') || value.startsWith('~\\')) {
     value = path.join(homeDir(env), value.slice(1));

@@ -38,11 +38,11 @@ PoB Community embeds `lua51.dll` for its own GUI. The Windows installer does **n
 - macOS (brew): `brew install luajit`
 - Linux (apt): `sudo apt-get install luajit`
 
-Then pass `luajitPath` to `configure_pob_path`, or set `LUAJIT_PATH`. Both accept the binary or a folder containing `luajit[.exe]` or `bin/luajit[.exe]`. Auto-detect also checks `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop shims and apps, Homebrew, `/usr/local/bin`, `/usr/bin` and `PATH`.
+Then pass `luajitPath` to `configure_pob_path`, or set `LUAJIT_PATH`. **The server executes this file.** As a `configure_pob_path` argument it must be the full path of an existing file named like `luajit` (`luajit.exe` on Windows; `.bat`/`.cmd`/`.sh` scripts are refused), and environment variables in it are not expanded. `LUAJIT_PATH` may also be a folder containing `luajit[.exe]` or `bin/luajit[.exe]`. Auto-detect also checks `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop shims and apps, Homebrew, `/usr/local/bin`, `/usr/bin` and `PATH`.
 
 ## "Path of Building was updated on disk from X to Y"
 
-PoB updated itself (typically for a new league) while the server was running. The engine still has the old code and data in memory, so the server refuses to compute with it. Call `reload_engine`: it exports the current build, restarts LuaJIT against the updated install, reloads the build and reports the old → new version. Undo history and stat snapshots are cleared, and `reset_build` then returns to the reloaded state. `get_engine_info` shows `installChangedSinceStart` and both versions.
+PoB updated itself (typically for a new league) while the server was running. The engine still has the old code and data in memory, so the server refuses to compute with it. Call `reload_engine`: it waits for running tool calls to finish (new calls queue behind it), exports the current build, restarts LuaJIT against the updated install, reloads the build and reports the old → new version. If exporting fails (e.g. the old engine is wedged) the engine is still restarted and the result says plainly that the build was **not** carried over (`buildExportError`). If the new PoB can't load the build, the result carries it as a PoB import code in `buildCode` — pass that to `load_build` or import it in PoB. Undo history and stat snapshots are cleared, and `reset_build` then returns to the reloaded state. `get_engine_info` shows `installChangedSinceStart` and both versions.
 
 ## "Path of Building … is in the middle of applying an update"
 
@@ -59,9 +59,9 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 
 ## "Lua engine has crashed N times — refusing to restart"
 
-**Cause:** The luajit child process died unexpectedly three times in a single server session. This circuit breaker stops rapid restart loops. `reload_engine` with the same paths is refused too.
+**Cause:** The luajit child process died unexpectedly three times for the same PoB/LuaJIT path pair. This circuit breaker stops rapid restart loops. The count is kept per path pair across engine swaps: `reload_engine` and `configure_pob_path` with the same paths are refused too, and a failed `configure_pob_path` to other paths does not reset it.
 
-**Fix:** Restart the MCP server process, or call `configure_pob_path` with a different PoB/LuaJIT path if the paths were the problem. If it recurs immediately, capture stderr (it is forwarded to the parent stderr by default) and inspect the failure. It is usually a malformed build XML or a missing data file in the loaded build.
+**Fix:** Restart the MCP server process, or call `configure_pob_path` with a different PoB/LuaJIT path if the paths were the problem. If PoB has since updated on disk (new `manifest.xml` version/mtime), that path pair starts a fresh count and `reload_engine` works again. If it recurs immediately, capture stderr (it is forwarded to the parent stderr by default) and inspect the failure. It is usually a malformed build XML or a missing data file in the loaded build.
 
 ## "Lua bridge timeout after Nms"
 
@@ -98,6 +98,10 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 ## "Nothing to undo"
 
 The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` cleared the stack. Note that *failed* mutating tools (e.g. `swap_item` with malformed text) still push an undo entry **before** their mutation, so you may sometimes have an undo entry that is effectively a no-op.
+
+## "The Path of Building engine was restarted … Retry the call"
+
+A tool call was queued or running when the engine was replaced (`reload_engine`, `configure_pob_path`) or the server shut down. Engine swaps normally wait for running calls, so this only appears in edge cases such as shutdown. Retry the call.
 
 ## "Lua bridge only supports one in-flight command at a time"
 

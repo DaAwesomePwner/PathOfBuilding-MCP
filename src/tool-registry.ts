@@ -48,7 +48,7 @@ function toResponse(result: unknown): ToolResponse {
 }
 
 export interface ToolRegistrar {
-  /** Engine-backed tool: waits for / validates the engine and passes the live session. */
+  /** Engine-backed tool: runs inside the engine gate (engine swaps wait for it) with the live session. */
   engine<TArgs>(name: string, schema: ToolSchema, handler: (args: TArgs, session: BuildSession) => Promise<unknown>): void;
   /** Tool that must work without a running engine (configuration, info, static data). */
   plain<TArgs>(name: string, schema: ToolSchema, handler: (args: TArgs) => Promise<unknown>): void;
@@ -71,7 +71,7 @@ export function createToolRegistrar(server: McpServer, engine: EngineManager): T
   };
   return {
     engine: (name, schema, handler) =>
-      register(name, schema, async (args) => handler(args as never, await engine.ensureReady())),
+      register(name, schema, (args) => engine.run((session) => handler(args as never, session))),
     plain: (name, schema, handler) => register(name, schema, (args) => handler(args as never)),
   };
 }

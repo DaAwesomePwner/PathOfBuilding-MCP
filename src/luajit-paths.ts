@@ -124,3 +124,38 @@ export function resolveLuaJITPath(pobPath: string, opts: ResolveOptions = {}): s
   return resolveLuaJIT(pobPath, opts).luajitPath;
 }
 
+
+/** Basename a tool-supplied LuaJIT path must have (luajit, luajit.exe, luajit-2.1.0-beta3, …). */
+export const LUAJIT_BASENAME = /^luajit[\w.-]*(\.exe)?$/i;
+
+/**
+ * Validate a LuaJIT path supplied as a TOOL ARGUMENT (configure_pob_path /
+ * elicitation). That binary is executed by the server, so this is stricter
+ * than env/config values: no environment-variable expansion, it must be an
+ * existing regular file, and its basename must look like luajit.
+ * Throws LuaJITNotFoundError with a reason.
+ */
+export function validateLuajitArgument(raw: string, env: NodeJS.ProcessEnv = process.env): string {
+  const abs = normalizeUserPath(raw, env, { expandEnv: false });
+  if (!abs) throw new LuaJITNotFoundError('luajitPath is empty.');
+  let isFile = false;
+  try {
+    isFile = statSync(abs).isFile();
+  } catch {
+    throw new LuaJITNotFoundError(`luajitPath=${raw}: ${abs} does not exist.`);
+  }
+  if (!isFile) {
+    throw new LuaJITNotFoundError(`luajitPath=${raw}: ${abs} is not a file — pass the luajit binary itself, not a folder.`);
+  }
+  const base = path.basename(abs);
+  const ext = path.extname(base).toLowerCase();
+  const scriptLike = /^.(bat|cmd|com|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|msc|lnk|sh|bash|zsh|py|pl|rb)$/.test(ext);
+  const winNeedsExe = process.platform === 'win32' && ext !== '.exe';
+  if (!LUAJIT_BASENAME.test(base) || scriptLike || winNeedsExe) {
+    throw new LuaJITNotFoundError(
+      `luajitPath=${raw}: refusing to run "${base}" — the file name must start with "luajit" ` +
+        `and be the LuaJIT executable (luajit.exe on Windows), not a script. This binary is executed by the server.`,
+    );
+  }
+  return abs;
+}

@@ -155,6 +155,14 @@ export function installChanged(start: InstallFingerprint, current: InstallFinger
  *    Update/manifest.xml last. So Update/manifest.xml (or opFileRuntime.txt)
  *    without opFile.txt means files are being replaced right now (or the apply
  *    was interrupted) → 'applying': the install is not safe to load.
+ *
+ * Known false positive: UpdateCheck.lua saves Update/manifest.xml (line ~300)
+ * a moment before it writes Update/opFile.txt (line ~335); in between it only
+ * creates directories, so that window is milliseconds long. Nothing on disk
+ * distinguishes it from an apply in progress, so it is reported as 'applying'.
+ * If a check is interrupted inside that window the state persists until PoB's
+ * next update check rewrites Update/ — the 'applying' message tells the user to
+ * open PoB once, which resolves both cases.
  */
 export type UpdateState = 'none' | 'staged' | 'applying';
 

@@ -11,7 +11,16 @@ export interface BuildInfo {
   ascendancy?: string;
   level?: number;
   mainSkill?: string;
+  /** Tree version of the loaded build, when the bridge reports it. */
+  treeVersion?: string;
+  /** Latest tree version known to the running PoB, when the bridge reports it. */
+  latestTreeVersion?: string;
 }
+
+/** Thrown to a call that was queued or in flight when its engine was replaced. */
+export const ENGINE_REPLACED_MESSAGE =
+  'The Path of Building engine was restarted (reload_engine / configure_pob_path / shutdown) while this ' +
+  'call was queued or running. Retry the call.';
 
 export interface Stats {
   [key: string]: number | string | boolean | null | undefined;
@@ -82,6 +91,17 @@ export async function fetchBuildFromURL(url: string): Promise<string> {
   throw new UserError(`Unsupported URL: ${url}`);
 }
 
+function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    proc.once('exit', () => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
+}
+
 export class LuaBridge {
   private process: ChildProcess | null = null;
   private readonly pobPath: string;
@@ -98,25 +118,27 @@ export class LuaBridge {
   private readonly maxCrashes = 3;
   private successesSinceCrash = 0;
   private disposed = false;
+  /** Process handle captured by dispose(), so forceKill() still reaches it after references are cleared. */
+  private retiredProcess: ChildProcess | null = null;
   // After this many clean round-trips since the last crash, treat the
   // process as healthy again and reset crashCount — otherwise a long-running
   // session accumulates strikes from unrelated transient hiccups until it
   // trips the breaker on a real problem.
   private readonly successesToClearCrashes = 5;
 
-  constructor(paths: ResolvedPaths, timeoutMs = 30_000) {
+  constructor(paths: ResolvedPaths, timeoutMs = 30_000, options: { initialCrashCount?: number } = {}) {
     this.pobPath = paths.pobPath;
     this.luajitPath = paths.luajitPath;
     this.bridgeLua = paths.bridgeLua;
     this.timeoutMs = timeoutMs;
+    // Carried over from a previous bridge for the same paths so the three-strike
+    // breaker can't be reset by swapping bridge instances.
+    this.crashCount = options.initialCrashCount ?? 0;
   }
 
   async start(): Promise<void> {
     if (this.disposed) {
-      throw new UserError(
-        'The Path of Building engine was restarted (reload_engine / configure_pob_path) while this ' +
-          'call was queued. Retry the call.',
-      );
+      throw new UserError(ENGINE_REPLACED_MESSAGE);
     }
     if (this.process && !this.process.killed) {
       return;
@@ -153,20 +175,50 @@ export class LuaBridge {
     return this.crashCount >= this.maxCrashes;
   }
 
+  /** PID of the live LuaJIT process, if any (tests / diagnostics). */
+  getPid(): number | undefined {
+    return this.process?.pid;
+  }
+
   /**
    * Shut the process down and refuse any future (re)start. Used when the
    * engine is replaced, so a call still holding the old session can never
-   * spawn a second LuaJIT process.
+   * spawn a second LuaJIT process. Always ends with the captured process
+   * handle killed (unless it already exited), and any in-flight call
+   * rejected with a retry UserError.
    */
   async dispose(): Promise<void> {
-    try {
-      await this.shutdown();
-    } catch {
-      this.killProcess();
-    } finally {
-      this.disposed = true;
-      this.killProcess();
+    if (this.disposed) return;
+    const proc = this.process;
+    this.retiredProcess = proc;
+    // Graceful shutdown only when nothing is in flight — otherwise send() would
+    // refuse ("one in-flight command") and leave the process running.
+    if (proc && !this.pending && !this.starting && this.isRunning()) {
+      try {
+        await this.send({ cmd: 'shutdown' }, 5_000);
+      } catch {
+        // fall through to the hard kill
+      }
+      await waitForExit(proc, 2_000);
     }
+    this.disposed = true;
+    const retry = new UserError(ENGINE_REPLACED_MESSAGE);
+    this.failPending(retry, retry);
+    this.forceKill();
+  }
+
+  /** Synchronous hard kill of the live process and of any process captured by dispose(). */
+  forceKill(): void {
+    for (const proc of [this.process, this.retiredProcess]) {
+      if (proc && proc.exitCode === null && proc.signalCode === null) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+    }
+    if (this.process) this.cleanupProcessReferences();
   }
 
   async send<T = unknown>(command: object, timeoutOverrideMs?: number): Promise<T> {

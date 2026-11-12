@@ -66,11 +66,12 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 ## Non-negotiable invariants
 
 - **The server never exits because PoB/LuaJIT is missing.** The MCP transport connects first; paths resolve and the engine boots in the background. While unconfigured, engine tools return `isError` text naming `configure_pob_path` (and elicit the path once when the client supports form elicitation). Nothing but MCP frames on stdout — log to stderr.
-- **One LuaJIT process per session.** Engine boot is ~2s; pre-warmed in the background after connect. An engine swap (`reload_engine` / `configure_pob_path`) disposes the old bridge before booting the new one; a disposed bridge refuses to respawn.
+- **One LuaJIT process per session.** Engine boot is ~2s; pre-warmed in the background after connect. Engine-backed tool calls hold a shared slot in `EngineGate` (`src/engine-gate.ts`); an engine swap (`reload_engine` / `configure_pob_path`) takes it exclusively, waits for running calls, then disposes the old bridge before booting the new one. `LuaBridge.dispose()` always kills the captured process and rejects any pending call with a retry `UserError`; a disposed bridge refuses to respawn.
 - **Never auto-restart on a PoB update.** The manifest version + mtime are recorded at engine start; if they change, engine tools error and point at `reload_engine`. Never write to the PoB directory.
 - **Serial execution via async mutex.** PoB is single-threaded with shared globals. Two ops at once corrupts state.
 - **Snapshot-and-restore for "what-if" queries.** Every `simulate_*`, `compare_*`, `find_*`, `evaluate_*` wraps its probe in a `try/finally` snapshot/restore pair. Must restore bit-exact (`Life`, `CombinedDPS`, `TotalEHP` spot-checked in `state-integrity-test.ts`).
-- **Three-strike crash circuit breaker.** After 3 unexpected LuaJIT exits, the server refuses respawns. Don't disable — it prevents silent respawn loops.
+- **Three-strike crash circuit breaker.** After 3 unexpected LuaJIT exits, the server refuses respawns. Don't disable — it prevents silent respawn loops. The count is kept per (pobPath, luajitPath) in `CrashLedger` (`src/crash-ledger.ts`) and handed to each new bridge, so engine swaps can't reset it; it clears only when that PoB install changes on disk.
+- **Tool arguments are untrusted.** `configure_pob_path` arguments are never env-expanded (no `%VAR%`/`$VAR` leaks via error text), and a `luajitPath` argument must be an existing file named `luajit*` (`.exe` on Windows, no scripts) because it is executed.
 - **Mutations push to the undo stack.** `swap_item`, `unequip_item`, `swap_gem`, `set_config`, and the commit-variant of `simulate_passive_change` push. `undo_last_change` pops; `reset_build` reverts to the originally-loaded XML.
 - **Error classification.** User-input errors (bad slot, unknown gem) → `UserError`, surfaced verbatim. Anything else → "Internal error: ... try reset_build".
 

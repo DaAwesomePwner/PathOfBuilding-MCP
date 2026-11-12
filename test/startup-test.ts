@@ -22,7 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EngineManager, EngineNotReadyError } from '../src/engine-manager.js';
-import type { LuaBridge } from '../src/lua-bridge.js';
+import { decodeBuildCode, LuaBridge } from '../src/lua-bridge.js';
 import { resolveAllPaths } from '../src/paths.js';
 import { UserError } from '../src/validation.js';
 
@@ -58,39 +58,79 @@ function setManifestVersion(dir: string, version: string): void {
   utimesSync(file, t, t);
 }
 
+/** In-process stand-in for LuaBridge: mirrors its breaker and disposal semantics, no LuaJIT. */
 class FakeBridge {
   static instances: FakeBridge[] = [];
+  /** When true, start() behaves like a LuaJIT process that dies during init. */
+  static crashOnStart = false;
+  static exportFails = false;
+  static loadFails = false;
   running = false;
   disposed = false;
-  constructor() {
+  crashCount: number;
+  xml: string | null = null;
+  readonly initialCrashCount: number;
+  constructor(_paths: unknown, opts: { initialCrashCount: number }) {
+    this.crashCount = this.initialCrashCount = opts.initialCrashCount;
     FakeBridge.instances.push(this);
   }
   async start() {
-    if (this.disposed) throw new Error('disposed bridge restarted');
+    if (this.disposed) throw new UserError('engine replaced — retry');
+    if (this.running) return;
+    if (this.crashCount >= 3) throw new Error(`Lua engine has crashed ${this.crashCount} times — refusing to restart.`);
+    if (FakeBridge.crashOnStart) {
+      this.crashCount++;
+      throw new Error('Lua bridge exited during init (code=1)');
+    }
     this.running = true;
   }
   isRunning() {
     return this.running;
   }
   getCrashCount() {
-    return 0;
+    return this.crashCount;
   }
   isCircuitOpen() {
-    return false;
+    return this.crashCount >= 3;
+  }
+  async loadBuildXML(xml: string) {
+    await this.start();
+    if (FakeBridge.loadFails) throw new UserError('this PoB cannot parse the build');
+    this.xml = xml;
+    return { class: 'Witch', level: 90 };
+  }
+  async getStats() {
+    await this.start();
+    return {};
+  }
+  async send(cmd: { cmd: string }) {
+    await this.start();
+    if (cmd.cmd === 'exportXML') {
+      if (FakeBridge.exportFails) throw new Error('Lua bridge exited unexpectedly');
+      return { ok: true, xml: this.xml };
+    }
+    return { ok: true, stats: {} };
   }
   async dispose() {
     this.running = false;
     this.disposed = true;
+  }
+  forceKill() {
+    this.running = false;
   }
   killProcess() {
     this.running = false;
   }
 }
 
+const BUILD_XML = '<PathOfBuilding><Build level="90" className="Witch"/></PathOfBuilding>';
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const runningFakes = () => FakeBridge.instances.filter((b) => b.running).length;
+
 function fakeManager(env: NodeJS.ProcessEnv): EngineManager {
   return new EngineManager({
     env,
-    bridgeFactory: () => new FakeBridge() as unknown as LuaBridge,
+    bridgeFactory: (p, o) => new FakeBridge(p, o) as unknown as LuaBridge,
     log: () => undefined,
     resolveOptions: { pobCandidates: [], luajitCandidates: [] },
   });
@@ -199,6 +239,216 @@ async function part1(): Promise<void> {
   assert.equal(prompts, 1);
   await m4.shutdown();
   log('PASS 1e');
+
+  // ---- review items -------------------------------------------------------
+  const fresh = (pobDir: string) =>
+    fakeManager({ POB_PATH: pobDir, LUAJIT_PATH: luajit, POB_MCP_CONFIG_DIR: tmp('cfg-') });
+
+  log('1f [item 1/10]: reload waits for an in-flight call; queued calls run on the new engine');
+  {
+    const pobF = makeFakePoB('3.0.0');
+    const mf = fresh(pobF);
+    await mf.ensureReady();
+    const order: string[] = [];
+    const seen: string[] = [];
+    const call1 = mf.run(async (session) => {
+      order.push('call1-start');
+      await sleep(150);
+      seen.push(String(await session.getStats().then(() => 'ok')));
+      order.push('call1-end');
+    });
+    await sleep(20);
+    const reload = mf.reload().then((r) => order.push(`reload-done:${r.newVersion}`));
+    await sleep(20);
+    const call2 = mf.run(async () => {
+      order.push('call2');
+      assert.equal(runningFakes(), 1, 'one engine during call2');
+    });
+    await Promise.all([call1, reload, call2]);
+    assert.deepEqual(order, ['call1-start', 'call1-end', 'reload-done:3.0.0', 'call2']);
+    assert.deepEqual(seen, ['ok'], 'in-flight call completed on the old engine before the swap');
+    assert.equal(runningFakes(), 1, 'exactly one running engine after the swap');
+    await mf.shutdown();
+    assert.equal(runningFakes(), 0);
+  }
+  log('PASS 1f');
+
+  log('1g [item 2/3]: configure arguments — strict luajitPath, no env-var expansion');
+  {
+    const secret = 's3cr3t-value-xyz';
+    const cfg = tmp('cfg-');
+    const ms = fakeManager({ POB_SECRET_TEST: secret, POB_MCP_CONFIG_DIR: cfg });
+    const good2 = makeFakePoB('2.6.0');
+    for (const arg of ['%POB_SECRET_TEST%', '$POB_SECRET_TEST', '${POB_SECRET_TEST}']) {
+      const text = await rejectsWith(ms.configure(arg, luajit), UserError, /does not exist/);
+      assert.ok(text.includes(arg), `literal ${arg} expected in: ${text}`);
+      assert.ok(!text.includes(secret), `env value leaked via pobPath ${arg}`);
+      const t2 = await rejectsWith(ms.configure(good2, arg), UserError);
+      assert.ok(!t2.includes(secret), `env value leaked via luajitPath ${arg}`);
+    }
+    const evil = path.join(tmp('evil-'), process.platform === 'win32' ? 'calc.exe' : 'sh');
+    writeFileSync(evil, '');
+    await rejectsWith(ms.configure(good2, evil), UserError, /must start with "luajit"/, /executed/);
+    await rejectsWith(ms.configure(good2, luajitDir), UserError, /not a file/);
+    await rejectsWith(ms.configure(good2, path.join(luajitDir, 'luajit-missing.exe')), UserError, /does not exist/);
+    assert.ok(!existsSync(path.join(cfg, 'config.json')), 'rejected arguments must not be saved');
+    const versioned = path.join(tmp('lj-ver-'), 'LuaJIT-2.1.0-beta3.exe');
+    writeFileSync(versioned, '');
+    const ok = await ms.configure(good2, versioned);
+    assert.equal(ok.luajitPath, versioned);
+    await ms.shutdown();
+  }
+  log('PASS 1g');
+
+  log('1h [item 4]: crash breaker survives failed configure and reload; resets only when PoB changes');
+  {
+    const pobH = makeFakePoB('4.0.0');
+    const mh = fresh(pobH);
+    FakeBridge.crashOnStart = true;
+    try {
+      for (let i = 1; i <= 3; i++) {
+        await rejectsWith(mh.ensureReady(), EngineNotReadyError, /failed to start/);
+      }
+      await rejectsWith(mh.ensureReady(), EngineNotReadyError, /crashed 3 times/);
+      assert.equal((await mh.info()).circuitOpen, true);
+      FakeBridge.crashOnStart = false; // even a now-healthy engine must stay refused
+      await rejectsWith(mh.configure(pobH, luajit), UserError, /crashed 3 times/);
+      await rejectsWith(mh.ensureReady(), EngineNotReadyError, /crashed 3 times/);
+      await rejectsWith(mh.reload(), EngineNotReadyError, /crashed 3 times/);
+      await rejectsWith(mh.ensureReady(), EngineNotReadyError, /crashed 3 times/);
+      const last = FakeBridge.instances[FakeBridge.instances.length - 1];
+      assert.equal(last.initialCrashCount, 3, 'new bridge for the same paths inherits the crash count');
+      setManifestVersion(pobH, '4.0.1'); // PoB updated on disk → fresh count
+      const r = await mh.reload();
+      assert.equal(r.newVersion, '4.0.1');
+      await mh.ensureReady();
+    } finally {
+      FakeBridge.crashOnStart = false;
+      await mh.shutdown();
+    }
+  }
+  log('PASS 1h');
+
+  log('1i [item 5]: export failure during reload is reported, reload still happens');
+  {
+    const pobI = makeFakePoB('5.0.0');
+    const mi = fresh(pobI);
+    await mi.run((s) => s.loadBuild(BUILD_XML));
+    FakeBridge.exportFails = true;
+    try {
+      const r = await mi.reload();
+      assert.equal(r.buildReloaded, false);
+      assert.match(String(r.buildExportError), /exited unexpectedly/);
+      assert.match(String(r.buildNote), /NOT carried over/);
+      await mi.ensureReady();
+    } finally {
+      FakeBridge.exportFails = false;
+      await mi.shutdown();
+    }
+  }
+  log('PASS 1i');
+
+  log('1j [item 7]: build that fails to load on the new engine is returned as an import code');
+  {
+    const pobJ = makeFakePoB('6.0.0');
+    const mj = fresh(pobJ);
+    await mj.run((s) => s.loadBuild(BUILD_XML));
+    FakeBridge.loadFails = true;
+    try {
+      const r = await mj.reload();
+      assert.equal(r.buildReloaded, false);
+      assert.match(String(r.buildError), /cannot parse/);
+      assert.ok(r.buildCode, 'buildCode expected');
+      assert.equal(decodeBuildCode(r.buildCode!), BUILD_XML);
+    } finally {
+      FakeBridge.loadFails = false;
+      await mj.shutdown();
+    }
+    // Success path carries the build.
+    const mk = fresh(makeFakePoB('6.1.0'));
+    await mk.run((s) => s.loadBuild(BUILD_XML));
+    const ok = await mk.reload();
+    assert.equal(ok.buildReloaded, true);
+    assert.equal(ok.build?.class, 'Witch');
+    await mk.shutdown();
+  }
+  log('PASS 1j');
+}
+
+/**
+ * Real child process (node standing in for LuaJIT) — the reviewer's scenario:
+ * a command is in flight when the bridge is disposed. The process must die and
+ * the pending call must get the retry UserError.
+ */
+async function partDispose(): Promise<void> {
+  log('1k [item 1/6]: LuaBridge.dispose with a command in flight kills the process');
+  const dir = tmp('fake-lj-');
+  const script = path.join(dir, 'fake-bridge.cjs');
+  writeFileSync(
+    script,
+    `process.stdout.write(JSON.stringify({ ok: true, ready: true }) + "\\n");
+let buf = "";
+process.stdin.on("data", (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    const cmd = JSON.parse(line).cmd;
+    if (cmd === "shutdown") { process.stdout.write(JSON.stringify({ ok: true }) + "\\n"); setTimeout(() => process.exit(0), 10); }
+    // every other command hangs forever (simulates a long calc)
+  }
+});
+setInterval(() => {}, 1000);
+`,
+  );
+  const paths = { pobPath: dir, luajitPath: process.execPath, bridgeLua: script };
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const waitDead = async (pid: number) => {
+    for (let i = 0; i < 50 && alive(pid); i++) await sleep(50);
+    return !alive(pid);
+  };
+
+  // In flight → hard kill + retry error.
+  const b1 = new LuaBridge(paths, 30_000);
+  await b1.start();
+  const pid1 = b1.getPid()!;
+  const pending = b1.send({ cmd: 'getStats' });
+  const pendingResult = pending.then(
+    () => 'resolved',
+    (e: unknown) => e,
+  );
+  await sleep(50);
+  await b1.dispose();
+  const err = await pendingResult;
+  assert.ok(err instanceof UserError, `pending call should get a UserError, got ${String(err)}`);
+  assert.match((err as Error).message, /Retry the call/);
+  assert.ok(await waitDead(pid1), 'process with an in-flight command must be killed');
+  await rejectsWith(b1.start(), UserError, /Retry the call/); // disposed bridge never respawns
+
+  // Idle → graceful shutdown, process gone.
+  const b2 = new LuaBridge(paths, 30_000);
+  await b2.start();
+  const pid2 = b2.getPid()!;
+  await b2.dispose();
+  assert.ok(await waitDead(pid2), 'idle process must exit on dispose');
+
+  // forceKill reaches a process even after dispose() started and cleared references.
+  const b3 = new LuaBridge(paths, 30_000);
+  await b3.start();
+  const pid3 = b3.getPid()!;
+  void b3.send({ cmd: 'hang' }).catch(() => undefined);
+  const d3 = b3.dispose();
+  b3.forceKill();
+  await d3;
+  assert.ok(await waitDead(pid3), 'forceKill must kill the captured process');
+  log('PASS 1k');
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +499,18 @@ async function part2(): Promise<void> {
   assert.ok(existsSync(builtServer), 'dist/server.js missing after build');
 
   const cfgDir = tmp('cfg-');
-  const env = serverEnv({ POB_PATH: path.join(os.tmpdir(), 'no-such-pob-dir'), POB_MCP_CONFIG_DIR: cfgDir });
+  const secret = 's3cr3t-e2e-value';
+  const env = serverEnv({
+    POB_PATH: path.join(os.tmpdir(), 'no-such-pob-dir'),
+    POB_MCP_CONFIG_DIR: cfgDir,
+    POB_SECRET_TEST: secret,
+  });
   await withServer(env, async (client) => {
+    // Item 3: tool arguments are never env-expanded, so the env value can't leak.
+    const leak = await client.callTool({ name: 'configure_pob_path', arguments: { pobPath: '%POB_SECRET_TEST%' } });
+    assert.equal((leak as ToolResult).isError, true);
+    assert.ok(textOf(leak).includes('%POB_SECRET_TEST%'), textOf(leak));
+    assert.ok(!textOf(leak).includes(secret), 'env value leaked through configure_pob_path');
     const names = (await client.listTools()).tools.map((t) => t.name);
     for (const n of ['configure_pob_path', 'get_engine_info', 'reload_engine', 'load_build', 'get_stats']) {
       assert.ok(names.includes(n), `tool ${n} missing`);
@@ -265,6 +525,27 @@ async function part2(): Promise<void> {
     assert.ok(!(scen as ToolResult).isError, 'static tools still work while unconfigured');
   });
   log(`PASS 2 (${'tools listed, isError mentions configure_pob_path'})`);
+}
+
+/** LuaJIT processes running THIS checkout's bridge.lua (null when it can't be determined). */
+function countBridgeProcesses(): number | null {
+  const bridge = path.join(repoRoot, 'lua', 'bridge.lua').toLowerCase();
+  try {
+    let lines: string[];
+    if (process.platform === 'win32') {
+      const out = execFileSync(
+        'powershell',
+        ['-NoProfile', '-Command', "Get-CimInstance Win32_Process -Filter \"Name='luajit.exe'\" | ForEach-Object { $_.CommandLine }"],
+        { encoding: 'utf8', timeout: 30_000, windowsHide: true },
+      );
+      lines = out.split(/\r?\n/);
+    } else {
+      lines = execFileSync('ps', ['-eo', 'args'], { encoding: 'utf8', timeout: 10_000 }).split('\n');
+    }
+    return lines.filter((l) => l.toLowerCase().includes(bridge)).length;
+  } catch {
+    return null;
+  }
 }
 
 async function part3(): Promise<void> {
@@ -307,8 +588,16 @@ async function part3(): Promise<void> {
     assert.equal(info.build?.class, 'Witch');
     log(`  engine info: PoB ${info.pobVersion}, layout ${info.layout}`);
 
-    const rl = await client.callTool({ name: 'reload_engine', arguments: {} });
+    // Item 1: a running engine call and reload_engine at the same time.
+    const diagP = client.callTool({ name: 'diagnose_build', arguments: {} });
+    await sleep(30);
+    const rlP = client.callTool({ name: 'reload_engine', arguments: {} });
+    const [diag, rl] = await Promise.all([diagP, rlP]);
+    assert.ok(!(diag as ToolResult).isError, `concurrent call failed: ${textOf(diag)}`);
     assert.ok(!(rl as ToolResult).isError, textOf(rl));
+    const procs = countBridgeProcesses();
+    if (procs !== null) assert.equal(procs, 1, `expected exactly one LuaJIT bridge process, found ${procs}`);
+    log(`  concurrent diagnose_build + reload_engine ok; bridge processes: ${procs ?? 'n/a'}`);
     const rj = JSON.parse(textOf(rl));
     assert.equal(rj.buildReloaded, true);
     assert.equal(rj.undoHistoryCleared, true);
@@ -362,6 +651,7 @@ async function part3(): Promise<void> {
 
 async function main(): Promise<void> {
   await part1();
+  await partDispose();
   await part2();
   await part3();
 }
