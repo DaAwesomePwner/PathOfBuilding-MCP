@@ -97,6 +97,7 @@ export class LuaBridge {
   private crashCount = 0;
   private readonly maxCrashes = 3;
   private successesSinceCrash = 0;
+  private disposed = false;
   // After this many clean round-trips since the last crash, treat the
   // process as healthy again and reset crashCount — otherwise a long-running
   // session accumulates strikes from unrelated transient hiccups until it
@@ -111,6 +112,12 @@ export class LuaBridge {
   }
 
   async start(): Promise<void> {
+    if (this.disposed) {
+      throw new UserError(
+        'The Path of Building engine was restarted (reload_engine / configure_pob_path) while this ' +
+          'call was queued. Retry the call.',
+      );
+    }
     if (this.process && !this.process.killed) {
       return;
     }
@@ -139,6 +146,27 @@ export class LuaBridge {
   /** Number of times the underlying luajit process has died unexpectedly this session. */
   getCrashCount(): number {
     return this.crashCount;
+  }
+
+  /** True once the three-strike crash breaker has tripped. */
+  isCircuitOpen(): boolean {
+    return this.crashCount >= this.maxCrashes;
+  }
+
+  /**
+   * Shut the process down and refuse any future (re)start. Used when the
+   * engine is replaced, so a call still holding the old session can never
+   * spawn a second LuaJIT process.
+   */
+  async dispose(): Promise<void> {
+    try {
+      await this.shutdown();
+    } catch {
+      this.killProcess();
+    } finally {
+      this.disposed = true;
+      this.killProcess();
+    }
   }
 
   async send<T = unknown>(command: object, timeoutOverrideMs?: number): Promise<T> {

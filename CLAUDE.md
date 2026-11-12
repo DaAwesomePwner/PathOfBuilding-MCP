@@ -12,12 +12,15 @@ PoB itself is an **external runtime dependency**. The user's PoB install at `%AP
 
 ```bash
 npm install
-npm run build         # tsc to dist/, marks dist/server.js executable
+npm run build         # tsc to dist/ (fails on tsc errors), marks dist/server.js executable
+npm run typecheck     # tsc --noEmit
 npm run dev           # tsx src/server.ts (no build needed)
 npm run start         # node dist/server.js (built artifacts)
 
 # Tests — POB_PATH must point at a real PoB install, or each integration test prints SKIPPED and exits 0.
-npm run test:paths    # unit tests for paths.ts (no LuaJIT needed)
+npm run test:paths    # unit tests for paths / discovery / config store (no LuaJIT needed)
+npm run test:startup  # builds, starts dist/server.js unconfigured, configure_pob_path, saved config, reload_engine, elicitation
+npm run test:safety   # engine safety tests
 npm run test:bridge   # ~10s, Lua bridge round-trip — run first when debugging
 npm run test:session
 npm run test:server
@@ -33,9 +36,12 @@ npm run test:all      # everything (~3 min)
 
 Single test: `tsx test/<file>.ts` — they're plain Node scripts.
 
+Path resolution order: **env var → saved config (`configure_pob_path`) → auto-detect probe table** (`src/paths.ts`, `src/luajit-paths.ts`). Errors list everything probed.
+
 Env vars:
-- `POB_PATH` — path to PoB install. Defaults: `%APPDATA%\Path of Building Community` on Windows, `~/Library/Application Support/Path of Building Community` on macOS, `~/.local/share/Path of Building Community` on Linux.
-- `LUAJIT_PATH` — path to a `luajit` binary. Probes `<POB_PATH>/runtime/luajit{,.exe}` and PATH if unset.
+- `POB_PATH` — PoB install (PoE1 only; the PoE2 edition is rejected). If set but invalid, auto-detect is skipped. Auto-detect probes `%APPDATA%\Path of Building Community`, the installer's `HKCU`/`HKLM` uninstall key `...\Uninstall\Path of Building Community` → `InstallLocation`, `%ProgramData%\Path of Building`, `%LOCALAPPDATA%\Programs\Path of Building Community`; macOS `~/Library/Application Support/Path of Building Community`; Linux `~/.local/share/...`, Flatpak, `/opt/path-of-building`.
+- `LUAJIT_PATH` — `luajit` binary or a folder containing it. The Windows PoB installer does **not** ship `luajit.exe` (only `lua51.dll`); probes `<POB_PATH>/runtime/`, `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop, Homebrew, `/usr/{local/,}bin`, then PATH.
+- `POB_MCP_CONFIG_DIR` — overrides the saved-config dir (default `%APPDATA%\pob-mcp-server`, `~/Library/Application Support/pob-mcp-server`, `$XDG_CONFIG_HOME|~/.config/pob-mcp-server`). Tests must always set it to a temp dir.
 - `POB_TIMING=1` — per-command timing on stderr.
 
 ## Architecture
@@ -49,14 +55,19 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 
 | Layer | File | Job |
 |---|---|---|
-| Path resolution | `src/paths.ts` | `resolvePoBPath()` + `resolveLuaJITPath()` — env var, auto-detect, error. Single source of truth for install discovery. |
+| Path resolution | `src/paths.ts`, `src/luajit-paths.ts`, `src/path-utils.ts` | `resolvePoB()` / `resolveLuaJIT()` / `resolveAllPaths()` — env var, saved config, probe table, error listing probes. Single source of truth for install discovery. |
+| Install inspection | `src/pob-install.ts` | Layout + `manifest.xml` version, PoE2 detection, install fingerprint (version + mtime), PoB self-updater state (`Update/opFile.txt` = staged, `Update/manifest.xml` without it = applying). Read-only. |
+| Config store | `src/config-store.ts` | Per-user `config.json` written by `configure_pob_path`. |
+| Engine manager | `src/engine-manager.ts` | Owns the LuaBridge + BuildSession pair. Lazy/background boot, `ensureReady()` gate (unconfigured / updating / stale → `EngineNotReadyError`), `configure()`, `reload()` (export build → dispose old bridge → boot → reload build), `info()`. |
 | Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
 | BuildSession | `src/build-session.ts` | TS class owning the LuaJIT subprocess. Snapshot/restore, undo stack, `withTemporaryChange`, async mutex, build-code/URL/XML loading, higher-level workflows. |
-| MCP server | `src/server.ts` | Registers 33 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. |
+| MCP server | `src/server.ts`, `src/tool-registry.ts`, `src/engine-tools.ts` | Registers 36 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. `tools.engine(...)` handlers get the live session from `engine.ensureReady()`; `tools.plain(...)` handlers (configure_pob_path, get_engine_info, reload_engine, list_scenarios) work without an engine. |
 
 ## Non-negotiable invariants
 
-- **One LuaJIT process per session.** Engine boot is ~2s; pre-warmed on startup.
+- **The server never exits because PoB/LuaJIT is missing.** The MCP transport connects first; paths resolve and the engine boots in the background. While unconfigured, engine tools return `isError` text naming `configure_pob_path` (and elicit the path once when the client supports form elicitation). Nothing but MCP frames on stdout — log to stderr.
+- **One LuaJIT process per session.** Engine boot is ~2s; pre-warmed in the background after connect. An engine swap (`reload_engine` / `configure_pob_path`) disposes the old bridge before booting the new one; a disposed bridge refuses to respawn.
+- **Never auto-restart on a PoB update.** The manifest version + mtime are recorded at engine start; if they change, engine tools error and point at `reload_engine`. Never write to the PoB directory.
 - **Serial execution via async mutex.** PoB is single-threaded with shared globals. Two ops at once corrupts state.
 - **Snapshot-and-restore for "what-if" queries.** Every `simulate_*`, `compare_*`, `find_*`, `evaluate_*` wraps its probe in a `try/finally` snapshot/restore pair. Must restore bit-exact (`Life`, `CombinedDPS`, `TotalEHP` spot-checked in `state-integrity-test.ts`).
 - **Three-strike crash circuit breaker.** After 3 unexpected LuaJIT exits, the server refuses respawns. Don't disable — it prevents silent respawn loops.
@@ -67,9 +78,9 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 
 1. Extend `lua/bridge.lua` with a new dispatch case.
 2. Expose it in `BuildSession` (route mutations through `withLock`, push to undo stack as needed).
-3. Register a Zod-validated entry in `src/server.ts`.
+3. Register a Zod-validated entry in `src/server.ts` with `tools.engine(name, schema, async (args, session) => ...)`.
 
-All 33 existing tools follow this pattern.
+All engine-backed tools follow this pattern.
 
 ## Conventions
 

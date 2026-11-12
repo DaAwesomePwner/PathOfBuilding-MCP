@@ -1,20 +1,15 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { homeDir, normalizeUserPath } from './path-utils.js';
+import { resolveLuaJIT } from './luajit-paths.js';
+import { inspectPoBInstall, PoBInstallInfo } from './pob-install.js';
 
 export class PoBInstallNotFoundError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'PoBInstallNotFoundError';
-  }
-}
-
-export class LuaJITNotFoundError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'LuaJITNotFoundError';
   }
 }
 
@@ -24,122 +19,192 @@ export interface ResolvedPaths {
   bridgeLua: string;
 }
 
-function defaultPoBCandidates(): string[] {
-  const candidates: string[] = [];
-  if (process.platform === 'win32' && process.env.APPDATA) {
-    candidates.push(path.join(process.env.APPDATA, 'Path of Building Community'));
-  }
-  if (process.platform === 'darwin') {
-    candidates.push(
-      path.join(os.homedir(), 'Library', 'Application Support', 'Path of Building Community'),
-    );
-  }
-  if (process.platform === 'linux') {
-    candidates.push(path.join(os.homedir(), '.local', 'share', 'Path of Building Community'));
-  }
-  return candidates;
+/** Where a resolved path came from. 'argument' = configure_pob_path / elicitation. */
+export type PathSource = 'env' | 'config' | 'auto-detect' | 'argument';
+
+export interface FullyResolvedPaths extends ResolvedPaths {
+  pobSource: PathSource;
+  luajitSource: PathSource;
+  pobInfo: PoBInstallInfo;
 }
 
-function isValidPoBInstall(dir: string): boolean {
-  // Compiled install (Windows installer) has Launch.lua at the root; a source
-  // clone has it under src/. Either is acceptable — bridge.lua detects the
-  // layout and adjusts its package.path accordingly.
-  return (
-    existsSync(path.join(dir, 'Launch.lua')) ||
-    existsSync(path.join(dir, 'src', 'Launch.lua'))
-  );
+/** One auto-detect probe. `resolve` is lazy so slow probes (registry, PATH) only run when needed. */
+export interface ProbeCandidate {
+  label: string;
+  resolve: () => string | null;
 }
 
-export function resolvePoBPath(): string {
+export interface ResolveOptions {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  savedPoBPath?: string;
+  savedLuaJITPath?: string;
+  /** Override the auto-detect probe tables (tests). */
+  pobCandidates?: ProbeCandidate[];
+  luajitCandidates?: ProbeCandidate[];
+}
+
+const fixed = (p: string): ProbeCandidate => ({ label: p, resolve: () => p });
+
+// ---------------------------------------------------------------------------
+// PoB discovery
+// ---------------------------------------------------------------------------
+
+const UNINSTALL_KEY = 'Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Path of Building Community';
+
+/** InstallLocation from the PoB installer's uninstall key (value is stored quoted). */
+function registryInstallLocation(key: string): string | null {
+  try {
+    const out = execFileSync('reg', ['query', key, '/v', 'InstallLocation'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const m = out.match(/InstallLocation\s+REG_(?:EXPAND_)?SZ\s+(.+)/);
+    return m ? normalizeUserPath(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function pobProbeCandidates(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): ProbeCandidate[] {
+  const home = homeDir(env);
+  const out: ProbeCandidate[] = [];
+  if (platform === 'win32') {
+    if (env.APPDATA) out.push(fixed(path.join(env.APPDATA, 'Path of Building Community')));
+    for (const key of [
+      `HKCU\\${UNINSTALL_KEY}`,
+      `HKLM\\${UNINSTALL_KEY}`,
+      `HKLM\\${UNINSTALL_KEY.replace('Software\\', 'Software\\WOW6432Node\\')}`,
+    ]) {
+      out.push({ label: `registry ${key} InstallLocation`, resolve: () => registryInstallLocation(key) });
+    }
+    if (env.ProgramData) out.push(fixed(path.join(env.ProgramData, 'Path of Building')));
+    if (env.LOCALAPPDATA) {
+      out.push(fixed(path.join(env.LOCALAPPDATA, 'Programs', 'Path of Building Community')));
+    }
+  } else if (platform === 'darwin') {
+    out.push(fixed(path.join(home, 'Library', 'Application Support', 'Path of Building Community')));
+  } else {
+    const xdgData = env.XDG_DATA_HOME || path.join(home, '.local', 'share');
+    out.push(fixed(path.join(xdgData, 'Path of Building Community')));
+    const flatpakData = path.join(home, '.var', 'app', 'community.pathofbuilding.PathOfBuilding', 'data');
+    out.push(fixed(path.join(flatpakData, 'Path of Building Community')));
+    out.push(fixed(flatpakData));
+    out.push(fixed('/opt/path-of-building'));
+  }
+  return out;
+}
+
+const POB_HINT =
+  `Typical locations:\n` +
+  `  Windows: %APPDATA%\\Path of Building Community\n` +
+  `  macOS:   ~/Library/Application Support/Path of Building Community\n` +
+  `  Linux:   ~/.local/share/Path of Building Community\n` +
+  `Fix: call the configure_pob_path tool with the folder that contains Launch.lua ` +
+  `(or set POB_PATH in your MCP client config).`;
+
+/**
+ * Validate a user-supplied PoB folder. Throws PoBInstallNotFoundError with a
+ * specific message (missing / not PoB / PoE2 edition).
+ */
+export function validatePoBPath(raw: string, label: string, env = process.env): PoBInstallInfo {
+  const abs = normalizeUserPath(raw, env);
+  if (!abs) throw new PoBInstallNotFoundError(`${label} is empty.`);
+  const result = inspectPoBInstall(abs);
+  if (result.ok) return result.info;
+  throw new PoBInstallNotFoundError(`${label}=${raw}: ${result.message}`);
+}
+
+/** Resolve PoB: POB_PATH env → saved config → auto-detect probe table. */
+export function resolvePoB(opts: ResolveOptions = {}): { info: PoBInstallInfo; source: PathSource } {
+  const env = opts.env ?? process.env;
+  if (env.POB_PATH && env.POB_PATH.trim()) {
+    try {
+      return { info: validatePoBPath(env.POB_PATH, 'POB_PATH', env), source: 'env' };
+    } catch (e) {
+      throw new PoBInstallNotFoundError(
+        `${(e as Error).message}\n\nPOB_PATH is set, so auto-detection was skipped. Fix or remove ` +
+          `POB_PATH in your MCP client config, or call configure_pob_path.`,
+      );
+    }
+  }
+
   const probed: string[] = [];
-
-  if (process.env.POB_PATH) {
-    const abs = path.resolve(process.env.POB_PATH);
-    if (isValidPoBInstall(abs)) return abs;
-    throw new PoBInstallNotFoundError(
-      `POB_PATH=${process.env.POB_PATH} does not look like a Path of Building install ` +
-        `(no Launch.lua found at ${abs} or ${abs}/src). Point POB_PATH at your PoB ` +
-        `Community install directory (the one containing Launch.lua and Path of Building.exe).`,
-    );
+  if (opts.savedPoBPath) {
+    const abs = normalizeUserPath(opts.savedPoBPath, env);
+    const r = abs ? inspectPoBInstall(abs) : null;
+    if (r?.ok) return { info: r.info, source: 'config' };
+    probed.push(`${opts.savedPoBPath} (saved config): ${r && !r.ok ? r.message : 'empty'}`);
   }
 
-  for (const candidate of defaultPoBCandidates()) {
-    probed.push(candidate);
-    if (isValidPoBInstall(candidate)) return candidate;
+  for (const c of opts.pobCandidates ?? pobProbeCandidates(opts.platform, env)) {
+    const dir = c.resolve();
+    if (!dir) {
+      probed.push(`${c.label}: not found`);
+      continue;
+    }
+    const r = inspectPoBInstall(dir);
+    if (r.ok) return { info: r.info, source: 'auto-detect' };
+    probed.push(c.label === dir ? r.message : `${c.label} → ${r.message}`);
   }
 
   throw new PoBInstallNotFoundError(
-    `Could not find a Path of Building Community install. Probed:\n` +
+    `Could not find a Path of Building Community (Path of Exile 1) install. Probed:\n` +
       probed.map((p) => `  - ${p}`).join('\n') +
-      `\n\nSet POB_PATH to your install directory. Typical locations:\n` +
-      `  Windows: %APPDATA%\\Path of Building Community\n` +
-      `  macOS:   ~/Library/Application Support/Path of Building Community\n` +
-      `  Linux:   ~/.local/share/Path of Building Community`,
+      `\n\n${POB_HINT}`,
   );
 }
 
-export function resolveLuaJITPath(pobPath: string): string {
-  const isWin = process.platform === 'win32';
-  const exe = isWin ? 'luajit.exe' : 'luajit';
-
-  if (process.env.LUAJIT_PATH) {
-    if (existsSync(process.env.LUAJIT_PATH)) return process.env.LUAJIT_PATH;
-    throw new LuaJITNotFoundError(
-      `LUAJIT_PATH=${process.env.LUAJIT_PATH} does not exist. ` +
-        `Unset LUAJIT_PATH to use auto-discovery, or point it at a valid luajit binary.\n\n` +
-        `Install LuaJIT 5.1:\n` +
-        `  Windows (scoop):  scoop install luajit\n` +
-        `  Windows (winget): winget install DEVCOM.LuaJIT\n` +
-        `  macOS (brew):     brew install luajit\n` +
-        `  Linux (apt):      sudo apt-get install luajit`,
-    );
-  }
-
-  const probed: string[] = [];
-  for (const candidate of [
-    path.join(pobPath, 'runtime', exe),
-    path.join(pobPath, 'runtime', 'bin', exe),
-  ]) {
-    probed.push(candidate);
-    if (existsSync(candidate)) return candidate;
-  }
-
-  try {
-    const which = isWin ? 'where' : 'which';
-    const out = execFileSync(which, ['luajit'], { encoding: 'utf-8' })
-      .trim()
-      .split(/\r?\n/)[0];
-    if (out && existsSync(out)) return out;
-    probed.push(`${exe} on PATH (${which} luajit returned: ${out || '<empty>'})`);
-  } catch {
-    probed.push(`${exe} on PATH (not found)`);
-  }
-
-  throw new LuaJITNotFoundError(
-    `Could not find a luajit executable. Probed:\n` +
-      probed.map((p) => `  - ${p}`).join('\n') +
-      `\n\nInstall LuaJIT 5.1:\n` +
-      `  Windows (scoop):  scoop install luajit\n` +
-      `  Windows (winget): winget install DEVCOM.LuaJIT\n` +
-      `  macOS (brew):     brew install luajit\n` +
-      `  Linux (apt):      sudo apt-get install luajit\n` +
-      `Or set LUAJIT_PATH to a luajit binary.`,
-  );
+/** Back-compat wrapper returning just the directory. */
+export function resolvePoBPath(opts: ResolveOptions = {}): string {
+  return resolvePoB(opts).info.dir;
 }
 
-export function resolvePaths(): ResolvedPaths {
-  const pobPath = resolvePoBPath();
-  const luajitPath = resolveLuaJITPath(pobPath);
-  // bridge.lua ships in this package at <pkg>/lua/bridge.lua. With the current
-  // tsconfig (rootDir: ./src), the module ends up at src/paths.ts in dev and
-  // dist/paths.js when built — both resolve `../lua/bridge.lua` to the right
-  // place. The second candidate is a defensive fallback in case rootDir ever
-  // changes back to "." (which would put the built module at dist/src/paths.js).
+export {
+  LuaJITNotFoundError,
+  luajitAt,
+  luajitProbeCandidates,
+  resolveLuaJIT,
+  resolveLuaJITPath,
+} from './luajit-paths.js';
+
+// ---------------------------------------------------------------------------
+// Combined
+// ---------------------------------------------------------------------------
+
+/**
+ * bridge.lua ships in this package at <pkg>/lua/bridge.lua. With rootDir ./src
+ * the module is src/paths.ts in dev and dist/paths.js when built — both resolve
+ * `../lua/bridge.lua`. The second candidate covers a nested dist/src layout.
+ */
+export function bridgeLuaPath(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
-    path.resolve(here, '..', 'lua', 'bridge.lua'),        // dev or flat dist
-    path.resolve(here, '..', '..', 'lua', 'bridge.lua'),  // nested dist/src fallback
+    path.resolve(here, '..', 'lua', 'bridge.lua'),
+    path.resolve(here, '..', '..', 'lua', 'bridge.lua'),
   ];
-  const bridgeLua = candidates.find((p) => existsSync(p)) ?? candidates[0];
+  return candidates.find((p) => existsSync(p)) ?? candidates[0];
+}
+
+export function resolveAllPaths(opts: ResolveOptions = {}): FullyResolvedPaths {
+  const pob = resolvePoB(opts);
+  const lj = resolveLuaJIT(pob.info.dir, opts);
+  return {
+    pobPath: pob.info.dir,
+    luajitPath: lj.luajitPath,
+    bridgeLua: bridgeLuaPath(),
+    pobSource: pob.source,
+    luajitSource: lj.source,
+    pobInfo: pob.info,
+  };
+}
+
+export function resolvePaths(opts: ResolveOptions = {}): ResolvedPaths {
+  const { pobPath, luajitPath, bridgeLua } = resolveAllPaths(opts);
   return { pobPath, luajitPath, bridgeLua };
 }
