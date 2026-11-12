@@ -449,6 +449,7 @@ async function part1(): Promise<void> {
     info = await mm.info();
     assert.equal(info.status, 'failed', 'an open breaker is not reported as ready');
     assert.equal(info.circuitOpen, true);
+    assert.match(String(info.hint), /crashed 3 times.*reload_engine.*restart the MCP server/, 'breaker-open hint says how to recover');
     assert.equal(bridge.starts, startsBefore, 'info() must not respawn the engine');
     assert.equal(bridge.running, false);
     await mm.shutdown();

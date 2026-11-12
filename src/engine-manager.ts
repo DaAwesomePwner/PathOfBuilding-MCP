@@ -514,6 +514,13 @@ export class EngineManager {
       ...(status === 'stopped' && this.startFingerprint
         ? { hint: 'The engine process is not running; the next engine tool call restarts it.' }
         : {}),
+      ...(status === 'failed' && this.startFingerprint && this.bridge?.isCircuitOpen()
+        ? {
+            hint:
+              'The engine crashed 3 times and will not restart with these paths. If Path of Building has since ' +
+              'been updated on disk, call reload_engine; otherwise restart the MCP server.',
+          }
+        : {}),
     };
   }
 
