@@ -16,7 +16,22 @@ local function fileExists(p)
 	return false
 end
 
-local IS_FLAT_INSTALL = fileExists(POB_PATH .. "/Launch.lua")
+-- The rule mirrors `detectLayout` in src/pob-install.ts, which also picks the
+-- working directory LuaJIT is spawned in, so the two cannot disagree: installed
+-- only when Launch.lua and Modules/Build.lua are both at the root; otherwise a
+-- source clone when both are under src/. Any other shape keeps the older
+-- behaviour (flat when the root has Launch.lua, else src/).
+local function hasPoBFiles(base)
+	return fileExists(base .. "/Launch.lua") and fileExists(base .. "/Modules/Build.lua")
+end
+local IS_FLAT_INSTALL
+if hasPoBFiles(POB_PATH) then
+	IS_FLAT_INSTALL = true
+elseif hasPoBFiles(POB_PATH .. "/src") then
+	IS_FLAT_INSTALL = false
+else
+	IS_FLAT_INSTALL = fileExists(POB_PATH .. "/Launch.lua")
+end
 local SCRIPT_PATH = IS_FLAT_INSTALL and POB_PATH or (POB_PATH .. "/src")
 local REPO_ROOT = POB_PATH  -- kept for the legacy GetWorkDir/GetUserPath/GetRuntimePath helpers below
 

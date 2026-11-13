@@ -69,7 +69,15 @@ function workingDirChoice(): void {
     assert(sameDir(bridgeWorkingDir(both), both), `flat+src layout: got ${bridgeWorkingDir(both)}`);
     log('PASS');
 
-    log('Working dir 4: an unrecognised directory keeps the given path');
+    log('Working dir 4: a bare root Launch.lua with a complete src/ is a source clone');
+    const bare = path.join(root, 'bare');
+    touch(path.join(bare, 'Launch.lua'));
+    touch(path.join(bare, 'src', 'Launch.lua'));
+    touch(path.join(bare, 'src', 'Modules', 'Build.lua'));
+    assert(sameDir(bridgeWorkingDir(bare), path.join(bare, 'src')), `bare root Launch.lua: got ${bridgeWorkingDir(bare)}`);
+    log('PASS');
+
+    log('Working dir 5: an unrecognised directory keeps the given path');
     const other = path.join(root, 'other');
     mkdirSync(other);
     assert(sameDir(bridgeWorkingDir(other), other), `unrecognised dir: got ${bridgeWorkingDir(other)}`);
