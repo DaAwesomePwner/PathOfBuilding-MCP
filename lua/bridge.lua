@@ -2140,26 +2140,94 @@ local function getNodeInfo(arg)
 	return info
 end
 
-local function allocNodesBatch(nodeIds)
-	for _, id in ipairs(nodeIds or { }) do
-		local node = build.spec.nodes[id]
+-- Node batches are all-or-nothing: every id is checked against the current
+-- tree before the first node changes, so a user error leaves the build
+-- untouched (and its export byte-identical).
+local function nodeLabel(node)
+	return tostring(node.id) .. (node.dn and (" (" .. node.dn .. ")") or "")
+end
+
+local function batchNodes(nodeIds)
+	if type(nodeIds) ~= "table" then
+		userError("nodeIds must be an array of node ids")
+	end
+	local nodes = { }
+	for i, id in ipairs(nodeIds) do
+		local node = type(id) == "number" and build.spec.nodes[id] or nil
 		if not node then
 			userError("Unknown node id: " .. tostring(id))
 		end
-		build.spec:AllocNode(node)
+		nodes[i] = node
 	end
+	return nodes
+end
+
+-- Run a batch mutation; if it fails part-way (something the checks could not
+-- foresee), put the tree back as it was before the batch and re-raise.
+local function withTreeRollback(fn)
+	local before = encodeSpecState(captureSpecState(build.spec))
+	local ok, err = pcall(fn)
+	if ok then return end
+	local restored, restoreErr = pcall(restoreTreeState, before)
+	if not restored then
+		error(tostring(err) .. " (rolling the passive tree back also failed: " .. tostring(restoreErr) .. ")", 0)
+	end
+	error(err, 0)
+end
+
+local function allocNodesBatch(nodeIds)
+	local nodes = batchNodes(nodeIds)
+	local choiceParent = { }
+	for _, node in ipairs(nodes) do
+		-- PassiveSpec:AllocNode silently does nothing for a node no path
+		-- reaches (another class's start, another ascendancy). Allocating a
+		-- node never removes a path, so checking up front is exact.
+		if not node.alloc and not node.path then
+			userError("Node " .. nodeLabel(node) .. " cannot be allocated: no path from the allocated tree reaches it")
+		end
+		-- Two options of one multiple-choice node: the second would silently
+		-- deallocate the first.
+		if node.isMultipleChoiceOption and node.linked and node.linked[1] then
+			local parent = node.linked[1]
+			local other = choiceParent[parent]
+			if other and other ~= node then
+				userError("Nodes " .. nodeLabel(other) .. " and " .. nodeLabel(node) .. " are options of the same choice; only one can be allocated")
+			end
+			choiceParent[parent] = node
+		end
+	end
+	withTreeRollback(function()
+		for _, node in ipairs(nodes) do
+			build.spec:AllocNode(node)
+		end
+		for _, node in ipairs(nodes) do
+			if not node.alloc then
+				userError("Node " .. nodeLabel(node) .. " could not be allocated")
+			end
+		end
+	end)
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
 
 local function deallocNodesBatch(nodeIds)
-	for _, id in ipairs(nodeIds or { }) do
-		local node = build.spec.nodes[id]
-		if not node then
-			userError("Unknown node id: " .. tostring(id))
+	local nodes = batchNodes(nodeIds)
+	for _, node in ipairs(nodes) do
+		if node.type == "ClassStart" or node.type == "AscendClassStart" then
+			userError("Node " .. nodeLabel(node) .. " is a class start and cannot be deallocated")
 		end
-		build.spec:DeallocNode(node)
+		-- Checked against the tree before the batch: a later node may lose its
+		-- allocation to an earlier one in the same batch (it depends on it),
+		-- which is the requested result anyway.
+		if not node.alloc then
+			userError("Node " .. nodeLabel(node) .. " is not allocated")
+		end
 	end
+	withTreeRollback(function()
+		for _, node in ipairs(nodes) do
+			build.spec:DeallocNode(node)
+		end
+	end)
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
@@ -2497,17 +2565,30 @@ end
 -- ProcessSocketGroup + OnFrame once. Used by testSupportCombinationLocked to
 -- avoid N_remove + N_add individual OnFrame calls (each ~55–65ms).
 -- cmd.gems is an array of { name, level, quality }.
+-- All-or-nothing: the group index and every gem are checked before the gem
+-- list changes, so a user error leaves the group untouched. Should the
+-- recalculation itself fail, the old gem list is put back.
 local function replaceSocketGroupImpl(groupIndex, gems)
 	local group, _ = getGroupAndGem(groupIndex, nil)
-	-- Wipe existing gem list in-place (mirrors what restoreSkills does per group)
-	for i = #group.gemList, 1, -1 do group.gemList[i] = nil end
-	-- Build new gems without triggering OnFrame
-	for _, gemSpec in ipairs(gems) do
+	if type(gems) ~= "table" then
+		userError("gems must be an array of { name, level, quality }")
+	end
+	local newGems = { }
+	for i, gemSpec in ipairs(gems) do
+		if type(gemSpec) ~= "table" then
+			userError("Gem " .. i .. " must be an object with a name")
+		end
 		local gemData, errMsg = findGemByName(gemSpec.name)
 		if not gemData then
 			userError("Gem lookup failed for '" .. tostring(gemSpec.name) .. "': " .. tostring(errMsg))
 		end
-		local newGem = {
+		for _, key in ipairs({ "level", "quality" }) do
+			local v = gemSpec[key]
+			if v ~= nil and (type(v) ~= "number" or v ~= v or v < 0 or v % 1 ~= 0) then
+				userError("Gem " .. i .. " (" .. gemData.name .. "): " .. key .. " must be a non-negative integer")
+			end
+		end
+		newGems[i] = {
 			nameSpec = gemData.name,
 			gemId = gemData.id,
 			skillId = gemData.grantedEffectId,
@@ -2518,12 +2599,25 @@ local function replaceSocketGroupImpl(groupIndex, gems)
 			enableGlobal2 = true,
 			count = 1,
 		}
-		table.insert(group.gemList, newGem)
+	end
+	local oldGems = { }
+	for i, gem in ipairs(group.gemList) do oldGems[i] = gem end
+	local function setGemList(list)
+		for i = #group.gemList, 1, -1 do group.gemList[i] = nil end
+		for i, gem in ipairs(list) do group.gemList[i] = gem end
+		build.skillsTab:ProcessSocketGroup(group)
+		build.buildFlag = true
+		runCallback("OnFrame")
 	end
 	-- Single recalc for the whole group
-	build.skillsTab:ProcessSocketGroup(group)
-	build.buildFlag = true
-	runCallback("OnFrame")
+	local ok, err = pcall(setGemList, newGems)
+	if not ok then
+		local restored, restoreErr = pcall(setGemList, oldGems)
+		if not restored then
+			error(tostring(err) .. " (putting the old gems back also failed: " .. tostring(restoreErr) .. ")", 0)
+		end
+		error(err, 0)
+	end
 end
 
 local function getGemByNameImpl(name)
@@ -2583,79 +2677,238 @@ local function setMainSocketGroupImpl(groupIndex)
 	runCallback("OnFrame")
 end
 
+-- ---------------------------------------------------------------------------
+-- Exact skills snapshot/restore for what-if probes and undo
+-- ---------------------------------------------------------------------------
+--
+-- A snapshot holds every skill set (id, title, order, the active one), the
+-- skills tab settings PoB saves (default gem level/quality, gem sorting and
+-- filters), the main socket group (and the Calcs tab's copy of it, which
+-- PoB clamps when groups disappear), and for every socket group and gem
+-- instance every field with a plain value (string, number, boolean). That
+-- is a superset of what SkillsTab:Save writes (label, slot, source, enabled,
+-- includeInFullDPS, groupCount, imbuedSupport, mainActiveSkill*, and per gem
+-- nameSpec, gemId, skillId, level, quality, enabled, enableGlobal1/2, count,
+-- skillPart*, skillStageCount*, skillMineCount*, skillMinion*,
+-- skillMinionItemSet*, skillMinionSkill*), so plain fields PoB adds later are
+-- carried without a change here. Table-valued fields are derived (gemData,
+-- grantedEffect, display lists, sourceItem) and are rebuilt by
+-- ProcessSocketGroup and the recalculation. The one exception is a
+-- monster-explosion gem's explodeSource, which CalcSetup uses to keep that
+-- gem's settings; it is relinked by key. Fields are stored as sorted
+-- [key, value] pairs so equal states encode to equal JSON.
+
+local SKILLS_SNAPSHOT_VERSION = 2
+local EXPLODE_SOURCE_KEY = "__explodeSourceKey"
+
+local function isPlainValue(v)
+	local t = type(v)
+	return t == "string" or t == "boolean" or (t == "number" and v == v and v ~= math.huge and v ~= -math.huge)
+end
+
+local function plainFields(tbl)
+	local keys = { }
+	for k, v in pairs(tbl) do
+		if type(k) == "string" and isPlainValue(v) then keys[#keys + 1] = k end
+	end
+	table.sort(keys)
+	local out = { }
+	for i, k in ipairs(keys) do out[i] = { k, tbl[k] } end
+	return out
+end
+
+local function explodeSourceKey(source)
+	if type(source) ~= "table" then return nil end
+	local key = source.modSource or source.id
+	if isPlainValue(key) then return tostring(key) end
+	return nil
+end
+
+local function snapshotSocketGroup(group)
+	local gems = { }
+	for j, gem in ipairs(group.gemList or { }) do
+		local fields = plainFields(gem)
+		local key = explodeSourceKey(gem.explodeSource)
+		if key then fields[#fields + 1] = { EXPLODE_SOURCE_KEY, key } end
+		gems[j] = fields
+	end
+	return { fields = plainFields(group), gems = gems }
+end
+
+local SKILLS_TAB_SETTINGS = {
+	"defaultGemLevel", "defaultGemQuality", "sortGemsByDPS", "sortGemsByDPSField",
+	"showSupportGemTypes", "showLegacyGems",
+}
+
+local function skillsTabOrError()
+	local tab = build and build.skillsTab
+	if not (tab and tab.socketGroupList and tab.skillSets and tab.skillSetOrderList) then
+		error("Skills tab not available (PoB SkillsTab changed?)")
+	end
+	return tab
+end
+
 local function snapshotSkills()
-	local snap = { mainSocketGroup = build.mainSocketGroup, groups = { } }
-	if not (build and build.skillsTab and build.skillsTab.socketGroupList) then
-		return snap
+	local tab = skillsTabOrError()
+	local settings = { }
+	for _, key in ipairs(SKILLS_TAB_SETTINGS) do
+		if isPlainValue(tab[key]) then settings[#settings + 1] = { key, tab[key] } end
 	end
-	for i, group in ipairs(build.skillsTab.socketGroupList) do
-		local gemList = { }
-		for j, gem in ipairs(group.gemList or { }) do
-			gemList[j] = {
-				nameSpec = gem.nameSpec,
-				gemId = gem.gemId,
-				skillId = gem.skillId,
-				level = gem.level,
-				quality = gem.quality,
-				qualityId = gem.qualityId,
-				enabled = gem.enabled,
-				enableGlobal1 = gem.enableGlobal1,
-				enableGlobal2 = gem.enableGlobal2,
-				count = gem.count,
-				skillPart = gem.skillPart,
-				skillPartCalcs = gem.skillPartCalcs,
-				skillMineCount = gem.skillMineCount,
-				skillStageCount = gem.skillStageCount,
-				skillStageCountCalcs = gem.skillStageCountCalcs,
-				triggered = gem.triggered,
-			}
+	local setIds = { }
+	for id in pairs(tab.skillSets) do setIds[#setIds + 1] = id end
+	table.sort(setIds)
+	local sets = { }
+	for i, id in ipairs(setIds) do
+		local set = tab.skillSets[id]
+		local groups = { }
+		for j, group in ipairs(set.socketGroupList) do groups[j] = snapshotSocketGroup(group) end
+		sets[i] = { id = id, title = set.title, groups = groups }
+	end
+	local order = { }
+	for i, id in ipairs(tab.skillSetOrderList) do order[i] = id end
+	local calcsInput = build.calcsTab and build.calcsTab.input
+	return {
+		version = SKILLS_SNAPSHOT_VERSION,
+		activeSkillSetId = tab.activeSkillSetId,
+		mainSocketGroup = build.mainSocketGroup,
+		calcsSkillNumber = calcsInput and calcsInput.skill_number,
+		settings = settings,
+		order = order,
+		sets = sets,
+	}
+end
+
+-- Shape check of a whole snapshot before anything is changed, so a bad
+-- snapshot never leaves the skills half restored.
+local function checkSkillsSnapshot(snap)
+	local function bad(what)
+		error("Invalid skills snapshot: " .. what, 0)
+	end
+	local function checkFields(fields, where)
+		if type(fields) ~= "table" then bad(where .. " has no field list") end
+		for _, pair in ipairs(fields) do
+			if type(pair) ~= "table" or type(pair[1]) ~= "string" or not isPlainValue(pair[2]) then
+				bad(where .. " has a malformed field")
+			end
 		end
-		snap.groups[i] = {
-			label = group.label,
-			slot = group.slot,
-			enabled = group.enabled,
-			source = group.source,
-			mainActiveSkill = group.mainActiveSkill,
-			mainActiveSkillCalcs = group.mainActiveSkillCalcs,
-			includeInFullDPS = group.includeInFullDPS,
-			noSupports = group.noSupports,
-			gemList = gemList,
-		}
 	end
-	return snap
+	if type(snap) ~= "table" or snap.version ~= SKILLS_SNAPSHOT_VERSION then bad("unknown version") end
+	if type(snap.sets) ~= "table" or type(snap.order) ~= "table" then bad("no skill sets") end
+	checkFields(snap.settings, "settings")
+	local ids = { }
+	for i, set in ipairs(snap.sets) do
+		if type(set) ~= "table" or type(set.id) ~= "number" or type(set.groups) ~= "table" then
+			bad("skill set " .. i .. " is malformed")
+		end
+		ids[set.id] = true
+		for j, group in ipairs(set.groups) do
+			local where = "skill set " .. set.id .. " group " .. j
+			if type(group) ~= "table" or type(group.gems) ~= "table" then bad(where .. " is malformed") end
+			checkFields(group.fields, where)
+			for k, gem in ipairs(group.gems) do checkFields(gem, where .. " gem " .. k) end
+		end
+	end
+	for _, id in ipairs(snap.order) do
+		if not ids[id] then bad("the skill set order names an unknown set") end
+	end
+	if not ids[snap.activeSkillSetId] then bad("the active skill set is missing") end
+end
+
+local function fromFields(fields, target)
+	for _, pair in ipairs(fields) do target[pair[1]] = pair[2] end
+	return target
+end
+
+local function restoreSkillsTabSettings(tab, settings)
+	local controls = tab.controls or { }
+	for _, pair in ipairs(settings) do
+		local key, value = pair[1], pair[2]
+		if tab[key] ~= value then
+			tab[key] = value
+			-- Keep the (headless) controls in step, as SkillsTab:Load does.
+			if key == "defaultGemLevel" and controls.defaultLevel then
+				controls.defaultLevel:SelByValue(value, "gemLevel")
+			elseif key == "defaultGemQuality" and controls.defaultQuality then
+				controls.defaultQuality:SetText(value)
+			elseif key == "sortGemsByDPS" and controls.sortGemsByDPS then
+				controls.sortGemsByDPS.state = value
+			elseif key == "showLegacyGems" and controls.showLegacyGems then
+				controls.showLegacyGems.state = value
+			elseif key == "showSupportGemTypes" and controls.showSupportGemTypes then
+				controls.showSupportGemTypes:SelByValue(value, "show")
+			elseif key == "sortGemsByDPSField" and controls.sortGemsByDPSFieldControl then
+				controls.sortGemsByDPSFieldControl:SelByValue(value, "type")
+			end
+		end
+	end
 end
 
 local function restoreSkills(snap)
-	if not (build and build.skillsTab and build.skillsTab.socketGroupList) then
-		error("Skills tab not available")
-	end
-	if type(snap) ~= "table" or type(snap.groups) ~= "table" then
-		error("Invalid skills snapshot")
-	end
-	-- Wipe current groups; we mutate in place to preserve socketGroupList reference
-	local list = build.skillsTab.socketGroupList
-	for i = #list, 1, -1 do list[i] = nil end
-	for i, snapGroup in ipairs(snap.groups) do
-		local group = {
-			label = snapGroup.label,
-			slot = snapGroup.slot,
-			enabled = snapGroup.enabled,
-			source = snapGroup.source,
-			mainActiveSkill = snapGroup.mainActiveSkill,
-			mainActiveSkillCalcs = snapGroup.mainActiveSkillCalcs,
-			includeInFullDPS = snapGroup.includeInFullDPS,
-			noSupports = snapGroup.noSupports,
-			gemList = { },
-		}
-		for j, snapGem in ipairs(snapGroup.gemList) do
-			local g = { }
-			for k, v in pairs(snapGem) do g[k] = v end
-			group.gemList[j] = g
+	local tab = skillsTabOrError()
+	checkSkillsSnapshot(snap)
+
+	-- Live explosion sources, to relink restored explosion gems.
+	local explodeSources = { }
+	for _, set in pairs(tab.skillSets) do
+		for _, group in ipairs(set.socketGroupList) do
+			for _, source in ipairs(type(group.explodeSources) == "table" and group.explodeSources or { }) do
+				local key = explodeSourceKey(source)
+				if key then explodeSources[key] = source end
+			end
+			for _, gem in ipairs(group.gemList or { }) do
+				local key = explodeSourceKey(gem.explodeSource)
+				if key and not explodeSources[key] then explodeSources[key] = gem.explodeSource end
+			end
 		end
-		list[i] = group
-		build.skillsTab:ProcessSocketGroup(group)
 	end
+	local displayIndex
+	for i, group in ipairs(tab.socketGroupList) do
+		if group == tab.displayGroup then displayIndex = i end
+	end
+
+	-- Every set is rebuilt in place (the active set's socketGroupList table is
+	-- shared with the tab and its group list control); sets the probe added
+	-- are dropped.
+	local keep = { }
+	for _, snapSet in ipairs(snap.sets) do
+		keep[snapSet.id] = true
+		local set = tab.skillSets[snapSet.id] or tab:NewSkillSet(snapSet.id)
+		set.title = snapSet.title
+		local list = set.socketGroupList
+		for i = #list, 1, -1 do list[i] = nil end
+		for i, snapGroup in ipairs(snapSet.groups) do
+			local group = fromFields(snapGroup.fields, { })
+			group.gemList = { }
+			for j, snapGem in ipairs(snapGroup.gems) do
+				local gem = fromFields(snapGem, { })
+				local key = gem[EXPLODE_SOURCE_KEY]
+				gem[EXPLODE_SOURCE_KEY] = nil
+				if key then gem.explodeSource = explodeSources[key] end
+				group.gemList[j] = gem
+			end
+			list[i] = group
+			tab:ProcessSocketGroup(group)
+		end
+	end
+	for id in pairs(tab.skillSets) do
+		if not keep[id] then tab.skillSets[id] = nil end
+	end
+	for i = #tab.skillSetOrderList, 1, -1 do tab.skillSetOrderList[i] = nil end
+	for i, id in ipairs(snap.order) do tab.skillSetOrderList[i] = id end
+
+	local activeSet = tab.skillSets[snap.activeSkillSetId]
+	if tab.activeSkillSetId ~= snap.activeSkillSetId or tab.socketGroupList ~= activeSet.socketGroupList then
+		tab:SetActiveSkillSet(snap.activeSkillSetId)
+	else
+		tab:RebuildImbuedSupportBySlot()
+		tab.displayGroup = tab.socketGroupList[displayIndex or 1]
+	end
+	restoreSkillsTabSettings(tab, snap.settings)
+
 	build.mainSocketGroup = snap.mainSocketGroup or 1
+	if build.calcsTab and build.calcsTab.input then
+		build.calcsTab.input.skill_number = snap.calcsSkillNumber
+	end
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
