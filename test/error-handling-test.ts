@@ -8,6 +8,7 @@
  *  - XML missing <PathOfBuilding>               → UserError surface
  *  - invalid slot name in swap_item             → error, no drift
  *  - bad item text in swap_item                 → UserError surface, no drift
+ *  - item that does not fit / unknown base      → UserError naming the slot, no undo entry
  *  - invalid gem name in swap_gem               → error, no drift
  *  - invalid keystone name in evaluate_keystone → error, no drift
  *  - undo_last_change with empty stack          → error, no drift
@@ -176,6 +177,29 @@ async function main(): Promise<void> {
     log(`  -> "${errText(r).slice(0, 90)}"`);
     post = await getKeyStats(client);
     assertStatsExact('after-bad-slot', baseline, post);
+
+    log('Test 7b: swap_item with an item that does not fit the slot / does not parse');
+    const ringBefore = errText(await call(client, 'get_item_in_slot', { slot: 'Ring 1' }));
+    r = await call(client, 'swap_item', {
+      slot: 'Ring 1',
+      itemText: 'Rarity: RARE\nWrong Slot Helmet\nHubris Circlet\n+80 to maximum Life',
+    });
+    assert(isError(r), 'expected error for a helmet in a ring slot');
+    assert(/Ring 1/.test(errText(r)) && /Helmet/.test(errText(r)), `expected slot and reason: ${errText(r)}`);
+    assert(!/Internal error/i.test(errText(r)), `a slot mismatch must be a user error: ${errText(r)}`);
+    log(`  -> "${errText(r).slice(0, 120)}"`);
+    r = await call(client, 'swap_item', {
+      slot: 'Ring 1',
+      itemText: 'Rarity: RARE\nUnknown Base Ring\nNot A Real Base\n+80 to maximum Life',
+    });
+    assert(isError(r), 'expected error for an unknown base');
+    assert(/Ring 1/.test(errText(r)) && /parse/i.test(errText(r)) && !/Internal error/i.test(errText(r)), `expected a parse user error: ${errText(r)}`);
+    log(`  -> "${errText(r).slice(0, 120)}"`);
+    assert(errText(await call(client, 'get_item_in_slot', { slot: 'Ring 1' })) === ringBefore, 'Ring 1 changed after refused items');
+    r = await call(client, 'undo_last_change');
+    assert(isError(r) && /empty/i.test(errText(r)), `refused swaps must not push undo entries: ${errText(r)}`);
+    post = await getKeyStats(client);
+    assertStatsExact('after-refused-items', baseline, post);
 
     // ----- gem error paths -----
     log('Test 8: swap_gem with bogus gem name');

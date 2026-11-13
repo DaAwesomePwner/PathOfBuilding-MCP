@@ -51,24 +51,14 @@ for later.
 ## What-if restore exactness
 
 Passive-tree restore is exact (masteries, tattoos, socketed jewels, extra
-nodes, tree version: `restoreTreeState` in `lua/bridge.lua`). The items below
-are the remaining gaps (items, skills, batch commands).
+nodes, tree version: `restoreTreeState` in `lua/bridge.lua`), and so is item
+restore (items re-selected by id in every slot the engine has, probe items
+deleted, unfitting or unparseable items refused: `restoreItemsState` and
+`equipItemInSlot`). The items below are the remaining gaps (skills, batch
+commands).
 
-- **Item restore duplicates the item (confirmed).** `restoreSlotUnlocked`
-  (`src/build-session.ts:219-229`) re-adds the item instead of re-selecting
-  `snapshot.itemId`; exports grow and ids churn. Probe items are never deleted.
-- **Item that does not fit its slot (confirmed).** `equipItemInSlot` in
-  `lua/bridge.lua` does not check `IsItemValidForSlot`; PoB silently empties the
-  slot. Return a user error instead. (The related wrong-item-on-id-gap bug was
-  fixed in `8477d676`.)
-- **Stale display item on parse failure.** `CreateDisplayItemFromRaw` leaves the
-  previous display item in place when parsing fails; clear `displayItem` before
-  calling it.
 - **Skills snapshot misses fields (confirmed).** `lua/bridge.lua:1224-1299` omits
   `imbuedSupport`, `groupCount`, `skillMinion*`, `skillMineCountCalcs`.
-- **Hardcoded slot list (confirmed).** `DEFAULT_TRACKED_SLOTS`
-  (`src/build-session.ts:45-63`) lacks `Ring 3`, `Graft 1`, `Graft 2`, jewel and
-  abyss sockets; snapshots and undo skip them. Take slots from `getValidSlots`.
 - **Batch commands validate mid-mutation (confirmed).** `replaceSocketGroup`,
   `allocNodes` (`lua/bridge.lua:781-803,1138-1165`) can leave partial state.
 

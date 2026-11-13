@@ -843,26 +843,266 @@ local function getItemInSlot(slotName)
 	}
 end
 
+-- Why ItemsTab:IsItemValidForSlot refused `item` for `slotName`.
+local function slotRefusalReason(tab, item, slotName)
+	local kind = item.type or (item.base and item.base.type) or "unknown"
+	if slotName:match("^Jewel %d+$") then
+		if kind ~= "Jewel" then
+			return "only jewels go in passive tree jewel sockets"
+		end
+		return "this jewel does not fit that socket (no such socket node, cluster jewel too large, or charm/socket mismatch)"
+	end
+	if slotName == "Weapon 2" or slotName == "Weapon 2 Swap" then
+		local mainSlot = slotName == "Weapon 2" and "Weapon 1" or "Weapon 1 Swap"
+		local entry = tab.activeItemSet[mainSlot]
+		local mainItem = entry and tab.items[entry.selItemId or 0]
+		if mainItem then
+			return "a " .. kind .. " cannot be used alongside the " .. tostring(mainItem.base and mainItem.base.type or mainItem.type)
+				.. " in " .. mainSlot
+		end
+		return "a " .. kind .. " cannot go in the off-hand slot"
+	end
+	return "a " .. kind .. " item does not go in that slot"
+end
+
+-- Parse item text exactly as ItemsTab:CreateDisplayItemFromRaw does (without
+-- normalising), but never through the items tab's displayItem: a parse
+-- failure can then never leave an earlier display item behind to be equipped.
+local function parseItemText(itemRaw, slotName)
+	local ok, item = pcall(new, "Item", itemRaw)
+	if not ok then
+		userError("Could not parse the item text for " .. slotName .. ": " .. stripColorCodes(tostring(item)))
+	end
+	if not (item and item.base) then
+		userError("Could not parse the item text for " .. slotName .. ": Path of Building does not recognise its base type")
+	end
+	return item
+end
+
+-- Everything that stops `item` going into `slot`, checked before anything is
+-- changed. PoB's PopulateSlots would otherwise silently empty the slot.
+local function assertItemFitsSlot(tab, slot, item)
+	local slotName = slot.slotName
+	if not tab:IsItemValidForSlot(item, slotName) then
+		userError(string.format("%s cannot be equipped in %s: %s", tostring(item.name or "This item"), slotName,
+			slotRefusalReason(tab, item, slotName)))
+	end
+	local parent = slot.parentSlot
+	if parent then
+		local index = 0
+		for i, s in ipairs(parent.abyssalSocketList or { }) do
+			if s == slot then index = i end
+		end
+		local parentItem = tab.items[parent.selItemId or 0]
+		local count = parentItem and parentItem.abyssalSocketCount or 0
+		if index > count then
+			userError(string.format("%s cannot be equipped in %s: the item in %s has %d abyssal socket(s)",
+				tostring(item.name or "This item"), slotName, parent.slotName, count))
+		end
+	end
+end
+
+-- Remove an item that nothing refers to from the build (no undo state, no
+-- slot repopulation; callers repopulate once).
+local function removeUnusedItem(tab, id)
+	tab.items[id] = nil
+	for i = #tab.itemOrderList, 1, -1 do
+		if tab.itemOrderList[i] == id then table.remove(tab.itemOrderList, i) end
+	end
+end
+
 local function equipItemInSlot(slotName, itemRaw)
-	local slot = build.itemsTab.slots[slotName]
+	local tab = build.itemsTab
+	local slot = tab.slots[slotName]
 	if not slot then
 		userError("Unknown slot: " .. tostring(slotName))
 	end
-	build.itemsTab:CreateDisplayItemFromRaw(itemRaw)
-	if not build.itemsTab.displayItem then
-		userError("Failed to parse item raw text")
-	end
-	-- AddItem gives the item the lowest free id (not the highest), and
-	-- AddDisplayItem clears displayItem, so keep the object to read its id.
-	local newItem = build.itemsTab.displayItem
-	build.itemsTab:AddDisplayItem(true) -- noAutoEquip = true
-	if not newItem.id or build.itemsTab.items[newItem.id] ~= newItem then
-		error("Path of Building did not add the item (ItemsTab:AddDisplayItem changed)")
+	local newItem = parseItemText(itemRaw, slotName)
+	assertItemFitsSlot(tab, slot, newItem)
+	-- AddItem gives the item the lowest free id (not the highest).
+	local previousId = slot.selItemId or 0
+	tab:AddItem(newItem, true) -- noAutoEquip = true
+	if not newItem.id or tab.items[newItem.id] ~= newItem then
+		error("Path of Building did not add the item (ItemsTab:AddItem changed)")
 	end
 	slot:SetSelItemId(newItem.id)
 	build.buildFlag = true
-	build.itemsTab:PopulateSlots()
+	tab:PopulateSlots()
+	if slot.selItemId ~= newItem.id then
+		-- Not expected after assertItemFitsSlot; put the slot back rather than
+		-- leave it silently empty.
+		slot:SetSelItemId(previousId)
+		removeUnusedItem(tab, newItem.id)
+		tab:PopulateSlots()
+		runCallback("OnFrame")
+		error("Path of Building did not keep the item in " .. slotName .. " (slot validation changed?)")
+	end
 	runCallback("OnFrame")
+end
+
+-- Re-select an item the build already holds. Returns false (changing
+-- nothing) when `itemId` is gone or now holds a different item than `itemRaw`.
+local function selectItemInSlot(slotName, itemId, itemRaw)
+	local tab = build.itemsTab
+	local slot = tab.slots[slotName]
+	if not slot then
+		userError("Unknown slot: " .. tostring(slotName))
+	end
+	local item = tab.items[itemId or 0]
+	if not item or (itemRaw ~= nil and item.raw ~= itemRaw) then
+		return false
+	end
+	assertItemFitsSlot(tab, slot, item)
+	slot:SetSelItemId(item.id)
+	build.buildFlag = true
+	tab:PopulateSlots()
+	runCallback("OnFrame")
+	return true
+end
+
+-- Item state of the active item set: the item id in every equipment slot
+-- that is not a passive-tree jewel socket (weapons and weapon swap, armour,
+-- jewellery including Ring 3, grafts, flasks, abyssal sockets), taken from
+-- the engine's own slot list, plus the build's item list in order. Jewel
+-- sockets are deliberately left out: PoB keeps them on the passive spec
+-- (spec.jewels), and the tree state (captureSpecState / restoreTreeState)
+-- owns them.
+local function captureItemsState()
+	local tab = build.itemsTab
+	local slots = { }
+	for _, slot in ipairs(tab.orderedSlots) do
+		local id = slot.selItemId or 0
+		if not slot.nodeId and id ~= 0 then
+			slots[#slots + 1] = { slot.slotName, id }
+		end
+	end
+	local order = { }
+	for i, id in ipairs(tab.itemOrderList) do order[i] = id end
+	return { slots = slots, itemOrder = order }
+end
+
+-- Where the build still refers to item `id`.
+local function itemReferences(tab, id)
+	local refs = { }
+	for slotName, slot in pairs(tab.slots) do
+		if slot.selItemId == id then refs[#refs + 1] = slotName end
+	end
+	for setId, itemSet in pairs(tab.itemSets or { }) do
+		if itemSet ~= tab.activeItemSet then
+			for slotName, entry in pairs(itemSet) do
+				if type(entry) == "table" and entry.selItemId == id then
+					refs[#refs + 1] = "item set " .. tostring(setId) .. " " .. tostring(slotName)
+				end
+			end
+		end
+	end
+	for i, spec in ipairs(build.treeTab and build.treeTab.specList or { build.spec }) do
+		for nodeId, itemId in pairs(spec.jewels or { }) do
+			if itemId == id then refs[#refs + 1] = "tree " .. i .. " socket " .. tostring(nodeId) end
+		end
+	end
+	table.sort(refs)
+	return refs
+end
+
+-- Put a captureItemsState state back: every non-socket slot re-selects the
+-- captured item id (by id, so nothing is re-added), items added since the
+-- capture (probe items, the item a swap added) are deleted, and the item
+-- order is the captured one. Snapshot items are never deleted, so ids held
+-- by older snapshots (tree states, undo entries) stay valid. Returns
+-- { exact, mismatches?, removedItemIds? }.
+local function restoreItemsState(state)
+	if type(state) ~= "table" or type(state.slots) ~= "table" or type(state.itemOrder) ~= "table" then
+		error("restoreItemsState: malformed item state")
+	end
+	local tab = build.itemsTab
+	local mismatches = { }
+	local want = { }
+	for _, pair in ipairs(state.slots) do
+		local name, id = pair[1], pair[2]
+		if type(name) ~= "string" or type(id) ~= "number" then
+			error("restoreItemsState: malformed slot entry")
+		end
+		if not tab.slots[name] or tab.slots[name].nodeId then
+			mismatches[#mismatches + 1] = "slot " .. name .. " does not exist"
+		elseif not tab.items[id] then
+			mismatches[#mismatches + 1] = "item " .. id .. " for " .. name .. " no longer exists"
+		end
+		want[name] = id
+	end
+	local keep = { }
+	for _, id in ipairs(state.itemOrder) do keep[id] = true end
+
+	local changed = false
+	for _, slot in ipairs(tab.orderedSlots) do
+		if not slot.nodeId then
+			local id = want[slot.slotName] or 0
+			if not tab.items[id] then id = 0 end
+			if (slot.selItemId or 0) ~= id then
+				slot:SetSelItemId(id)
+				changed = true
+			end
+		end
+	end
+
+	local extra = { }
+	for id in pairs(tab.items) do
+		if not keep[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	local removed = { }
+	for _, id in ipairs(extra) do
+		local refs = itemReferences(tab, id)
+		if #refs > 0 then
+			mismatches[#mismatches + 1] = "item " .. id .. " added since the snapshot is still in use (" .. table.concat(refs, ", ") .. ")"
+		else
+			removeUnusedItem(tab, id)
+			removed[#removed + 1] = id
+		end
+	end
+
+	local orderMatches = #tab.itemOrderList == #state.itemOrder
+	for i, id in ipairs(state.itemOrder) do
+		if tab.itemOrderList[i] ~= id then orderMatches = false end
+	end
+	if not orderMatches then
+		-- Same items, different order: put the captured order back (in place;
+		-- the item list control holds this table).
+		local sameItems = true
+		for _, id in ipairs(state.itemOrder) do
+			if not tab.items[id] then sameItems = false end
+		end
+		for id in pairs(tab.items) do
+			if not keep[id] then sameItems = false end
+		end
+		if sameItems then
+			for i = #tab.itemOrderList, 1, -1 do tab.itemOrderList[i] = nil end
+			for i, id in ipairs(state.itemOrder) do tab.itemOrderList[i] = id end
+		else
+			mismatches[#mismatches + 1] = "item list differs from the snapshot"
+		end
+	end
+
+	if changed or #removed > 0 then
+		tab:PopulateSlots()
+		build.buildFlag = true
+		runCallback("OnFrame")
+	end
+	for _, slot in ipairs(tab.orderedSlots) do
+		if not slot.nodeId then
+			local id = want[slot.slotName] or 0
+			if tab.items[id] and (slot.selItemId or 0) ~= id then
+				mismatches[#mismatches + 1] = slot.slotName .. " holds item " .. tostring(slot.selItemId) .. ", expected " .. id
+			end
+		end
+	end
+	local report = { exact = #mismatches == 0 }
+	if #mismatches > 0 then
+		report.mismatches = mismatches
+		STDERR:write("[pob-mcp] warning: item restore is not exact: ", encodeJSON(report), "\n")
+	end
+	if #removed > 0 then report.removedItemIds = removed end
+	return report
 end
 
 local function unequipSlot(slotName)
@@ -1458,6 +1698,29 @@ local function restoreTreeState(encoded)
 		error("Tree restore failed: build.spec or PassiveSpec:RestoreUndoState is unavailable (PoB changed?)")
 	end
 	local state = decodeSpecState(encoded)
+	local before = state.treeVersion == spec.treeVersion and treeStateDifferences(spec, state)
+	local jewelsOnly = before and #before.missing == 0 and #before.pending == 0 and #before.extra == 0
+		and #before.mismatches > 0
+	if jewelsOnly then
+		for _, text in ipairs(before.mismatches) do
+			if not text:find("^jewel in socket ") then jewelsOnly = false end
+		end
+	end
+	if jewelsOnly then
+		-- Only socketed jewels differ (an item probe on a jewel socket): put
+		-- them back without re-importing the node list, which would reshuffle
+		-- PoB's allocNodes table and so the order of the saved node list.
+		restoreSpecJewels(spec, state.jewels)
+		spec:BuildClusterJewelGraphs()
+		if build.itemsTab.PopulateSlots then build.itemsTab:PopulateSlots() end
+		local diff = treeStateDifferences(spec, state)
+		if #diff.missing == 0 and #diff.pending == 0 and #diff.extra == 0 and #diff.mismatches == 0 then
+			build.buildFlag = true
+			runCallback("OnFrame")
+			return treeStateReport(diff)
+		end
+		-- Something else moved with the jewels: fall through to the full restore.
+	end
 	if state.treeVersion ~= spec.treeVersion then
 		restoreSpecState(encoded)
 		spec = build.spec
@@ -2527,25 +2790,18 @@ local DISPATCH = {
 		handler = function(cmd) unequipSlot(cmd.slot) return { } end,
 		mutating = true,
 	},
-	snapshotAllItems = {
+	selectItem = {
+		-- Re-select an item the build already holds; `selected` is false (nothing
+		-- changed) when the id is gone or holds a different item than `itemText`.
 		handler = function(cmd)
-			if type(cmd.slots) ~= "table" then
-				userError("snapshotAllItems requires `slots` array")
-			end
-			local out = {}
-			for i = 1, #cmd.slots do
-				local slotName = cmd.slots[i]
-				local item = getItemInSlot(slotName)
-				-- Transform to ItemSnapshot shape: { slot, itemText, itemId }
-				-- (mirrors the logic in TS snapshotSlotUnlocked)
-				if item.itemId and item.itemId ~= 0 and item.raw then
-					out[i] = { slot = slotName, itemText = item.raw, itemId = item.itemId }
-				else
-					out[i] = { slot = slotName, itemText = dkjson.null, itemId = dkjson.null }
-				end
-			end
-			return { items = out }
+			return { selected = selectItemInSlot(cmd.slot, cmd.itemId, cmd.itemText) }
 		end,
+	},
+	captureItemsState = {
+		handler = function(_cmd) return { state = captureItemsState() } end,
+	},
+	restoreItemsState = {
+		handler = function(cmd) return restoreItemsState(cmd.state) end,
 	},
 
 	-- Passive tree
