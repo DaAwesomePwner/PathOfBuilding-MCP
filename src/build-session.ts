@@ -1,11 +1,5 @@
-import {
-  BuildInfo,
-  decodeBuildCode,
-  encodeBuildCode,
-  fetchBuildFromURL,
-  LuaBridge,
-  Stats,
-} from './lua-bridge.js';
+import { encodeBuildCode, resolveBuildSource } from './build-source.js';
+import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { UserError } from './validation.js';
 
 export interface ItemSnapshot {
@@ -148,17 +142,10 @@ export class BuildSession {
   // ------------------------------------------------------------------
 
   async loadBuild(source: string): Promise<BuildInfo> {
+    // Download and decode outside the lock: a slow pobb.in/pastebin fetch must
+    // not block other engine calls. Only the engine load and state swap are serialised.
+    const xml = await resolveBuildSource(source);
     return this.withLock(async () => {
-      const trimmed = source.trim();
-      let xml: string;
-      if (/^https?:\/\//i.test(trimmed)) {
-        xml = await fetchBuildFromURL(trimmed);
-      } else if (trimmed.startsWith('<?xml') || trimmed.startsWith('<PathOfBuilding')) {
-        xml = trimmed;
-      } else {
-        xml = decodeBuildCode(trimmed);
-      }
-
       const info = await this.bridge.loadBuildXML(xml);
       this.originalXML = xml;
       this.buildInfo = info;
