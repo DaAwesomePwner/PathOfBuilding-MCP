@@ -1014,6 +1014,10 @@ end
 -- new object with the same id: give each the token its predecessor had, but
 -- only where the reloaded item has the same text, so undo entries and
 -- snapshots of that build stay valid while anything else still mismatches.
+-- The texts compare equal even for items PoB re-serialises (crafted mods,
+-- variants, rolled ranges): ItemsTab:Save rewrites each item's raw text
+-- (BuildAndParseRaw) before writing it, `identities` is read after that
+-- SaveDB, and the reloaded item's raw text is exactly the saved text.
 local function carryItemIdentities(identities)
 	local carried = 0
 	for id, item in pairs(build and build.itemsTab and build.itemsTab.items or { }) do
@@ -1044,9 +1048,10 @@ local function captureItemsState()
 end
 
 -- Refuse (internal error, before anything changes) a captured item state
--- whose ids no longer name the captured items: a snapshot applied out of
--- order, e.g. one taken before load_build or reset_build replaced every item
--- object while keeping the same ids.
+-- whose ids no longer name the captured items: a snapshot taken before the
+-- engine was restarted or the build was reloaded, which replaces every item
+-- object while keeping the same ids. (The bridge's own failed-load recovery
+-- carries identities over, see carryItemIdentities.)
 local function checkItemsState(state)
 	if type(state) ~= "table" or type(state.itemOrder) ~= "table" or type(state.itemTokens) ~= "table"
 		or #state.itemTokens ~= #state.itemOrder then

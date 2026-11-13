@@ -29,7 +29,8 @@
 //      error naming reset_build, before anything changes.
 //  12. A load_build PoB rejects keeps the previous build (the bridge reloads
 //      it from its own save): undo entries taken before it (item, jewel,
-//      config, tree conversion) still undo back to the loaded build.
+//      config, tree conversion) still undo back to the loaded build, also
+//      with crafted, variant and ranged items whose text PoB re-serialises.
 //  13. Item identity tokens differ between engine processes, so a snapshot
 //      from an engine that has since crashed or been replaced (same build,
 //      same ids) is refused by the new one.
@@ -123,6 +124,38 @@ Item Restore Jewel B
 Crimson Jewel
 Item Level: 84
 7% increased maximum Life`;
+
+// Item text PoB re-serialises when it saves (ItemsTab:Save rebuilds the raw
+// text): a crafted mod, a unique with variants, and rolled ranges.
+const CRAFTED_RING = `Rarity: RARE
+Item Restore Crafted Ring
+Two-Stone Ring
+Item Level: 84
+Implicits: 1
++(12-16)% to Cold and Lightning Resistances
++42 to maximum Life
+{crafted}+35% to Fire Resistance`;
+
+const VARIANT_RING = `Rarity: UNIQUE
+Item Restore Variant Ring
+Gold Ring
+Variant: Old
+Variant: New
+Selected Variant: 2
+Implicits: 1
+(6-15)% increased Rarity of Items found
+{variant:1}+20 to maximum Life
+{variant:2}+40 to maximum Life
++25% to Fire Resistance`;
+
+const RANGED_AMULET = `Rarity: RARE
+Item Restore Ranged Amulet
+Onyx Amulet
+Item Level: 84
+Implicits: 1
+{range:0.5}+(10-16) to all Attributes
+{range:0.25}+(70-79) to maximum Life
+{range:1}+(36-41)% to Cold Resistance`;
 
 const GARBAGE = `Rarity: RARE
 Item Restore Garbage
@@ -225,15 +258,12 @@ function sortNodeLists(xml: string): string {
  * tag, runs of consecutive self-closing sibling elements at one indentation
  * (<Input/>, <PlayerStat/>, <Slot/> mixed with <SocketIdURL/>, <Socket/>, ...)
  * are sorted, and so are the top-level sections. <Gem/> lines keep their
- * order (it is the gem order of a socket group). With `reread`, a
- * <TimelessData> without socketFilterDistance gets the "0" PoB reads it as
- * (Build.lua), since PoB only writes that attribute once it has read it. Items keep their order and
+ * order (it is the gem order of a socket group). Items keep their order and
  * text (they are not self-closing), and the item list and slot ids are
  * compared separately anyway.
  */
-function canonicalXml(xml: string, reread = false): string {
-  const filled = reread ? xml.replace(/<TimelessData(?![^>]*socketFilterDistance=)/g, '<TimelessData socketFilterDistance="0"') : xml;
-  const lines = sortNodeLists(filled)
+function canonicalXml(xml: string): string {
+  const lines = sortNodeLists(xml)
     .split('\n')
     .map((line) =>
       line.replace(/<(\w+)((?:\s+\w+="[^"]*")+)\s*(\/?)>/g, (_m, tag: string, attrList: string, close: string) =>
@@ -271,35 +301,10 @@ function canonicalXml(xml: string, reread = false): string {
 }
 
 /**
- * 'rebuilt': PoB rebuilt the passive spec, so table-ordered lists may
- * reorder (canonicalXml). 'reread': PoB re-read the build from its own save
- * (failed-load recovery): as 'rebuilt', and an attribute PoB saved as "nil"
- * (unset) may come back as the default it reads it as, so "nil" on either
- * side matches any value of the same attribute on the same line; attribute
- * names, all other values, text and line structure must still match.
+ * 'rebuilt': PoB rebuilt the passive spec or re-read the build, so the order
+ * of table-ordered lists may differ (canonicalXml); everything else exact.
  */
-type XmlCompare = false | 'rebuilt' | 'reread';
-
-function lineAttrs(line: string): { head: string; attrs: Map<string, string> } | null {
-  const m = /^(\s*<\/?\w+)((?:\s+\w+="[^"]*")*)\s*(\/?>)\s*$/.exec(line);
-  if (!m) return null;
-  return { head: m[1] + m[3], attrs: new Map([...m[2].matchAll(/(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]])) };
-}
-
-function nilTolerantDifference(actual: string, expected: string): string | null {
-  const a = actual.split('\n');
-  const e = expected.split('\n');
-  if (a.length !== e.length) return `${a.length} lines vs ${e.length}`;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] === e[i]) continue;
-    const la = lineAttrs(a[i]);
-    const le = lineAttrs(e[i]);
-    const same = la && le && la.head === le.head && la.attrs.size === le.attrs.size &&
-      [...la.attrs].every(([k, v]) => le.attrs.has(k) && (v === le.attrs.get(k) || v === 'nil' || le.attrs.get(k) === 'nil'));
-    if (!same) return `line ${i + 1}:\n  ${a[i]}\n  vs ${e[i]}`;
-  }
-  return null;
-}
+type XmlCompare = false | 'rebuilt';
 
 function assertSameBuild(label: string, actual: BuildState, expected: BuildState, compare: XmlCompare = false): void {
   assert(
@@ -313,11 +318,6 @@ function assertSameBuild(label: string, actual: BuildState, expected: BuildState
   );
   for (const key of ['Life', 'CombinedDPS', 'TotalEHP'] as const) {
     assert(actual.stats[key] === expected.stats[key], `${label}: ${key} not bit-exact (${actual.stats[key]} != ${expected.stats[key]})`);
-  }
-  if (compare === 'reread') {
-    const diff = nilTolerantDifference(canonicalXml(actual.xml, true), canonicalXml(expected.xml, true));
-    assert(diff === null, `${label}: exported XML differs at ${diff}`);
-    return;
   }
   const norm = (xml: string): string => (compare === 'rebuilt' ? canonicalXml(xml) : xml);
   assert(norm(actual.xml) === norm(expected.xml), `${label}: exported XML differs ${firstDifference(norm(actual.xml), norm(expected.xml))}`);
@@ -625,19 +625,23 @@ async function main(): Promise<void> {
       assert(err instanceof Error && /previously loaded build is still active/.test(err.message), `${label}: expected a recovered failed load, got ${String(err)}`);
     };
     // The recovery reloads the build from the bridge's own SaveDB output, so
-    // what is left is PoB's re-read of that save: table-ordered lists may
-    // come back in another order and values it saved as "nil" come back as
-    // defaults. Exports after a recovery are compared in 'reread' mode; items,
-    // slot ids and stats are exact.
-    // The plain case: swap, failed load, undo.
+    // what is left is PoB's re-read of that save. A first re-read is not
+    // byte-idempotent (values PoB saved as "nil" come back as defaults, a
+    // <TimelessData> gains socketFilterDistance), so the build is put through
+    // one failed load before any baseline is taken: every expected state is
+    // then already in re-read form and is compared strictly ('rebuilt': only
+    // the order of table-ordered lists may differ; items, slot ids and stats
+    // exact).
     await session.loadBuild(occXml);
+    await failLoad('priming');
+    // The plain case: swap, failed load, undo.
     const f0 = await buildState(session);
     await session.swapItemWithDiff('Ring 1', RING_A);
     const f1 = await buildState(session);
     await failLoad('after a swap');
-    assertSameBuild('after the failed load (build kept as left)', await buildState(session), f1, 'reread');
+    assertSameBuild('after the failed load (build kept as left)', await buildState(session), f1, 'rebuilt');
     await session.undoLastChange();
-    assertSameBuild('swap, failed load, undo', await buildState(session), f0, 'reread');
+    assertSameBuild('swap, failed load, undo', await buildState(session), f0, 'rebuilt');
     // Every undo entry kind across the recovery reload: config, item, jewel
     // (tree-owned socket), and a tree conversion (spec entry).
     await session.setConfigWithUndo({ usePowerCharges: true });
@@ -650,16 +654,54 @@ async function main(): Promise<void> {
     assert(conv3.converted, 'OccVortex (3_13) should convert');
     const g4 = await buildState(session);
     await failLoad('after config, item, jewel and conversion entries');
-    assertSameBuild('after the second failed load', await buildState(session), g4, 'reread');
+    assertSameBuild('after the second failed load', await buildState(session), g4, 'rebuilt');
     await session.compareItems('Ring 1', [RING_B]); // probes work on the reloaded build too
     await session.undoLastChange();
-    assertSameBuild('undo of the conversion after a failed load', await buildState(session), g3, 'reread');
+    assertSameBuild('undo of the conversion after a failed load', await buildState(session), g3, 'rebuilt');
     await session.undoLastChange();
-    assertSameBuild('undo of the jewel swap after a failed load', await buildState(session), g2, 'reread');
+    assertSameBuild('undo of the jewel swap after a failed load', await buildState(session), g2, 'rebuilt');
     await session.undoLastChange();
-    assertSameBuild('undo of the ring swap after a failed load', await buildState(session), g1, 'reread');
+    assertSameBuild('undo of the ring swap after a failed load', await buildState(session), g1, 'rebuilt');
     await session.undoLastChange();
-    assertSameBuild('undo of the config change after a failed load', await buildState(session), f0, 'reread');
+    assertSameBuild('undo of the config change after a failed load', await buildState(session), f0, 'rebuilt');
+    // Items whose text PoB re-serialises on save (crafted mods, variants,
+    // rolled ranges): the carry-over compares the text the bridge saved with
+    // the re-read item's text, so their undo entries must keep working too.
+    // Round 1 never exports before the failed load, so the items' text is
+    // still exactly as pasted when the undo entry is taken.
+    await session.equipItem('Ring 1', CRAFTED_RING);
+    await session.equipItem('Ring 2', VARIANT_RING);
+    await session.equipItem('Amulet', RANGED_AMULET);
+    type RawItems = { state: { slots: Array<[string, number]>; itemOrder: number[] } };
+    const pasted = await bridge.send<RawItems>({ cmd: 'captureItemsState' });
+    const pastedStats = await session.getStats();
+    await session.swapItemWithDiff('Ring 1', RING_A);
+    await session.swapItemWithDiff('Amulet', AMULET);
+    await failLoad('with crafted, variant and ranged items');
+    await session.undoLastChange();
+    await session.undoLastChange();
+    const back = await bridge.send<RawItems>({ cmd: 'captureItemsState' });
+    assert(JSON.stringify(back.state.itemOrder) === JSON.stringify(pasted.state.itemOrder), `item list after undo: ${JSON.stringify(back.state.itemOrder)} vs ${JSON.stringify(pasted.state.itemOrder)}`);
+    assert(JSON.stringify(back.state.slots) === JSON.stringify(pasted.state.slots), 'slot ids after undo differ');
+    const backStats = await session.getStats();
+    for (const key of ['Life', 'CombinedDPS', 'TotalEHP'] as const) {
+      assert(backStats[key] === pastedStats[key], `special items, round 1: ${key} ${backStats[key]} != ${pastedStats[key]}`);
+    }
+    // The premise: PoB's save did rewrite each item's text, so the
+    // carry-over really had to match re-serialised text.
+    for (const [slot, pastedText] of [['Ring 1', CRAFTED_RING], ['Ring 2', VARIANT_RING], ['Amulet', RANGED_AMULET]]) {
+      const raw = (await bridge.send<{ item: { raw: string } }>({ cmd: 'getItemInSlot', slot })).item.raw;
+      assert(raw !== pastedText, `${slot}: PoB kept the pasted text, so this case tests nothing`);
+    }
+    // Round 2 with full export comparisons (exporting re-serialises the text).
+    await failLoad('re-read form for round 2');
+    const h0 = await buildState(session);
+    await session.swapItemWithDiff('Ring 2', RING_B);
+    await session.swapItemWithDiff('Amulet', AMULET);
+    await failLoad('with special items, round 2');
+    await session.undoLastChange();
+    await session.undoLastChange();
+    assertSameBuild('crafted/variant/ranged items: swap, failed load, undo', await buildState(session), h0, 'rebuilt');
     // Still refused: a snapshot from before a successful reload.
     const old = await session.snapshotAll();
     await session.loadBuild(occXml);

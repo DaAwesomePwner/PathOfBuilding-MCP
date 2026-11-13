@@ -21,8 +21,8 @@ export interface ItemsState {
   /**
    * Identity token of each item in `itemOrder` (bridge-side, per item object):
    * a restore is refused, before anything changes, when an id no longer
-   * names the item it named at capture (e.g. a snapshot taken before
-   * load_build or reset_build).
+   * names the item it named at capture: a snapshot taken before the engine
+   * was restarted or the build was reloaded.
    */
   itemTokens: string[];
 }
@@ -364,9 +364,9 @@ export class BuildSession {
     between?: () => Promise<void>,
     after?: () => Promise<void>,
   ): Promise<void> {
-    // A snapshot whose item ids no longer name its items (taken before a
-    // load_build / reset_build) is refused before the tree, which holds
-    // jewel item ids, or anything else is touched.
+    // A snapshot whose item ids no longer name its items (taken before the
+    // engine was restarted or the build was reloaded) is refused before the
+    // tree, which holds jewel item ids, or anything else is touched.
     await this.bridge.send({ cmd: 'checkItemsState', state: items });
     // A tree the probe did not touch is left alone: re-importing it would
     // only reshuffle PoB's allocNodes table (and so the order of the exported
