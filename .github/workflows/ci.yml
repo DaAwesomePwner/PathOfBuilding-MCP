@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only pull request runs are superseded; every push to master gets tested.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Path of Building Community release the integration tests run against.

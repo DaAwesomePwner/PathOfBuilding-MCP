@@ -781,7 +781,7 @@ async function part3(): Promise<void> {
     const p = resolveAllPaths();
     real = { pobPath: p.pobPath, luajitPath: p.luajitPath, version: p.pobInfo.version };
   } catch (e) {
-    console.log(`SKIPPED part 3 (no real PoB/LuaJIT): ${(e as Error).message.split('\n')[0]}`);
+    skipOrFail(' part 3 (no real PoB/LuaJIT)', (e as Error).message.split('\n')[0]);
     return;
   }
   const fixture = readFileSync(path.join(testDir, 'fixtures', 'OccVortex.xml'), 'utf8');
