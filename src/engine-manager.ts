@@ -89,7 +89,9 @@ export class EngineManager {
   private startFingerprint: InstallFingerprint | null = null;
   private startedAt: string | null = null;
   private carryXML: string | null = null;
-  private lastExport: { xml: string | null; error?: string } | null = null;
+  /** What the carried build is missing, when the old engine could not give its current build. */
+  private carryNote: string | undefined;
+  private lastExport: { xml: string | null; error?: string; note?: string } | null = null;
   private lastCarry: { info: BuildInfo | null; error?: string; xml?: string } | null = null;
   private pathPrompt: PathPrompt | null = null;
   private prompted = false;
@@ -196,6 +198,7 @@ export class EngineManager {
       if (this.carryXML && this.session) {
         const xml = this.carryXML;
         this.carryXML = null;
+        this.carryNote = undefined;
         try {
           this.lastCarry = { info: await this.session.loadBuild(xml) };
         } catch (e) {
@@ -299,12 +302,11 @@ export class EngineManager {
   // ------------------------------------------------------------------ swaps
 
   /** Export the loaded build (if any) from the current engine so it survives a restart. */
-  private async exportCurrentBuild(): Promise<{ xml: string | null; error?: string }> {
-    if (this.carryXML) return { xml: this.carryXML };
+  private async exportCurrentBuild(): Promise<{ xml: string | null; error?: string; note?: string }> {
+    if (this.carryXML) return { xml: this.carryXML, note: this.carryNote };
     if (!this.session || !this.startFingerprint) return { xml: null };
-    if (!this.session.hasBuild()) return { xml: null };
     try {
-      return { xml: await this.session.exportForEngineSwap() }; // also covers an engine that already crashed
+      return await this.session.exportForEngineSwap(); // also covers an engine that already crashed (and no build)
     } catch (e) {
       const error = (e as Error).message;
       this.log(`could not export the current build before restart: ${error}`);
@@ -318,6 +320,7 @@ export class EngineManager {
     await this.stopEngine();
     this.paths = next;
     this.carryXML = exp.xml;
+    this.carryNote = exp.note;
     this.lastExport = exp;
     this.lastCarry = null;
     await this.boot();
@@ -343,8 +346,8 @@ export class EngineManager {
         buildNote: msg.carryLoadFailedNote(c.error),
       };
     }
-    if (c?.info) return { buildReloaded: true, build: c.info };
-    return { buildReloaded: false, build: null, buildNote: 'No build was loaded, so none was carried over.' };
+    if (c?.info) return { buildReloaded: true, build: c.info, ...(exp?.note ? { buildNote: exp.note } : {}) };
+    return { buildReloaded: false, build: null, buildNote: exp?.note ?? 'No build was loaded, so none was carried over.' };
   }
 
   /** Restart LuaJIT against the on-disk install, carrying the current build over. */

@@ -71,19 +71,19 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 
 **What the server does:** the stuck process is killed and the timeout counts as one of the three strikes (see above); the in-flight tool call returns an error. The next tool call restarts the engine — see the next section.
 
+**Fix:**
+- Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter on `suggest_upgrades`.
+- If a specific build always times out, capture stderr (`POB_TIMING=1` helps) and try simplifying the build (remove very large jewel clusters, exotic skill setups) to isolate the offending data.
+
 ## "The Path of Building engine stopped unexpectedly and was restarted"
 
 **Cause:** The LuaJIT engine crashed or hung (strike 1 or 2 of 3) and the server restarted it at the start of this tool call.
 
-**What the server did:** the new engine holds the build as it was after the last committed change (`load_build`, `reset_build`, `swap_item`, `unequip_item`, `set_config`, `convert_tree_to_latest` or `undo_last_change`); a change whose call failed when the engine stopped was not kept, and a `load_build` that PoB rejected is never restored. Undo history is cleared (its entries belonged to the old engine process); `undo_last_change` then says so. Labelled stat snapshots are kept. `reset_build` still returns to the originally loaded build. The call that reports this does nothing else.
+**What the server did:** the new engine holds the build as it was after the last committed change (`load_build`, `reset_build`, `swap_item`, `unequip_item`, `set_config`, `convert_tree_to_latest` or `undo_last_change`); a change whose call failed when the engine stopped was not kept, and a `load_build` that PoB rejected is never restored. Undo history is cleared (its entries belonged to the old engine process); `undo_last_change` then says so. Labelled stat snapshots are kept. `reset_build` still returns to the originally loaded build. The call that reports this does nothing else. A `load_build` or `reset_build` after a crash does not fail: it loads normally and its result carries an `engineRestart` note with the strike count instead.
 
 **Fix:** retry the call. If the notice says the build could not be restored, call `reset_build` or `load_build`.
 
 A call that was running when the engine stopped fails with *"The Path of Building engine stopped during this call"*: it did not finish, and nothing it was doing is retried on the new engine.
-
-**Fix:**
-- Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter on `suggest_upgrades`.
-- If a specific build always times out, capture stderr (`POB_TIMING=1` helps) and try simplifying the build (remove very large jewel clusters, exotic skill setups) to isolate the offending data.
 
 ## "Build code is empty" / "Invalid build code"
 

@@ -1,7 +1,7 @@
 import { ChildProcess, spawn } from 'child_process';
 import path from 'path';
 import { decodeBuildCode, fetchBuildFromURL } from './build-source.js';
-import { circuitOpen, engineDown, MAX_CRASHES } from './engine-messages.js';
+import { circuitOpen, engineDown, loadAfterRestart, MAX_CRASHES } from './engine-messages.js';
 import { ResolvedPaths } from './paths.js';
 import { inspectPoBInstall } from './pob-install.js';
 import { startTimer } from './timing.js';
@@ -16,6 +16,11 @@ export interface BuildInfo {
   treeVersion?: string;
   /** Latest tree version known to the running PoB, when the bridge reports it. */
   latestTreeVersion?: string;
+  /**
+   * Set only on a load result: the engine had stopped unexpectedly and was
+   * restarted for this load (the one-time strike notice for that path).
+   */
+  engineRestart?: string;
 }
 
 /** Thrown to a call that was queued or in flight when its engine was replaced. */
@@ -110,6 +115,16 @@ export class LuaBridge {
    */
   private recoveryBuild: { xml: string; name?: string } | null = null;
   private recoveryOps: object[] = [];
+  /**
+   * Set when a respawn could not restore the recovery build: the build and
+   * journal are kept (they are still the last known good state) but are not
+   * replayed again, and nothing more is journaled until a load succeeds.
+   */
+  private recoveryError: string | null = null;
+  /** A load is about to replace the build, so a respawn for it skips the replay. */
+  private deferRestore = false;
+  /** A respawn skipped its replay for a load; the load result or a failed load settles it. */
+  private restorePending = false;
   private starting: Promise<void> | null = null;
   private readyResolve: { resolve: () => void; reject: (err: Error) => void; timeout: NodeJS.Timeout } | null = null;
   private stdoutBuffer = '';
@@ -124,7 +139,7 @@ export class LuaBridge {
   private disposed = false;
   /** Process handle captured by dispose(), so forceKill() still reaches it after references are cleared. */
   private retiredProcess: ChildProcess | null = null;
-  private readonly testFaults: string | undefined;
+  private testFaults: string | undefined;
   /** Processes that reached "ready". A start after the first is a respawn. */
   private spawnCount = 0;
   private respawnReport: RespawnReport | null = null;
@@ -212,9 +227,26 @@ export class LuaBridge {
     return this.recoveryBuild?.xml ?? null;
   }
 
-  /** Record a command the engine just completed as a committed change, replayed after a respawn. */
+  /**
+   * What is known about the build a respawn would restore: the last accepted
+   * XML, how many committed changes follow it, and, if an earlier respawn
+   * could not restore it, why.
+   */
+  getRecoveryState(): { xml: string | null; committed: number; lostError: string | null } {
+    return { xml: this.recoveryBuild?.xml ?? null, committed: this.recoveryOps.length, lostError: this.recoveryError };
+  }
+
+  /** Test-only: fault names for the next process this bridge starts (see LuaBridgeOptions.testFaults). */
+  setTestFaults(faults: string | undefined): void {
+    this.testFaults = faults;
+  }
+
+  /**
+   * Record a command as a committed change, replayed after a respawn. Call
+   * only once the whole tool call that made it has succeeded.
+   */
   recordCommitted(command: object): void {
-    if (this.recoveryBuild) this.recoveryOps.push(command);
+    if (this.recoveryBuild && !this.recoveryError) this.recoveryOps.push(command);
   }
 
   /** Number of committed commands recorded since the last accepted load. */
@@ -335,13 +367,33 @@ export class LuaBridge {
     });
   }
 
+  /**
+   * Load a build. If the engine has to be respawned for it (it stopped since
+   * the last call), the respawn skips replaying the old build, which this
+   * load replaces; only if the load fails is the old build put back, as any
+   * respawn would. A successful load reports the restart in `engineRestart`.
+   */
   async loadBuildXML(xml: string, name?: string): Promise<BuildInfo> {
-    const result = await this.send<{ ok: true; info: BuildInfo }>({ cmd: 'loadXML', xml, name });
+    this.deferRestore = this.spawnCount > 0 && !this.isRunning() && !this.disposed;
+    let result: { ok: true; info: BuildInfo };
+    try {
+      result = await this.send<{ ok: true; info: BuildInfo }>({ cmd: 'loadXML', xml, name });
+    } catch (error) {
+      if (this.restorePending && this.isRunning()) {
+        await this.restoreAfterRespawn().catch(() => undefined); // a crash here is counted; the next call retries
+      }
+      throw error;
+    } finally {
+      this.deferRestore = false;
+    }
+    const restart = this.respawnReport ?? (this.restorePending ? { crashCount: this.crashCount } : null);
     // Recorded only once the engine accepted it: a rejected build is never replayed.
     this.recoveryBuild = { xml, name };
     this.recoveryOps = [];
+    this.recoveryError = null;
     this.respawnReport = null;
-    return result.info;
+    this.restorePending = false;
+    return restart ? { ...result.info, engineRestart: loadAfterRestart(restart.crashCount) } : result.info;
   }
 
   async loadBuildCode(code: string, name?: string): Promise<BuildInfo> {
@@ -470,19 +522,31 @@ export class LuaBridge {
 
     const respawn = this.spawnCount > 0;
     this.spawnCount++;
-    if (respawn) await this.restoreAfterRespawn();
+    if (!respawn) return;
+    if (this.deferRestore) {
+      this.restorePending = true;
+      return;
+    }
+    await this.restoreAfterRespawn();
   }
 
   /**
    * Give a respawned process the recovery build back: the accepted XML, then
    * every committed command in order. A crash or timeout while doing so is
    * thrown (and already counted); anything the new engine refuses is
-   * reported as 'failed' and the recovery state is dropped.
+   * reported as 'failed', and the recovery state is marked lost (kept for
+   * engine swaps, never replayed again).
    */
   private async restoreAfterRespawn(): Promise<void> {
+    this.restorePending = false;
     const build = this.recoveryBuild;
     if (!build) {
       this.respawnReport = { crashCount: this.crashCount, restored: 'none' };
+      return;
+    }
+    if (this.recoveryError) {
+      const error = `it was already lost at an earlier restart (${this.recoveryError})`;
+      this.respawnReport = { crashCount: this.crashCount, restored: 'failed', error };
       return;
     }
     const ops = [...this.recoveryOps];
@@ -498,9 +562,8 @@ export class LuaBridge {
       this.respawnReport = { crashCount: this.crashCount, restored: 'build', info: info.info };
     } catch (error) {
       if (!this.isRunning()) throw error;
-      this.recoveryBuild = null;
-      this.recoveryOps = [];
-      this.respawnReport = { crashCount: this.crashCount, restored: 'failed', error: `${step}: ${(error as Error).message}` };
+      this.recoveryError = `${step}: ${(error as Error).message}`;
+      this.respawnReport = { crashCount: this.crashCount, restored: 'failed', error: this.recoveryError };
     }
   }
 

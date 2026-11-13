@@ -131,6 +131,7 @@ tools.engine<{ source: string }>(
         ascendancy: info.ascendancy,
         level: info.level,
         mainSkill: info.mainSkill,
+        ...(info.engineRestart ? { engineRestart: info.engineRestart } : {}),
       };
     } finally {
       stop();
@@ -873,6 +874,7 @@ tools.engine<Record<string, never>>(
       ascendancy: info.ascendancy,
       level: info.level,
       mainSkill: info.mainSkill,
+      ...(info.engineRestart ? { engineRestart: info.engineRestart } : {}),
     };
   },
 );

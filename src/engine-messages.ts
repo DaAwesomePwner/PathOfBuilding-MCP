@@ -79,6 +79,27 @@ export function engineDown(crashCount: number): string {
   );
 }
 
+/** load_build / reset_build after the engine stopped: they do not fail, the restart is noted once in their result. */
+export function loadAfterRestart(crashCount: number): string {
+  const left = MAX_CRASHES - crashCount;
+  return (
+    `The Path of Building engine had stopped unexpectedly and was restarted for this load (strike ${crashCount} ` +
+    `of ${MAX_CRASHES}; ${left > 0 ? `after ${left} more the engine is not restarted again` : 'it will not be restarted again'}). ` +
+    'The build loaded normally; undo history from before was cleared.'
+  );
+}
+
+/** Engine swap after a crash when the committed changes could not be replayed: the last accepted build is carried. */
+export function carriedWithoutChanges(committed: number, reason: string): string {
+  const head = `The engine had stopped and ${reason}, so the build was carried over as last loaded`;
+  if (committed === 0) return `${head}.`;
+  const what = committed > 0 ? `the ${committed} committed change${committed === 1 ? '' : 's'}` : 'any changes';
+  return (
+    `${head}, WITHOUT ${what} made after that load (swap_item, unequip_item, set_config, ` +
+    'convert_tree_to_latest). Redo them if you still want them.'
+  );
+}
+
 export interface RestartNotice {
   crashCount: number;
   restored: 'build' | 'none' | 'failed';

@@ -655,10 +655,16 @@ local function testFaultStall()
 end
 
 -- Test faults for any command: exitOn_<cmd> ends the process, hangOn_<cmd>
--- stalls before running it.
+-- stalls and failOn_<cmd> raises an error before running it. exitAfterChange
+-- ends the process on the first command after a successful build change
+-- (equipItem, unequipItem, setConfig, convertTreeToLatest).
+local TEST_CHANGE_COMMANDS = { equipItem = true, unequipItem = true, setConfig = true, convertTreeToLatest = true }
+local testChangeDone = false
 local function testFaultsForCommand(name)
+	if TEST_FAULTS.exitAfterChange and testChangeDone then os.exit(3) end
 	if TEST_FAULTS["exitOn_" .. tostring(name)] then os.exit(3) end
 	if TEST_FAULTS["hangOn_" .. tostring(name)] then testFaultStall() end
+	if TEST_FAULTS["failOn_" .. tostring(name)] then error("test fault: " .. tostring(name) .. " failed", 0) end
 end
 
 local function encodeJSON(obj)
@@ -3531,6 +3537,7 @@ local function dispatch(cmd)
 	local popupsBefore = currentPopups()
 	local ok, body = pcall(function()
 		local b = entry.handler(cmd)
+		if TEST_CHANGE_COMMANDS[cmd.cmd] then testChangeDone = true end
 		if entry.mutating then
 			b.stats = getStats()
 		end
