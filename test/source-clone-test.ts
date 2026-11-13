@@ -9,7 +9,8 @@
  * bridge against it, loads test/fixtures/OccVortex.xml twice, and checks that
  * stats come back, PoB reports no error popup, the write guard never fired
  * (dev mode autosave is switched off rather than blocked) and the clone is
- * unchanged on disk. Make a clone with:
+ * unchanged on disk. With REQUIRE_POB=1 a missing POB_SOURCE_PATH or LuaJIT
+ * fails instead of skipping. Make a clone with:
  *   git clone --depth 1 https://github.com/PathOfBuildingCommunity/PathOfBuilding <dir>
  */
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
@@ -19,6 +20,7 @@ import { fileURLToPath } from 'url';
 import { resolveLuaJIT, LuaJITNotFoundError } from '../src/luajit-paths.js';
 import { bridgeLuaPath } from '../src/paths.js';
 import { bridgeWorkingDir, LuaBridge } from '../src/lua-bridge.js';
+import { skipOrFail } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -127,7 +129,7 @@ async function cloneIntegration(clone: string): Promise<void> {
     luajitPath = resolveLuaJIT(resolved).luajitPath;
   } catch (e) {
     if (e instanceof LuaJITNotFoundError) {
-      console.log(`SKIPPED (clone integration): ${e.message}`);
+      skipOrFail(' (clone integration)', e.message);
       return;
     }
     throw e;
@@ -181,7 +183,7 @@ async function main(): Promise<void> {
 
   const clone = process.env.POB_SOURCE_PATH;
   if (!clone || !clone.trim()) {
-    console.log('SKIPPED (clone integration): POB_SOURCE_PATH is not set');
+    skipOrFail(' (clone integration)', 'POB_SOURCE_PATH is not set');
     return;
   }
   await cloneIntegration(clone.trim());

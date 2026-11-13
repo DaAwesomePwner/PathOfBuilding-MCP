@@ -1,5 +1,7 @@
 # pob-mcp-server
 
+[![CI](https://github.com/DaAwesomePwner/PathOfBuilding-MCP/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/DaAwesomePwner/PathOfBuilding-MCP/actions/workflows/ci.yml)
+
 An MCP server that exposes [Path of Building Community](https://pathofbuilding.community/)'s build-planning and calculation engine to LLM clients (Claude Desktop, Claude Code, and other [MCP](https://modelcontextprotocol.io/) hosts).
 
 The server runs PoB's real Lua calculation engine in headless mode and surfaces 36 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," and comparing alternatives.
@@ -63,6 +65,7 @@ Paths are resolved in this order: **environment variable → saved config → au
 | `LUAJIT_PATH`        | A `luajit` binary, or a folder containing `luajit[.exe]` or `bin/luajit[.exe]`. | Saved config, then auto-detect. |
 | `POB_MCP_CONFIG_DIR` | Overrides the config directory (used by the tests). | See below. |
 | `POB_TIMING`         | When set to `1`, prints per-command timing to stderr. | unset |
+| `REQUIRE_POB`        | Tests only. When set to `1`, an integration test that cannot find PoB, LuaJIT or `POB_SOURCE_PATH` fails instead of printing `SKIPPED` and exiting 0. CI sets it. | unset |
 
 **Saved config.** `configure_pob_path` writes `config.json` to:
 
@@ -123,7 +126,7 @@ $env:POB_PATH = "$env:APPDATA\Path of Building Community"
 npm run test:all
 ```
 
-If `POB_PATH` is unset and auto-detect fails, the integration tests print `SKIPPED:` and exit 0. `npm run test:paths` and the first two parts of `npm run test:startup` need no PoB install. The tests never read or write your real saved config (`test:startup` uses a temp `POB_MCP_CONFIG_DIR`).
+If `POB_PATH` is unset and auto-detect fails, the integration tests print `SKIPPED:` and exit 0 — unless `REQUIRE_POB=1` is set, in which case they fail. `test:source-clone` additionally needs `POB_SOURCE_PATH` pointing at a PoB git clone. `npm run test:paths` and the first two parts of `npm run test:startup` need no PoB install. The tests never read or write your real saved config (`test:startup` uses a temp `POB_MCP_CONFIG_DIR`).
 
 Single test file:
 
@@ -131,7 +134,7 @@ Single test file:
 tsx test/bridge-test.ts
 ```
 
-CI: a GitHub Actions workflow is not yet wired up — contributions welcome.
+CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs on pushes to `master` and on pull requests. On Ubuntu and Windows (Node 22) it type-checks, builds and runs `npm run test:all` with `REQUIRE_POB=1` against a pinned PoB release (`POB_TAG`), both as a git clone and flattened into the installer's layout, and LuaJIT (apt on Linux, built from source on Windows). A Node 20 job runs typecheck, build and `test:paths`.
 
 ## License
 

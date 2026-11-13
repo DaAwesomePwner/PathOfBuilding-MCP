@@ -7,7 +7,7 @@
  * Part 2 (always runs): the BUILT server (dist/server.js) with POB_PATH pointing
  *   at a missing dir and an empty temp config dir — it must complete MCP
  *   initialize, list tools, and return an isError result naming configure_pob_path.
- * Part 3 (needs a real PoB + LuaJIT, else SKIPPED): configure_pob_path → engine
+ * Part 3 (needs a real PoB + LuaJIT, else SKIPPED; fails under REQUIRE_POB=1): configure_pob_path → engine
  *   works → config file written → second start finds the saved path → elicitation.
  *
  * Never touches the real user config: POB_MCP_CONFIG_DIR is always a temp dir.
@@ -25,6 +25,7 @@ import { EngineManager, EngineNotReadyError } from '../src/engine-manager.js';
 import { decodeBuildCode, LuaBridge } from '../src/lua-bridge.js';
 import { resolveAllPaths } from '../src/paths.js';
 import { UserError } from '../src/validation.js';
+import { skipOrFail } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(testDir, '..');
@@ -780,7 +781,7 @@ async function part3(): Promise<void> {
     const p = resolveAllPaths();
     real = { pobPath: p.pobPath, luajitPath: p.luajitPath, version: p.pobInfo.version };
   } catch (e) {
-    console.log(`SKIPPED part 3 (no real PoB/LuaJIT): ${(e as Error).message.split('\n')[0]}`);
+    skipOrFail(' part 3 (no real PoB/LuaJIT)', (e as Error).message.split('\n')[0]);
     return;
   }
   const fixture = readFileSync(path.join(testDir, 'fixtures', 'OccVortex.xml'), 'utf8');

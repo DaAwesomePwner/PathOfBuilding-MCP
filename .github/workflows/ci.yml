@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only pull request runs are superseded; every push to master gets tested.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Path of Building Community release the integration tests run against.
+  POB_TAG: v2.67.2
+  # LuaJIT commit built from source on Windows (rolling v2.1 branch). Later
+  # v2.1 commits (from c41d727, 2026-10-20) only skip a `#!` first line, and
+  # PoB's Launch.lua starts with `#@`, so stay on the commit before that.
+  LUAJIT_SHA: dd3b24369ddfaa83c78cd6fdd91d157c8968ec8d
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Node 22)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+      - name: Install LuaJIT (apt)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit
+          echo "LUAJIT_PATH=$(command -v luajit)" >> "$GITHUB_ENV"
+
+      - name: Build LuaJIT (MSVC)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:RUNNER_TEMP 'luajit-src'
+          git init -q $src
+          git -C $src fetch -q --depth 1 https://github.com/LuaJIT/LuaJIT $env:LUAJIT_SHA
+          git -C $src checkout -q FETCH_HEAD
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          Push-Location (Join-Path $src 'src')
+          cmd /c msvcbuild.bat
+          if ($LASTEXITCODE -ne 0) { throw "msvcbuild.bat failed ($LASTEXITCODE)" }
+          Pop-Location
+          $bin = Join-Path $env:RUNNER_TEMP 'luajit'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Copy-Item (Join-Path $src 'src\luajit.exe'), (Join-Path $src 'src\lua51.dll') $bin
+          & (Join-Path $bin 'luajit.exe') -v
+          "LUAJIT_PATH=$(Join-Path $bin 'luajit.exe')" >> $env:GITHUB_ENV
+
+      # POB_SOURCE_PATH is the git clone (source layout). POB_PATH is a copy
+      # flattened the way the Windows installer lays files out (src/ and
+      # runtime/ merged into the root), so both layouts are exercised.
+      - name: Clone Path of Building ${{ env.POB_TAG }}
+        shell: bash
+        run: |
+          git -c advice.detachedHead=false clone --depth 1 --branch "$POB_TAG" \
+            https://github.com/PathOfBuildingCommunity/PathOfBuilding "$RUNNER_TEMP/pob-src"
+          git -C "$RUNNER_TEMP/pob-src" log -1 --format='PoB %H %cs'
+          mkdir "$RUNNER_TEMP/pob"
+          cp -R "$RUNNER_TEMP/pob-src/src/." "$RUNNER_TEMP/pob-src/runtime/." "$RUNNER_TEMP/pob/"
+          cp "$RUNNER_TEMP/pob-src"/{manifest.xml,changelog.txt,help.txt,LICENSE.md} "$RUNNER_TEMP/pob/"
+
+      - name: Test (npm run test:all)
+        shell: bash
+        env:
+          REQUIRE_POB: '1'
+          POB_PATH: ${{ runner.temp }}/pob
+          POB_SOURCE_PATH: ${{ runner.temp }}/pob-src
+          POB_MCP_CONFIG_DIR: ${{ runner.temp }}/pob-mcp-config
+        run: npm run test:all
+
+  node20:
+    name: typecheck, build, test:paths (Node 20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Test (npm run test:paths)
+        env:
+          POB_MCP_CONFIG_DIR: ${{ runner.temp }}/pob-mcp-config
+        run: npm run test:paths

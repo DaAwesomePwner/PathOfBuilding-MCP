@@ -139,7 +139,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 
 ## Tests and CI
 
-- **Skipped tests exit 0.** Add a `REQUIRE_POB=1` mode and a CI workflow.
 - **Fixture is pinned to tree `3_13`** (`test/fixtures/OccVortex.xml`) with
   hardcoded gem names in `test/phase5-test.ts`; assert on structure, add a
   current-league fixture.

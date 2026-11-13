@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { configDir, configFilePath, loadConfig, saveConfig } from '../src/config-store.js';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { CrashLedger } from '../src/crash-ledger.js';
@@ -26,6 +28,7 @@ const EXE = IS_WIN ? 'luajit.exe' : 'luajit';
 const REAL_POE1 = process.env.APPDATA ? path.join(process.env.APPDATA, 'Path of Building Community') : '';
 const REAL_POE2 = process.env.APPDATA ? path.join(process.env.APPDATA, 'Path of Building Community (PoE2)') : '';
 const tmpDirs: string[] = [];
+const testDir = path.dirname(fileURLToPath(import.meta.url));
 
 function tmp(prefix: string): string {
   const d = mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -364,6 +367,29 @@ async function main(): Promise<void> {
       assert.equal(env.paths.pobPath, path.resolve(fake));
       assert.ok(env.fixturePath.endsWith(path.join('fixtures', 'OccVortex.xml')));
     });
+  });
+
+  await test('REQUIRE_POB: missing PoB skips (exit 0) without it, fails (exit 1) with it', () => {
+    const missing = path.join(tmp('no-pob-'), 'nope');
+    const run = (requirePoB: string | undefined) => {
+      const env: NodeJS.ProcessEnv = { ...process.env, POB_PATH: missing, POB_MCP_CONFIG_DIR: tmp('cfg-') };
+      delete env.LUAJIT_PATH;
+      if (requirePoB === undefined) delete env.REQUIRE_POB;
+      else env.REQUIRE_POB = requirePoB;
+      return spawnSync(process.execPath, ['--import', 'tsx', path.join(testDir, 'bridge-test.ts')], {
+        env,
+        encoding: 'utf8',
+        timeout: 60_000,
+        windowsHide: true,
+      });
+    };
+    const skipped = run(undefined);
+    assert.equal(skipped.status, 0, skipped.stderr);
+    assert.match(skipped.stdout, /^SKIPPED: /m);
+    const failed = run('1');
+    assert.equal(failed.status, 1, failed.stdout + failed.stderr);
+    assert.match(failed.stderr, /FAILED: REQUIRE_POB=1 is set but a prerequisite is missing: .*POB_PATH/);
+    assert.doesNotMatch(failed.stdout, /SKIPPED/);
   });
 
   // ---------------------------------------------------------------- config store
