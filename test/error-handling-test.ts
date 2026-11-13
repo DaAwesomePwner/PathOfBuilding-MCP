@@ -185,7 +185,8 @@ async function main(): Promise<void> {
       itemText: 'Rarity: RARE\nWrong Slot Helmet\nHubris Circlet\n+80 to maximum Life',
     });
     assert(isError(r), 'expected error for a helmet in a ring slot');
-    assert(/Ring 1/.test(errText(r)) && /Helmet/.test(errText(r)), `expected slot and reason: ${errText(r)}`);
+    // The item is named "...Helmet", so check the slot and the reason as one phrase.
+    assert(/cannot be equipped in Ring 1: a Helmet item does not go in that slot/.test(errText(r)), `expected slot and reason: ${errText(r)}`);
     assert(!/Internal error/i.test(errText(r)), `a slot mismatch must be a user error: ${errText(r)}`);
     log(`  -> "${errText(r).slice(0, 120)}"`);
     r = await call(client, 'swap_item', {

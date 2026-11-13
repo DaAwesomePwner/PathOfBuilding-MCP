@@ -18,6 +18,13 @@ export interface ItemsState {
   /** [slot name, item id] for every occupied non-socket slot. */
   slots: Array<[string, number]>;
   itemOrder: number[];
+  /**
+   * Identity token of each item in `itemOrder` (bridge-side, per item object):
+   * a restore is refused, before anything changes, when an id no longer
+   * names the item it named at capture: a snapshot taken before the engine
+   * was restarted or the build was reloaded.
+   */
+  itemTokens: string[];
 }
 
 /** What the bridge's restoreItemsState found. */
@@ -326,7 +333,7 @@ export class BuildSession {
   private async captureItemsStateUnlocked(): Promise<ItemsState> {
     const result = await this.bridge.send<{ ok: true; state: ItemsState }>({ cmd: 'captureItemsState' });
     const state = result.state;
-    if (!state || !Array.isArray(state.slots) || !Array.isArray(state.itemOrder)) {
+    if (!state || !Array.isArray(state.slots) || !Array.isArray(state.itemOrder) || !Array.isArray(state.itemTokens)) {
       throw new Error('captureItemsState returned a malformed item state');
     }
     return state;
@@ -357,6 +364,10 @@ export class BuildSession {
     between?: () => Promise<void>,
     after?: () => Promise<void>,
   ): Promise<void> {
+    // A snapshot whose item ids no longer name its items (taken before the
+    // engine was restarted or the build was reloaded) is refused before the
+    // tree, which holds jewel item ids, or anything else is touched.
+    await this.bridge.send({ cmd: 'checkItemsState', state: items });
     // A tree the probe did not touch is left alone: re-importing it would
     // only reshuffle PoB's allocNodes table (and so the order of the exported
     // node list) and cost a recalculation.

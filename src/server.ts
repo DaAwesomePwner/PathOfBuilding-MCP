@@ -262,7 +262,7 @@ tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
-      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). An item that cannot go in the slot, or text Path of Building cannot parse, is refused without changing anything.',
+      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, or text Path of Building cannot parse, is refused without changing anything.',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name.'),
       itemText: z

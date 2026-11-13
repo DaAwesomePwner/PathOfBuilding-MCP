@@ -967,6 +967,69 @@ end
 -- sockets are deliberately left out: PoB keeps them on the passive spec
 -- (spec.jewels), and the tree state (captureSpecState / restoreTreeState)
 -- owns them.
+-- Identity tokens for item objects (weak keys: a collected item's token goes
+-- with it, and tokens are never reused), so a captured id can be checked to
+-- still name the very item it named at capture time, cheaply.
+local itemTokens = setmetatable({ }, { __mode = "k" })
+-- Tokens are "<process tag>:<counter>". The tag is made once per engine
+-- process, at its first token (after PoB has booted and a build is loaded),
+-- from the wall clock, the CPU time used so far, the Lua heap size and the
+-- addresses of fresh objects (which address-space randomisation varies), so
+-- tokens from an engine that has since crashed or been replaced never match
+-- this one's by coincidence. PoB's math.random state is left alone.
+local itemTokenTag = nil
+local function makeItemTokenTag()
+	local function address(obj)
+		local text = tostring(obj)
+		return text:match("0x(%x+)") or text:match("(%x+)$") or "0"
+	end
+	return string.format("%x-%x-%x-%s-%s", os.time(), math.floor(os.clock() * 1e6),
+		math.floor(collectgarbage("count") * 1024), address({ }), address(function() end))
+end
+local nextItemToken = 0
+local function itemToken(item)
+	if not item then return "" end
+	local token = itemTokens[item]
+	if not token then
+		itemTokenTag = itemTokenTag or makeItemTokenTag()
+		nextItemToken = nextItemToken + 1
+		token = itemTokenTag .. ":" .. nextItemToken
+		itemTokens[item] = token
+	end
+	return token
+end
+
+-- Token, and raw text to check it against, of every item that has one: kept
+-- across a reload of the same build (the failed-load recovery in loadXML).
+local function itemIdentities()
+	local out = { }
+	for id, item in pairs(build and build.itemsTab and build.itemsTab.items or { }) do
+		local token = itemTokens[item]
+		if token then out[id] = { token = token, raw = item.raw } end
+	end
+	return out
+end
+
+-- After the build was reloaded from its own SaveDB output, every item is a
+-- new object with the same id: give each the token its predecessor had, but
+-- only where the reloaded item has the same text, so undo entries and
+-- snapshots of that build stay valid while anything else still mismatches.
+-- The texts compare equal even for items PoB re-serialises (crafted mods,
+-- variants, rolled ranges): ItemsTab:Save rewrites each item's raw text
+-- (BuildAndParseRaw) before writing it, `identities` is read after that
+-- SaveDB, and the reloaded item's raw text is exactly the saved text.
+local function carryItemIdentities(identities)
+	local carried = 0
+	for id, item in pairs(build and build.itemsTab and build.itemsTab.items or { }) do
+		local known = identities[id]
+		if known and item.raw == known.raw then
+			itemTokens[item] = known.token
+			carried = carried + 1
+		end
+	end
+	return carried
+end
+
 local function captureItemsState()
 	local tab = build.itemsTab
 	local slots = { }
@@ -976,9 +1039,34 @@ local function captureItemsState()
 			slots[#slots + 1] = { slot.slotName, id }
 		end
 	end
-	local order = { }
-	for i, id in ipairs(tab.itemOrderList) do order[i] = id end
-	return { slots = slots, itemOrder = order }
+	local order, tokens = { }, { }
+	for i, id in ipairs(tab.itemOrderList) do
+		order[i] = id
+		tokens[i] = itemToken(tab.items[id])
+	end
+	return { slots = slots, itemOrder = order, itemTokens = tokens }
+end
+
+-- Refuse (internal error, before anything changes) a captured item state
+-- whose ids no longer name the captured items: a snapshot taken before the
+-- engine was restarted or the build was reloaded, which replaces every item
+-- object while keeping the same ids. (The bridge's own failed-load recovery
+-- carries identities over, see carryItemIdentities.)
+local function checkItemsState(state)
+	if type(state) ~= "table" or type(state.itemOrder) ~= "table" or type(state.itemTokens) ~= "table"
+		or #state.itemTokens ~= #state.itemOrder then
+		error("Item snapshot is malformed; nothing was restored; call reset_build to return to the loaded build", 0)
+	end
+	local tab = build.itemsTab
+	for i, id in ipairs(state.itemOrder) do
+		local item = tab.items[id]
+		if not item or itemTokens[item] ~= state.itemTokens[i] then
+			error("Item snapshot does not match the build (item " .. tostring(id) .. " is "
+				.. (item and "a different item" or "gone") .. ": the snapshot was taken before the engine was "
+				.. "restarted or the build was reloaded); nothing was restored; call reset_build to return to "
+				.. "the loaded build", 0)
+		end
+	end
 end
 
 -- Where the build still refers to item `id`.
@@ -1015,6 +1103,7 @@ local function restoreItemsState(state)
 	if type(state) ~= "table" or type(state.slots) ~= "table" or type(state.itemOrder) ~= "table" then
 		error("restoreItemsState: malformed item state")
 	end
+	checkItemsState(state)
 	local tab = build.itemsTab
 	local mismatches = { }
 	local want = { }
@@ -1675,7 +1764,13 @@ local function restoreSpecJewels(spec, wanted)
 		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
 	end
 	if not changed then return false end
-	spec.jewels = jewels
+	-- Updated in place: PassiveSpec:Save writes <Sockets> in this table's
+	-- iteration order, which a fresh table would reshuffle.
+	if type(spec.jewels) ~= "table" then spec.jewels = { } end
+	for nodeId in pairs(spec.jewels) do
+		if jewels[nodeId] == nil then spec.jewels[nodeId] = nil end
+	end
+	for nodeId, itemId in pairs(jewels) do spec.jewels[nodeId] = itemId end
 	for nodeId, slot in pairs(build.itemsTab and build.itemsTab.sockets or { }) do
 		slot.selItemId = jewels[nodeId] or 0
 	end
@@ -2705,7 +2800,7 @@ local DISPATCH = {
 				-- rather than throwing; that must not be blamed on the new load.
 				local saveErr = mainObject.promptMsg
 				if okSave and type(prevXml) == "string" and not saveErr then
-					previous = { xml = prevXml, name = build.buildName }
+					previous = { xml = prevXml, name = build.buildName, identities = itemIdentities() }
 				else
 					local reason = saveErr and stripColorCodes(saveErr):gsub("%s+", " ")
 						or (okSave and "SaveDB returned no XML" or tostring(prevXml))
@@ -2720,6 +2815,9 @@ local DISPATCH = {
 					clearPoBErrorState()
 					local restoreFailure = tryLoadBuild(previous.xml, previous.name)
 					if not restoreFailure then
+						-- Same build, same item ids, new item objects: keep their
+						-- identities so the session's undo entries still apply.
+						carryItemIdentities(previous.identities)
 						error(failure .. " (the previously loaded build is still active)", 0)
 					end
 					STDERR:write("[pob-mcp] failed to restore previous build: ", (restoreFailure:gsub("\n", " ")), "\n")
@@ -2802,6 +2900,10 @@ local DISPATCH = {
 	},
 	restoreItemsState = {
 		handler = function(cmd) return restoreItemsState(cmd.state) end,
+	},
+	checkItemsState = {
+		-- Raises when the captured ids no longer name the captured items.
+		handler = function(cmd) checkItemsState(cmd.state) return { } end,
 	},
 
 	-- Passive tree
