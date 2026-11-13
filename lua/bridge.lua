@@ -1002,6 +1002,312 @@ local function restoreTreeFromIds(nodeIds)
 	return missing
 end
 
+-- ---------------------------------------------------------------------------
+-- Tree version conversion
+-- ---------------------------------------------------------------------------
+
+local CONVERT_LIST_CAP = 50
+
+local function listContains(list, value)
+	for _, v in pairs(list or { }) do
+		if v == value then return true end
+	end
+	return false
+end
+
+-- The version PoB's own "Convert to <latest>" button targets: latestTreeVersion
+-- (keeping any suffix the current version already has after it), then
+-- ConvertToVersion keeps a ruthless/alternate sub-type when the latest tree
+-- has that variant (TreeTab.lua getLatestTreeVersion + ConvertToVersion).
+local function latestConvertTarget(curVersion)
+	local latest = rawget(_G, "latestTreeVersion")
+	if type(latest) ~= "string" or type(curVersion) ~= "string" then
+		error("Tree convert failed: latestTreeVersion or the spec's treeVersion is missing (PoB GameVersions changed?)")
+	end
+	local version = latest .. (curVersion:match("^" .. latest .. "(.*)") or "")
+	local subType = curVersion:match("(_%l+_?%l*)")
+	if subType and not version:match(subType) and listContains(rawget(_G, "treeVersionList"), version .. subType) then
+		version = version .. subType
+	end
+	return version
+end
+
+-- Lua-native copy of everything a spec needs to be rebuilt on any version.
+-- Unlike PassiveSpec:CreateUndoState this keeps the secondary ascendancy
+-- (CreateUndoState reads a field that does not exist), the title and jewels.
+local function captureSpecState(spec)
+	local hashList = { }
+	for id in pairs(spec.allocNodes or { }) do hashList[#hashList + 1] = id end
+	table.sort(hashList)
+	return {
+		treeVersion = spec.treeVersion,
+		title = spec.title,
+		classId = spec.curClassId,
+		ascendClassId = spec.curAscendClassId,
+		secondaryAscendClassId = spec.curSecondaryAscendClassId,
+		hashList = hashList,
+		masteryEffects = shallowCopy(spec.masterySelections),
+		hashOverrides = shallowCopy(spec.hashOverrides),
+		jewels = shallowCopy(spec.jewels),
+	}
+end
+
+local function sortedPairs(map, valueFn)
+	local out = { }
+	for k, v in pairs(map or { }) do out[#out + 1] = { k, valueFn and valueFn(v) or v } end
+	table.sort(out, function(a, b) return a[1] < b[1] end)
+	return out
+end
+
+-- JSON-safe form of a captured state (integer-keyed maps become pair arrays;
+-- tattoo overrides are carried by name, the way PassiveSpec:Load reads them).
+local function encodeSpecState(state)
+	local overrides = { }
+	for nodeId, node in pairs(state.hashOverrides or { }) do
+		overrides[#overrides + 1] = { nodeId = nodeId, dn = node.dn }
+	end
+	table.sort(overrides, function(a, b) return a.nodeId < b.nodeId end)
+	return {
+		treeVersion = state.treeVersion,
+		title = state.title,
+		classId = state.classId,
+		ascendClassId = state.ascendClassId,
+		secondaryAscendClassId = state.secondaryAscendClassId,
+		nodeIds = state.hashList,
+		masteryEffects = sortedPairs(state.masteryEffects),
+		jewels = sortedPairs(state.jewels),
+		hashOverrides = overrides,
+	}
+end
+
+local function decodeIdPairs(list, what)
+	local out = { }
+	if list == nil then return out end
+	if type(list) ~= "table" then error("Tree restore failed: " .. what .. " is not an array") end
+	for _, pair in ipairs(list) do
+		local k, v = type(pair) == "table" and tonumber(pair[1]), type(pair) == "table" and tonumber(pair[2])
+		if not (k and v) then error("Tree restore failed: malformed " .. what .. " entry") end
+		out[k] = v
+	end
+	return out
+end
+
+local function decodeSpecState(encoded)
+	if type(encoded) ~= "table" or type(encoded.treeVersion) ~= "string" or tonumber(encoded.classId) == nil then
+		error("Tree restore failed: malformed spec state")
+	end
+	local hashList = { }
+	for _, id in ipairs(encoded.nodeIds or { }) do
+		local n = tonumber(id)
+		if not n then error("Tree restore failed: malformed node id") end
+		hashList[#hashList + 1] = n
+	end
+	local overrideNames = { }
+	for _, o in ipairs(encoded.hashOverrides or { }) do
+		if type(o) == "table" and tonumber(o.nodeId) and type(o.dn) == "string" then
+			overrideNames[tonumber(o.nodeId)] = o.dn
+		end
+	end
+	return {
+		treeVersion = encoded.treeVersion,
+		title = type(encoded.title) == "string" and encoded.title or nil,
+		classId = tonumber(encoded.classId),
+		ascendClassId = tonumber(encoded.ascendClassId) or 0,
+		secondaryAscendClassId = tonumber(encoded.secondaryAscendClassId) or 0,
+		hashList = hashList,
+		masteryEffects = decodeIdPairs(encoded.masteryEffects, "masteryEffects"),
+		jewels = decodeIdPairs(encoded.jewels, "jewels"),
+		overrideNames = overrideNames,
+	}
+end
+
+-- Replace the active spec with a new PassiveSpec on `version` built from
+-- `state` (TreeTab:ConvertToVersion with remove=true, minus the popup). Tattoo
+-- overrides given by name are looked up in the target tree like
+-- PassiveSpec:Load does; ones that tree lacks are dropped and returned.
+local function installSpec(version, state)
+	local treeTab = build.treeTab
+	if not (treeTab and type(treeTab.specList) == "table" and treeTab.activeSpec and type(treeTab.SetActiveSpec) == "function") then
+		error("Tree convert failed: build.treeTab spec list is unavailable (PoB TreeTab changed?)")
+	end
+	local versions = rawget(_G, "treeVersions")
+	if type(versions) ~= "table" or not versions[version] then
+		error("Tree convert failed: unknown tree version " .. tostring(version))
+	end
+	local newSpec = new("PassiveSpec", build, version)
+	newSpec.title = state.title
+	newSpec.jewels = shallowCopy(state.jewels)
+	local overrides = shallowCopy(state.hashOverrides)
+	local droppedOverrides = { }
+	for nodeId, dn in pairs(state.overrideNames or { }) do
+		local tattoo = newSpec.tree.tattoo and newSpec.tree.tattoo.nodes and newSpec.tree.tattoo.nodes[dn]
+		if tattoo then
+			overrides[nodeId] = copyTable(tattoo, true)
+			overrides[nodeId].id = nodeId
+		else
+			droppedOverrides[#droppedOverrides + 1] = { nodeId = nodeId, name = dn }
+		end
+	end
+	newSpec:RestoreUndoState({
+		classId = state.classId,
+		ascendClassId = state.ascendClassId,
+		secondaryAscendClassId = state.secondaryAscendClassId,
+		hashList = state.hashList,
+		hashOverrides = overrides,
+		masteryEffects = shallowCopy(state.masteryEffects),
+		treeVersion = version,
+	}, version)
+	newSpec:BuildClusterJewelGraphs()
+
+	-- Swap the spec in. Launch.lua's OnFrame catches errors into promptMsg
+	-- instead of throwing, so both channels count as failure; on failure the
+	-- previous spec goes back so the build is left exactly as it was.
+	local index = treeTab.activeSpec
+	local previousSpec = treeTab.specList[index]
+	local promptBefore = mainObject.promptMsg
+	local function activate(spec)
+		treeTab.specList[index] = spec
+		treeTab:SetActiveSpec(index)
+		if build.spec ~= spec then
+			error("TreeTab:SetActiveSpec did not activate the spec (PoB TreeTab changed?)", 0)
+		end
+		build.buildFlag = true
+		runCallback("OnFrame")
+		if mainObject.promptMsg ~= promptBefore then
+			error(stripColorCodes(tostring(mainObject.promptMsg)):gsub("%s+", " "), 0)
+		end
+	end
+	local ok, err = pcall(activate, newSpec)
+	if not ok then
+		mainObject.promptMsg = promptBefore
+		local restored, restoreErr = pcall(activate, previousSpec)
+		if not restored then
+			mainObject.promptMsg = promptBefore
+			error("Tree change to " .. tostring(version) .. " failed (" .. tostring(err)
+				.. ") and restoring the previous tree also failed (" .. tostring(restoreErr) .. "); call reset_build", 0)
+		end
+		error("Tree change to " .. tostring(version) .. " failed; the previous tree was restored: " .. tostring(err), 0)
+	end
+	return droppedOverrides
+end
+
+-- True when `effectId` is one of the effects the tree offers on that mastery node.
+local function nodeOffersMasteryEffect(node, effectId)
+	for _, effect in ipairs(node and node.masteryEffects or { }) do
+		if effect.effect == effectId then return true end
+	end
+	return false
+end
+
+local function masteryEffectText(spec, effectId)
+	local effect = spec.tree and spec.tree.masteryEffects and spec.tree.masteryEffects[effectId]
+	if effect and type(effect.sd) == "table" then
+		return table.concat(effect.sd, " / ")
+	end
+	return nil
+end
+
+local function cappedList(list)
+	local shown = { }
+	for i = 1, math.min(#list, CONVERT_LIST_CAP) do shown[i] = list[i] end
+	return shown, math.max(0, #list - CONVERT_LIST_CAP)
+end
+
+local function countKeys(map)
+	local n = 0
+	for _ in pairs(map or { }) do n = n + 1 end
+	return n
+end
+
+-- Move the active spec to the latest tree. Returns { converted = false } when
+-- it is already there; otherwise a report of what the conversion lost. The
+-- caller takes its undo state (captureSpecState command) before calling this.
+local function convertTreeToLatest()
+	local oldSpec = build.spec
+	if type(oldSpec) ~= "table" or type(oldSpec.treeVersion) ~= "string" then
+		error("Tree convert failed: build.spec is unavailable (PoB Build module changed?)")
+	end
+	local fromVersion = oldSpec.treeVersion
+	local toVersion = latestConvertTarget(fromVersion)
+	if toVersion == fromVersion then
+		return { converted = false, fromVersion = fromVersion, toVersion = toVersion }
+	end
+	local state = captureSpecState(oldSpec)
+	local oldNodes = { }
+	for id, node in pairs(oldSpec.allocNodes) do oldNodes[id] = node end
+	local oldPoints = oldSpec.CountAllocNodes and oldSpec:CountAllocNodes() or nil
+
+	local overrideNames = { }
+	for nodeId, node in pairs(state.hashOverrides) do overrideNames[nodeId] = node.dn end
+	local convertState = shallowCopy(state)
+	convertState.hashOverrides = { }
+	convertState.overrideNames = overrideNames
+	local droppedOverrides = installSpec(toVersion, convertState)
+	local newSpec = build.spec
+
+	local lost, changed = { }, { }
+	for _, id in ipairs(state.hashList) do
+		local before = oldNodes[id]
+		local after = newSpec.allocNodes[id]
+		if not after then
+			lost[#lost + 1] = { id = id, name = before.dn, type = before.type }
+		elseif before.dn ~= after.dn then
+			changed[#changed + 1] = { id = id, oldName = before.dn, newName = after.dn }
+		end
+	end
+	local droppedMasteries = { }
+	for _, pair in ipairs(sortedPairs(state.masteryEffects)) do
+		local nodeId, effectId = pair[1], pair[2]
+		-- PoB keeps a selection whose effect exists anywhere on the new tree, even
+		-- when that node no longer offers it; count that as dropped too.
+		if newSpec.masterySelections[nodeId] ~= effectId or not newSpec.allocNodes[nodeId]
+			or not nodeOffersMasteryEffect(newSpec.nodes[nodeId], effectId) then
+			local node = oldNodes[nodeId] or oldSpec.nodes[nodeId]
+			droppedMasteries[#droppedMasteries + 1] = {
+				nodeId = nodeId,
+				name = node and node.dn,
+				effectId = effectId,
+				effect = masteryEffectText(oldSpec, effectId),
+			}
+		end
+	end
+	local lostShown, lostOmitted = cappedList(lost)
+	local changedShown, changedOmitted = cappedList(changed)
+	local masteryShown, masteryOmitted = cappedList(droppedMasteries)
+	local tattooShown, tattooOmitted = cappedList(droppedOverrides)
+	local newPoints = newSpec.CountAllocNodes and newSpec:CountAllocNodes() or nil
+	return {
+		converted = true,
+		fromVersion = fromVersion,
+		toVersion = newSpec.treeVersion,
+		allocatedBefore = #state.hashList,
+		allocatedAfter = countKeys(newSpec.allocNodes),
+		pointsBefore = oldPoints,
+		pointsAfter = newPoints,
+		lostNodeCount = #lost,
+		lostNodes = lostShown,
+		lostNodesOmitted = lostOmitted,
+		changedNodeCount = #changed,
+		changedNodes = changedShown,
+		changedNodesOmitted = changedOmitted,
+		droppedMasteryCount = #droppedMasteries,
+		droppedMasteries = masteryShown,
+		droppedMasteriesOmitted = masteryOmitted,
+		droppedTattooCount = #droppedOverrides,
+		droppedTattoos = tattooShown,
+		droppedTattoosOmitted = tattooOmitted,
+	}
+end
+
+local function restoreSpecState(encoded)
+	local state = decodeSpecState(encoded)
+	local dropped = installSpec(state.treeVersion, state)
+	if #dropped > 0 then
+		STDERR:write("[pob-mcp] warning: tree restore could not find ", tostring(#dropped), " tattoo(s) on tree ",
+			state.treeVersion, "\n")
+	end
+end
+
 local function getFullConfigInput()
 	local result = { }
 	if build.configTab and build.configTab.input then
@@ -2083,6 +2389,17 @@ local DISPATCH = {
 			end
 			return { }
 		end,
+		mutating = true,
+	},
+	captureSpecState = {
+		handler = function(_cmd) return { state = encodeSpecState(captureSpecState(build.spec)) } end,
+	},
+	convertTreeToLatest = {
+		handler = function(_cmd) return { result = convertTreeToLatest() } end,
+		mutating = true,
+	},
+	restoreSpecState = {
+		handler = function(cmd) restoreSpecState(cmd.state) return { } end,
 		mutating = true,
 	},
 

@@ -323,7 +323,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item or set_config). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -345,6 +345,32 @@ tools.engine<Record<string, never>>(
   },
   async (_args, session) => {
     return session.getPassiveTree();
+  },
+);
+
+tools.engine<Record<string, never>>(
+  'convert_tree_to_latest',
+  {
+    description:
+      "Convert the build's active passive tree to Path of Building's latest tree version (keeping a ruthless/alternate tree sub-type, like PoB's own convert button), so node advice targets the current league. PERMANENTLY mutates the build (use undo_last_change to revert). Reports the old/new tree version, allocated node and point counts, `lostNodes` (allocated before, not after), `changedNodes` (still allocated but renamed on the new tree), `droppedMasteries` (selections the new tree no longer offers on that node), `droppedTattoos` (tattoos the new tree lacks) and key stat deltas. Each list is capped at 50 with a total count and an omitted count. A build already on the latest tree is left unchanged.",
+    inputSchema: {},
+  },
+  async (_args, session) => {
+    const result = await session.convertTreeToLatest();
+    if (!result.converted) {
+      return {
+        status: 'already-latest',
+        treeVersion: result.fromVersion,
+        message: `The build is already on the latest tree (${result.fromVersion}); nothing was changed.`,
+      };
+    }
+    const { before: _before, after: _after, diff, ...rest } = result;
+    return {
+      status: 'converted',
+      ...rest,
+      keyDeltas: keyDeltas(diff),
+      undo: 'Call undo_last_change to return to the previous tree version.',
+    };
   },
 );
 
