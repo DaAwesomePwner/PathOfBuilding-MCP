@@ -41,6 +41,10 @@
 //  14. reset_build after a crash: blank respawn, no replay, the original
 //      build, a one-time engineRestart note.
 //  11 and 14 check the commands actually sent, so a skipped replay is proven.
+//  15. Engine swap export after a crash whose restart replay kills the engine
+//      again: the last accepted build is carried with a note naming the
+//      missing change (no engine stderr in it), one more strike, no live
+//      process; with the breaker then open, no process is started at all.
 //   3 also: an engine swap with the breaker open carries the last accepted
 //      build with a note naming the committed changes it lacks.
 import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, mkdirSync } from 'fs';
@@ -573,6 +577,33 @@ async function test14ResetAfterCrash(): Promise<void> {
   log('PASS 14');
 }
 
+async function test15SwapExportReplayCrash(): Promise<void> {
+  log('Test 15: engine-swap export when the restart replay crashes, then with the breaker open');
+  const bridge = newBridge();
+  const { session } = await primedSession(bridge);
+  const accepted = bridge.getRecoveryXML();
+  assert(accepted !== null, 'a build was accepted');
+  await session.swapItemWithDiff('Ring 1', RING_A);
+  await crash(bridge); // strike 1
+  bridge.setTestFaults('exitOn_equipItem'); // replaying the committed swap kills the restarted engine
+  const spawns = bridge.getSpawnCount();
+  const r1 = await session.exportForEngineSwap();
+  assert(r1.xml === accepted, 'the carried XML must be the last accepted build');
+  assert(/failed again while being restarted/.test(r1.note ?? '') && /WITHOUT the 1 committed change made since that load/.test(r1.note ?? ''), `note: ${r1.note}`);
+  assert(!/Stderr|exited|code=/.test(r1.note ?? ''), `engine details must stay out of the note: ${r1.note}`);
+  assert(bridge.getCrashCount() === 2, `exactly one more strike, got ${bridge.getCrashCount()}`);
+  assert(bridge.getSpawnCount() === spawns + 1 && !bridge.isRunning() && bridge.getPid() === undefined, 'the restarted engine is gone');
+
+  // Third strike the same way, then the breaker is open: no process may start.
+  await session.exportForEngineSwap();
+  assert(bridge.isCircuitOpen() && bridge.getPid() === undefined, `breaker open after strike 3 (${bridge.getCrashCount()})`);
+  const openSpawns = bridge.getSpawnCount();
+  const r2 = await session.exportForEngineSwap();
+  assert(r2.xml === accepted && /not restarted again after too many crashes/.test(r2.note ?? '') && /WITHOUT the 1 committed change/.test(r2.note ?? ''), `breaker-open note: ${r2.note}`);
+  assert(bridge.getSpawnCount() === openSpawns && bridge.getPid() === undefined && bridge.getCrashCount() === 3, 'no process may start with the breaker open');
+  log('PASS 15');
+}
+
 async function main(): Promise<void> {
   try {
     await test1Breaker();
@@ -588,6 +619,7 @@ async function main(): Promise<void> {
     await test12LostRestore();
     await test13AppliedButFailed();
     await test14ResetAfterCrash();
+    await test15SwapExportReplayCrash();
   } finally {
     const pids = bridges.map((b) => b.getPid()).filter((p): p is number => p !== undefined);
     for (const b of bridges) await b.dispose().catch(() => undefined);

@@ -319,18 +319,20 @@ export class BuildSession {
             await this.bridge.start();
           } catch (e) {
             // The restart (or its replay) failed: carry what is known, say what is missing.
-            return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, `could not be restarted to replay them (${(e as Error).message})`) };
+            console.error('[pob-mcp] restarting the engine to export the build for an engine swap failed:', (e as Error).message);
+            return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'restartFailed') };
           }
           this.bridge.takeRespawnReport(); // the swap result reports the restart itself
           rec = this.bridge.getRecoveryState();
         }
       }
       if (rec.lostError && rec.xml) {
-        return { xml: rec.xml, note: carriedWithoutChanges(-1, `could not restore the build (${rec.lostError})`) };
+        console.error('[pob-mcp] the build was lost at an earlier restart:', rec.lostError);
+        return { xml: rec.xml, note: carriedWithoutChanges(-1, 'buildLost') };
       }
       if (!this.bridge.isRunning()) {
         if (!rec.xml) return { xml: null };
-        return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'could not be restarted to replay them (too many crashes)') };
+        return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'breakerOpen') };
       }
       if (!this.buildInfo && !rec.xml) return { xml: null };
       const result = await this.bridge.send<{ ok: true; xml: string }>({ cmd: 'exportXML' });

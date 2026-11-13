@@ -89,13 +89,25 @@ export function loadAfterRestart(crashCount: number): string {
   );
 }
 
-/** Engine swap after a crash when the committed changes could not be replayed: the last accepted build is carried. */
-export function carriedWithoutChanges(committed: number, reason: string): string {
-  const head = `The engine had stopped and ${reason}, so the build was carried over as last loaded`;
+/** Why an engine swap after a crash could not carry the committed changes. */
+export type CarryLimit = 'breakerOpen' | 'restartFailed' | 'buildLost';
+
+/**
+ * Engine swap after a crash when the committed changes could not be replayed:
+ * the last accepted build is carried. `committed` < 0 means the count is
+ * unknown. Engine details (stderr) go to the server log, never into this note.
+ */
+export function carriedWithoutChanges(committed: number, why: CarryLimit): string {
+  const cause = {
+    breakerOpen: 'The engine had stopped and is not restarted again after too many crashes',
+    restartFailed: 'The engine had stopped and failed again while being restarted (details are in the server log)',
+    buildLost: 'The engine could not restore the build after an earlier crash',
+  }[why];
+  const head = `${cause}, so the build was carried over as it was last loaded`;
   if (committed === 0) return `${head}.`;
   const what = committed > 0 ? `the ${committed} committed change${committed === 1 ? '' : 's'}` : 'any changes';
   return (
-    `${head}, WITHOUT ${what} made after that load (swap_item, unequip_item, set_config, ` +
+    `${head}, WITHOUT ${what} made since that load (swap_item, unequip_item, set_config, ` +
     'convert_tree_to_latest). Redo them if you still want them.'
   );
 }
