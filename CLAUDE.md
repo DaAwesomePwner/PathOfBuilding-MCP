@@ -44,7 +44,7 @@ Env vars:
 - `LUAJIT_PATH` — `luajit` binary or a folder containing it. The Windows PoB installer does **not** ship `luajit.exe` (only `lua51.dll`); probes `<POB_PATH>/runtime/`, `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop, Homebrew, `/usr/{local/,}bin`, then PATH.
 - `POB_MCP_CONFIG_DIR` — overrides the saved-config dir (default `%APPDATA%\pob-mcp-server`, `~/Library/Application Support/pob-mcp-server`, `$XDG_CONFIG_HOME|~/.config/pob-mcp-server`). Tests must always set it to a temp dir.
 - `POB_TIMING=1` — per-command timing on stderr.
-- `REQUIRE_POB=1` — tests only: a missing PoB, LuaJIT or `POB_SOURCE_PATH` fails the test instead of printing `SKIPPED` and exiting 0 (`skipOrFail` in `test/_skip.ts`). CI (`.github/workflows/ci.yml`) sets it and points `POB_PATH`/`POB_SOURCE_PATH` at a clone of the pinned `POB_TAG`.
+- `REQUIRE_POB=1` — tests only: a missing PoB, LuaJIT or `POB_SOURCE_PATH` fails the test instead of printing `SKIPPED` and exiting 0 (`skipOrFail` in `test/_skip.ts`). CI (`.github/workflows/ci.yml`) sets it and points `POB_SOURCE_PATH` at a clone of the pinned `POB_TAG` and `POB_PATH` at a copy flattened into the installed layout.
 
 ## Architecture
 

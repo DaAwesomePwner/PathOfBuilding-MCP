@@ -134,7 +134,7 @@ Single test file:
 tsx test/bridge-test.ts
 ```
 
-CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs on pushes to `master` and on pull requests. On Ubuntu and Windows (Node 22) it type-checks, builds and runs `npm run test:all` with `REQUIRE_POB=1` against a source clone of a pinned PoB release (`POB_TAG`) and LuaJIT (apt on Linux, built from source on Windows). A Node 20 job runs typecheck, build and `test:paths`.
+CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs on pushes to `master` and on pull requests. On Ubuntu and Windows (Node 22) it type-checks, builds and runs `npm run test:all` with `REQUIRE_POB=1` against a pinned PoB release (`POB_TAG`), both as a git clone and flattened into the installer's layout, and LuaJIT (apt on Linux, built from source on Windows). A Node 20 job runs typecheck, build and `test:paths`.
 
 ## License
 
