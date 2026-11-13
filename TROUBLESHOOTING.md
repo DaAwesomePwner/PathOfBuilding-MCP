@@ -63,7 +63,7 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 
 **Cause:** The luajit child process died unexpectedly three times for the same PoB/LuaJIT path pair. This circuit breaker stops rapid restart loops. The count is kept per path pair across engine swaps: `reload_engine` and `configure_pob_path` with the same paths are refused too, and a failed `configure_pob_path` to other paths does not reset it.
 
-**Fix:** Restart the MCP server process, or call `configure_pob_path` with a different PoB/LuaJIT path if the paths were the problem. If PoB has since updated on disk (new `manifest.xml` version/mtime), that path pair starts a fresh count and `reload_engine` works again. If it recurs immediately, capture stderr (it is forwarded to the parent stderr by default) and inspect the failure. It is usually a malformed build XML or a missing data file in the loaded build.
+**Fix:** Restart the MCP server process, or update Path of Building and then call `reload_engine` (a new `manifest.xml` version/mtime on disk starts a fresh count for that path pair). Calling `configure_pob_path` with the same paths does not clear it; a genuinely different PoB/LuaJIT path pair has its own count. If it recurs immediately, capture stderr (it is forwarded to the parent stderr by default) and inspect the failure. It is usually a malformed build XML or a missing data file in the loaded build.
 
 ## "Lua bridge timeout after Nms"
 

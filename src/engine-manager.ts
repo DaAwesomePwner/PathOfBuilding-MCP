@@ -302,16 +302,7 @@ export class EngineManager {
   private async exportCurrentBuild(): Promise<{ xml: string | null; error?: string }> {
     if (this.carryXML) return { xml: this.carryXML };
     if (!this.session || !this.startFingerprint) return { xml: null };
-    try {
-      await this.session.getBuildInfo(); // throws UserError("No build loaded …") when none is loaded
-    } catch (e) {
-      // Text match on BuildSession.getBuildInfo()'s UserError('No build loaded — call load_build first')
-      // (src/build-session.ts); BuildSession has no public "is loaded" accessor. Keep in sync if that text changes.
-      if (e instanceof UserError && /no build loaded/i.test(e.message)) return { xml: null };
-      const error = (e as Error).message;
-      this.log(`could not read the current build before restart: ${error}`);
-      return { xml: null, error };
-    }
+    if (!this.session.hasBuild()) return { xml: null };
     try {
       return { xml: await this.session.exportXML() };
     } catch (e) {
