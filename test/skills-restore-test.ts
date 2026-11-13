@@ -25,6 +25,18 @@
 //      message and has the probe error as its cause; the same for
 //      suggest_upgrades' restore. Without the injection the probe error stays
 //      a user error, shown verbatim.
+//   6. The monster-explosion group (from OccVortex's items): a gem level
+//      changed through the engine survives skills probes (the gem is
+//      relinked to its source); a snapshot naming a source that no longer
+//      exists (injected by the same wrapper) is an internal error naming
+//      reset_build, not a silent difference.
+//   7. Batch-command rollbacks, with failures injected inside the engine
+//      through POB_MCP_TEST_FAULTS (read by bridge.lua at start, only in
+//      engine processes this test starts): a batch that fails after changing
+//      the tree or group is rolled back and stays a user error; a rollback
+//      that throws or leaves the tree different is an internal error naming
+//      reset_build that keeps the original message without the user-error
+//      marker.
 import { readFileSync } from 'fs';
 import { BuildSession } from '../src/build-session.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
@@ -50,6 +62,9 @@ function log(msg: string): void {
 
 /** Test-only seam: while true, skills snapshots come back corrupted, so restoring them throws. */
 let corruptSkillsSnapshot = false;
+/** Test-only seam: while true, explosion gems in skills snapshots name a source that does not exist. */
+let unknownExplodeSource = false;
+const EXPLODE_KEY = '__explodeSourceKey';
 
 function installSeam(bridge: LuaBridge): void {
   const realSend = bridge.send.bind(bridge);
@@ -58,8 +73,36 @@ function installSeam(bridge: LuaBridge): void {
     if (corruptSkillsSnapshot && (command as { cmd?: string }).cmd === 'snapshotSkills') {
       result.snapshot = 'corrupted by the test seam';
     }
+    if (unknownExplodeSource && (command as { cmd?: string }).cmd === 'snapshotSkills') {
+      const text = JSON.stringify(result.snapshot);
+      assert(text.includes(EXPLODE_KEY), 'seam: the snapshot has no explosion gem');
+      result.snapshot = JSON.parse(text.replace(new RegExp(`\\["${EXPLODE_KEY}",(?:"[^"]*"|[\\d.]+)\\]`, 'g'), `["${EXPLODE_KEY}","no such source"]`));
+    }
     return result;
   }) as LuaBridge['send'];
+}
+
+/** A second engine process started with test-only faults (POB_MCP_TEST_FAULTS, read by bridge.lua at start). */
+async function faultySession(paths: ReturnType<typeof setupTestEnv>['paths'], faults: string, xml: string): Promise<{ bridge: LuaBridge; session: BuildSession }> {
+  const previous = process.env.POB_MCP_TEST_FAULTS;
+  process.env.POB_MCP_TEST_FAULTS = faults;
+  const bridge = new LuaBridge(paths, 120_000);
+  const session = new BuildSession(bridge);
+  try {
+    await session.loadBuild(xml);
+  } finally {
+    if (previous === undefined) delete process.env.POB_MCP_TEST_FAULTS;
+    else process.env.POB_MCP_TEST_FAULTS = previous;
+  }
+  return { bridge, session };
+}
+
+function assertInternal(err: Error, parts: RegExp[], label: string): void {
+  assert(!(err instanceof UserError), `${label}: reported as a user error: ${err.message}`);
+  for (const p of parts) assert(p.test(err.message), `${label}: ${p} missing from: ${err.message}`);
+  assert(!err.message.startsWith('__USER__') && !err.message.includes('__USER__'), `${label}: user-error marker leaked: ${err.message}`);
+  const reply = errorResponse(err).content[0].text;
+  assert(reply.startsWith('Internal error: ') && reply.includes('reset_build'), `${label}: client reply: ${reply}`);
 }
 
 async function rejection(promise: Promise<unknown>): Promise<Error> {
@@ -315,6 +358,74 @@ async function main(): Promise<void> {
     await session.suggestUpgrades('Ring 1');
     assertSame('after suggest_upgrades', await state(bridge, session), s5b);
     log('PASS: restore failures keep the probe error and name reset_build');
+
+    // ---------------------------------------------------------------- 6
+    log('Test 6: monster-explosion gem settings survive a skills probe; an unrelinkable one is reported');
+    const groups = await session.listSkillGroups();
+    const explode = groups.find((g) => g.source === 'Explode');
+    assert(explode && explode.gems.length > 0, `test build has no explosion group: ${JSON.stringify(groups.map((g) => g.source))}`);
+    // The explosion skill has one level, so its quality is the setting changed.
+    const explodeLevel = explode.gems[0].level ?? 1;
+    await bridge.send({ cmd: 'setGemLevel', groupIndex: explode.index, gemIndex: 1, quality: 7 });
+    const s6 = await state(bridge, session);
+    assert(/<Gem [^>]*skillId="EnemyExplode"[^>]*>/.exec(s6.xml)?.[0].includes('quality="7"'),
+      `the explosion gem quality change did not stick: ${/<Gem [^>]*skillId="EnemyExplode"[^>]*>/.exec(s6.xml)?.[0]}`);
+    assert(s6.skills.includes(EXPLODE_KEY), 'explosion gem snapshot carries no source key');
+    await session.swapGemWithDiff(MAIN_GROUP, 1, 'Added Cold Damage', 20, 20);
+    await session.evaluateGemLevels(explode.index, 1, [explodeLevel + 1]);
+    assertSame('after skills probes with a changed explosion gem', await state(bridge, session), s6);
+    unknownExplodeSource = true;
+    const explodeErr = await rejection(session.swapGemWithDiff(MAIN_GROUP, 1, 'Added Cold Damage', 20, 20));
+    unknownExplodeSource = false;
+    assertInternal(explodeErr, [/Skills restore was not exact/, /monster-explosion/, /no such source/], 'unrelinkable explosion gem');
+    log('PASS: explosion gems are relinked; a lost one is an internal error naming reset_build');
+
+    // ---------------------------------------------------------------- 7
+    log('Test 7: a failed rollback of a batch command is an internal error naming reset_build');
+    {
+      // Rollback succeeds: the user error stays, the tree and group are back.
+      const { bridge: b, session: s } = await faultySession(paths, 'batchFailsAfterChange,replaceFailsAfterChange', fieldXml);
+      try {
+        const t0 = await state(b, s);
+        const allocErr = await rejection(b.send({ cmd: 'allocNodes', nodeIds: REACHABLE }));
+        assert(allocErr instanceof UserError && /test fault/.test(allocErr.message), `rolled-back batch: ${allocErr.message}`);
+        const t1 = await state(b, s);
+        assert(JSON.stringify(t1.nodeIds) === JSON.stringify(t0.nodeIds), 'tree not rolled back');
+        assert(t1.skills === t0.skills && t1.stats.Life === t0.stats.Life, 'rollback changed something else');
+        const replaceErr = await rejection(b.send({ cmd: 'replaceSocketGroup', groupIndex: MAIN_GROUP, gems: [{ name: 'Vortex' }] }));
+        assert(replaceErr instanceof UserError && /test fault/.test(replaceErr.message), `rolled-back replace: ${replaceErr.message}`);
+        assertSame('after a rolled-back replaceSocketGroup', await state(b, s), t1);
+      } finally {
+        await b.shutdown();
+      }
+    }
+    {
+      const { bridge: b, session: s } = await faultySession(paths, 'batchFailsAfterChange,treeRollbackThrows,replaceFailsAfterChange,replaceRollbackThrows', fieldXml);
+      try {
+        assertInternal(await rejection(b.send({ cmd: 'allocNodes', nodeIds: REACHABLE })),
+          [/test fault: batch failed/, /rolling the passive tree back also failed: test fault: tree rollback threw/], 'throwing tree rollback');
+        assertInternal(await rejection(b.send({ cmd: 'deallocNodes', nodeIds: [someNormal] })),
+          [/test fault: batch failed/, /rolling the passive tree back also failed/], 'throwing tree rollback (dealloc)');
+        assertInternal(await rejection(b.send({ cmd: 'replaceSocketGroup', groupIndex: MAIN_GROUP, gems: [{ name: 'Vortex' }] })),
+          [/test fault: replaceSocketGroup failed/, /putting the old gems back also failed: test fault/], 'throwing gem rollback');
+        // Through the tool: the probe's restore then fixes the build, but the
+        // rollback failure is still an internal error, not a user error.
+        assertInternal(await rejection(s.simulatePassiveChange(REACHABLE, [])),
+          [/test fault: batch failed/, /rolling the passive tree back also failed/], 'simulate_passive_change');
+      } finally {
+        await b.shutdown();
+      }
+    }
+    {
+      const { bridge: b } = await faultySession(paths, 'batchFailsAfterChange,treeRollbackInexact', fieldXml);
+      try {
+        assertInternal(await rejection(b.send({ cmd: 'allocNodes', nodeIds: REACHABLE })),
+          [/test fault: batch failed/, /rolling the passive tree back also failed: the tree is not as before/, /missingNodeIds/], 'inexact tree rollback');
+      } finally {
+        await b.shutdown();
+      }
+    }
+    log('PASS: failed or inexact rollbacks are internal errors that keep the original message');
 
     log('ALL SKILLS RESTORE TESTS PASSED');
   } finally {

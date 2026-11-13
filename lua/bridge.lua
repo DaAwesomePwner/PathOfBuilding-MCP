@@ -627,6 +627,26 @@ local function userError(msg)
   error(USER_ERROR_PREFIX .. msg, 0)
 end
 
+-- A command failed and putting things back failed too: always an internal
+-- error (the build may have changed, so the client is pointed at
+-- reset_build), keeping the original message without the user-error marker.
+local function failedRecoveryError(err, what, detail)
+	local msg = tostring(err)
+	if msg:sub(1, #USER_ERROR_PREFIX) == USER_ERROR_PREFIX then
+		msg = msg:sub(#USER_ERROR_PREFIX + 1)
+	end
+	error(msg .. " (" .. what .. " also failed: " .. tostring(detail) .. ")", 0)
+end
+
+-- Test-only fault injection, read once from the environment of the LuaJIT
+-- process (never from a command, so MCP tool arguments cannot reach it).
+-- POB_MCP_TEST_FAULTS is a comma-separated list of fault names; see the
+-- uses of TEST_FAULTS below. Unset in normal use.
+local TEST_FAULTS = { }
+for name in tostring(os.getenv("POB_MCP_TEST_FAULTS") or ""):gmatch("[%w_]+") do
+	TEST_FAULTS[name] = true
+end
+
 local function encodeJSON(obj)
 	local ok, encoded = pcall(dkjson.encode, obj)
 	if ok and type(encoded) == "string" then
@@ -2163,14 +2183,36 @@ local function batchNodes(nodeIds)
 end
 
 -- Run a batch mutation; if it fails part-way (something the checks could not
--- foresee), put the tree back as it was before the batch and re-raise.
+-- foresee), put the tree back as it was before the batch and re-raise. A
+-- rollback that throws or does not reproduce the tree is an internal error.
 local function withTreeRollback(fn)
 	local before = encodeSpecState(captureSpecState(build.spec))
-	local ok, err = pcall(fn)
+	local ok, err = pcall(function()
+		fn()
+		if TEST_FAULTS.batchFailsAfterChange then userError("test fault: batch failed after changing the tree") end
+	end)
 	if ok then return end
-	local restored, restoreErr = pcall(restoreTreeState, before)
+	local target = before
+	if TEST_FAULTS.treeRollbackInexact then
+		-- Roll back to the state minus one Normal node, so the result differs.
+		target = shallowCopy(before)
+		target.nodeIds = { }
+		local dropped = false
+		for _, id in ipairs(before.nodeIds) do
+			local node = build.spec.nodes[id]
+			if not dropped and node and node.type == "Normal" then dropped = true else target.nodeIds[#target.nodeIds + 1] = id end
+		end
+	end
+	local restored, report = pcall(function()
+		if TEST_FAULTS.treeRollbackThrows then error("test fault: tree rollback threw", 0) end
+		restoreTreeState(target)
+		return verifyTreeState(before)
+	end)
 	if not restored then
-		error(tostring(err) .. " (rolling the passive tree back also failed: " .. tostring(restoreErr) .. ")", 0)
+		failedRecoveryError(err, "rolling the passive tree back", report)
+	end
+	if not report.exact then
+		failedRecoveryError(err, "rolling the passive tree back", "the tree is not as before: " .. encodeJSON(report))
 	end
 	error(err, 0)
 end
@@ -2610,11 +2652,17 @@ local function replaceSocketGroupImpl(groupIndex, gems)
 		runCallback("OnFrame")
 	end
 	-- Single recalc for the whole group
-	local ok, err = pcall(setGemList, newGems)
+	local ok, err = pcall(function()
+		setGemList(newGems)
+		if TEST_FAULTS.replaceFailsAfterChange then userError("test fault: replaceSocketGroup failed after changing the group") end
+	end)
 	if not ok then
-		local restored, restoreErr = pcall(setGemList, oldGems)
+		local restored, restoreErr = pcall(function()
+			if TEST_FAULTS.replaceRollbackThrows then error("test fault: putting the old gems back threw", 0) end
+			setGemList(oldGems)
+		end)
 		if not restored then
-			error(tostring(err) .. " (putting the old gems back also failed: " .. tostring(restoreErr) .. ")", 0)
+			failedRecoveryError(err, "putting the old gems back", restoreErr)
 		end
 		error(err, 0)
 	end
@@ -2695,7 +2743,11 @@ end
 -- grantedEffect, display lists, sourceItem) and are rebuilt by
 -- ProcessSocketGroup and the recalculation. The one exception is a
 -- monster-explosion gem's explodeSource, which CalcSetup uses to keep that
--- gem's settings; it is relinked by key. Fields are stored as sorted
+-- gem's settings (and which the explosion calculation reads); it is relinked
+-- by its key (the source's modSource or id) to the live source with that key.
+-- When the active set has an explosion gem whose source no longer exists,
+-- PoB would recreate that gem with default settings, so the restore reports
+-- itself inexact instead of differing silently. Fields are stored as sorted
 -- [key, value] pairs so equal states encode to equal JSON.
 
 local SKILLS_SNAPSHOT_VERSION = 2
@@ -2720,7 +2772,7 @@ end
 local function explodeSourceKey(source)
 	if type(source) ~= "table" then return nil end
 	local key = source.modSource or source.id
-	if isPlainValue(key) then return tostring(key) end
+	if isPlainValue(key) then return key end
 	return nil
 end
 
@@ -2870,6 +2922,7 @@ local function restoreSkills(snap)
 	-- shared with the tab and its group list control); sets the probe added
 	-- are dropped.
 	local keep = { }
+	local unlinked = { }
 	for _, snapSet in ipairs(snap.sets) do
 		keep[snapSet.id] = true
 		local set = tab.skillSets[snapSet.id] or tab:NewSkillSet(snapSet.id)
@@ -2883,7 +2936,12 @@ local function restoreSkills(snap)
 				local gem = fromFields(snapGem, { })
 				local key = gem[EXPLODE_SOURCE_KEY]
 				gem[EXPLODE_SOURCE_KEY] = nil
-				if key then gem.explodeSource = explodeSources[key] end
+				if key ~= nil then
+					gem.explodeSource = explodeSources[key]
+					if not gem.explodeSource and snapSet.id == snap.activeSkillSetId then
+						unlinked[#unlinked + 1] = "group " .. i .. " gem " .. j .. " (source " .. tostring(key) .. ")"
+					end
+				end
 				group.gemList[j] = gem
 			end
 			list[i] = group
@@ -2900,7 +2958,10 @@ local function restoreSkills(snap)
 	if tab.activeSkillSetId ~= snap.activeSkillSetId or tab.socketGroupList ~= activeSet.socketGroupList then
 		tab:SetActiveSkillSet(snap.activeSkillSetId)
 	else
-		tab:RebuildImbuedSupportBySlot()
+		-- Added to PoB with imbued supports; older versions have no such map.
+		if type(tab.RebuildImbuedSupportBySlot) == "function" then
+			tab:RebuildImbuedSupportBySlot()
+		end
 		tab.displayGroup = tab.socketGroupList[displayIndex or 1]
 	end
 	restoreSkillsTabSettings(tab, snap.settings)
@@ -2911,6 +2972,10 @@ local function restoreSkills(snap)
 	end
 	build.buildFlag = true
 	runCallback("OnFrame")
+	if #unlinked > 0 then
+		error("Skills restore was not exact (monster-explosion gem settings lost because their explosion source is gone: "
+			.. table.concat(unlinked, ", ") .. "); call reset_build to return to the loaded build", 0)
+	end
 end
 
 -- Commands that do not need a loaded build (everything else requires PoB to
