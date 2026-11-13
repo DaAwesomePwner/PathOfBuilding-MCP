@@ -55,6 +55,31 @@ One known difference remains: a tree restore that has to re-import nodes
 puts back the same node set in a different `allocNodes` order, so the saved
 node list and tree URL can come out reordered.
 
+## Found during the restore and crash-recovery work
+
+Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
+
+- **Replay journal is unbounded.** After a crash the engine replays every
+  committed change since the last load, so recovery time grows with them.
+  Folding the journal into a new baseline needs an export, which re-parses
+  every item in the live build.
+- **Partial change is not journaled.** If a mutation command itself fails with
+  the engine still alive, the undo entry is kept but the change is never
+  recorded for replay; a later crash restores the build without it.
+- **Explosion gems in inactive skill sets** lose their settings on a skills
+  restore without any report; the relink-or-refuse check covers the active set
+  only.
+- **`replaceSocketGroup` rollback is not checked for exactness** (the tree
+  rollback is).
+- **Untested failure paths.** The `convert_tree_to_latest` rollback, a LuaJIT
+  exit or timeout during a what-if restore, and the "build lost" engine-swap
+  carry have no test; each needs a fault from the `POB_MCP_TEST_FAULTS` seam.
+- **Node list order after a tree re-import.** See "What-if restore exactness";
+  tests compare that list as a set in those cases.
+- **Wording.** A failed-restore reply can name `reset_build` twice; the
+  swap-carry note says "failed again while being restarted" even when no
+  process ever started.
+
 ## Robustness and security
 
 - **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
@@ -63,9 +88,11 @@ node list and tree URL can come out reordered.
 - **Swallowed errors give wrong answers (confirmed).** Empty `catch {}` in
   `compareSupports`, `suggestUpgrades`, `compareScenarios`
   (`src/build-session.ts:998,1364,1490`) turn failures into zero deltas.
-- **Undo edge cases (confirmed).** Entry pushed before a mutation and not removed
-  on failure; `undoLastChange` pops before restoring; a throwing restore in
-  `finally` hides the original error.
+- **Undo edge cases (confirmed).** `undoLastChange` pops the entry before
+  restoring, so a failed restore loses it. `set_config` pushes an undo entry
+  even when the bridge refuses the change with a user error (`swap_item` does
+  not). (Fixed 2026-11-13: entries are pushed only after the call succeeds, and
+  a failing what-if restore no longer hides the probe's error.)
 - **Protocol framing.** No request ids between TS and Lua, so one stray stdout
   line desynchronises responses. No `'error'` listener on the child's stdin
   (EPIPE, plausible).
