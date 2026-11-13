@@ -103,7 +103,7 @@ See [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md). Common issues:
 - **"Path of Building is not configured"**: give the assistant your PoB folder (it calls `configure_pob_path`), or set `POB_PATH`.
 - **LuaJIT not found**: install LuaJIT separately (the Windows PoB installer has no `luajit.exe`), then pass `luajitPath` to `configure_pob_path` or set `LUAJIT_PATH`.
 - **"Path of Building was updated on disk"**: call `reload_engine`.
-- **Bridge timeout / crash**: see the troubleshooting doc. The server includes a three-strike circuit breaker per PoB/LuaJIT path pair; it survives `reload_engine` and failed `configure_pob_path` attempts and clears only on a server restart, a different path pair, or PoB changing on disk.
+- **Bridge timeout / crash**: see the troubleshooting doc. After a crash or a timeout the next tool call restarts the engine with the build as of the last committed change, clears undo history and says so once. The server includes a three-strike circuit breaker per PoB/LuaJIT path pair (unexpected exits, command timeouts and failed starts all count; successes in between do not reset it); it survives `reload_engine` and failed `configure_pob_path` attempts and clears only on a server restart, a different path pair, or PoB changing on disk.
 
 ## Development
 

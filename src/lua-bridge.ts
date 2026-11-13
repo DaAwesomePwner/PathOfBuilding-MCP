@@ -1,7 +1,7 @@
 import { ChildProcess, spawn } from 'child_process';
 import path from 'path';
 import { decodeBuildCode, fetchBuildFromURL } from './build-source.js';
-import { circuitOpen } from './engine-messages.js';
+import { circuitOpen, engineDown, MAX_CRASHES } from './engine-messages.js';
 import { ResolvedPaths } from './paths.js';
 import { inspectPoBInstall } from './pob-install.js';
 import { startTimer } from './timing.js';
@@ -22,6 +22,29 @@ export interface BuildInfo {
 export const ENGINE_REPLACED_MESSAGE =
   'The Path of Building engine was restarted (reload_engine / configure_pob_path / shutdown) while this ' +
   'call was queued or running. Retry the call.';
+
+/** What a respawn after a crash or timeout put back into the new engine process. */
+export interface RespawnReport {
+  /** Strikes counted so far (the breaker opens at MAX_CRASHES). */
+  crashCount: number;
+  /** 'build': the recovery build was reloaded; 'none': no build had been loaded; 'failed': it could not be reloaded. */
+  restored: 'build' | 'none' | 'failed';
+  info?: BuildInfo;
+  error?: string;
+}
+
+export interface LuaBridgeOptions {
+  /** Strike count carried over from a previous bridge for the same paths (CrashLedger). */
+  initialCrashCount?: number;
+  /**
+   * Test-only fault names for lua/bridge.lua (POB_MCP_TEST_FAULTS). Only this
+   * option sets it for the LuaJIT child; the server's own environment value is
+   * never passed through.
+   */
+  testFaults?: string;
+}
+
+const TEST_FAULTS_ENV = 'POB_MCP_TEST_FAULTS';
 
 export interface Stats {
   [key: string]: number | string | boolean | null | undefined;
@@ -78,23 +101,39 @@ export class LuaBridge {
   private readonly timeoutMs: number;
   private readonly stderrLines: string[] = [];
   private pending: PendingRequest | null = null;
-  private lastLoadedXML: { xml: string; name?: string } | null = null;
+  /**
+   * What a respawned process is given back: the last build the engine
+   * accepted (loadBuildXML; never a build it rejected) and the committed
+   * commands applied to it since (recordCommitted), replayed in order. Kept as
+   * commands rather than a fresh export because PoB's save re-parses every
+   * item of the live build.
+   */
+  private recoveryBuild: { xml: string; name?: string } | null = null;
+  private recoveryOps: object[] = [];
   private starting: Promise<void> | null = null;
   private readyResolve: { resolve: () => void; reject: (err: Error) => void; timeout: NodeJS.Timeout } | null = null;
   private stdoutBuffer = '';
+  /**
+   * Strikes: unexpected exits (any exit not asked for with a shutdown
+   * command), command timeouts, and failed or timed-out startups of a process
+   * that ran. Never forgiven by later successes; a count starts over only
+   * with a new bridge whose CrashLedger entry was cleared (the PoB install
+   * changed on disk) or in a new server process.
+   */
   private crashCount = 0;
-  private readonly maxCrashes = 3;
-  private successesSinceCrash = 0;
   private disposed = false;
   /** Process handle captured by dispose(), so forceKill() still reaches it after references are cleared. */
   private retiredProcess: ChildProcess | null = null;
-  // After this many clean round-trips since the last crash, treat the
-  // process as healthy again and reset crashCount — otherwise a long-running
-  // session accumulates strikes from unrelated transient hiccups until it
-  // trips the breaker on a real problem.
-  private readonly successesToClearCrashes = 5;
+  private readonly testFaults: string | undefined;
+  /** Processes that reached "ready". A start after the first is a respawn. */
+  private spawnCount = 0;
+  private respawnReport: RespawnReport | null = null;
+  /** While set, send() refuses to respawn a dead process (see setRespawnHeld). */
+  private respawnHeld = false;
+  /** A shutdown command was sent to the live process, so its exit is expected. */
+  private shutdownRequested = false;
 
-  constructor(paths: ResolvedPaths, timeoutMs = 30_000, options: { initialCrashCount?: number } = {}) {
+  constructor(paths: ResolvedPaths, timeoutMs = 30_000, options: LuaBridgeOptions = {}) {
     this.pobPath = paths.pobPath;
     this.luajitPath = paths.luajitPath;
     this.bridgeLua = paths.bridgeLua;
@@ -102,6 +141,7 @@ export class LuaBridge {
     // Carried over from a previous bridge for the same paths so the three-strike
     // breaker can't be reset by swapping bridge instances.
     this.crashCount = options.initialCrashCount ?? 0;
+    this.testFaults = options.testFaults;
   }
 
   async start(): Promise<void> {
@@ -111,8 +151,8 @@ export class LuaBridge {
     if (this.process && !this.process.killed) {
       return;
     }
-    if (this.crashCount >= this.maxCrashes) {
-      throw new Error(circuitOpen(this.crashCount));
+    if (this.crashCount >= MAX_CRASHES) {
+      throw new UserError(circuitOpen(this.crashCount));
     }
     if (this.starting) {
       return this.starting;
@@ -137,7 +177,54 @@ export class LuaBridge {
 
   /** True once the three-strike crash breaker has tripped. */
   isCircuitOpen(): boolean {
-    return this.crashCount >= this.maxCrashes;
+    return this.crashCount >= MAX_CRASHES;
+  }
+
+  /** Number of engine processes that reached "ready" (above 1 means the engine was respawned). */
+  getSpawnCount(): number {
+    return this.spawnCount;
+  }
+
+  /**
+   * The report of a respawn nobody has handled yet; reading it clears it. A
+   * successful loadBuildXML clears it too: the new build replaces whatever
+   * the respawn restored.
+   */
+  takeRespawnReport(): RespawnReport | null {
+    const r = this.respawnReport;
+    this.respawnReport = null;
+    return r;
+  }
+
+  /**
+   * While held, a send() that finds the process dead (it exited, or was
+   * killed after a timeout) fails instead of starting a new one, so a
+   * multi-command operation never carries on against a fresh engine with the
+   * old engine's state in hand. BuildSession holds it for the body of every
+   * locked operation and respawns only at the start of the next one.
+   */
+  setRespawnHeld(held: boolean): void {
+    this.respawnHeld = held;
+  }
+
+  /** The build XML a respawn reloads before replaying committed commands (null when none was accepted). */
+  getRecoveryXML(): string | null {
+    return this.recoveryBuild?.xml ?? null;
+  }
+
+  /** Record a command the engine just completed as a committed change, replayed after a respawn. */
+  recordCommitted(command: object): void {
+    if (this.recoveryBuild) this.recoveryOps.push(command);
+  }
+
+  /** Number of committed commands recorded since the last accepted load. */
+  committedCount(): number {
+    return this.recoveryOps.length;
+  }
+
+  /** Forget committed commands past the first `count` (an undo reverted them). */
+  truncateCommitted(count: number): void {
+    if (count < this.recoveryOps.length) this.recoveryOps.length = Math.max(0, count);
   }
 
   /** PID of the live LuaJIT process, if any (tests / diagnostics). */
@@ -187,6 +274,9 @@ export class LuaBridge {
   }
 
   async send<T = unknown>(command: object, timeoutOverrideMs?: number): Promise<T> {
+    if (this.respawnHeld && this.spawnCount > 0 && !this.isRunning() && !this.disposed) {
+      throw new Error(engineDown(this.crashCount));
+    }
     await this.start();
 
     if (!this.process?.stdin?.writable) {
@@ -201,15 +291,22 @@ export class LuaBridge {
     const stopTimer = startTimer(`bridge.${cmdName}`);
     const effectiveTimeout = timeoutOverrideMs ?? this.timeoutMs;
 
+    if (cmdName === 'shutdown') this.shutdownRequested = true;
+
     return new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending = null;
         const stderr = this.getStderr();
+        // The process may be stuck mid-command with half-changed state: it is
+        // killed, and the timeout counts as a strike like a crash.
+        const strike = this.isRunning() && !this.shutdownRequested;
         this.killProcess();
+        if (strike) this.crashCount++;
         stopTimer();
         reject(
           new Error(
             `Lua bridge timeout after ${effectiveTimeout}ms on cmd "${cmdName}"` +
+              (strike ? ` (the engine was stopped; strike ${this.crashCount} of ${MAX_CRASHES})` : '') +
               (stderr ? `\nStderr tail:\n${stderr.split('\n').slice(-10).join('\n')}` : ''),
           ),
         );
@@ -218,13 +315,6 @@ export class LuaBridge {
       this.pending = {
         resolve: (value) => {
           stopTimer();
-          if (this.crashCount > 0) {
-            this.successesSinceCrash++;
-            if (this.successesSinceCrash >= this.successesToClearCrashes) {
-              this.crashCount = 0;
-              this.successesSinceCrash = 0;
-            }
-          }
           resolve(value as T);
         },
         reject: (reason) => {
@@ -246,8 +336,11 @@ export class LuaBridge {
   }
 
   async loadBuildXML(xml: string, name?: string): Promise<BuildInfo> {
-    this.lastLoadedXML = { xml, name };
     const result = await this.send<{ ok: true; info: BuildInfo }>({ cmd: 'loadXML', xml, name });
+    // Recorded only once the engine accepted it: a rejected build is never replayed.
+    this.recoveryBuild = { xml, name };
+    this.recoveryOps = [];
+    this.respawnReport = null;
     return result.info;
   }
 
@@ -318,8 +411,10 @@ export class LuaBridge {
 
     this.stderrLines.length = 0;
     this.stdoutBuffer = '';
+    this.shutdownRequested = false;
     const proc = spawn(this.luajitPath, [bridgePath, this.pobPath], {
       cwd,
+      env: this.childEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.process = proc;
@@ -340,14 +435,13 @@ export class LuaBridge {
 
     proc.on('exit', (code, signal) => {
       if (this.process !== proc) return; // Stale process — don't touch new state
-      // Track unexpected exits (anything other than a clean shutdown).
-      if (code !== 0 || signal) {
-        this.crashCount++;
-        this.successesSinceCrash = 0;
-      }
+      // Every exit not asked for with a shutdown command is a strike.
+      const unexpected = !this.shutdownRequested;
+      if (unexpected) this.crashCount++;
+      const strike = unexpected ? ` (strike ${this.crashCount} of ${MAX_CRASHES})` : '';
       this.failPending(
-        new Error(`Lua bridge exited during init (code=${code}, signal=${signal}). Stderr:\n${this.getStderr()}`),
-        new Error(`Lua bridge exited unexpectedly. Stderr:\n${this.getStderr()}`),
+        new Error(`Lua bridge exited during init (code=${code}, signal=${signal})${strike}. Stderr:\n${this.getStderr()}`),
+        new Error(`Lua bridge exited unexpectedly (code=${code}, signal=${signal})${strike}. Stderr:\n${this.getStderr()}`),
       );
     });
 
@@ -360,13 +454,64 @@ export class LuaBridge {
       throw new Error('Lua bridge stdout was not created');
     }
 
-    await this.waitForReady();
-
-    if (this.lastLoadedXML) {
-      const loaded = this.lastLoadedXML;
-      this.lastLoadedXML = null;
-      await this.loadBuildXML(loaded.xml, loaded.name);
+    try {
+      await this.waitForReady();
+    } catch (error) {
+      // A failed or timed-out startup of a process that is still alive: never
+      // leave it running unready. It ran and could not be used, so it is a
+      // strike (an exit during init was already counted by the exit handler).
+      if (this.process === proc) {
+        this.killProcess(); // no-op if it already exited
+        this.cleanupProcessReferences(); // so a queued exit event is not counted again
+        this.crashCount++;
+      }
+      throw error;
     }
+
+    const respawn = this.spawnCount > 0;
+    this.spawnCount++;
+    if (respawn) await this.restoreAfterRespawn();
+  }
+
+  /**
+   * Give a respawned process the recovery build back: the accepted XML, then
+   * every committed command in order. A crash or timeout while doing so is
+   * thrown (and already counted); anything the new engine refuses is
+   * reported as 'failed' and the recovery state is dropped.
+   */
+  private async restoreAfterRespawn(): Promise<void> {
+    const build = this.recoveryBuild;
+    if (!build) {
+      this.respawnReport = { crashCount: this.crashCount, restored: 'none' };
+      return;
+    }
+    const ops = [...this.recoveryOps];
+    let step = 'reloading the build';
+    try {
+      await this.send({ cmd: 'loadXML', xml: build.xml, name: build.name });
+      for (let i = 0; i < ops.length; i++) {
+        step = `replaying committed change ${i + 1} of ${ops.length} (${(ops[i] as { cmd?: string }).cmd})`;
+        await this.send(ops[i]);
+      }
+      step = 'reading the build info';
+      const info = await this.send<{ ok: true; info: BuildInfo }>({ cmd: 'getBuildInfo' });
+      this.respawnReport = { crashCount: this.crashCount, restored: 'build', info: info.info };
+    } catch (error) {
+      if (!this.isRunning()) throw error;
+      this.recoveryBuild = null;
+      this.recoveryOps = [];
+      this.respawnReport = { crashCount: this.crashCount, restored: 'failed', error: `${step}: ${(error as Error).message}` };
+    }
+  }
+
+  /** The server's environment without the test fault switch, plus this bridge's own test faults, if any. */
+  private childEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (key.toUpperCase() !== TEST_FAULTS_ENV) env[key] = value;
+    }
+    if (this.testFaults) env[TEST_FAULTS_ENV] = this.testFaults;
+    return env;
   }
 
   private waitForReady(): Promise<void> {

@@ -123,6 +123,22 @@ class FakeBridge {
   killProcess() {
     this.running = false;
   }
+  // Crash-recovery hooks BuildSession uses (this fake never respawns).
+  getSpawnCount() {
+    return this.starts;
+  }
+  takeRespawnReport() {
+    return null;
+  }
+  setRespawnHeld(_held: boolean) {}
+  recordCommitted(_command: object) {}
+  committedCount() {
+    return 0;
+  }
+  truncateCommitted(_count: number) {}
+  getRecoveryXML() {
+    return this.xml;
+  }
 }
 
 const BUILD_XML = '<PathOfBuilding><Build level="90" className="Witch"/></PathOfBuilding>';
@@ -463,7 +479,8 @@ async function part1(): Promise<void> {
     assert.equal(session.hasBuild(), false, 'hasBuild() is false before any build is loaded');
     await session.loadBuild(BUILD_XML);
     assert.equal(session.hasBuild(), true, 'hasBuild() is true once a build is loaded');
-    (session as unknown as { exportXML: () => Promise<string> }).exportXML = async () => {
+    // The export an engine swap uses (it never respawns a crashed engine).
+    (session as unknown as { exportForEngineSwap: () => Promise<string> }).exportForEngineSwap = async () => {
       throw new Error('Lua bridge exited unexpectedly');
     };
     const r = await mn.reload();

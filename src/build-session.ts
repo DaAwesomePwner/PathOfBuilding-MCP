@@ -1,6 +1,18 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
+import { engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { UserError } from './validation.js';
+
+/**
+ * The engine was restarted after a crash or timeout since the last tool call.
+ * Thrown once, by the first locked call after the restart, which does nothing else.
+ */
+export class EngineRestartedError extends UserError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EngineRestartedError';
+  }
+}
 
 export interface ItemSnapshot {
   slot: string;
@@ -134,11 +146,15 @@ export interface FullSnapshot {
  */
 export type SpecState = Record<string, unknown>;
 
-export type UndoEntry =
+export type UndoEntry = (
   | { kind: 'full'; snapshot: FullSnapshot }
   | { kind: 'config'; snapshot: ConfigSnapshot }
   /** Tree-version change: restores the whole spec, version included. */
-  | { kind: 'spec'; state: SpecState };
+  | { kind: 'spec'; state: SpecState }
+) & {
+  /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
+  journal?: number;
+};
 
 export interface StatDelta {
   before: number | string | boolean | null | undefined;
@@ -205,6 +221,8 @@ export class BuildSession {
   private configMetaCache: Map<string, ConfigVarMetadata> | null = null;
   private originalXML: string | null = null;
   private buildInfo: BuildInfo | null = null;
+  /** Undo history was dropped by an engine restart (named when undo finds the stack empty). */
+  private undoClearedByRestart = false;
 
   constructor(
     bridge: LuaBridge,
@@ -218,13 +236,83 @@ export class BuildSession {
   // Locking
   // ------------------------------------------------------------------
 
+  /**
+   * Serialise an engine operation. A dead engine is restarted only here,
+   * before the operation starts (the restart reloads the last committed
+   * build; the first call after it reports it and stops). While the operation
+   * runs the bridge refuses to respawn, so a crash or timeout part-way
+   * through fails the call instead of letting it continue, or roll back,
+   * against a fresh engine.
+   */
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.mutex.acquire();
+    try {
+      await this.bridge.start();
+      this.handleRespawnUnlocked();
+      this.bridge.setRespawnHeld(true);
+      try {
+        return await fn();
+      } finally {
+        this.bridge.setRespawnHeld(false);
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** load_build / reset_build replace the whole build, so they skip the restart notice. */
+  private async withLoadLock<T>(fn: () => Promise<T>): Promise<T> {
     const release = await this.mutex.acquire();
     try {
       return await fn();
     } finally {
       release();
     }
+  }
+
+  /**
+   * After a respawn: undo entries refer to the old process (item identity
+   * tokens, ids) and are dropped; labelled snapshots hold only stats and are
+   * kept. Throws the one-time notice.
+   */
+  private handleRespawnUnlocked(): void {
+    const report = this.bridge.takeRespawnReport();
+    if (!report) return;
+    const undoEntriesCleared = this.undoStack.length;
+    this.undoStack.length = 0;
+    this.undoClearedByRestart = true;
+    this.configMetaCache = null;
+    this.buildInfo = report.restored === 'build' ? (report.info ?? this.buildInfo) : null;
+    throw new EngineRestartedError(
+      engineRestarted({
+        crashCount: report.crashCount,
+        restored: report.restored,
+        error: report.error,
+        undoEntriesCleared,
+        snapshotsKept: this.snapshots.size,
+      }),
+    );
+  }
+
+  /**
+   * The build to carry over an engine swap (which already holds the gate
+   * exclusively). When the process is gone after a crash: the accepted build
+   * XML if nothing was committed since, otherwise the engine is restarted
+   * here (replaying the committed changes) just to export it — refused, and
+   * so not carried, while the breaker is open.
+   */
+  async exportForEngineSwap(): Promise<string | null> {
+    return this.withLoadLock(async () => {
+      if (!this.bridge.isRunning()) {
+        if (!this.buildInfo) return null;
+        if (this.bridge.committedCount() === 0) return this.bridge.getRecoveryXML();
+        await this.bridge.start();
+        const report = this.bridge.takeRespawnReport(); // the swap result reports the restart itself
+        if (report?.restored === 'failed') throw new Error(`could not restore the build after a crash: ${report.error}`);
+      }
+      const result = await this.bridge.send<{ ok: true; xml: string }>({ cmd: 'exportXML' });
+      return result.xml;
+    });
   }
 
   // ------------------------------------------------------------------
@@ -238,12 +326,14 @@ export class BuildSession {
     // order, not call order (a slow URL load started first can land after, and
     // replace, a build code loaded later).
     const xml = await resolveBuildSource(source);
-    return this.withLock(async () => {
+    return this.withLoadLock(async () => {
+      // The bridge records the build for crash recovery only once it is accepted.
       const info = await this.bridge.loadBuildXML(xml);
       this.originalXML = xml;
       this.buildInfo = info;
       this.configMetaCache = null;
       this.undoStack.length = 0;
+      this.undoClearedByRestart = false;
       this.snapshots.clear();
       return info;
     });
@@ -252,11 +342,12 @@ export class BuildSession {
   async resetBuild(): Promise<BuildInfo> {
     if (!this.originalXML) throw new UserError('No build loaded — call load_build first');
     const xml = this.originalXML;
-    return this.withLock(async () => {
+    return this.withLoadLock(async () => {
       const info = await this.bridge.loadBuildXML(xml);
       this.buildInfo = info;
       this.configMetaCache = null;
       this.undoStack.length = 0;
+      this.undoClearedByRestart = false;
       this.snapshots.clear();
       return info;
     });
@@ -644,17 +735,22 @@ export class BuildSession {
   async pushUndo(): Promise<void> {
     return this.withLock(async () => {
       const snapshot = await this.snapshotAllUnlocked();
-      this.undoStack.push({ kind: 'full', snapshot });
-      while (this.undoStack.length > this.maxUndo) {
-        this.undoStack.shift();
-      }
+      this.pushUndoEntryUnlocked({ kind: 'full', snapshot });
     });
   }
 
   async undoLastChange(): Promise<Stats> {
     return this.withLock(async () => {
       const entry = this.undoStack.pop();
-      if (!entry) throw new UserError('Nothing to undo — the undo stack is empty');
+      if (!entry) {
+        throw new UserError(
+          'Nothing to undo — the undo stack is empty' +
+            (this.undoClearedByRestart
+              ? ' (earlier undo history was cleared when the engine was restarted after a crash; ' +
+                'reset_build still returns to the originally loaded build)'
+              : ''),
+        );
+      }
       if (entry.kind === 'full') {
         await this.restoreAllUnlocked(entry.snapshot);
       } else if (entry.kind === 'spec') {
@@ -663,6 +759,8 @@ export class BuildSession {
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
+      // The commands this entry's change and any later ones recorded are reverted.
+      if (entry.journal !== undefined) this.bridge.truncateCommitted(entry.journal);
       return this.bridge.getStats();
     });
   }
@@ -672,7 +770,7 @@ export class BuildSession {
   }
 
   private pushUndoEntryUnlocked(entry: UndoEntry): void {
-    this.undoStack.push(entry);
+    this.undoStack.push({ ...entry, journal: this.bridge.committedCount() });
     while (this.undoStack.length > this.maxUndo) this.undoStack.shift();
   }
 
@@ -762,6 +860,7 @@ export class BuildSession {
       throw err;
     }
     this.pushUndoEntryUnlocked({ kind: 'full', snapshot: undoSnap });
+    this.bridge.recordCommitted(command);
     const after = await this.bridge.getStats();
     return { before, after, diff: computeDiff(before, after) };
   }
@@ -842,11 +941,12 @@ export class BuildSession {
         throw new Error('captureSpecState returned no tree version');
       }
       const undoState = { ...captured.state, treeVersion };
+      const spawn = this.bridge.getSpawnCount();
       let res: { ok: true; result: RawTreeConversion; stats: Stats };
       try {
         res = await this.bridge.send({ cmd: 'convertTreeToLatest' });
       } catch (err) {
-        await this.rollBackTreeUnlocked(undoState);
+        await this.rollBackTreeUnlocked(undoState, spawn);
         throw err;
       }
       const raw = res.result;
@@ -854,6 +954,7 @@ export class BuildSession {
         return { converted: false, fromVersion: raw.fromVersion, toVersion: raw.toVersion };
       }
       this.pushUndoEntryUnlocked({ kind: 'spec', state: undoState });
+      this.bridge.recordCommitted({ cmd: 'convertTreeToLatest' });
       await this.refreshBuildInfoUnlocked();
       const after = res.stats;
       const list = <T>(value: T[] | undefined): T[] => (Array.isArray(value) ? value : []);
@@ -889,8 +990,15 @@ export class BuildSession {
    * activating the new one fails, but a failure after a successful swap (e.g.
    * while building the report) would leave the tree converted with no undo
    * entry. Put the captured spec back whenever the tree version moved.
+   * Skipped when the engine process stopped (crash, or killed after a
+   * timeout) or was replaced: the captured spec belongs to the old process,
+   * and the restarted engine reloads the last committed build anyway.
    */
-  private async rollBackTreeUnlocked(state: SpecState & { treeVersion: string }): Promise<void> {
+  private async rollBackTreeUnlocked(state: SpecState & { treeVersion: string }, spawn: number): Promise<void> {
+    if (!this.bridge.isRunning() || this.bridge.getSpawnCount() !== spawn) {
+      console.error('[pob-mcp] tree conversion failed and the engine stopped; no rollback on a restarted engine');
+      return;
+    }
     try {
       const info = await this.bridge.send<{ ok: true; info: BuildInfo }>({ cmd: 'getBuildInfo' });
       if (info.info.treeVersion !== state.treeVersion) {
@@ -1622,12 +1730,10 @@ export class BuildSession {
       // Validate before the undo push so a rejected call changes nothing.
       await this.validateConfigOptionsUnlocked(options);
       const configSnap = await this.snapshotConfigUnlocked();
-      this.undoStack.push({ kind: 'config', snapshot: configSnap });
-      while (this.undoStack.length > this.maxUndo) {
-        this.undoStack.shift();
-      }
+      this.pushUndoEntryUnlocked({ kind: 'config', snapshot: configSnap });
       const before = await this.bridge.getStats();
       await this.bridge.setConfig(options);
+      this.bridge.recordCommitted({ cmd: 'setConfig', options: { ...options } });
       const after = await this.bridge.getStats();
       return { before, after, diff: computeDiff(before, after) };
     });

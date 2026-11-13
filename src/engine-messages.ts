@@ -55,16 +55,71 @@ export function bootFailed(paths: ResolvedPaths, error: string): string {
   );
 }
 
+/** Strikes (unexpected exits, command timeouts, failed starts) after which the engine is not restarted. */
+export const MAX_CRASHES = 3;
+
 /**
  * The crash count is kept per (PoB path, LuaJIT path) pair (CrashLedger), so calling
  * configure_pob_path or reload_engine with the same paths does not clear it.
  */
 export function circuitOpen(crashCount: number): string {
   return (
-    `Lua engine has crashed ${crashCount} times — refusing to restart. ` +
-    'Restart the MCP server process to clear this state, or update Path of Building ' +
+    `Lua engine has crashed ${crashCount} times (unexpected exits, command timeouts or failed starts) — ` +
+    'refusing to restart. Restart the MCP server process to clear this state, or update Path of Building ' +
     'and then call reload_engine (the count clears once the install has changed on disk).'
   );
+}
+
+/** A command found the engine process gone part-way through a tool call. */
+export function engineDown(crashCount: number): string {
+  const strike = crashCount > 0 ? ` (strike ${crashCount} of ${MAX_CRASHES})` : '';
+  return (
+    `The Path of Building engine stopped during this call${strike}, so the call did not finish. ` +
+    'The next tool call restarts the engine with the build as of the last committed change.'
+  );
+}
+
+export interface RestartNotice {
+  crashCount: number;
+  restored: 'build' | 'none' | 'failed';
+  error?: string;
+  undoEntriesCleared: number;
+  snapshotsKept: number;
+}
+
+/**
+ * Told once, by the first tool call after the engine was restarted following
+ * a crash or a timeout. That call does nothing else.
+ */
+export function engineRestarted(n: RestartNotice): string {
+  const left = MAX_CRASHES - n.crashCount;
+  const build =
+    n.restored === 'build'
+      ? 'The build was restored as it was after the last committed change (load_build, reset_build, swap_item, ' +
+        'unequip_item, set_config, convert_tree_to_latest or undo_last_change). A change whose call failed when the ' +
+        'engine stopped was not kept.'
+      : n.restored === 'none'
+        ? 'No build was loaded, so none was restored.'
+        : `The build could NOT be fully restored (${n.error ?? 'unknown error'}), so do not rely on the engine's ` +
+          'current build. Call reset_build to reload the originally loaded build, or load_build.';
+  const undo =
+    n.undoEntriesCleared > 0
+      ? `Undo history was cleared (${n.undoEntriesCleared} entr${n.undoEntriesCleared === 1 ? 'y' : 'ies'}): ` +
+        'those entries belonged to the stopped engine and cannot be applied to the new one.'
+      : 'There was no undo history to keep.';
+  return [
+    `The Path of Building engine stopped unexpectedly and was restarted (strike ${n.crashCount} of ${MAX_CRASHES}; ` +
+      (left > 0
+        ? `after ${left} more the engine is not restarted again).`
+        : 'it will not be restarted again).'),
+    build,
+    undo,
+    n.restored === 'failed' ? '' : 'reset_build still returns to the originally loaded build.',
+    n.snapshotsKept > 0 ? `Labelled stat snapshots (${n.snapshotsKept}) are kept; they hold stats only.` : '',
+    'Nothing else was done for this call: retry it.',
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 export function envOverride(pobEnv: string): string {

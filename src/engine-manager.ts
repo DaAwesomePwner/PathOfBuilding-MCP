@@ -304,7 +304,7 @@ export class EngineManager {
     if (!this.session || !this.startFingerprint) return { xml: null };
     if (!this.session.hasBuild()) return { xml: null };
     try {
-      return { xml: await this.session.exportXML() };
+      return { xml: await this.session.exportForEngineSwap() }; // also covers an engine that already crashed
     } catch (e) {
       const error = (e as Error).message;
       this.log(`could not export the current build before restart: ${error}`);
