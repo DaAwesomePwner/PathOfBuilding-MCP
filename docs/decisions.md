@@ -6,7 +6,7 @@ decisions, one line each, current state only.
 ## Scope
 
 - Only the launch-critical fix set shipped for the new-league PoB update; every other 2026-11-12 review finding lives in `docs/backlog.md`. Why: the user said a new Path of Exile 1 update was due the next day and chose to postpone the rest. (2026-11-12, launch-critical-fixes, docs/backlog.md)
-- Postponed by the user, not rejected: `convert_tree_to_latest` tool, what-if restore exactness (masteries, items, skills), URL-loading hardening, crash-breaker tuning, the install DLL locks, tests/CI and docs polish. Why: outside the launch-critical set. (2026-11-12, launch-critical-fixes, docs/backlog.md)
+- Postponed by the user, not rejected: `convert_tree_to_latest` tool, what-if restore exactness (masteries, items, skills), poe.ninja build links, crash-breaker tuning, the install DLL locks, tests/CI and docs polish. Why: outside the launch-critical set; URL-loading hardening has since shipped, and poe.ninja support is a new feature left in the backlog. (2026-11-13, backlog-ready-items, 65426efd) Replaces: the same list including URL-loading hardening (2026-11-12)
 
 ## Engine and PoB install
 
@@ -19,4 +19,6 @@ decisions, one line each, current state only.
 
 - Path resolution order is environment variable, then saved config, then auto-detect; a missing PoB or LuaJIT never exits the server. Why: MCP clients only show "server disconnected" on exit, so the user could not be asked. (2026-11-12, launch-critical-fixes, a4b9218e)
 - Paths supplied through `configure_pob_path` or elicitation are not environment-expanded and may not be network or device paths; `luajitPath` must be an existing file named `luajit*` (`.exe` on Windows). Paths from `POB_PATH`/`LUAJIT_PATH` keep expansion. Why: these values can come from the model, and they are executed or echoed back. (2026-11-12, launch-critical-fixes, a4b9218e)
+- `load_build` URLs are accepted only for the exact hosts `pastebin.com` and `pobb.in` (with or without `www.`) over https; the request URL is rebuilt from a fixed origin plus the build id, redirects are refused, and the fetch and the decoded build are size- and time-bounded. Why: the source string can come from the model, so the caller's URL must never reach `fetch`. (2026-11-13, backlog-ready-items, 65426efd)
+- `load_build` downloads and decodes before taking the session lock, so overlapping loads take effect in completion order, not call order. Why: a slow fetch must not block every other engine call; making the later call win was not asked for. (2026-11-13, backlog-ready-items, 65426efd)
 - The three-strike crash count is kept per resolved (PoB path, LuaJIT path) pair and clears only when that install changes on disk. Why: reconfiguring must not be a way around the breaker, and a PoB update must be a way out. (2026-11-12, launch-critical-fixes, a4b9218e)
