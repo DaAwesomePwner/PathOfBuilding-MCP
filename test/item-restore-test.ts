@@ -27,6 +27,12 @@
 //  10. A second item set (OccVortexItemSets.xml) survives probes and undo.
 //  11. A full snapshot taken before reset_build is refused, as an internal
 //      error naming reset_build, before anything changes.
+//  12. A load_build PoB rejects keeps the previous build (the bridge reloads
+//      it from its own save): undo entries taken before it (item, jewel,
+//      config, tree conversion) still undo back to the loaded build.
+//  13. Item identity tokens differ between engine processes, so a snapshot
+//      from an engine that has since crashed or been replaced (same build,
+//      same ids) is refused by the new one.
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -211,7 +217,91 @@ function sortNodeLists(xml: string): string {
     .replace(/<URL>[\s\S]*?<\/URL>/g, '<URL/>');
 }
 
-function assertSameBuild(label: string, actual: BuildState, expected: BuildState, sortNodes = false): void {
+/**
+ * For builds whose spec PoB rebuilt (tree conversion or its undo) or that PoB
+ * re-read from its own save (the failed-load recovery):
+ * every list PoB writes in Lua table order may come back in another order.
+ * Node lists are sorted (sortNodeLists), attributes are sorted inside each
+ * tag, runs of consecutive self-closing sibling elements at one indentation
+ * (<Input/>, <PlayerStat/>, <Slot/> mixed with <SocketIdURL/>, <Socket/>, ...)
+ * are sorted, and so are the top-level sections. <Gem/> lines keep their
+ * order (it is the gem order of a socket group). With `reread`, a
+ * <TimelessData> without socketFilterDistance gets the "0" PoB reads it as
+ * (Build.lua), since PoB only writes that attribute once it has read it. Items keep their order and
+ * text (they are not self-closing), and the item list and slot ids are
+ * compared separately anyway.
+ */
+function canonicalXml(xml: string, reread = false): string {
+  const filled = reread ? xml.replace(/<TimelessData(?![^>]*socketFilterDistance=)/g, '<TimelessData socketFilterDistance="0"') : xml;
+  const lines = sortNodeLists(filled)
+    .split('\n')
+    .map((line) =>
+      line.replace(/<(\w+)((?:\s+\w+="[^"]*")+)\s*(\/?)>/g, (_m, tag: string, attrList: string, close: string) =>
+        `<${tag} ${[...attrList.matchAll(/\w+="[^"]*"/g)].map((m) => m[0]).sort().join(' ')}${close}>`),
+    );
+  const out: string[] = [];
+  let run: string[] = [];
+  let runKey: string | null = null;
+  const flush = (): void => {
+    out.push(...run.sort());
+    run = [];
+  };
+  for (const line of lines) {
+    const m = /^(\s*)<(\w+)\b[^>]*\/>\s*$/.exec(line);
+    const key = m && m[2] !== 'Gem' ? m[1] : null;
+    if (key === null || key !== runKey) flush();
+    runKey = key;
+    if (key === null) out.push(line);
+    else run.push(line);
+  }
+  flush();
+  // Top-level sections (<Build>, <Items>, <Config>, ...) are written in the
+  // order of a Lua table too, which can differ between engine processes.
+  const blocks: string[][] = [];
+  const head: string[] = [];
+  const tail: string[] = [];
+  for (const line of out) {
+    if (/^<\/PathOfBuilding>/.test(line) || tail.length > 0) tail.push(line);
+    else if (/^\t<\w/.test(line)) blocks.push([line]);
+    else if (blocks.length > 0) blocks[blocks.length - 1].push(line);
+    else head.push(line);
+  }
+  blocks.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return [...head, ...blocks.flat(), ...tail].join('\n');
+}
+
+/**
+ * 'rebuilt': PoB rebuilt the passive spec, so table-ordered lists may
+ * reorder (canonicalXml). 'reread': PoB re-read the build from its own save
+ * (failed-load recovery): as 'rebuilt', and an attribute PoB saved as "nil"
+ * (unset) may come back as the default it reads it as, so "nil" on either
+ * side matches any value of the same attribute on the same line; attribute
+ * names, all other values, text and line structure must still match.
+ */
+type XmlCompare = false | 'rebuilt' | 'reread';
+
+function lineAttrs(line: string): { head: string; attrs: Map<string, string> } | null {
+  const m = /^(\s*<\/?\w+)((?:\s+\w+="[^"]*")*)\s*(\/?>)\s*$/.exec(line);
+  if (!m) return null;
+  return { head: m[1] + m[3], attrs: new Map([...m[2].matchAll(/(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]])) };
+}
+
+function nilTolerantDifference(actual: string, expected: string): string | null {
+  const a = actual.split('\n');
+  const e = expected.split('\n');
+  if (a.length !== e.length) return `${a.length} lines vs ${e.length}`;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === e[i]) continue;
+    const la = lineAttrs(a[i]);
+    const le = lineAttrs(e[i]);
+    const same = la && le && la.head === le.head && la.attrs.size === le.attrs.size &&
+      [...la.attrs].every(([k, v]) => le.attrs.has(k) && (v === le.attrs.get(k) || v === 'nil' || le.attrs.get(k) === 'nil'));
+    if (!same) return `line ${i + 1}:\n  ${a[i]}\n  vs ${e[i]}`;
+  }
+  return null;
+}
+
+function assertSameBuild(label: string, actual: BuildState, expected: BuildState, compare: XmlCompare = false): void {
   assert(
     JSON.stringify(actual.items.itemOrder) === JSON.stringify(expected.items.itemOrder),
     `${label}: item list differs\n  expected ${JSON.stringify(expected.items.itemOrder)}\n  actual   ${JSON.stringify(actual.items.itemOrder)}`,
@@ -224,7 +314,12 @@ function assertSameBuild(label: string, actual: BuildState, expected: BuildState
   for (const key of ['Life', 'CombinedDPS', 'TotalEHP'] as const) {
     assert(actual.stats[key] === expected.stats[key], `${label}: ${key} not bit-exact (${actual.stats[key]} != ${expected.stats[key]})`);
   }
-  const norm = (xml: string): string => (sortNodes ? sortNodeLists(xml) : xml);
+  if (compare === 'reread') {
+    const diff = nilTolerantDifference(canonicalXml(actual.xml, true), canonicalXml(expected.xml, true));
+    assert(diff === null, `${label}: exported XML differs at ${diff}`);
+    return;
+  }
+  const norm = (xml: string): string => (compare === 'rebuilt' ? canonicalXml(xml) : xml);
   assert(norm(actual.xml) === norm(expected.xml), `${label}: exported XML differs ${firstDifference(norm(actual.xml), norm(expected.xml))}`);
 }
 
@@ -413,9 +508,9 @@ async function main(): Promise<void> {
     // ---------------------------------------------------------------- 8
     log('Test 8: item and jewel swaps around convert_tree_to_latest, both orders');
     // Converting rebuilds the passive spec, and undoing it rebuilds it again;
-    // PoB writes the allocated node list in Lua table order, so after a spec
-    // rebuild only that list's order may differ (same nodes). Compared with
-    // the node list sorted; everything else byte for byte.
+    // PoB writes the allocated nodes and socketed jewels in Lua table order,
+    // so after a spec rebuild only the order of such lists may differ (same
+    // entries). Compared with canonicalXml; items, slot ids and stats exact.
     await session.loadBuild(masteryXml);
     const c0 = await buildState(session);
     await session.swapItemWithDiff('Ring 1', RING_A);
@@ -425,11 +520,11 @@ async function main(): Promise<void> {
     const conv1 = await session.convertTreeToLatest();
     assert(conv1.converted, 'the 3_24 fixture should convert');
     await session.undoLastChange();
-    assertSameBuild('order 1: after undoing the conversion', await buildState(session), a2, true);
+    assertSameBuild('order 1: after undoing the conversion', await buildState(session), a2, 'rebuilt');
     await session.undoLastChange();
-    assertSameBuild('order 1: after undoing the jewel swap', await buildState(session), a1, true);
+    assertSameBuild('order 1: after undoing the jewel swap', await buildState(session), a1, 'rebuilt');
     await session.undoLastChange();
-    assertSameBuild('order 1: after undoing the ring swap', await buildState(session), c0, true);
+    assertSameBuild('order 1: after undoing the ring swap', await buildState(session), c0, 'rebuilt');
 
     await session.loadBuild(masteryXml);
     const conv2 = await session.convertTreeToLatest();
@@ -444,7 +539,7 @@ async function main(): Promise<void> {
     await session.undoLastChange();
     assertSameBuild('order 2: after undoing the jewel swap', await buildState(session), b1);
     await session.undoLastChange();
-    assertSameBuild('order 2: after undoing the conversion', await buildState(session), c0, true);
+    assertSameBuild('order 2: after undoing the conversion', await buildState(session), c0, 'rebuilt');
     log('PASS: swaps before and after a tree conversion undo back to the loaded build');
 
     // ---------------------------------------------------------------- 9
@@ -505,7 +600,7 @@ async function main(): Promise<void> {
       caught = e;
     }
     assert(caught instanceof Error && !(caught instanceof UserError), `stale restore should be an internal error, got ${String(caught)}`);
-    assert(/does not match the build/.test(caught.message) && /reset_build/.test(caught.message) && /nothing was restored/.test(caught.message), `unexpected message: ${caught.message}`);
+    assert(/does not match the build/.test(caught.message) && /restarted or the build was reloaded/.test(caught.message) && /reset_build/.test(caught.message) && /nothing was restored/.test(caught.message), `unexpected message: ${caught.message}`);
     assertSameBuild('after a refused stale full restore', await buildState(session), r0);
     caught = null;
     try {
@@ -516,6 +611,92 @@ async function main(): Promise<void> {
     assert(caught instanceof Error && !(caught instanceof UserError) && /reset_build/.test(caught.message), `stale item restore should be refused: ${String(caught)}`);
     assertSameBuild('after a refused stale item restore', await buildState(session), r0);
     log('PASS: a mismatched snapshot is refused with an internal error naming reset_build');
+
+    // ---------------------------------------------------------------- 12
+    log('Test 12: undo still works after a load_build that PoB rejects');
+    const badXml = occXml.replace(/treeVersion="3_13"/g, 'treeVersion="9_99"');
+    const failLoad = async (label: string): Promise<void> => {
+      let err: unknown = null;
+      try {
+        await session.loadBuild(badXml);
+      } catch (e) {
+        err = e;
+      }
+      assert(err instanceof Error && /previously loaded build is still active/.test(err.message), `${label}: expected a recovered failed load, got ${String(err)}`);
+    };
+    // The recovery reloads the build from the bridge's own SaveDB output, so
+    // what is left is PoB's re-read of that save: table-ordered lists may
+    // come back in another order and values it saved as "nil" come back as
+    // defaults. Exports after a recovery are compared in 'reread' mode; items,
+    // slot ids and stats are exact.
+    // The plain case: swap, failed load, undo.
+    await session.loadBuild(occXml);
+    const f0 = await buildState(session);
+    await session.swapItemWithDiff('Ring 1', RING_A);
+    const f1 = await buildState(session);
+    await failLoad('after a swap');
+    assertSameBuild('after the failed load (build kept as left)', await buildState(session), f1, 'reread');
+    await session.undoLastChange();
+    assertSameBuild('swap, failed load, undo', await buildState(session), f0, 'reread');
+    // Every undo entry kind across the recovery reload: config, item, jewel
+    // (tree-owned socket), and a tree conversion (spec entry).
+    await session.setConfigWithUndo({ usePowerCharges: true });
+    const g1 = await buildState(session);
+    await session.swapItemWithDiff('Ring 2', RING_B);
+    const g2 = await buildState(session);
+    await session.swapItemWithDiff('Jewel 36634', JEWEL_A);
+    const g3 = await buildState(session);
+    const conv3 = await session.convertTreeToLatest();
+    assert(conv3.converted, 'OccVortex (3_13) should convert');
+    const g4 = await buildState(session);
+    await failLoad('after config, item, jewel and conversion entries');
+    assertSameBuild('after the second failed load', await buildState(session), g4, 'reread');
+    await session.compareItems('Ring 1', [RING_B]); // probes work on the reloaded build too
+    await session.undoLastChange();
+    assertSameBuild('undo of the conversion after a failed load', await buildState(session), g3, 'reread');
+    await session.undoLastChange();
+    assertSameBuild('undo of the jewel swap after a failed load', await buildState(session), g2, 'reread');
+    await session.undoLastChange();
+    assertSameBuild('undo of the ring swap after a failed load', await buildState(session), g1, 'reread');
+    await session.undoLastChange();
+    assertSameBuild('undo of the config change after a failed load', await buildState(session), f0, 'reread');
+    // Still refused: a snapshot from before a successful reload.
+    const old = await session.snapshotAll();
+    await session.loadBuild(occXml);
+    let refused: unknown = null;
+    try {
+      await session.restoreAll(old);
+    } catch (e) {
+      refused = e;
+    }
+    assert(refused instanceof Error && /restarted or the build was reloaded/.test(refused.message) && /reset_build/.test(refused.message), `a pre-reload snapshot must still be refused: ${String(refused)}`);
+    log('PASS: undo entries survive the failed-load recovery; pre-reload snapshots are still refused');
+
+    // ---------------------------------------------------------------- 13
+    log('Test 13: a snapshot from another engine process is refused');
+    await session.loadBuild(occXml);
+    const mine = (await bridge.send<{ state: { itemOrder: number[]; itemTokens: string[] } }>({ cmd: 'captureItemsState' })).state;
+    const otherBridge = new LuaBridge(paths, 120_000);
+    try {
+      await otherBridge.loadBuildXML(occXml, 'OccVortex');
+      const theirs = (await otherBridge.send<{ state: { itemOrder: number[]; itemTokens: string[] } }>({ cmd: 'captureItemsState' })).state;
+      assert(JSON.stringify(theirs.itemOrder) === JSON.stringify(mine.itemOrder), 'both engines should hold the same item ids');
+      const tag = (t: string): string => t.slice(0, t.lastIndexOf(':'));
+      assert(tag(theirs.itemTokens[0]) !== tag(mine.itemTokens[0]), `engines share a token tag: ${theirs.itemTokens[0]} / ${mine.itemTokens[0]}`);
+      for (const t of theirs.itemTokens) assert(!mine.itemTokens.includes(t), `token ${t} exists in both engines`);
+      const before = (await otherBridge.send<{ xml: string }>({ cmd: 'exportXML' })).xml;
+      let crossErr: unknown = null;
+      try {
+        await otherBridge.send({ cmd: 'restoreItemsState', state: { ...mine, slots: [] } });
+      } catch (e) {
+        crossErr = e;
+      }
+      assert(crossErr instanceof Error && !(crossErr instanceof UserError) && /restarted or the build was reloaded/.test(crossErr.message), `another engine's snapshot must be refused: ${String(crossErr)}`);
+      assert((await otherBridge.send<{ xml: string }>({ cmd: 'exportXML' })).xml === before, 'a refused restore changed the other engine');
+    } finally {
+      await otherBridge.shutdown();
+    }
+    log('PASS: tokens are per engine process; a foreign snapshot is refused');
 
     log('ALL ITEM RESTORE TESTS PASSED');
   } finally {

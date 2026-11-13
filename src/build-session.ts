@@ -24,7 +24,7 @@ export interface ItemsState {
    * names the item it named at capture (e.g. a snapshot taken before
    * load_build or reset_build).
    */
-  itemTokens: number[];
+  itemTokens: string[];
 }
 
 /** What the bridge's restoreItemsState found. */
