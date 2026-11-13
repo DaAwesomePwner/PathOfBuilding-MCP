@@ -144,6 +144,9 @@ export class BuildSession {
   async loadBuild(source: string): Promise<BuildInfo> {
     // Download and decode outside the lock: a slow pobb.in/pastebin fetch must
     // not block other engine calls. Only the engine load and state swap are serialised.
+    // Recorded choice: concurrent loadBuild calls therefore finish in completion
+    // order, not call order (a slow URL load started first can land after, and
+    // replace, a build code loaded later).
     const xml = await resolveBuildSource(source);
     return this.withLock(async () => {
       const info = await this.bridge.loadBuildXML(xml);

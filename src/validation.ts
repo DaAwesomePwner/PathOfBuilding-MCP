@@ -142,17 +142,20 @@ export function validateBuildSource(source: unknown): string {
   } else if (kind === 'url') {
     parseBuildURL(trimmed);
   } else {
-    // base64 build code — PoB uses URL-safe base64 (-,_) plus =, A-Z, a-z, 0-9
-    if (!/^[A-Za-z0-9+/=_-]+$/.test(trimmed)) {
+    // base64 build code — PoB uses URL-safe base64 (-,_) plus =, A-Z, a-z, 0-9.
+    // Whitespace (line-wrapped pastes) is dropped, as decodeBuildCode does.
+    const compact = trimmed.replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(compact)) {
       throw new UserError(
         'Invalid build code — contains characters outside the URL-safe base64 alphabet',
       );
     }
-    if (trimmed.length < 32) {
+    if (compact.length < 32) {
       throw new UserError(
-        'Build code is too short to be a real PoB build (got ' + trimmed.length + ' chars)',
+        'Build code is too short to be a real PoB build (got ' + compact.length + ' chars)',
       );
     }
+    return compact;
   }
   return trimmed;
 }

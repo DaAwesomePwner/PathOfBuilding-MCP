@@ -23,11 +23,9 @@ export function encodeBuildCode(xml: string): string {
   return compressed.toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
+/** zlib's error when inflate output would exceed maxOutputLength. Anything else is malformed input. */
 function isOutputTooLarge(err: unknown): boolean {
-  return (
-    err instanceof RangeError ||
-    (typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ERR_BUFFER_TOO_LARGE')
-  );
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ERR_BUFFER_TOO_LARGE';
 }
 
 const oversizeBuildError = (): UserError =>
@@ -89,11 +87,18 @@ export async function fetchBuildFromURL(url: string, options: FetchBuildOptions 
   const maxBytes = options.maxBytes ?? BUILD_FETCH_MAX_BYTES;
 
   const controller = new AbortController();
+  const timeoutError = new UserError(
+    `Downloading the build from ${site} timed out after ${Math.round(timeoutMs / 1000)} s. ${PASTE_CODE_HINT}`,
+  );
+  let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
+      // Reject first, then abort: the abort makes a pending fetch/read reject
+      // too, and that must still be reported as a timeout (see catch blocks).
+      timedOut = true;
+      reject(timeoutError);
       controller.abort();
-      reject(new UserError(`Downloading the build from ${site} timed out after ${Math.round(timeoutMs / 1000)} s. ${PASTE_CODE_HINT}`));
     }, timeoutMs);
   });
   deadline.catch(() => {});
@@ -111,6 +116,7 @@ export async function fetchBuildFromURL(url: string, options: FetchBuildOptions 
         }),
       );
     } catch (err) {
+      if (timedOut) throw timeoutError;
       if (err instanceof UserError) throw err;
       throw new UserError(
         `Could not download the build from ${site} (network error or an unexpected redirect). ${PASTE_CODE_HINT}`,
@@ -139,6 +145,7 @@ export async function fetchBuildFromURL(url: string, options: FetchBuildOptions 
         try {
           chunk = await withinDeadline(reader.read());
         } catch (err) {
+          if (timedOut) throw timeoutError;
           if (err instanceof UserError) throw err;
           throw new UserError(`The ${site} download was interrupted. ${PASTE_CODE_HINT}`);
         }

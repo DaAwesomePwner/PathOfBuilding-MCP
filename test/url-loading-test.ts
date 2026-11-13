@@ -208,6 +208,24 @@ async function main(): Promise<void> {
     );
   });
 
+  await test('a body read that rejects on abort still reports a timeout', async () => {
+    await withFetch(
+      async (_url, init) =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(new TextEncoder().encode(CODE.slice(0, 10)));
+              // Like a real fetch body: aborting errors the stream, rejecting the pending read.
+              init?.signal?.addEventListener('abort', () => c.error(new TypeError('terminated')));
+            },
+          }),
+        ),
+      async () => {
+        await expectUserError(fetchBuildFromURL('https://pobb.in/abc', { timeoutMs: 50 }), /timed out/);
+      },
+    );
+  });
+
   await test('a body larger than the cap is refused without buffering it all', async () => {
     let pulled = 0;
     const chunk = new Uint8Array(64 * 1024).fill(65);
@@ -318,6 +336,15 @@ async function main(): Promise<void> {
     await expectUserError(() => decodeBuildCode('A'.repeat(64)), /invalid build code/i);
     await expectUserError(() => decodeBuildCode('not a code!'), /invalid build code/i);
     await expectUserError(() => decodeBuildCode(''), /empty/i);
+  });
+
+  await test('validateBuildSource accepts line-wrapped codes and normalises them like decoding', () => {
+    assert(CODE.length > 80, 'fixture code must be long enough to wrap');
+    const wrapped = `  ${CODE.slice(0, 40)}\n${CODE.slice(40, 80)}\r\n ${CODE.slice(80)}  `;
+    const cleaned = validateBuildSource(wrapped);
+    assert.equal(cleaned, CODE);
+    assert.equal(decodeBuildCode(cleaned), XML);
+    assert.equal(decodeBuildCode(wrapped), XML);
   });
 
   await test('deflate data that is not a PoB build is a UserError', async () => {
