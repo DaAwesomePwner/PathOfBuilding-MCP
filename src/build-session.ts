@@ -10,6 +10,77 @@ export interface ItemSnapshot {
 
 export interface TreeSnapshot {
   allocatedNodeIds: number[];
+  /** Tree version the snapshot was taken on; restoring onto another version rebuilds the spec. */
+  treeVersion: string;
+  /**
+   * Full spec state from the bridge's captureSpecState: nodes, mastery
+   * selections, tattoos (hash overrides), socketed jewels, class,
+   * ascendancies and tree version. Restored exactly by restoreTreeState.
+   */
+  state: SpecState;
+}
+
+/** What the bridge's restoreTreeState / verifyTreeState found after a restore. */
+export interface TreeRestoreReport {
+  exact: boolean;
+  /** Wanted nodes PoB did not allocate. */
+  missingNodeIds?: number[];
+  /** Wanted cluster-jewel nodes whose subgraph does not exist (jewel missing). */
+  pendingNodeIds?: number[];
+  /** Allocated nodes the snapshot does not have. */
+  extraNodeIds?: number[];
+  /** Nodes PoB re-allocated on its own during the restore that were deallocated again. */
+  correctedExtraNodeIds?: number[];
+  /** Mastery, tattoo, jewel, class, ascendancy or tree-version differences. */
+  mismatches?: string[];
+}
+
+/**
+ * Run a what-if probe, then restore. A probe error (UserError or not) is
+ * thrown unchanged when the restore succeeds. When the restore fails too, the
+ * build may be left changed, so the result is always an internal (non-user)
+ * error, reported with the "Internal error ... reset_build" advice; its text
+ * holds both messages and the probe's error is the `cause`. A restore failure
+ * after a successful probe is thrown as is.
+ */
+async function probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promise<void>): Promise<T> {
+  let result: T;
+  try {
+    result = await probe();
+  } catch (probeError) {
+    try {
+      await restore();
+    } catch (restoreError) {
+      throw withRestoreFailure(probeError, restoreError);
+    }
+    throw probeError;
+  }
+  await restore();
+  return result;
+}
+
+function withRestoreFailure(probeError: unknown, restoreError: unknown): Error {
+  const text = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+  const message = `${text(probeError)} (restoring the build afterwards also failed: ${text(restoreError)})`;
+  return new Error(message, { cause: probeError });
+}
+
+function describeTreeMismatch(report: TreeRestoreReport): string {
+  const ids = (list: number[]): string => list.slice(0, 10).join(', ') + (list.length > 10 ? ', ...' : '');
+  const parts: string[] = [];
+  if (report.missingNodeIds?.length) {
+    parts.push(`${report.missingNodeIds.length} node(s) not allocated (${ids(report.missingNodeIds)})`);
+  }
+  if (report.pendingNodeIds?.length) {
+    parts.push(`${report.pendingNodeIds.length} cluster node(s) without their jewel graph (${ids(report.pendingNodeIds)})`);
+  }
+  if (report.extraNodeIds?.length) {
+    parts.push(`${report.extraNodeIds.length} extra node(s) allocated (${ids(report.extraNodeIds)})`);
+  }
+  if (report.mismatches?.length) {
+    parts.push(report.mismatches.slice(0, 10).join('; ') + (report.mismatches.length > 10 ? '; ...' : ''));
+  }
+  return parts.join('; ') || 'unknown difference';
 }
 
 export interface ConfigSnapshot {
@@ -265,21 +336,48 @@ export class BuildSession {
   }
 
   private async snapshotTreeUnlocked(): Promise<TreeSnapshot> {
-    const result = await this.bridge.send<{ ok: true; nodeIds: number[] }>({
-      cmd: 'getAllocatedNodes',
-    });
-    return { allocatedNodeIds: [...result.nodeIds] };
+    const result = await this.bridge.send<{
+      ok: true;
+      state: SpecState & { nodeIds?: unknown; treeVersion?: unknown };
+    }>({ cmd: 'captureSpecState' });
+    const { nodeIds, treeVersion } = result.state ?? {};
+    if (!Array.isArray(nodeIds) || typeof treeVersion !== 'string') {
+      throw new Error('captureSpecState returned a malformed tree state');
+    }
+    return { allocatedNodeIds: [...(nodeIds as number[])], treeVersion, state: result.state };
   }
 
+  /** Restore a tree snapshot exactly; throws when the engine cannot reproduce it. */
   async restoreTree(snapshot: TreeSnapshot): Promise<void> {
     return this.withLock(() => this.restoreTreeUnlocked(snapshot));
   }
 
   private async restoreTreeUnlocked(snapshot: TreeSnapshot): Promise<void> {
-    await this.bridge.send({
-      cmd: 'restoreTreeFromList',
-      nodeIds: snapshot.allocatedNodeIds,
+    this.assertTreeExact(await this.restoreTreeStateUnlocked(snapshot));
+  }
+
+  /** Restore without judging the result (restoreAll checks again once items are back). */
+  private async restoreTreeStateUnlocked(snapshot: TreeSnapshot): Promise<TreeRestoreReport> {
+    const result = await this.bridge.send<{ ok: true } & TreeRestoreReport>({
+      cmd: 'restoreTreeState',
+      state: snapshot.state,
     });
+    return result;
+  }
+
+  private async verifyTreeUnlocked(snapshot: TreeSnapshot): Promise<TreeRestoreReport> {
+    return this.bridge.send<{ ok: true } & TreeRestoreReport>({
+      cmd: 'verifyTreeState',
+      state: snapshot.state,
+    });
+  }
+
+  private assertTreeExact(report: TreeRestoreReport): void {
+    if (report.exact !== true) {
+      throw new Error(
+        `Passive tree restore was not exact (${describeTreeMismatch(report)}); call reset_build to return to the loaded build`,
+      );
+    }
   }
 
   async allocNode(nodeId: number): Promise<Stats> {
@@ -367,15 +465,22 @@ export class BuildSession {
   }
 
   private async restoreAllUnlocked(snapshot: FullSnapshot): Promise<void> {
-    // Order matters: restore tree first (cheap, atomic), then config, then items.
-    // Skills are restored last because re-equipping items may add duplicate
-    // granted-skill groups; the skills snapshot fully replaces the gem list.
-    await this.restoreTreeUnlocked(snapshot.tree);
+    // Order matters: restore tree first (cheap, atomic; it also puts socketed
+    // jewels back, which PoB keeps on the spec), then config, then items.
+    // Once items are back the tree is checked again and, if an item change
+    // moved it (or the first pass could not finish without them), restored a
+    // second time; a tree that still differs is an error, never a silent
+    // difference. Skills are restored last because re-equipping items may add
+    // duplicate granted-skill groups; the skills snapshot fully replaces the gem list.
+    let treeReport = await this.restoreTreeStateUnlocked(snapshot.tree);
     await this.restoreConfigUnlocked(snapshot.config);
     for (const item of snapshot.items.values()) {
       await this.restoreSlotUnlocked(item);
     }
+    if (treeReport.exact) treeReport = await this.verifyTreeUnlocked(snapshot.tree);
+    if (!treeReport.exact) treeReport = await this.restoreTreeStateUnlocked(snapshot.tree);
     await this.restoreSkillsUnlocked(snapshot.skills);
+    this.assertTreeExact(treeReport);
   }
 
   // ------------------------------------------------------------------
@@ -387,11 +492,10 @@ export class BuildSession {
   ): Promise<T> {
     return this.withLock(async () => {
       const snapshot = await this.snapshotAllUnlocked();
-      try {
-        return await changeFn(this.bridge);
-      } finally {
-        await this.restoreAllUnlocked(snapshot);
-      }
+      return probeThenRestore(
+        () => changeFn(this.bridge),
+        () => this.restoreAllUnlocked(snapshot),
+      );
     });
   }
 
@@ -408,38 +512,22 @@ export class BuildSession {
    */
   private async withTreeProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotTreeUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreTreeUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreTreeUnlocked(snap));
   }
 
   private async withSkillsProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotSkillsUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreSkillsUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreSkillsUnlocked(snap));
   }
 
   private async withConfigProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotConfigUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreConfigUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreConfigUnlocked(snap));
   }
 
   private async withSlotProbeUnlocked<T>(slot: string, fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotSlotUnlocked(slot);
-    try {
-      return await fn();
-    } finally {
-      await this.restoreSlotUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreSlotUnlocked(snap));
   }
 
   // ------------------------------------------------------------------

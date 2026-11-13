@@ -25,18 +25,11 @@ for later.
   near '+'`. Release tags (checked: `v2.67.2`) work. Needs an upstream fix, or
   a source transform in `bridge.lua`'s module loader. `POB_SOURCE_PATH` for
   `npm run test:source-clone` should point at a release tag until then.
-- **Jewel-supported nodes lost on undo (confirmed).** `restoreAllUnlocked`
-  (`src/build-session.ts`) restores the tree before items and ignores the
-  bridge's `missingNodeIds`. Undo after unequipping an Intuitive Leap, Thread
-  of Hope or Impossible Escape leaves the nodes it supported unallocated.
-  Restore the tree again once items are back.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
 - **Rejected build recorded for respawn.** `LuaBridge.lastLoadedXML` is set
   before the load succeeds, so a crash restart replays a build the engine
   refused.
-- **`allocExtendedNodes` extras** re-allocated by PoB on restore are not
-  detected; only missing nodes are reported.
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
   install are not normalised. Network-path installs get no zlib.
 - **`__proto__` dropped by the input schema.** `z.record` removes the key
@@ -57,13 +50,10 @@ for later.
 
 ## What-if restore exactness
 
-The mastery and hash-override items touch `restoreTreeFromList`, which the
-launch-critical tree-restore fix rewrites; do them on top of that fix.
+Passive-tree restore is exact (masteries, tattoos, socketed jewels, extra
+nodes, tree version: `restoreTreeState` in `lua/bridge.lua`). The items below
+are the remaining gaps (items, skills, batch commands).
 
-- **Mastery selections lost on tree restore (confirmed).** The TS tree snapshot
-  (`src/build-session.ts:17-19,260-276`) stores node ids only. Deallocating a node
-  upstream of a mastery clears its selection, and the restore then skips that
-  mastery. Snapshot `masterySelections` (or use PoB's `CreateUndoState`).
 - **Item restore duplicates the item (confirmed).** `restoreSlotUnlocked`
   (`src/build-session.ts:219-229`) re-adds the item instead of re-selecting
   `snapshot.itemId`; exports grow and ids churn. Probe items are never deleted.
@@ -81,8 +71,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
   abyss sockets; snapshots and undo skip them. Take slots from `getValidSlots`.
 - **Batch commands validate mid-mutation (confirmed).** `replaceSocketGroup`,
   `allocNodes` (`lua/bridge.lua:781-803,1138-1165`) can leave partial state.
-- **Tattoo/hash-override exactness (plausible).** Restore reuses current
-  `hashOverrides`, not the snapshot's.
 
 ## Robustness and security
 

@@ -13,12 +13,19 @@
 //     "Tattoo of the Arohongui Makanga" on node 1031.
 //   2: PoB "Copy + Convert" of spec 1 onto 3_28_alternate with secondary
 //     ascendancy 4 (Chaos Bloodline), which 3_29 has no alternate tree for.
+//
+// The latest tree version is read from the running engine. The notes above
+// describe tree 3_29 (FIXTURE_DATA_VERSION); assertions that depend on that
+// tree's data run only when it is the latest and otherwise print why they
+// were skipped. Everything else is checked on any latest tree.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { BuildInfo, LuaBridge } from '../src/lua-bridge.js';
+import { ResolvedPaths } from '../src/paths.js';
 import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +35,8 @@ const MASTERY_FIXTURE = path.resolve(testDir, 'fixtures', 'ConvertTreeMasteries.
 const GONE_MASTERY = { nodeId: 38921, effectId: 41322 };
 const MOVED_MASTERY = { nodeId: 2841, effectId: 64381 };
 const TATTOO = '1031=Tattoo of the Arohongui Makanga';
+/** Tree whose data the mastery/bloodline expectations below were checked against. */
+const FIXTURE_DATA_VERSION = '3_29';
 
 const RING = `Rarity: RARE
 Convert Test Ring
@@ -69,23 +78,17 @@ async function callJson<T>(client: Client, name: string, args: Record<string, un
   return JSON.parse(extractText(await call(client, name, args))) as T;
 }
 
-/** Last entry of PoB's treeVersionList (GameVersions.lua) = latestTreeVersion. */
-function engineLatestTreeVersion(pobPath: string): string {
-  const candidates = [path.join(pobPath, 'GameVersions.lua'), path.join(pobPath, 'src', 'GameVersions.lua')];
-  for (const file of candidates) {
-    let text: string;
-    try {
-      text = readFileSync(file, 'utf8');
-    } catch {
-      continue;
-    }
-    const list = /treeVersionList\s*=\s*\{([^}]*)\}/.exec(text);
-    assert(list, `treeVersionList not found in ${file}`);
-    const versions = [...list[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
-    assert(versions.length > 0, `treeVersionList is empty in ${file}`);
-    return versions[versions.length - 1];
+/** latestTreeVersion as reported by a running engine (bridge getBuildInfo). */
+async function engineLatestTreeVersion(paths: ResolvedPaths, xml: string): Promise<string> {
+  const bridge = new LuaBridge(paths, 60_000);
+  try {
+    await bridge.loadBuildXML(xml);
+    const { info } = await bridge.send<{ info: BuildInfo }>({ cmd: 'getBuildInfo' });
+    assert(typeof info.latestTreeVersion === 'string' && info.latestTreeVersion.length > 0, 'engine reported no latestTreeVersion');
+    return info.latestTreeVersion;
+  } finally {
+    await bridge.shutdown().catch(() => undefined);
   }
-  throw new Error(`GameVersions.lua not found under ${pobPath}`);
 }
 
 interface SpecInfo {
@@ -225,8 +228,17 @@ interface ConvertResult {
 async function main(): Promise<void> {
   const { paths, fixturePath } = setupTestEnv();
   const xml = readFileSync(fixturePath, 'utf8');
-  const latest = engineLatestTreeVersion(paths.pobPath);
+  const latest = await engineLatestTreeVersion(paths, xml);
   assert(latest !== FIXTURE_TREE_VERSION, `engine latest tree is the fixture's own version ${latest}`);
+  log(`Engine latest tree: ${latest}`);
+  /** Run a check that depends on FIXTURE_DATA_VERSION's tree data; skip it, saying why, on any other tree. */
+  const onFixtureData = (what: string, check: () => void): void => {
+    if (latest === FIXTURE_DATA_VERSION) {
+      check();
+    } else {
+      log(`SKIP (latest tree is ${latest}, expectation written for ${FIXTURE_DATA_VERSION}): ${what}`);
+    }
+  };
   const configDir = mkdtempSync(path.join(os.tmpdir(), 'pob-mcp-convert-'));
   const transport = new StdioClientTransport({
     command: 'npx',
@@ -371,26 +383,46 @@ async function main(): Promise<void> {
     assert(mc.status === 'converted' && mc.fromVersion === '3_24' && mc.toVersion === latest, `mastery convert: ${mc.fromVersion} -> ${mc.toVersion}`);
     const dropped = mc.droppedMasteries ?? [];
     assert(mc.droppedMasteryCount === dropped.length + (mc.droppedMasteriesOmitted ?? 0), 'droppedMasteryCount mismatch');
-    for (const want of [GONE_MASTERY, MOVED_MASTERY]) {
-      const reported = dropped.find((d) => d.nodeId === want.nodeId);
-      assert(reported && reported.effectId === want.effectId, `${key(want)} not reported dropped: ${JSON.stringify(dropped)}`);
-      assert(typeof reported.name === 'string' && typeof reported.effect === 'string', `${key(want)} lacks name/effect text`);
+    for (const d of dropped) {
+      assert(origMasteries.includes(key(d)), `reported dropped ${key(d)} was not a fixture selection`);
+      assert(typeof d.name === 'string' && typeof d.effect === 'string', `${key(d)} lacks name/effect text`);
     }
-    assert(dropped.length === 2, `expected exactly the 2 fixture masteries dropped, got ${JSON.stringify(dropped)}`);
+    onFixtureData(`${key(GONE_MASTERY)} and ${key(MOVED_MASTERY)} are exactly the dropped masteries`, () => {
+      for (const want of [GONE_MASTERY, MOVED_MASTERY]) {
+        const reported = dropped.find((d) => d.nodeId === want.nodeId);
+        assert(reported && reported.effectId === want.effectId, `${key(want)} not reported dropped: ${JSON.stringify(dropped)}`);
+      }
+      assert(dropped.length === 2, `expected exactly the 2 fixture masteries dropped, got ${JSON.stringify(dropped)}`);
+    });
     const m1 = await treeState(client);
-    const afterMasteries = m1.spec.masteryEffects.match(/\{\d+,\d+\}/g) ?? [];
+    const afterMasteries: string[] = m1.spec.masteryEffects.match(/\{\d+,\d+\}/g) ?? [];
     const droppedKeys = new Set(dropped.map((d) => `{${d.nodeId},${d.effectId}}`));
     // PoB itself keeps the moved selection (its effect exists elsewhere on 3_29),
     // which is why the report has to check the node's own offer list.
-    assert(afterMasteries.includes(key(MOVED_MASTERY)), `PoB no longer keeps ${key(MOVED_MASTERY)}; fixture assumption broken`);
-    assert(!afterMasteries.includes(key(GONE_MASTERY)), `${key(GONE_MASTERY)} survived the convert`);
+    onFixtureData(`PoB keeps the moved selection ${key(MOVED_MASTERY)} and drops ${key(GONE_MASTERY)}`, () => {
+      assert(afterMasteries.includes(key(MOVED_MASTERY)), `PoB no longer keeps ${key(MOVED_MASTERY)}; fixture assumption broken`);
+      assert(!afterMasteries.includes(key(GONE_MASTERY)), `${key(GONE_MASTERY)} survived the convert`);
+    });
     for (const sel of origMasteries) {
       if (!droppedKeys.has(sel)) {
         assert(afterMasteries.includes(sel), `mastery ${sel} not reported dropped but missing after convert`);
       }
     }
-    assert((mc.droppedTattooCount ?? -1) === 0 && (mc.droppedTattoos ?? []).length === 0, `tattoo dropped: ${JSON.stringify(mc.droppedTattoos)}`);
-    assert(m1.spec.overrides === TATTOO, `tattoo after convert: ${m1.spec.overrides}`);
+    // The tattoo is either kept or reported dropped (and then really gone).
+    const droppedTattoos = mc.droppedTattoos ?? [];
+    assert((mc.droppedTattooCount ?? -1) === droppedTattoos.length + (mc.droppedTattoosOmitted ?? 0), 'droppedTattooCount mismatch');
+    if (droppedTattoos.length === 0) {
+      assert(m1.spec.overrides === TATTOO, `tattoo after convert: ${m1.spec.overrides}`);
+    } else {
+      assert(
+        droppedTattoos.length === 1 && `${droppedTattoos[0].nodeId}=${droppedTattoos[0].name}` === TATTOO,
+        `tattoo dropped: ${JSON.stringify(droppedTattoos)}`,
+      );
+      assert(m1.spec.overrides === '', `tattoo reported dropped but still present: ${m1.spec.overrides}`);
+    }
+    onFixtureData('the tattoo exists on the latest tree and is kept', () => {
+      assert(droppedTattoos.length === 0, `tattoo dropped: ${JSON.stringify(droppedTattoos)}`);
+    });
     assert(m1.spec.specCount === 2 && m1.spec.inactive === m0.spec.inactive, 'convert changed the inactive spec');
     await call(client, 'undo_last_change');
     assertSameState(await treeState(client), m0, 'mastery fixture after undo');
@@ -403,15 +435,25 @@ async function main(): Promise<void> {
     assert(b0.spec.treeVersion === '3_28_alternate', `bloodline spec on ${b0.spec.treeVersion}`);
     assert(b0.spec.secondaryAscendClassId === '4', `bloodline spec secondary ascendancy ${b0.spec.secondaryAscendClassId}`);
     const bc = await callJson<ConvertResult>(client, 'convert_tree_to_latest');
-    assert(bc.status === 'converted' && bc.toVersion === latest, `bloodline convert -> ${bc.toVersion}`);
+    assert(
+      bc.status === 'converted' && typeof bc.toVersion === 'string' && bc.toVersion.startsWith(latest),
+      `bloodline convert -> ${bc.toVersion}`,
+    );
+    // 3_29 has no alternate tree, so the alternate spec lands on plain 3_29;
+    // a later tree may ship an alternate variant, which PoB's convert keeps.
+    onFixtureData(`the 3_28_alternate spec converts to plain ${latest}`, () => {
+      assert(bc.toVersion === latest, `bloodline convert -> ${bc.toVersion}`);
+    });
     const b1 = await treeState(client);
-    assert(b1.spec.treeVersion === latest && b1.spec.inactive === b0.spec.inactive, 'bloodline convert: wrong version or touched spec 1');
+    assert(b1.spec.treeVersion === bc.toVersion && b1.spec.inactive === b0.spec.inactive, 'bloodline convert: wrong version or touched spec 1');
     // 3_29 supports secondary ascendancies; PoB's own convert would drop it
     // (CreateUndoState reads a field that does not exist), this tool keeps it.
-    assert(b1.spec.secondaryAscendClassId === '4', `bloodline lost on convert: ${b1.spec.secondaryAscendClassId}`);
+    onFixtureData('the latest tree supports secondary ascendancy 4 (Chaos Bloodline)', () => {
+      assert(b1.spec.secondaryAscendClassId === '4', `bloodline lost on convert: ${b1.spec.secondaryAscendClassId}`);
+    });
     await call(client, 'undo_last_change');
     assertSameState(await treeState(client), b0, 'bloodline fixture after undo');
-    log(`PASS: 3_28_alternate bloodline -> ${latest} keeps secondary ascendancy 4; undo restores the 3_28_alternate spec exactly`);
+    log(`PASS: 3_28_alternate bloodline -> ${bc.toVersion} (secondary ascendancy ${b1.spec.secondaryAscendClassId}); undo restores the 3_28_alternate spec exactly`);
 
     log('ALL CONVERT-TREE TESTS PASSED');
   } finally {

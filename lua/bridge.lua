@@ -1059,12 +1059,22 @@ local function sortedPairs(map, valueFn)
 	return out
 end
 
+-- Override (tattoo) tables seen by encodeSpecState, keyed by tree version,
+-- node id and name, so an in-place tree restore can put back the very table
+-- PoB had instead of a rebuilt copy. Bounded by the distinct (version, node,
+-- tattoo) triples ever captured.
+local overrideRegistry = { }
+local function overrideKey(treeVersion, nodeId, dn)
+	return tostring(treeVersion) .. "\0" .. tostring(nodeId) .. "\0" .. tostring(dn)
+end
+
 -- JSON-safe form of a captured state (integer-keyed maps become pair arrays;
 -- tattoo overrides are carried by name, the way PassiveSpec:Load reads them).
 local function encodeSpecState(state)
 	local overrides = { }
 	for nodeId, node in pairs(state.hashOverrides or { }) do
 		overrides[#overrides + 1] = { nodeId = nodeId, dn = node.dn }
+		overrideRegistry[overrideKey(state.treeVersion, nodeId, node.dn)] = node
 	end
 	table.sort(overrides, function(a, b) return a.nodeId < b.nodeId end)
 	return {
@@ -1306,6 +1316,198 @@ local function restoreSpecState(encoded)
 		STDERR:write("[pob-mcp] warning: tree restore could not find ", tostring(#dropped), " tattoo(s) on tree ",
 			state.treeVersion, "\n")
 	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Exact tree restore for what-if probes and undo
+-- ---------------------------------------------------------------------------
+
+local function sortedKeys(set)
+	local out = { }
+	for id in pairs(set) do out[#out + 1] = id end
+	table.sort(out)
+	return out
+end
+
+local function socketedJewel(map, nodeId)
+	local itemId = map and map[nodeId]
+	if itemId == 0 then return nil end
+	return itemId
+end
+
+-- Every way the active spec differs from a decoded state. Wanted node ids the
+-- spec does not know (cluster subgraph nodes whose jewel graph is not built)
+-- are `pending`; allocated ids the state does not list are `extra`.
+local function treeStateDifferences(spec, state)
+	local want = { }
+	for _, id in ipairs(state.hashList) do want[id] = true end
+	local missing, pending, extra = { }, { }, { }
+	for id in pairs(want) do
+		if not spec.allocNodes[id] then
+			if spec.nodes[id] then missing[id] = true else pending[id] = true end
+		end
+	end
+	for id in pairs(spec.allocNodes) do
+		if not want[id] then extra[id] = true end
+	end
+	local mismatches = { }
+	local function check(what, have, wanted)
+		if have ~= wanted then
+			mismatches[#mismatches + 1] = what .. " is " .. tostring(have) .. ", expected " .. tostring(wanted)
+		end
+	end
+	check("tree version", spec.treeVersion, state.treeVersion)
+	check("class", spec.curClassId, state.classId)
+	check("ascendancy", spec.curAscendClassId or 0, state.ascendClassId)
+	check("secondary ascendancy", spec.curSecondaryAscendClassId or 0, state.secondaryAscendClassId)
+	local selections = spec.masterySelections or { }
+	local ids = shallowCopy(state.masteryEffects)
+	for id in pairs(selections) do ids[id] = true end
+	for _, id in ipairs(sortedKeys(ids)) do
+		check("mastery " .. id, selections[id], state.masteryEffects[id])
+	end
+	local overrides = spec.hashOverrides or { }
+	ids = shallowCopy(state.overrideNames)
+	for id in pairs(overrides) do ids[id] = true end
+	for _, id in ipairs(sortedKeys(ids)) do
+		check("tattoo on node " .. id, overrides[id] and overrides[id].dn, state.overrideNames[id])
+	end
+	ids = shallowCopy(state.jewels)
+	for id in pairs(spec.jewels or { }) do ids[id] = true end
+	for _, id in ipairs(sortedKeys(ids)) do
+		check("jewel in socket " .. id, socketedJewel(spec.jewels, id), socketedJewel(state.jewels, id))
+	end
+	return { missing = sortedKeys(missing), pending = sortedKeys(pending), extra = sortedKeys(extra), mismatches = mismatches }
+end
+
+local function treeStateReport(diff, corrected)
+	local report = { exact = #diff.missing == 0 and #diff.pending == 0 and #diff.extra == 0 and #diff.mismatches == 0 }
+	if #diff.missing > 0 then report.missingNodeIds = diff.missing end
+	if #diff.pending > 0 then report.pendingNodeIds = diff.pending end
+	if #diff.extra > 0 then report.extraNodeIds = diff.extra end
+	if #diff.mismatches > 0 then report.mismatches = diff.mismatches end
+	if corrected and #corrected > 0 then report.correctedExtraNodeIds = corrected end
+	return report
+end
+
+local function verifyTreeState(encoded)
+	if type(build.spec) ~= "table" then
+		error("Tree verify failed: build.spec is unavailable (PoB Build module changed?)")
+	end
+	return treeStateReport(treeStateDifferences(build.spec, decodeSpecState(encoded)))
+end
+
+-- Override tables for a same-version restore: the exact table captured
+-- earlier when known, else the named tattoo from this tree (as
+-- PassiveSpec:Load does). Unresolvable ones are left out and show up as a
+-- mismatch in the report.
+local function resolveOverrides(spec, overrideNames)
+	local overrides = { }
+	for nodeId, dn in pairs(overrideNames) do
+		local key = overrideKey(spec.treeVersion, nodeId, dn)
+		local node = overrideRegistry[key]
+		if not node then
+			local tattoo = spec.tree and spec.tree.tattoo and spec.tree.tattoo.nodes and spec.tree.tattoo.nodes[dn]
+			if tattoo then
+				node = copyTable(tattoo, true)
+				node.id = nodeId
+				overrideRegistry[key] = node
+			end
+		end
+		overrides[nodeId] = node
+	end
+	return overrides
+end
+
+-- Put the socketed jewels back (they live on the spec in PoB) before the node
+-- list is applied: Intuitive Leap-like support and cluster graphs come from
+-- them. Ids are restored as captured, even ones whose item no longer exists
+-- (PoB's own TreeTab:SetActiveSpec does the same and its tree code skips
+-- them), so a snapshot compares equal to the state it was taken from.
+-- Returns true when anything changed.
+local function restoreSpecJewels(spec, wanted)
+	local jewels = shallowCopy(wanted)
+	local changed = false
+	for nodeId in pairs(jewels) do
+		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
+	end
+	for nodeId in pairs(spec.jewels or { }) do
+		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
+	end
+	if not changed then return false end
+	spec.jewels = jewels
+	for nodeId, slot in pairs(build.itemsTab and build.itemsTab.sockets or { }) do
+		slot.selItemId = jewels[nodeId] or 0
+	end
+	return true
+end
+
+-- Replace the active tree with a captured spec state (captureSpecState):
+-- nodes, masteries, tattoos, class, ascendancies, jewels and tree version.
+-- Same version: restored in place through PassiveSpec:RestoreUndoState,
+-- feeding it the captured masteries and tattoos (not the current ones).
+-- Other version: the spec is rebuilt (restoreSpecState). Afterwards the result
+-- is compared with the state; nodes PoB re-allocated on its own (cluster
+-- nodes ImportFromNodeList re-allocates from allocExtendedNodes) are
+-- deallocated, dropped from allocExtendedNodes (so only the first restore
+-- after such a node's deallocation has to correct it) and listed in
+-- correctedExtraNodeIds, and anything still different is reported.
+local function restoreTreeState(encoded)
+	local spec = build.spec
+	if type(spec) ~= "table" or type(spec.RestoreUndoState) ~= "function" then
+		error("Tree restore failed: build.spec or PassiveSpec:RestoreUndoState is unavailable (PoB changed?)")
+	end
+	local state = decodeSpecState(encoded)
+	if state.treeVersion ~= spec.treeVersion then
+		restoreSpecState(encoded)
+		spec = build.spec
+	else
+		local jewelsChanged = restoreSpecJewels(spec, state.jewels)
+		local ok, err = pcall(spec.RestoreUndoState, spec, {
+			classId = state.classId,
+			ascendClassId = state.ascendClassId,
+			secondaryAscendClassId = state.secondaryAscendClassId,
+			hashList = state.hashList,
+			hashOverrides = resolveOverrides(spec, state.overrideNames),
+			masteryEffects = shallowCopy(state.masteryEffects),
+			treeVersion = state.treeVersion,
+		}, state.treeVersion)
+		if not ok then
+			error("Tree restore failed in PassiveSpec:RestoreUndoState (PoB API may have changed): " .. tostring(err))
+		end
+		if jewelsChanged then
+			spec:BuildClusterJewelGraphs()
+			if build.itemsTab.PopulateSlots then build.itemsTab:PopulateSlots() end
+		end
+	end
+
+	local diff = treeStateDifferences(spec, state)
+	local corrected = { }
+	if #diff.extra > 0 then
+		local extended = { }
+		for _, id in ipairs(diff.extra) do
+			local node = spec.allocNodes[id]
+			if node and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+				spec:DeallocSingleNode(node)
+				extended[id] = true
+				corrected[#corrected + 1] = id
+			end
+		end
+		if type(spec.allocExtendedNodes) == "table" then
+			for i = #spec.allocExtendedNodes, 1, -1 do
+				if extended[spec.allocExtendedNodes[i]] then table.remove(spec.allocExtendedNodes, i) end
+			end
+		end
+		spec:BuildAllDependsAndPaths()
+		diff = treeStateDifferences(spec, state)
+	end
+	build.buildFlag = true
+	runCallback("OnFrame")
+	local report = treeStateReport(diff, corrected)
+	if not report.exact then
+		STDERR:write("[pob-mcp] warning: tree restore is not exact: ", encodeJSON(report), "\n")
+	end
+	return report
 end
 
 local function getFullConfigInput()
@@ -2392,7 +2594,19 @@ local DISPATCH = {
 		mutating = true,
 	},
 	captureSpecState = {
-		handler = function(_cmd) return { state = encodeSpecState(captureSpecState(build.spec)) } end,
+		handler = function(_cmd)
+			if type(build.spec) ~= "table" then
+				userError("No build loaded — call load_build first")
+			end
+			return { state = encodeSpecState(captureSpecState(build.spec)) }
+		end,
+	},
+	restoreTreeState = {
+		handler = function(cmd) return restoreTreeState(cmd.state) end,
+		mutating = true,
+	},
+	verifyTreeState = {
+		handler = function(cmd) return verifyTreeState(cmd.state) end,
 	},
 	convertTreeToLatest = {
 		handler = function(_cmd) return { result = convertTreeToLatest() } end,
