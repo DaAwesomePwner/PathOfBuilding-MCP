@@ -1059,12 +1059,13 @@ local function sortedPairs(map, valueFn)
 	return out
 end
 
--- Override (tattoo) tables seen by encodeSpecState, keyed by node id and name,
--- so an in-place tree restore can put back the very table PoB had instead of
--- a rebuilt copy. Bounded by the distinct (node, tattoo) pairs ever captured.
+-- Override (tattoo) tables seen by encodeSpecState, keyed by tree version,
+-- node id and name, so an in-place tree restore can put back the very table
+-- PoB had instead of a rebuilt copy. Bounded by the distinct (version, node,
+-- tattoo) triples ever captured.
 local overrideRegistry = { }
-local function overrideKey(nodeId, dn)
-	return tostring(nodeId) .. "\0" .. tostring(dn)
+local function overrideKey(treeVersion, nodeId, dn)
+	return tostring(treeVersion) .. "\0" .. tostring(nodeId) .. "\0" .. tostring(dn)
 end
 
 -- JSON-safe form of a captured state (integer-keyed maps become pair arrays;
@@ -1073,7 +1074,7 @@ local function encodeSpecState(state)
 	local overrides = { }
 	for nodeId, node in pairs(state.hashOverrides or { }) do
 		overrides[#overrides + 1] = { nodeId = nodeId, dn = node.dn }
-		overrideRegistry[overrideKey(nodeId, node.dn)] = node
+		overrideRegistry[overrideKey(state.treeVersion, nodeId, node.dn)] = node
 	end
 	table.sort(overrides, function(a, b) return a.nodeId < b.nodeId end)
 	return {
@@ -1403,13 +1404,14 @@ end
 local function resolveOverrides(spec, overrideNames)
 	local overrides = { }
 	for nodeId, dn in pairs(overrideNames) do
-		local node = overrideRegistry[overrideKey(nodeId, dn)]
+		local key = overrideKey(spec.treeVersion, nodeId, dn)
+		local node = overrideRegistry[key]
 		if not node then
 			local tattoo = spec.tree and spec.tree.tattoo and spec.tree.tattoo.nodes and spec.tree.tattoo.nodes[dn]
 			if tattoo then
 				node = copyTable(tattoo, true)
 				node.id = nodeId
-				overrideRegistry[overrideKey(nodeId, dn)] = node
+				overrideRegistry[key] = node
 			end
 		end
 		overrides[nodeId] = node
@@ -1419,15 +1421,12 @@ end
 
 -- Put the socketed jewels back (they live on the spec in PoB) before the node
 -- list is applied: Intuitive Leap-like support and cluster graphs come from
--- them. Ids of items that no longer exist are socketed as empty. Returns true
--- when anything changed.
+-- them. Ids are restored as captured, even ones whose item no longer exists
+-- (PoB's own TreeTab:SetActiveSpec does the same and its tree code skips
+-- them), so a snapshot compares equal to the state it was taken from.
+-- Returns true when anything changed.
 local function restoreSpecJewels(spec, wanted)
-	local items = build.itemsTab and build.itemsTab.items or { }
-	local jewels = { }
-	for nodeId, itemId in pairs(wanted) do
-		jewels[nodeId] = (itemId == 0 or items[itemId]) and itemId or 0
-	end
-	local changed = false
+	local jewels = shallowCopy(wanted)	local changed = false
 	for nodeId in pairs(jewels) do
 		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
 	end
@@ -1448,7 +1447,9 @@ end
 -- feeding it the captured masteries and tattoos (not the current ones).
 -- Other version: the spec is rebuilt (restoreSpecState). Afterwards the result
 -- is compared with the state; nodes PoB re-allocated on its own (cluster
--- nodes remembered in allocExtendedNodes) are deallocated and listed in
+-- nodes ImportFromNodeList re-allocates from allocExtendedNodes) are
+-- deallocated, dropped from allocExtendedNodes (so only the first restore
+-- after such a node's deallocation has to correct it) and listed in
 -- correctedExtraNodeIds, and anything still different is reported.
 local function restoreTreeState(encoded)
 	local spec = build.spec
@@ -1460,16 +1461,7 @@ local function restoreTreeState(encoded)
 		restoreSpecState(encoded)
 		spec = build.spec
 	else
-		local want = { }
-		for _, id in ipairs(state.hashList) do want[id] = true end
 		local jewelsChanged = restoreSpecJewels(spec, state.jewels)
-		-- ImportFromNodeList re-allocates every remembered cluster node; keep
-		-- only the ones the state wants.
-		if type(spec.allocExtendedNodes) == "table" then
-			for i = #spec.allocExtendedNodes, 1, -1 do
-				if not want[spec.allocExtendedNodes[i]] then table.remove(spec.allocExtendedNodes, i) end
-			end
-		end
 		local ok, err = pcall(spec.RestoreUndoState, spec, {
 			classId = state.classId,
 			ascendClassId = state.ascendClassId,

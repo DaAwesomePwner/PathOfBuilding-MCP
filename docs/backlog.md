@@ -50,8 +50,9 @@ for later.
 
 ## What-if restore exactness
 
-The mastery and hash-override items touch `restoreTreeFromList`, which the
-launch-critical tree-restore fix rewrites; do them on top of that fix.
+Passive-tree restore is exact (masteries, tattoos, socketed jewels, extra
+nodes, tree version: `restoreTreeState` in `lua/bridge.lua`). The items below
+are the remaining gaps (items, skills, batch commands).
 
 - **Item restore duplicates the item (confirmed).** `restoreSlotUnlocked`
   (`src/build-session.ts:219-229`) re-adds the item instead of re-selecting

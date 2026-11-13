@@ -35,6 +35,36 @@ export interface TreeRestoreReport {
   mismatches?: string[];
 }
 
+/**
+ * Run a what-if probe, then restore. When both fail, neither error is lost:
+ * the probe's error class is kept (so a UserError from the probe is still
+ * reported as one), both messages are included and the probe's error is the
+ * `cause`. A restore failure after a successful probe is thrown as is.
+ */
+async function probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promise<void>): Promise<T> {
+  let result: T;
+  try {
+    result = await probe();
+  } catch (probeError) {
+    try {
+      await restore();
+    } catch (restoreError) {
+      throw withRestoreFailure(probeError, restoreError);
+    }
+    throw probeError;
+  }
+  await restore();
+  return result;
+}
+
+function withRestoreFailure(probeError: unknown, restoreError: unknown): Error {
+  const text = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+  const message = `${text(probeError)} (restoring the build afterwards also failed: ${text(restoreError)})`;
+  const combined = probeError instanceof UserError ? new UserError(message) : new Error(message);
+  combined.cause = probeError;
+  return combined;
+}
+
 function describeTreeMismatch(report: TreeRestoreReport): string {
   const ids = (list: number[]): string => list.slice(0, 10).join(', ') + (list.length > 10 ? ', ...' : '');
   const parts: string[] = [];
@@ -345,7 +375,7 @@ export class BuildSession {
   private assertTreeExact(report: TreeRestoreReport): void {
     if (report.exact !== true) {
       throw new Error(
-        `Passive tree restore was not exact: ${describeTreeMismatch(report)}. Call reset_build to return to the loaded build.`,
+        `Passive tree restore was not exact (${describeTreeMismatch(report)}); call reset_build to return to the loaded build`,
       );
     }
   }
@@ -462,11 +492,10 @@ export class BuildSession {
   ): Promise<T> {
     return this.withLock(async () => {
       const snapshot = await this.snapshotAllUnlocked();
-      try {
-        return await changeFn(this.bridge);
-      } finally {
-        await this.restoreAllUnlocked(snapshot);
-      }
+      return probeThenRestore(
+        () => changeFn(this.bridge),
+        () => this.restoreAllUnlocked(snapshot),
+      );
     });
   }
 
@@ -483,38 +512,22 @@ export class BuildSession {
    */
   private async withTreeProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotTreeUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreTreeUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreTreeUnlocked(snap));
   }
 
   private async withSkillsProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotSkillsUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreSkillsUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreSkillsUnlocked(snap));
   }
 
   private async withConfigProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotConfigUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreConfigUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreConfigUnlocked(snap));
   }
 
   private async withSlotProbeUnlocked<T>(slot: string, fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotSlotUnlocked(slot);
-    try {
-      return await fn();
-    } finally {
-      await this.restoreSlotUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreSlotUnlocked(snap));
   }
 
   // ------------------------------------------------------------------

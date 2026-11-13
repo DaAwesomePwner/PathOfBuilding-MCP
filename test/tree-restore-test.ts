@@ -16,11 +16,24 @@
 //      deallocated: a restore must not bring it back, and a stray extra node
 //      must be reported by verifyTreeState.
 //   5. A snapshot taken on 3_13 restores across a tree conversion.
+//   6. A probe whose tree snapshot holds a node id PoB does not know (injected
+//      through a test-only wrapper around this process's LuaBridge.send, not
+//      reachable from MCP tool arguments): the restore error names
+//      reset_build, the rest of the tree is restored, and a probe's own
+//      error stays visible (and keeps its UserError class) when both fail.
+//   7. The same through undo: items, config and skills are restored before
+//      the error is raised.
+//   8. A socket entry whose item id has no item is restored as captured by a
+//      probe and by undo. PoB's ItemSlotControl:Populate zeroes such ids on
+//      every socket that has a slot control, so this state only survives on
+//      an entry without one (here a node id that is no socket on any tree,
+//      which PassiveSpec:Load keeps).
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { BuildSession, TreeSnapshot } from '../src/build-session.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
+import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +46,20 @@ const IL_SOCKET = 36634;
 const IL_SUPPORTED = [53757, 29861]; // Shamanistic Fury, Explosive Runes: not connected to the tree
 const CLUSTER_SOCKET = 21984;
 const CLUSTER_NOTABLE = 65898; // Smoking Remains on the cluster subgraph
+const UNKNOWN_NODE = 999999; // no tree or cluster node has this id
+const MISSING_ITEM = 9999; // no item in OccVortex has this id
+const SLOTLESS_SOCKET = 999998; // no tree node: the items tab has no slot control for it
+
+const RING = `Rarity: RARE
+Tree Restore Ring
+Coral Ring
+Item Level: 63
+LevelReq: 64
+Implicits: 1
++30 to maximum Life
++150 to maximum Life
++50 to maximum Mana
++30% to all Elemental Resistances`;
 
 const INTUITIVE_LEAP = `Rarity: UNIQUE
 Intuitive Leap
@@ -82,6 +109,36 @@ interface TreeState {
   stats: { Life: unknown; CombinedDPS: unknown; TotalEHP: unknown };
 }
 
+interface TreeReport {
+  exact: boolean;
+  correctedExtraNodeIds?: number[];
+  extraNodeIds?: number[];
+}
+
+/** Test-only seam: while true, captured tree states also list UNKNOWN_NODE. */
+let injectUnknownNode = false;
+
+function installSeam(bridge: LuaBridge): void {
+  const realSend = bridge.send.bind(bridge);
+  bridge.send = (async (command: object, timeoutOverrideMs?: number) => {
+    const result = await realSend<{ state?: RawState }>(command, timeoutOverrideMs);
+    if (injectUnknownNode && (command as { cmd?: string }).cmd === 'captureSpecState' && result.state) {
+      result.state.nodeIds = [...result.state.nodeIds, UNKNOWN_NODE];
+    }
+    return result;
+  }) as LuaBridge['send'];
+}
+
+async function rejection(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise;
+  } catch (err) {
+    assert(err instanceof Error, `rejected with a non-Error: ${String(err)}`);
+    return err;
+  }
+  throw new Error('expected the call to fail, but it succeeded');
+}
+
 const list = <T>(v: T[] | undefined | Record<string, never>): T[] => (Array.isArray(v) ? v : []);
 
 async function rawState(bridge: LuaBridge): Promise<RawState> {
@@ -127,6 +184,7 @@ async function main(): Promise<void> {
   const occXml = readFileSync(fixturePath, 'utf8');
   const masteryXml = readFileSync(MASTERY_FIXTURE, 'utf8');
   const bridge = new LuaBridge(paths, 120_000);
+  installSeam(bridge);
   const session = new BuildSession(bridge);
 
   try {
@@ -216,9 +274,22 @@ async function main(): Promise<void> {
     const c0 = await treeState(bridge);
     assert(!c0.nodeIds.includes(CLUSTER_NOTABLE), 'cluster notable still allocated after dealloc');
 
+    // PoB's ImportFromNodeList re-allocates the remembered cluster notable;
+    // restoreTreeState must deallocate it again and say so, once.
+    const cSnap = await session.snapshotTree();
+    const first = await bridge.send<TreeReport>({ cmd: 'restoreTreeState', state: cSnap.state });
+    assert(first.exact === true, `first restore not exact: ${JSON.stringify(first)}`);
+    assert(
+      JSON.stringify(first.correctedExtraNodeIds) === JSON.stringify([CLUSTER_NOTABLE]),
+      `expected correctedExtraNodeIds [${CLUSTER_NOTABLE}], got ${JSON.stringify(first)}`,
+    );
+    assertSameTree('after the correcting restore', await treeState(bridge), c0);
+    const second = await bridge.send<TreeReport>({ cmd: 'restoreTreeState', state: cSnap.state });
+    assert(second.exact === true && second.correctedExtraNodeIds === undefined, `second restore: ${JSON.stringify(second)}`);
+    log('PASS: a cluster notable PoB re-allocates on restore is deallocated and reported in correctedExtraNodeIds');
+
     await session.simulatePassiveChange([CLUSTER_NOTABLE], []);
     assertSameTree('after a cluster probe', await treeState(bridge), c0);
-    const cSnap = await session.snapshotTree();
     await session.restoreTree(cSnap);
     assertSameTree('after restoring an unchanged tree', await treeState(bridge), c0);
     log('PASS: restore leaves the deallocated cluster notable unallocated');
@@ -244,6 +315,86 @@ async function main(): Promise<void> {
     await session.restoreTree(vSnap);
     assertSameTree('after restoring a pre-convert snapshot', await treeState(bridge), v0);
     log(`PASS: snapshot on ${v0.treeVersion} restores exactly after converting to ${conv.toVersion}`);
+
+    // ---------------------------------------------------------------- 6
+    log('Test 6: an inexact tree restore after a probe is an error naming reset_build');
+    await session.loadBuild(occXml);
+    const p0 = await treeState(bridge);
+    let someNode: number | undefined;
+    for (const id of p0.nodeIds) {
+      const info = await bridge.send<{ node: { type: string } | null }>({ cmd: 'getNodeInfo', nodeId: id });
+      if (info.node?.type === 'Normal') {
+        someNode = id;
+        break;
+      }
+    }
+    assert(someNode !== undefined, 'no allocated Normal node to probe');
+    injectUnknownNode = true;
+    const probeErr = await rejection(session.simulatePassiveChange([], [someNode]));
+    injectUnknownNode = false;
+    assert(!(probeErr instanceof UserError), `inexact restore reported as a user error: ${probeErr.message}`);
+    assert(/not exact/.test(probeErr.message) && probeErr.message.includes(String(UNKNOWN_NODE)), `unexpected error: ${probeErr.message}`);
+    assert(probeErr.message.includes('reset_build'), `error does not name reset_build: ${probeErr.message}`);
+    assert(!probeErr.message.endsWith('.'), `error text ends in a period (the MCP layer appends one): ${probeErr.message}`);
+    assertSameTree('after an inexact probe restore (everything but the unknown node)', await treeState(bridge), p0);
+    log('PASS: probe restore that cannot place a node throws, names reset_build, and restores the rest');
+
+    // The probe's own error stays visible when the restore also fails, and a
+    // user error from the probe is still a user error.
+    injectUnknownNode = true;
+    const bothErr = await rejection(session.simulatePassiveChange([], [UNKNOWN_NODE]));
+    injectUnknownNode = false;
+    assert(bothErr instanceof UserError, `probe user error lost its class: ${bothErr.name}: ${bothErr.message}`);
+    assert(bothErr.message.includes(`Unknown node id: ${UNKNOWN_NODE}`), `probe error missing: ${bothErr.message}`);
+    assert(/restoring the build afterwards also failed: Passive tree restore was not exact/.test(bothErr.message), `restore error missing: ${bothErr.message}`);
+    assert(bothErr.message.includes('reset_build'), `combined error does not name reset_build: ${bothErr.message}`);
+    assert(bothErr.cause instanceof UserError && /Unknown node id/.test(bothErr.cause.message), 'probe error is not the cause');
+    const plainErr = await rejection(session.simulatePassiveChange([], [UNKNOWN_NODE]));
+    assert(plainErr instanceof UserError && !/also failed/.test(plainErr.message), `plain probe error changed: ${plainErr.message}`);
+    assertSameTree('after failing probes', await treeState(bridge), p0);
+    log('PASS: probe error and restore error are both reported; user-error class kept');
+
+    // ---------------------------------------------------------------- 7
+    log('Test 7: an inexact undo still restores items, config and skills before failing');
+    await session.loadBuild(occXml);
+    const u0 = await treeState(bridge);
+    const ring0 = await session.getItemInSlot('Ring 1');
+    const config0 = JSON.stringify((await session.snapshotConfig()).input);
+    const skills0 = JSON.stringify(await session.snapshotSkills());
+    injectUnknownNode = true;
+    await session.swapItemWithDiff('Ring 1', RING); // pushes the (tampered) full undo snapshot
+    injectUnknownNode = false;
+    const powerCharges = (await session.snapshotConfig()).input.usePowerCharges === true;
+    await session.setConfig({ usePowerCharges: !powerCharges });
+    const groups = (await bridge.send<{ groups: Array<{ isMainGroup?: boolean; gems?: unknown[] }> }>({ cmd: 'getSocketGroups' })).groups;
+    const mainGroup = Math.max(0, groups.findIndex((g) => g.isMainGroup)) + 1;
+    await bridge.send({ cmd: 'setGemLevel', groupIndex: mainGroup, gemIndex: 1, level: 1, quality: 0 });
+    assert((await session.getItemInSlot('Ring 1'))?.raw !== ring0?.raw, 'ring swap did not change Ring 1');
+    assert(JSON.stringify((await session.snapshotConfig()).input) !== config0, 'config change did not apply');
+    assert(JSON.stringify(await session.snapshotSkills()) !== skills0, 'gem level change did not apply');
+    const undoErr = await rejection(session.undoLastChange());
+    assert(/not exact/.test(undoErr.message) && undoErr.message.includes('reset_build'), `unexpected undo error: ${undoErr.message}`);
+    assert((await session.getItemInSlot('Ring 1'))?.raw === ring0?.raw, 'undo threw before restoring Ring 1');
+    assert(JSON.stringify((await session.snapshotConfig()).input) === config0, 'undo threw before restoring config');
+    assert(JSON.stringify(await session.snapshotSkills()) === skills0, 'undo threw before restoring skills');
+    assertSameTree('after an inexact undo (everything but the unknown node)', await treeState(bridge), u0);
+    log('PASS: inexact undo throws naming reset_build after items, config and skills are back');
+
+    // ---------------------------------------------------------------- 8
+    log('Test 8: a socket entry pointing at a missing item restores as captured');
+    await session.loadBuild(occXml);
+    const exported = await session.exportXML();
+    assert((exported.match(/<Sockets>/g) ?? []).length === 1, 'export should have exactly one <Sockets> element');
+    await session.loadBuild(exported.replace('<Sockets>', `<Sockets><Socket nodeId="${SLOTLESS_SOCKET}" itemId="${MISSING_ITEM}"/>`));
+    const j0 = await treeState(bridge);
+    assert(j0.jewels.includes(`${SLOTLESS_SOCKET}:${MISSING_ITEM}`), `PoB dropped the dangling socket id: ${j0.jewels}`);
+    await session.simulatePassiveChange([], [someNode]);
+    assertSameTree('after a probe on a build with a dangling socket id', await treeState(bridge), j0);
+    await session.pushUndo();
+    await session.deallocNode(someNode);
+    await session.undoLastChange();
+    assertSameTree('after undo on a build with a dangling socket id', await treeState(bridge), j0);
+    log('PASS: dangling socket item id survives probe and undo unchanged');
 
     log('ALL TREE-RESTORE TESTS PASSED');
   } finally {
