@@ -20,7 +20,7 @@
 //      through a test-only wrapper around this process's LuaBridge.send, not
 //      reachable from MCP tool arguments): the restore error names
 //      reset_build, the rest of the tree is restored, and a probe's own
-//      error stays visible (and keeps its UserError class) when both fail.
+//      error stays visible when both fail (as an internal error, its cause).
 //   7. The same through undo: items, config and skills are restored before
 //      the error is raised.
 //   8. A socket entry whose item id has no item is restored as captured by a
@@ -33,6 +33,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { BuildSession, TreeSnapshot } from '../src/build-session.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
+import { errorResponse } from '../src/tool-registry.js';
 import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
@@ -117,6 +118,8 @@ interface TreeReport {
 
 /** Test-only seam: while true, captured tree states also list UNKNOWN_NODE. */
 let injectUnknownNode = false;
+/** Test-only seam: while true, captured tree states carry a malformed node id, so restoring them throws. */
+let injectMalformedNode = false;
 
 function installSeam(bridge: LuaBridge): void {
   const realSend = bridge.send.bind(bridge);
@@ -124,6 +127,9 @@ function installSeam(bridge: LuaBridge): void {
     const result = await realSend<{ state?: RawState }>(command, timeoutOverrideMs);
     if (injectUnknownNode && (command as { cmd?: string }).cmd === 'captureSpecState' && result.state) {
       result.state.nodeIds = [...result.state.nodeIds, UNKNOWN_NODE];
+    }
+    if (injectMalformedNode && (command as { cmd?: string }).cmd === 'captureSpecState' && result.state) {
+      result.state.nodeIds = [...result.state.nodeIds, 'not-a-node' as unknown as number];
     }
     return result;
   }) as LuaBridge['send'];
@@ -339,20 +345,35 @@ async function main(): Promise<void> {
     assertSameTree('after an inexact probe restore (everything but the unknown node)', await treeState(bridge), p0);
     log('PASS: probe restore that cannot place a node throws, names reset_build, and restores the rest');
 
-    // The probe's own error stays visible when the restore also fails, and a
-    // user error from the probe is still a user error.
+    // When the probe fails with a user error and the restore fails too, the
+    // result is an internal error (the build may be changed) that still shows
+    // the probe's message and keeps the probe error as its cause.
+    const assertInternalWithProbe = (err: Error, restoreText: RegExp, label: string): void => {
+      assert(!(err instanceof UserError), `${label}: reported as a user error: ${err.message}`);
+      assert(err.message.includes(`Unknown node id: ${UNKNOWN_NODE}`), `${label}: probe message missing: ${err.message}`);
+      assert(restoreText.test(err.message), `${label}: restore message missing: ${err.message}`);
+      assert(err.cause instanceof UserError && /Unknown node id/.test(err.cause.message), `${label}: probe error is not the cause`);
+      const reply = errorResponse(err).content[0].text;
+      assert(reply.startsWith('Internal error: '), `${label}: client reply is not an internal error: ${reply}`);
+      assert(reply.includes('reset_build'), `${label}: client reply does not name reset_build: ${reply}`);
+      assert(reply.includes(`Unknown node id: ${UNKNOWN_NODE}`), `${label}: client reply lost the probe message: ${reply}`);
+    };
     injectUnknownNode = true;
     const bothErr = await rejection(session.simulatePassiveChange([], [UNKNOWN_NODE]));
     injectUnknownNode = false;
-    assert(bothErr instanceof UserError, `probe user error lost its class: ${bothErr.name}: ${bothErr.message}`);
-    assert(bothErr.message.includes(`Unknown node id: ${UNKNOWN_NODE}`), `probe error missing: ${bothErr.message}`);
-    assert(/restoring the build afterwards also failed: Passive tree restore was not exact/.test(bothErr.message), `restore error missing: ${bothErr.message}`);
-    assert(bothErr.message.includes('reset_build'), `combined error does not name reset_build: ${bothErr.message}`);
-    assert(bothErr.cause instanceof UserError && /Unknown node id/.test(bothErr.cause.message), 'probe error is not the cause');
+    assertInternalWithProbe(bothErr, /restoring the build afterwards also failed: Passive tree restore was not exact/, 'inexact restore');
+    // A restore error whose own text says nothing about reset_build.
+    injectMalformedNode = true;
+    const malformedErr = await rejection(session.simulatePassiveChange([], [UNKNOWN_NODE]));
+    injectMalformedNode = false;
+    const restoreText = malformedErr.message.split('restoring the build afterwards also failed: ')[1] ?? '';
+    assert(/malformed/.test(restoreText) && !restoreText.includes('reset_build'), `unexpected restore error: ${malformedErr.message}`);
+    assertInternalWithProbe(malformedErr, /restoring the build afterwards also failed: .*malformed/, 'failed restore');
     const plainErr = await rejection(session.simulatePassiveChange([], [UNKNOWN_NODE]));
     assert(plainErr instanceof UserError && !/also failed/.test(plainErr.message), `plain probe error changed: ${plainErr.message}`);
+    assert(errorResponse(plainErr).content[0].text === plainErr.message, 'plain probe user error is not shown verbatim');
     assertSameTree('after failing probes', await treeState(bridge), p0);
-    log('PASS: probe error and restore error are both reported; user-error class kept');
+    log('PASS: probe + restore failure is an internal error naming reset_build with the probe message; a lone probe user error stays a user error');
 
     // ---------------------------------------------------------------- 7
     log('Test 7: an inexact undo still restores items, config and skills before failing');

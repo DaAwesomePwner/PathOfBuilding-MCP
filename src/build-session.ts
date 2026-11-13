@@ -36,10 +36,12 @@ export interface TreeRestoreReport {
 }
 
 /**
- * Run a what-if probe, then restore. When both fail, neither error is lost:
- * the probe's error class is kept (so a UserError from the probe is still
- * reported as one), both messages are included and the probe's error is the
- * `cause`. A restore failure after a successful probe is thrown as is.
+ * Run a what-if probe, then restore. A probe error (UserError or not) is
+ * thrown unchanged when the restore succeeds. When the restore fails too, the
+ * build may be left changed, so the result is always an internal (non-user)
+ * error, reported with the "Internal error ... reset_build" advice; its text
+ * holds both messages and the probe's error is the `cause`. A restore failure
+ * after a successful probe is thrown as is.
  */
 async function probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promise<void>): Promise<T> {
   let result: T;
@@ -60,9 +62,7 @@ async function probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promi
 function withRestoreFailure(probeError: unknown, restoreError: unknown): Error {
   const text = (e: unknown): string => (e instanceof Error ? e.message : String(e));
   const message = `${text(probeError)} (restoring the build afterwards also failed: ${text(restoreError)})`;
-  const combined = probeError instanceof UserError ? new UserError(message) : new Error(message);
-  combined.cause = probeError;
-  return combined;
+  return new Error(message, { cause: probeError });
 }
 
 function describeTreeMismatch(report: TreeRestoreReport): string {

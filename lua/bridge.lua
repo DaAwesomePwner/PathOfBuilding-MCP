@@ -1426,7 +1426,8 @@ end
 -- them), so a snapshot compares equal to the state it was taken from.
 -- Returns true when anything changed.
 local function restoreSpecJewels(spec, wanted)
-	local jewels = shallowCopy(wanted)	local changed = false
+	local jewels = shallowCopy(wanted)
+	local changed = false
 	for nodeId in pairs(jewels) do
 		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
 	end
