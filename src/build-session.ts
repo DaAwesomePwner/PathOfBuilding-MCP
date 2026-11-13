@@ -24,9 +24,18 @@ export interface FullSnapshot {
   stats: Stats;
 }
 
+/**
+ * Opaque, JSON-safe state of a whole passive spec (tree version, class,
+ * ascendancies, allocated nodes, masteries, jewels, tattoos) produced by the
+ * bridge's convertTreeToLatest and fed back to restoreSpecState.
+ */
+export type SpecState = Record<string, unknown>;
+
 export type UndoEntry =
   | { kind: 'full'; snapshot: FullSnapshot }
-  | { kind: 'config'; snapshot: ConfigSnapshot };
+  | { kind: 'config'; snapshot: ConfigSnapshot }
+  /** Tree-version change: restores the whole spec, version included. */
+  | { kind: 'spec'; state: SpecState };
 
 export interface StatDelta {
   before: number | string | boolean | null | undefined;
@@ -477,6 +486,9 @@ export class BuildSession {
       if (!entry) throw new UserError('Nothing to undo — the undo stack is empty');
       if (entry.kind === 'full') {
         await this.restoreAllUnlocked(entry.snapshot);
+      } else if (entry.kind === 'spec') {
+        await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
+        await this.refreshBuildInfoUnlocked();
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
@@ -486,6 +498,17 @@ export class BuildSession {
 
   undoStackDepth(): number {
     return this.undoStack.length;
+  }
+
+  private pushUndoEntryUnlocked(entry: UndoEntry): void {
+    this.undoStack.push(entry);
+    while (this.undoStack.length > this.maxUndo) this.undoStack.shift();
+  }
+
+  /** Re-read class / tree version after a change that can alter them. */
+  private async refreshBuildInfoUnlocked(): Promise<void> {
+    const result = await this.bridge.send<{ ok: true; info: BuildInfo }>({ cmd: 'getBuildInfo' });
+    this.buildInfo = result.info;
   }
 
   // ------------------------------------------------------------------
@@ -625,6 +648,53 @@ export class BuildSession {
   // ------------------------------------------------------------------
   // Phase 4: passive tree analysis
   // ------------------------------------------------------------------
+
+  /**
+   * Move the active passive tree to PoB's latest tree version (keeping a
+   * ruthless/alternate sub-type, like PoB's own convert button). Pushes a
+   * spec-level undo entry carrying the old version; a no-op (already latest)
+   * pushes nothing.
+   */
+  async convertTreeToLatest(): Promise<TreeConversionResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    return this.withLock(async () => {
+      const before = await this.bridge.getStats();
+      const res = await this.bridge.send<{ ok: true; result: RawTreeConversion; stats: Stats }>({
+        cmd: 'convertTreeToLatest',
+      });
+      const raw = res.result;
+      if (!raw.converted) {
+        return { converted: false, fromVersion: raw.fromVersion, toVersion: raw.toVersion };
+      }
+      if (!raw.undoState) throw new Error('convertTreeToLatest returned no undo state');
+      this.pushUndoEntryUnlocked({ kind: 'spec', state: raw.undoState });
+      await this.refreshBuildInfoUnlocked();
+      const after = res.stats;
+      const list = <T>(value: T[] | undefined): T[] => (Array.isArray(value) ? value : []);
+      return {
+        converted: true,
+        fromVersion: raw.fromVersion,
+        toVersion: raw.toVersion,
+        allocatedBefore: raw.allocatedBefore ?? 0,
+        allocatedAfter: raw.allocatedAfter ?? 0,
+        pointsBefore: raw.pointsBefore,
+        pointsAfter: raw.pointsAfter,
+        lostNodeCount: raw.lostNodeCount ?? 0,
+        lostNodes: list(raw.lostNodes),
+        lostNodesOmitted: raw.lostNodesOmitted ?? 0,
+        changedNodeCount: raw.changedNodeCount ?? 0,
+        changedNodes: list(raw.changedNodes),
+        changedNodesOmitted: raw.changedNodesOmitted ?? 0,
+        droppedMasteryCount: raw.droppedMasteryCount ?? 0,
+        droppedMasteries: list(raw.droppedMasteries),
+        droppedMasteriesOmitted: raw.droppedMasteriesOmitted ?? 0,
+        droppedTattoos: list(raw.droppedTattoos),
+        before,
+        after,
+        diff: computeDiff(before, after),
+      };
+    });
+  }
 
   async getPassiveTree(): Promise<PassiveTreeInfo> {
     return this.withLock(async () => {
@@ -1891,6 +1961,71 @@ export interface PassiveTreeSummary {
   className?: string | null;
   ascendClassName?: string | null;
 }
+
+export interface ConvertedNode {
+  id: number;
+  name?: string;
+  type?: string;
+}
+
+export interface RenamedNode {
+  id: number;
+  oldName?: string;
+  newName?: string;
+}
+
+export interface DroppedMastery {
+  nodeId: number;
+  name?: string;
+  effectId: number;
+  effect?: string;
+}
+
+interface RawTreeConversion {
+  converted: boolean;
+  fromVersion: string;
+  toVersion: string;
+  undoState?: SpecState;
+  allocatedBefore?: number;
+  allocatedAfter?: number;
+  pointsBefore?: number;
+  pointsAfter?: number;
+  lostNodeCount?: number;
+  lostNodes?: ConvertedNode[];
+  lostNodesOmitted?: number;
+  changedNodeCount?: number;
+  changedNodes?: RenamedNode[];
+  changedNodesOmitted?: number;
+  droppedMasteryCount?: number;
+  droppedMasteries?: DroppedMastery[];
+  droppedMasteriesOmitted?: number;
+  droppedTattoos?: Array<{ nodeId: number; name: string }>;
+}
+
+export type TreeConversionResult =
+  | { converted: false; fromVersion: string; toVersion: string }
+  | {
+      converted: true;
+      fromVersion: string;
+      toVersion: string;
+      allocatedBefore: number;
+      allocatedAfter: number;
+      pointsBefore?: number;
+      pointsAfter?: number;
+      lostNodeCount: number;
+      lostNodes: ConvertedNode[];
+      lostNodesOmitted: number;
+      changedNodeCount: number;
+      changedNodes: RenamedNode[];
+      changedNodesOmitted: number;
+      droppedMasteryCount: number;
+      droppedMasteries: DroppedMastery[];
+      droppedMasteriesOmitted: number;
+      droppedTattoos: Array<{ nodeId: number; name: string }>;
+      before: Stats;
+      after: Stats;
+      diff: StatDiff;
+    };
 
 export interface PassiveTreeInfo {
   allocatedNodes: TreeNodeInfo[];

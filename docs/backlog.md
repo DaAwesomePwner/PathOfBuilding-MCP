@@ -13,10 +13,6 @@ it plausible.
   while the MCP server is running. Until fixed, stop the MCP server before
   updating PoB. Options: load native modules from a private temp copy, use the
   pure-Lua UTF-8 fallback, or shut the engine down when idle.
-- **`convert_tree_to_latest` tool.** A build saved on an old tree stays on that
-  tree, so node advice targets the old league. Call
-  `build.treeTab:ConvertToVersion(latestTreeVersion, ...)` (`Classes/TreeTab.lua`),
-  push to the undo stack, report nodes lost.
 
 ## Found during the launch-critical fixes
 
