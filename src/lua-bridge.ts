@@ -2,6 +2,7 @@ import { ChildProcess, spawn } from 'child_process';
 import path from 'path';
 import { decodeBuildCode, fetchBuildFromURL } from './build-source.js';
 import { ResolvedPaths } from './paths.js';
+import { inspectPoBInstall } from './pob-install.js';
 import { startTimer } from './timing.js';
 import { UserError } from './validation.js';
 
@@ -55,6 +56,17 @@ function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
       resolve();
     });
   });
+}
+
+/**
+ * Directory LuaJIT is spawned in. PoB loads its files relative to the directory
+ * holding Launch.lua: the install root for an installed layout, `src/` for a
+ * source clone. Layout detection is `inspectPoBInstall`'s; anything it does not
+ * accept keeps the install root (the engine will not boot from it anyway).
+ */
+export function bridgeWorkingDir(pobPath: string): string {
+  const inspected = inspectPoBInstall(pobPath);
+  return inspected.ok && inspected.info.layout === 'source' ? path.join(pobPath, 'src') : pobPath;
 }
 
 export class LuaBridge {
@@ -300,10 +312,11 @@ export class LuaBridge {
 
   private async spawnProcess(): Promise<void> {
     const bridgePath = this.bridgeLua;
-    // Run from the install root. For a compiled install Launch.lua + Modules/
-    // live at the root; for a source clone bridge.lua sets package.path to
-    // resolve src/* relative to POB_PATH, so cwd at the root works either way.
-    const cwd = this.pobPath;
+    // Run from the directory holding Launch.lua: PoB opens Modules/, Data/ and
+    // manifest.xml relative to the working directory. That is the install root
+    // for an installed layout and `src/` for a source clone (bridge.lua sets
+    // package.path for both, but cannot change the process's working directory).
+    const cwd = bridgeWorkingDir(this.pobPath);
 
     this.stderrLines.length = 0;
     this.stdoutBuffer = '';
