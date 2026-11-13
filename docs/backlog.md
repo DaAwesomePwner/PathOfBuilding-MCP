@@ -47,11 +47,13 @@ for later.
 
 ## What-if restore exactness
 
-No open items. Tree, item and skills restores are exact
+Tree, item and skills restores are exact for the active build
 (`restoreTreeState`, `restoreItemsState`, `restoreSkills` in
 `lua/bridge.lua`), and the batch commands (`replaceSocketGroup`,
 `allocNodes`, `deallocNodes`) check the whole batch before changing anything.
-One known difference remains: a tree restore that has to re-import nodes
+Two smaller gaps are listed under "Found during the restore and crash-recovery
+work" (explosion gems in inactive skill sets, the unchecked
+`replaceSocketGroup` rollback). One known difference remains: a tree restore that has to re-import nodes
 puts back the same node set in a different `allocNodes` order, so the saved
 node list and tree URL can come out reordered.
 
@@ -75,7 +77,7 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
   exit or timeout during a what-if restore, and the "build lost" engine-swap
   carry have no test; each needs a fault from the `POB_MCP_TEST_FAULTS` seam.
 - **Node list order after a tree re-import.** See "What-if restore exactness";
-  tests compare that list as a set in those cases.
+  the restore tests compare that list as a set where a re-import happened.
 - **Wording.** A failed-restore reply can name `reset_build` twice; the
   swap-carry note says "failed again while being restarted" even when no
   process ever started.
