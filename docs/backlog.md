@@ -54,16 +54,10 @@ for later.
 - **Manifest read hiccup looks like an install change**, which lets a later
   `reload_engine` reset the crash count.
 - **Mapped network drive letters** are accepted by `configure_pob_path`.
-- **"No build loaded" is matched by message text** in
-  `src/engine-manager.ts`; add a `hasBuild()` accessor to `BuildSession`.
 - **After `reload_engine`, `reset_build` returns to the reloaded build**, not
   the originally loaded one.
 - **Registry and `where luajit` probes run synchronously** after connect.
-- **Unused `circuitOpen()`** in `src/engine-messages.ts`;
-  `src/engine-manager.ts` is well past the ~200-line guideline.
-- **Breaker error text.** When the crash breaker is open the bridge's own error
-  says only to restart the server; it should also say that a Path of Building
-  update followed by `reload_engine` clears it.
+- **`src/engine-manager.ts` is well past the ~200-line guideline.**
 
 ## What-if restore exactness
 
@@ -113,9 +107,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 - **Protocol framing.** No request ids between TS and Lua, so one stray stdout
   line desynchronises responses. No `'error'` listener on the child's stdin
   (EPIPE, plausible).
-- **User errors misreported (plausible).** With a short bridge path the Lua error
-  prefix keeps the drive letter and the `__USER__` check fails
-  (`lua/bridge.lua:253-255,1558-1559`). Use `error(msg, 0)`.
 - **`arg[1]` leaks into PoB (confirmed).** `Modules/Main.lua` treats it as a
   `pob://` link; clear `arg` before loading `Launch.lua`.
 - **`allocNode` silently no-ops** when a node has no path; check `node.alloc`.
@@ -144,9 +135,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
   `bridge.shutdown()`, `server.close()` not called.
 - **Duplicate payloads.** `diagnose_build` and `suggest_upgrades` return the data
   twice; JSON is pretty-printed everywhere.
-- **`swap_gem` description says it does not push undo**, contradicting
-  `CLAUDE.md`; `undo_last_change` mentions a non-existent `allocate_node` tool.
-- **`snapshot_and_compare` leaks a `__current_compare__` snapshot.**
 - **Unbounded growth** of `stderrLines` and labelled snapshots.
 
 ## Tests and CI
@@ -158,8 +146,3 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 - **No tests** for the crash breaker, timeout recovery, stdin-EOF shutdown, or
   that all tools are registered. `test/` is not type-checked.
 - **Nightly run against PoB's `dev` branch** to catch internal API changes early.
-
-## Licensing
-
-- **Attribution.** The host stub block in `lua/bridge.lua` is adapted from PoB's
-  MIT-licensed `HeadlessWrapper.lua`; add an attribution line.

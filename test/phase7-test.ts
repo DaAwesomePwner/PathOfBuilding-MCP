@@ -180,12 +180,20 @@ async function main(): Promise<void> {
     assert(compareResp.diff.CombinedDPS && compareResp.diff.CombinedDPS.delta !== 0, 'expected DPS delta');
     log(`  DPS delta baseline→after_config: ${compareResp.diff.CombinedDPS.delta}`);
 
-    // Compare with "current"
+    // Compare with "current" — must not leave an extra label in `list`
+    const listBefore = JSON.parse(extractText(await call(client, 'snapshot_and_compare', { action: 'list' }))) as { snapshots: string[] };
     const compareCurrent = JSON.parse(extractText(await call(client, 'snapshot_and_compare', {
       action: 'compare', labelA: 'baseline', labelB: 'current',
     }))) as { diff: Record<string, { delta: number }> };
     assert(compareCurrent.diff.CombinedDPS && compareCurrent.diff.CombinedDPS.delta !== 0, 'live current diff');
-    log('PASS: snapshot_and_compare workflow');
+    const listAfter = JSON.parse(extractText(await call(client, 'snapshot_and_compare', { action: 'list' }))) as { snapshots: string[] };
+    assert(JSON.stringify(listAfter.snapshots) === JSON.stringify(listBefore.snapshots), `compare against "current" changed the snapshot list: ${JSON.stringify(listBefore.snapshots)} -> ${JSON.stringify(listAfter.snapshots)}`);
+    // ...including when the diff throws (unknown labelA)
+    const badCurrent = await call(client, 'snapshot_and_compare', { action: 'compare', labelA: 'no_such_label', labelB: 'current' });
+    assert(badCurrent.isError === true, 'compare of unknown labelA against current should error');
+    const listAfterBad = JSON.parse(extractText(await call(client, 'snapshot_and_compare', { action: 'list' }))) as { snapshots: string[] };
+    assert(JSON.stringify(listAfterBad.snapshots) === JSON.stringify(listBefore.snapshots), `failed compare against "current" changed the snapshot list: ${JSON.stringify(listAfterBad.snapshots)}`);
+    log('PASS: snapshot_and_compare workflow (no leftover label after compare against "current")');
 
     // Test 10: undo_last_change reverts the set_config
     log('Test 10: undo last change');

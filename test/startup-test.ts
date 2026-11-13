@@ -456,11 +456,14 @@ async function part1(): Promise<void> {
   }
   log('PASS 1m');
 
-  log('1n [r2 item 5]: a non-"no build" getBuildInfo error is reported, not "no build loaded"');
+  log('1n [r2 item 5]: an export error with a build loaded is reported, not "no build loaded"; hasBuild() tells them apart');
   {
     const mn = fresh(makeFakePoB('9.1.0'));
     const session = await mn.ensureReady();
-    (session as unknown as { getBuildInfo: () => Promise<unknown> }).getBuildInfo = async () => {
+    assert.equal(session.hasBuild(), false, 'hasBuild() is false before any build is loaded');
+    await session.loadBuild(BUILD_XML);
+    assert.equal(session.hasBuild(), true, 'hasBuild() is true once a build is loaded');
+    (session as unknown as { exportXML: () => Promise<string> }).exportXML = async () => {
       throw new Error('Lua bridge exited unexpectedly');
     };
     const r = await mn.reload();
@@ -476,6 +479,17 @@ async function part1(): Promise<void> {
     await mn2.shutdown();
   }
   log('PASS 1n');
+
+  log('1n2: the real bridge open-breaker error names both ways to clear it');
+  {
+    // Constructed with the ledger's count already at the limit: start() throws before spawning anything.
+    const open = new LuaBridge({ pobPath: 'x', luajitPath: 'y', bridgeLua: 'z' }, 1000, { initialCrashCount: 3 });
+    const text = await rejectsWith(open.start(), Error, /crashed 3 times/);
+    assert.match(text, /Restart the MCP server/, 'says a server restart clears it');
+    assert.match(text, /update Path of Building and then call reload_engine/, 'says a PoB update + reload_engine clears it');
+    assert.doesNotMatch(text, /configure_pob_path/, 'does not offer switching paths as a way round the breaker');
+  }
+  log('PASS 1n2');
 
   log('1o [r2 item 9]: a saved luajitPath that fails the tool-argument rules is ignored');
   {

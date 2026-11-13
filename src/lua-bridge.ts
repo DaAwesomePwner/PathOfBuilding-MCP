@@ -1,6 +1,7 @@
 import { ChildProcess, spawn } from 'child_process';
 import path from 'path';
 import { decodeBuildCode, fetchBuildFromURL } from './build-source.js';
+import { circuitOpen } from './engine-messages.js';
 import { ResolvedPaths } from './paths.js';
 import { inspectPoBInstall } from './pob-install.js';
 import { startTimer } from './timing.js';
@@ -111,10 +112,7 @@ export class LuaBridge {
       return;
     }
     if (this.crashCount >= this.maxCrashes) {
-      throw new Error(
-        `Lua engine has crashed ${this.crashCount} times — refusing to restart. ` +
-          `Restart the server process to clear this state.`,
-      );
+      throw new Error(circuitOpen(this.crashCount));
     }
     if (this.starting) {
       return this.starting;

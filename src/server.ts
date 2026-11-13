@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { BuildSession, ComparisonResult, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
+import { BuildSession, ComparisonResult, computeDiff, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
 import type { Stats } from './lua-bridge.js';
@@ -323,7 +323,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, allocate_node, etc.). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item or set_config). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -818,12 +818,14 @@ tools.engine<{ action: 'take' | 'compare' | 'list'; label?: string; labelA?: str
       }
       case 'compare': {
         if (!labelA || !labelB) throw new UserError('labelA and labelB required for action "compare"');
-        let bLabel = labelB;
         if (labelB === 'current') {
-          bLabel = '__current_compare__';
-          await session.takeSnapshot(bLabel);
+          // Diff against live stats directly: nothing is stored, so nothing can leak into "list".
+          const current = await session.getStats();
+          const a = session.getSnapshot(labelA);
+          if (!a) throw new UserError(`Snapshot not found: ${labelA}`);
+          return { from: labelA, to: labelB, diff: computeDiff(a, current) };
         }
-        const diff = session.diffSnapshots(labelA, bLabel);
+        const diff = session.diffSnapshots(labelA, labelB);
         return { from: labelA, to: labelB, diff };
       }
     }

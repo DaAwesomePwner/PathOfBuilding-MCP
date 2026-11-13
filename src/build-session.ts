@@ -172,6 +172,11 @@ export class BuildSession {
     });
   }
 
+  /** True once a build has been loaded into this session. */
+  hasBuild(): boolean {
+    return this.buildInfo !== null;
+  }
+
   async getBuildInfo(): Promise<BuildInfo> {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
     return this.buildInfo;

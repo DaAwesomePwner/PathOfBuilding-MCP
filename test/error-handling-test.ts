@@ -12,12 +12,17 @@
  *  - invalid keystone name in evaluate_keystone → error, no drift
  *  - undo_last_change with empty stack          → error, no drift
  *  - compare_items rejects fewer than 2         → Zod / error
+ *  - bridge started from a short, untruncated script path → user errors still classified as UserError
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { readFileSync } from 'fs';
+import { copyFileSync, readFileSync, rmSync } from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { LuaBridge } from '../src/lua-bridge.js';
+import type { ResolvedPaths } from '../src/paths.js';
+import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -65,8 +70,46 @@ function assertStatsExact(label: string, before: KeyStats, after: KeyStats): voi
   }
 }
 
+/**
+ * Lua prefixes thrown errors with "<script path>:<line>:". When the bridge script's
+ * path is short enough not to be truncated to "...", that prefix keeps the drive
+ * letter ("C:\...\b.lua:599:"), which the old prefix stripper could not cross, so a
+ * user error came back as an internal one. Boot a bridge from a copy of bridge.lua
+ * at a short path and check user errors still arrive as UserError, without a prefix.
+ */
+async function checkUserErrorsFromShortScriptPath(paths: ResolvedPaths): Promise<void> {
+  const shortScript = path.join(os.tmpdir(), 'b.lua');
+  assert(shortScript.length < 50, `temp dir path is too long to test an untruncated script path: ${shortScript}`);
+  copyFileSync(paths.bridgeLua, shortScript);
+  const bridge = new LuaBridge({ ...paths, bridgeLua: shortScript }, 60_000);
+  try {
+    log(`Test 0: user errors from a bridge started at a short script path (${shortScript})`);
+    let caught: unknown;
+    try {
+      await bridge.send({ cmd: 'definitelyNotACommand' });
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof UserError, `expected UserError, got ${caught instanceof Error ? caught.constructor.name + ': ' + caught.message : String(caught)}`);
+    assert(/^Unknown command: definitelyNotACommand$/.test(caught.message), `unexpected user error text: ${caught.message}`);
+    caught = undefined;
+    try {
+      await bridge.send({ cmd: 'getItem', slot: 'Not A Slot' });
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof UserError, `expected UserError for unknown slot, got ${String(caught)}`);
+    assert(!/\.lua:\d+:|__USER__/.test(caught.message), `user error still has a prefix: ${caught.message}`);
+    log(`PASS: user error classified without prefix ("${caught.message}")`);
+  } finally {
+    await bridge.dispose().catch(() => {});
+    rmSync(shortScript, { force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const { paths, fixturePath } = setupTestEnv();
+  await checkUserErrorsFromShortScriptPath(paths);
   const xml = readFileSync(fixturePath, 'utf8');
   const transport = new StdioClientTransport({
     command: 'npx',
