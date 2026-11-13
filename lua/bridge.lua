@@ -967,6 +967,22 @@ end
 -- sockets are deliberately left out: PoB keeps them on the passive spec
 -- (spec.jewels), and the tree state (captureSpecState / restoreTreeState)
 -- owns them.
+-- Identity tokens for item objects (weak keys: a collected item's token goes
+-- with it, and tokens are never reused), so a captured id can be checked to
+-- still name the very item it named at capture time, cheaply.
+local itemTokens = setmetatable({ }, { __mode = "k" })
+local nextItemToken = 0
+local function itemToken(item)
+	if not item then return 0 end
+	local token = itemTokens[item]
+	if not token then
+		nextItemToken = nextItemToken + 1
+		token = nextItemToken
+		itemTokens[item] = token
+	end
+	return token
+end
+
 local function captureItemsState()
 	local tab = build.itemsTab
 	local slots = { }
@@ -976,9 +992,32 @@ local function captureItemsState()
 			slots[#slots + 1] = { slot.slotName, id }
 		end
 	end
-	local order = { }
-	for i, id in ipairs(tab.itemOrderList) do order[i] = id end
-	return { slots = slots, itemOrder = order }
+	local order, tokens = { }, { }
+	for i, id in ipairs(tab.itemOrderList) do
+		order[i] = id
+		tokens[i] = itemToken(tab.items[id])
+	end
+	return { slots = slots, itemOrder = order, itemTokens = tokens }
+end
+
+-- Refuse (internal error, before anything changes) a captured item state
+-- whose ids no longer name the captured items: a snapshot applied out of
+-- order, e.g. one taken before load_build or reset_build replaced every item
+-- object while keeping the same ids.
+local function checkItemsState(state)
+	if type(state) ~= "table" or type(state.itemOrder) ~= "table" or type(state.itemTokens) ~= "table"
+		or #state.itemTokens ~= #state.itemOrder then
+		error("Item snapshot is malformed; nothing was restored; call reset_build to return to the loaded build", 0)
+	end
+	local tab = build.itemsTab
+	for i, id in ipairs(state.itemOrder) do
+		local item = tab.items[id]
+		if not item or itemTokens[item] ~= state.itemTokens[i] then
+			error("Item snapshot does not match the build (item " .. tostring(id) .. " is "
+				.. (item and "a different item" or "gone") .. " since the snapshot, e.g. after load_build or "
+				.. "reset_build); nothing was restored; call reset_build to return to the loaded build", 0)
+		end
+	end
 end
 
 -- Where the build still refers to item `id`.
@@ -1015,6 +1054,7 @@ local function restoreItemsState(state)
 	if type(state) ~= "table" or type(state.slots) ~= "table" or type(state.itemOrder) ~= "table" then
 		error("restoreItemsState: malformed item state")
 	end
+	checkItemsState(state)
 	local tab = build.itemsTab
 	local mismatches = { }
 	local want = { }
@@ -1675,7 +1715,13 @@ local function restoreSpecJewels(spec, wanted)
 		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
 	end
 	if not changed then return false end
-	spec.jewels = jewels
+	-- Updated in place: PassiveSpec:Save writes <Sockets> in this table's
+	-- iteration order, which a fresh table would reshuffle.
+	if type(spec.jewels) ~= "table" then spec.jewels = { } end
+	for nodeId in pairs(spec.jewels) do
+		if jewels[nodeId] == nil then spec.jewels[nodeId] = nil end
+	end
+	for nodeId, itemId in pairs(jewels) do spec.jewels[nodeId] = itemId end
 	for nodeId, slot in pairs(build.itemsTab and build.itemsTab.sockets or { }) do
 		slot.selItemId = jewels[nodeId] or 0
 	end
@@ -2802,6 +2848,10 @@ local DISPATCH = {
 	},
 	restoreItemsState = {
 		handler = function(cmd) return restoreItemsState(cmd.state) end,
+	},
+	checkItemsState = {
+		-- Raises when the captured ids no longer name the captured items.
+		handler = function(cmd) checkItemsState(cmd.state) return { } end,
 	},
 
 	-- Passive tree

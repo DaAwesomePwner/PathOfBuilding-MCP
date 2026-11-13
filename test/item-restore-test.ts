@@ -19,6 +19,14 @@
 //      snapshot taken first still restores exactly, with its jewel item ids
 //      resolving, after item probes on rings and on a jewel socket, and after
 //      a jewel swap + undo.
+//   7. Two swaps then two undos step back exactly.
+//   8. Ring and jewel swaps before and after convert_tree_to_latest, undone
+//      back to the loaded build.
+//   9. More than 20 committed swaps (undo cap): undoing what is left leaves
+//      items behind but never removes one in use.
+//  10. A second item set (OccVortexItemSets.xml) survives probes and undo.
+//  11. A full snapshot taken before reset_build is refused, as an internal
+//      error naming reset_build, before anything changes.
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -30,6 +38,18 @@ import { setupTestEnv } from './_skip.js';
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const MASTERY_FIXTURE = path.resolve(testDir, 'fixtures', 'ConvertTreeMasteries.xml');
 const JEWEL_SOCKET = 36634; // holds item 17 in ConvertTreeMasteries.xml
+// OccVortex.xml plus a second item set (Ring 1 = a ring of its own, id 8,
+// Amulet = the shared amulet), made through PoB's ItemsTab:NewItemSet and
+// ItemsTab:EquipItemInSet and saved with exportXML.
+const ITEM_SETS_FIXTURE = path.resolve(testDir, 'fixtures', 'OccVortexItemSets.xml');
+
+const AMULET = `Rarity: RARE
+Item Restore Amulet
+Jade Amulet
+Item Level: 80
+Implicits: 1
++25 to Dexterity
++60 to maximum Life`;
 
 const RING_A = `Rarity: RARE
 Item Restore Ring A
@@ -132,19 +152,28 @@ function attrs(tag: string): Record<string, string> {
  * Item list order and the occupied slots of the active item set, read from
  * the exported XML (independent of the bridge's own item-state command).
  */
-function itemsFromXml(xml: string): ItemsState {
+function itemsSection(xml: string): string {
   const start = xml.indexOf('<Items');
-  const section = xml.slice(start, xml.indexOf('</Items>', start));
-  const active = attrs(/<Items[^>]*>/.exec(section)?.[0] ?? '').activeItemSet;
-  const itemOrder = [...section.matchAll(/<Item id="(\d+)"/g)].map((m) => Number(m[1]));
-  const set = [...section.matchAll(/<ItemSet [^>]*>([\s\S]*?)<\/ItemSet>/g)].find((m) => attrs(m[0].slice(0, m[0].indexOf('>'))).id === active);
-  assert(set, `active item set ${active} not found in the export`);
-  const slots: Array<[string, number]> = [];
+  return xml.slice(start, xml.indexOf('</Items>', start));
+}
+
+/** Occupied slots of item set `setId` in an exported build. */
+function itemSetSlots(xml: string, setId: string): Map<string, number> {
+  const set = [...itemsSection(xml).matchAll(/<ItemSet [^>]*>([\s\S]*?)<\/ItemSet>/g)].find((m) => attrs(m[0].slice(0, m[0].indexOf('>'))).id === setId);
+  assert(set, `item set ${setId} not found in the export`);
+  const slots = new Map<string, number>();
   for (const m of set[1].matchAll(/<Slot [^>]*\/>/g)) {
     const a = attrs(m[0]);
-    if (Number(a.itemId) !== 0) slots.push([a.name, Number(a.itemId)]);
+    if (Number(a.itemId) !== 0) slots.set(a.name, Number(a.itemId));
   }
-  return { slots, itemOrder };
+  return slots;
+}
+
+function itemsFromXml(xml: string): ItemsState {
+  const section = itemsSection(xml);
+  const active = attrs(/<Items[^>]*>/.exec(section)?.[0] ?? '').activeItemSet;
+  const itemOrder = [...section.matchAll(/<Item id="(\d+)"/g)].map((m) => Number(m[1]));
+  return { slots: [...itemSetSlots(xml, active)], itemOrder };
 }
 
 async function itemsState(session: BuildSession): Promise<ItemsState> {
@@ -171,7 +200,18 @@ function firstDifference(a: string, b: string): string {
   return `at ${i}: ...${JSON.stringify(a.slice(Math.max(0, i - 80), i + 80))}\n  vs ...${JSON.stringify(b.slice(Math.max(0, i - 80), i + 80))}`;
 }
 
-function assertSameBuild(label: string, actual: BuildState, expected: BuildState): void {
+/**
+ * Sort every exported passive node list and drop the tree URL, which encodes
+ * the same list in the same order: both follow Lua table order, which a spec
+ * rebuild (tree conversion, or undoing one) reshuffles.
+ */
+function sortNodeLists(xml: string): string {
+  return xml
+    .replace(/ nodes="([\d,]*)"/g, (_m, list: string) => ` nodes="${list.split(',').map(Number).sort((x, y) => x - y).join(',')}"`)
+    .replace(/<URL>[\s\S]*?<\/URL>/g, '<URL/>');
+}
+
+function assertSameBuild(label: string, actual: BuildState, expected: BuildState, sortNodes = false): void {
   assert(
     JSON.stringify(actual.items.itemOrder) === JSON.stringify(expected.items.itemOrder),
     `${label}: item list differs\n  expected ${JSON.stringify(expected.items.itemOrder)}\n  actual   ${JSON.stringify(actual.items.itemOrder)}`,
@@ -184,7 +224,8 @@ function assertSameBuild(label: string, actual: BuildState, expected: BuildState
   for (const key of ['Life', 'CombinedDPS', 'TotalEHP'] as const) {
     assert(actual.stats[key] === expected.stats[key], `${label}: ${key} not bit-exact (${actual.stats[key]} != ${expected.stats[key]})`);
   }
-  assert(actual.xml === expected.xml, `${label}: exported XML differs ${firstDifference(actual.xml, expected.xml)}`);
+  const norm = (xml: string): string => (sortNodes ? sortNodeLists(xml) : xml);
+  assert(norm(actual.xml) === norm(expected.xml), `${label}: exported XML differs ${firstDifference(norm(actual.xml), norm(expected.xml))}`);
 }
 
 async function expectUserError(label: string, fn: () => Promise<unknown>, ...needles: string[]): Promise<string> {
@@ -250,13 +291,13 @@ async function main(): Promise<void> {
     // ---------------------------------------------------------------- 3
     log('Test 3: an item that does not fit the slot is refused before any change');
     const depth = session.undoStackDepth();
-    await expectUserError('helmet into Ring 1', () => session.swapItemWithDiff('Ring 1', HELMET), 'Ring 1', 'Helmet');
-    await expectUserError('abyss jewel into a missing abyssal socket', () => session.swapItemWithDiff('Helmet Abyssal Socket 1', ABYSS_JEWEL_A), 'Helmet Abyssal Socket 1', 'abyssal socket');
-    await expectUserError('ring into a jewel socket', () => session.equipItem(`Jewel ${JEWEL_SOCKET}`, RING_A), `Jewel ${JEWEL_SOCKET}`);
+    await expectUserError('helmet into Ring 1', () => session.swapItemWithDiff('Ring 1', HELMET), 'cannot be equipped in Ring 1: a Helmet item does not go in that slot');
+    await expectUserError('abyss jewel into a missing abyssal socket', () => session.swapItemWithDiff('Helmet Abyssal Socket 1', ABYSS_JEWEL_A), 'cannot be equipped in Helmet Abyssal Socket 1: the item in Helmet has 0 abyssal socket(s)');
+    await expectUserError('ring into a jewel socket', () => session.equipItem(`Jewel ${JEWEL_SOCKET}`, RING_A), `cannot be equipped in Jewel ${JEWEL_SOCKET}: only jewels go in passive tree jewel sockets`);
     assert(session.undoStackDepth() === depth, 'a refused swap must not push an undo entry');
     assertSameBuild('after refused items', await buildState(session), base);
     const refusedCmp = await session.compareItems('Ring 1', [HELMET, RING_A]);
-    assert(refusedCmp.candidates[0].error?.includes('Ring 1') && refusedCmp.candidates[0].stats === null, `helmet candidate should fail: ${JSON.stringify(refusedCmp.candidates[0])}`);
+    assert(refusedCmp.candidates[0].error?.includes('Ring 1: a Helmet item does not go in that slot') && refusedCmp.candidates[0].stats === null, `helmet candidate should fail: ${JSON.stringify(refusedCmp.candidates[0])}`);
     assert(refusedCmp.candidates[1].error === null, 'the ring candidate should still be evaluated');
     assertSameBuild('after a comparison with a refused candidate', await buildState(session), base);
     log('PASS: refused with the slot named; slot, item list and undo stack unchanged');
@@ -266,9 +307,9 @@ async function main(): Promise<void> {
     const helmetId = slotId(base.items, 'Helmet');
     // The helmet parses fine (it is only refused for the slot); unparseable
     // text right after must not equip it in the Helmet slot.
-    await expectUserError('helmet into Ring 2', () => session.equipItem('Ring 2', HELMET), 'Ring 2');
-    await expectUserError('garbage into Helmet', () => session.swapItemWithDiff('Helmet', GARBAGE), 'Helmet', 'parse');
-    await expectUserError('garbage into Helmet (unequipped path)', () => session.equipItem('Helmet', GARBAGE), 'Helmet');
+    await expectUserError('helmet into Ring 2', () => session.equipItem('Ring 2', HELMET), 'cannot be equipped in Ring 2: a Helmet item does not go in that slot');
+    await expectUserError('garbage into Helmet', () => session.swapItemWithDiff('Helmet', GARBAGE), 'Could not parse the item text for Helmet: Path of Building does not recognise its base type');
+    await expectUserError('garbage into Helmet (unequipped path)', () => session.equipItem('Helmet', GARBAGE), 'Could not parse the item text for Helmet:');
     const afterGarbage = await buildState(session);
     assert(slotId(afterGarbage.items, 'Helmet') === helmetId, 'Helmet lost its item');
     assert(session.undoStackDepth() === depth, 'an unparseable swap must not push an undo entry');
@@ -352,6 +393,129 @@ async function main(): Promise<void> {
     await session.undoLastChange();
     assertSameBuild('after undoing the committed jewel swap', await buildState(session), m0);
     log('PASS: early tree snapshot restores exactly; its jewel item ids still resolve');
+
+    // ---------------------------------------------------------------- 7
+    log('Test 7: two swaps then two undos step back exactly');
+    await session.loadBuild(occXml);
+    const t0 = await buildState(session);
+    await session.swapItemWithDiff('Ring 1', RING_A);
+    const t1 = await buildState(session);
+    await session.swapItemWithDiff('Ring 1', RING_B);
+    const t2 = await buildState(session);
+    assert(t2.items.itemOrder.includes(slotId(t1.items, 'Ring 1')), 'ring A must stay in the build for the undo');
+    assert(slotId(t2.items, 'Ring 1') !== slotId(t1.items, 'Ring 1'), 'the second swap did not change Ring 1');
+    await session.undoLastChange();
+    assertSameBuild('after the first undo (back to ring A)', await buildState(session), t1);
+    await session.undoLastChange();
+    assertSameBuild('after the second undo (back to the loaded ring)', await buildState(session), t0);
+    log('PASS: A->B->C, undo, undo restores each step exactly');
+
+    // ---------------------------------------------------------------- 8
+    log('Test 8: item and jewel swaps around convert_tree_to_latest, both orders');
+    // Converting rebuilds the passive spec, and undoing it rebuilds it again;
+    // PoB writes the allocated node list in Lua table order, so after a spec
+    // rebuild only that list's order may differ (same nodes). Compared with
+    // the node list sorted; everything else byte for byte.
+    await session.loadBuild(masteryXml);
+    const c0 = await buildState(session);
+    await session.swapItemWithDiff('Ring 1', RING_A);
+    const a1 = await buildState(session);
+    await session.swapItemWithDiff(`Jewel ${JEWEL_SOCKET}`, JEWEL_A);
+    const a2 = await buildState(session);
+    const conv1 = await session.convertTreeToLatest();
+    assert(conv1.converted, 'the 3_24 fixture should convert');
+    await session.undoLastChange();
+    assertSameBuild('order 1: after undoing the conversion', await buildState(session), a2, true);
+    await session.undoLastChange();
+    assertSameBuild('order 1: after undoing the jewel swap', await buildState(session), a1, true);
+    await session.undoLastChange();
+    assertSameBuild('order 1: after undoing the ring swap', await buildState(session), c0, true);
+
+    await session.loadBuild(masteryXml);
+    const conv2 = await session.convertTreeToLatest();
+    assert(conv2.converted, 'the 3_24 fixture should convert');
+    const b1 = await buildState(session);
+    await session.swapItemWithDiff(`Jewel ${JEWEL_SOCKET}`, JEWEL_B);
+    const b2 = await buildState(session);
+    await session.swapItemWithDiff('Ring 1', RING_B);
+    await session.compareItems(`Jewel ${JEWEL_SOCKET}`, [JEWEL_A]);
+    await session.undoLastChange();
+    assertSameBuild('order 2: after undoing the ring swap', await buildState(session), b2);
+    await session.undoLastChange();
+    assertSameBuild('order 2: after undoing the jewel swap', await buildState(session), b1);
+    await session.undoLastChange();
+    assertSameBuild('order 2: after undoing the conversion', await buildState(session), c0, true);
+    log('PASS: swaps before and after a tree conversion undo back to the loaded build');
+
+    // ---------------------------------------------------------------- 9
+    log('Test 9: more than 20 committed swaps, then undo everything that is left');
+    await session.loadBuild(occXml);
+    const u0 = await buildState(session);
+    let afterFifth: BuildState | null = null;
+    for (let i = 1; i <= 25; i++) {
+      await session.swapItemWithDiff('Ring 1', i % 2 ? RING_A : RING_B);
+      if (i === 5) afterFifth = await buildState(session);
+    }
+    assert(afterFifth, 'state after the fifth swap not recorded');
+    assert(session.undoStackDepth() === 20, `undo depth ${session.undoStackDepth()}, expected the 20-entry cap`);
+    for (let i = 0; i < 20; i++) await session.undoLastChange();
+    const trimmed = await buildState(session);
+    assertSameBuild('after undoing all 20 remaining entries', trimmed, afterFifth);
+    // Items from the five trimmed swaps are left behind (unequipped), and
+    // nothing in use was removed: the loaded items are all still there.
+    assert(trimmed.items.itemOrder.length === u0.items.itemOrder.length + 5, `expected 5 leftover items: ${JSON.stringify(trimmed.items.itemOrder)}`);
+    for (const id of u0.items.itemOrder) assert(trimmed.items.itemOrder.includes(id), `loaded item ${id} was removed`);
+    for (const [slot, id] of trimmed.items.slots) assert(trimmed.items.itemOrder.includes(id), `${slot} holds missing item ${id}`);
+    await expectUserError('undo past the trimmed entries', () => session.undoLastChange(), 'empty');
+    await session.compareItems('Ring 1', [RING_B]);
+    assertSameBuild('after a probe on the trimmed build', await buildState(session), afterFifth);
+    log('PASS: the trim leaves items behind, never removes one in use');
+
+    // ---------------------------------------------------------------- 10
+    log('Test 10: items of a non-active item set survive probes and undo');
+    await session.loadBuild(readFileSync(ITEM_SETS_FIXTURE, 'utf8'));
+    const s0 = await buildState(session);
+    const secondSet = itemSetSlots(s0.xml, '2');
+    assert(secondSet.get('Ring 1') === 8 && secondSet.get('Amulet') === slotId(s0.items, 'Amulet'), `fixture item set 2: ${JSON.stringify([...secondSet])}`);
+    assert(!s0.items.slots.some(([, id]) => id === 8), 'the set-2 ring must not be equipped in the active set');
+    for (let i = 0; i < 3; i++) await session.compareItems('Ring 1', [RING_A, RING_B]);
+    await session.compareItems('Amulet', [RING_A]);
+    await session.suggestUpgrades();
+    await session.swapItemWithDiff('Ring 1', RING_A);
+    await session.swapItemWithDiff('Amulet', AMULET);
+    await session.undoLastChange();
+    await session.undoLastChange();
+    const s1 = await buildState(session);
+    assertSameBuild('after probes and undo with two item sets', s1, s0);
+    assert(JSON.stringify([...itemSetSlots(s1.xml, '2')]) === JSON.stringify([...secondSet]), 'item set 2 changed');
+    log('PASS: the second item set and its own ring are untouched');
+
+    // ---------------------------------------------------------------- 11
+    log('Test 11: a snapshot taken before reset_build is refused before anything changes');
+    await session.loadBuild(occXml);
+    await session.swapItemWithDiff('Ring 1', RING_A); // a differing build, so a wrong restore would show
+    const stale = await session.snapshotAll();
+    await session.resetBuild();
+    await session.swapItemWithDiff('Ring 2', RING_B);
+    const r0 = await buildState(session);
+    let caught: unknown = null;
+    try {
+      await session.restoreAll(stale);
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof Error && !(caught instanceof UserError), `stale restore should be an internal error, got ${String(caught)}`);
+    assert(/does not match the build/.test(caught.message) && /reset_build/.test(caught.message) && /nothing was restored/.test(caught.message), `unexpected message: ${caught.message}`);
+    assertSameBuild('after a refused stale full restore', await buildState(session), r0);
+    caught = null;
+    try {
+      await bridge.send({ cmd: 'restoreItemsState', state: stale.items });
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof Error && !(caught instanceof UserError) && /reset_build/.test(caught.message), `stale item restore should be refused: ${String(caught)}`);
+    assertSameBuild('after a refused stale item restore', await buildState(session), r0);
+    log('PASS: a mismatched snapshot is refused with an internal error naming reset_build');
 
     log('ALL ITEM RESTORE TESTS PASSED');
   } finally {
