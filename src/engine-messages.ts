@@ -100,6 +100,14 @@ export function carriedWithoutChanges(committed: number, reason: string): string
   );
 }
 
+/** A committed change the engine applied, whose tool call then failed with the engine still running. */
+export function appliedButFailed(error: string): string {
+  return (
+    `${error} — the change itself WAS applied and is kept in the build (a restart after a crash restores it); ` +
+    'call undo_last_change to revert it'
+  );
+}
+
 export interface RestartNotice {
   crashCount: number;
   restored: 'build' | 'none' | 'failed';

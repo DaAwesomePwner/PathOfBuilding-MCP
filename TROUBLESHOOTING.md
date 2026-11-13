@@ -83,6 +83,8 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 
 **Fix:** retry the call. If the notice says the build could not be restored, call `reset_build` or `load_build`.
 
+An internal error ending in *"the change itself WAS applied and is kept in the build"* means a committed change went through but reading the result failed: the change stays (also across a later restart); call `undo_last_change` to revert it.
+
 A call that was running when the engine stopped fails with *"The Path of Building engine stopped during this call"*: it did not finish, and nothing it was doing is retried on the new engine.
 
 ## "Build code is empty" / "Invalid build code"
