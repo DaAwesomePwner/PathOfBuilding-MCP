@@ -1158,14 +1158,45 @@ local function installSpec(version, state)
 		treeVersion = version,
 	}, version)
 	newSpec:BuildClusterJewelGraphs()
-	treeTab.specList[treeTab.activeSpec] = newSpec
-	treeTab:SetActiveSpec(treeTab.activeSpec)
-	if build.spec ~= newSpec then
-		error("Tree convert failed: TreeTab:SetActiveSpec did not activate the new spec (PoB TreeTab changed?)")
+
+	-- Swap the spec in. Launch.lua's OnFrame catches errors into promptMsg
+	-- instead of throwing, so both channels count as failure; on failure the
+	-- previous spec goes back so the build is left exactly as it was.
+	local index = treeTab.activeSpec
+	local previousSpec = treeTab.specList[index]
+	local promptBefore = mainObject.promptMsg
+	local function activate(spec)
+		treeTab.specList[index] = spec
+		treeTab:SetActiveSpec(index)
+		if build.spec ~= spec then
+			error("TreeTab:SetActiveSpec did not activate the spec (PoB TreeTab changed?)", 0)
+		end
+		build.buildFlag = true
+		runCallback("OnFrame")
+		if mainObject.promptMsg ~= promptBefore then
+			error(stripColorCodes(tostring(mainObject.promptMsg)):gsub("%s+", " "), 0)
+		end
 	end
-	build.buildFlag = true
-	runCallback("OnFrame")
+	local ok, err = pcall(activate, newSpec)
+	if not ok then
+		mainObject.promptMsg = promptBefore
+		local restored, restoreErr = pcall(activate, previousSpec)
+		if not restored then
+			mainObject.promptMsg = promptBefore
+			error("Tree change to " .. tostring(version) .. " failed (" .. tostring(err)
+				.. ") and restoring the previous tree also failed (" .. tostring(restoreErr) .. "); call reset_build", 0)
+		end
+		error("Tree change to " .. tostring(version) .. " failed; the previous tree was restored: " .. tostring(err), 0)
+	end
 	return droppedOverrides
+end
+
+-- True when `effectId` is one of the effects the tree offers on that mastery node.
+local function nodeOffersMasteryEffect(node, effectId)
+	for _, effect in ipairs(node and node.masteryEffects or { }) do
+		if effect.effect == effectId then return true end
+	end
+	return false
 end
 
 local function masteryEffectText(spec, effectId)
@@ -1189,8 +1220,8 @@ local function countKeys(map)
 end
 
 -- Move the active spec to the latest tree. Returns { converted = false } when
--- it is already there; otherwise the pre-convert state (for undo) and a
--- report of what the conversion lost.
+-- it is already there; otherwise a report of what the conversion lost. The
+-- caller takes its undo state (captureSpecState command) before calling this.
 local function convertTreeToLatest()
 	local oldSpec = build.spec
 	if type(oldSpec) ~= "table" or type(oldSpec.treeVersion) ~= "string" then
@@ -1227,7 +1258,10 @@ local function convertTreeToLatest()
 	local droppedMasteries = { }
 	for _, pair in ipairs(sortedPairs(state.masteryEffects)) do
 		local nodeId, effectId = pair[1], pair[2]
-		if newSpec.masterySelections[nodeId] ~= effectId or not newSpec.allocNodes[nodeId] then
+		-- PoB keeps a selection whose effect exists anywhere on the new tree, even
+		-- when that node no longer offers it; count that as dropped too.
+		if newSpec.masterySelections[nodeId] ~= effectId or not newSpec.allocNodes[nodeId]
+			or not nodeOffersMasteryEffect(newSpec.nodes[nodeId], effectId) then
 			local node = oldNodes[nodeId] or oldSpec.nodes[nodeId]
 			droppedMasteries[#droppedMasteries + 1] = {
 				nodeId = nodeId,
@@ -1240,12 +1274,12 @@ local function convertTreeToLatest()
 	local lostShown, lostOmitted = cappedList(lost)
 	local changedShown, changedOmitted = cappedList(changed)
 	local masteryShown, masteryOmitted = cappedList(droppedMasteries)
+	local tattooShown, tattooOmitted = cappedList(droppedOverrides)
 	local newPoints = newSpec.CountAllocNodes and newSpec:CountAllocNodes() or nil
 	return {
 		converted = true,
 		fromVersion = fromVersion,
 		toVersion = newSpec.treeVersion,
-		undoState = encodeSpecState(state),
 		allocatedBefore = #state.hashList,
 		allocatedAfter = countKeys(newSpec.allocNodes),
 		pointsBefore = oldPoints,
@@ -1259,7 +1293,9 @@ local function convertTreeToLatest()
 		droppedMasteryCount = #droppedMasteries,
 		droppedMasteries = masteryShown,
 		droppedMasteriesOmitted = masteryOmitted,
-		droppedTattoos = droppedOverrides,
+		droppedTattooCount = #droppedOverrides,
+		droppedTattoos = tattooShown,
+		droppedTattoosOmitted = tattooOmitted,
 	}
 end
 
@@ -2354,6 +2390,9 @@ local DISPATCH = {
 			return { }
 		end,
 		mutating = true,
+	},
+	captureSpecState = {
+		handler = function(_cmd) return { state = encodeSpecState(captureSpecState(build.spec)) } end,
 	},
 	convertTreeToLatest = {
 		handler = function(_cmd) return { result = convertTreeToLatest() } end,

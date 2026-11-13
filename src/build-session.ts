@@ -27,7 +27,7 @@ export interface FullSnapshot {
 /**
  * Opaque, JSON-safe state of a whole passive spec (tree version, class,
  * ascendancies, allocated nodes, masteries, jewels, tattoos) produced by the
- * bridge's convertTreeToLatest and fed back to restoreSpecState.
+ * bridge's captureSpecState and fed back to restoreSpecState.
  */
 export type SpecState = Record<string, unknown>;
 
@@ -659,15 +659,28 @@ export class BuildSession {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
     return this.withLock(async () => {
       const before = await this.bridge.getStats();
-      const res = await this.bridge.send<{ ok: true; result: RawTreeConversion; stats: Stats }>({
-        cmd: 'convertTreeToLatest',
+      // Undo state is taken before anything changes, so a conversion can never
+      // land without one.
+      const captured = await this.bridge.send<{ ok: true; state: SpecState & { treeVersion?: unknown } }>({
+        cmd: 'captureSpecState',
       });
+      const treeVersion = captured.state?.treeVersion;
+      if (typeof treeVersion !== 'string') {
+        throw new Error('captureSpecState returned no tree version');
+      }
+      const undoState = { ...captured.state, treeVersion };
+      let res: { ok: true; result: RawTreeConversion; stats: Stats };
+      try {
+        res = await this.bridge.send({ cmd: 'convertTreeToLatest' });
+      } catch (err) {
+        await this.rollBackTreeUnlocked(undoState);
+        throw err;
+      }
       const raw = res.result;
       if (!raw.converted) {
         return { converted: false, fromVersion: raw.fromVersion, toVersion: raw.toVersion };
       }
-      if (!raw.undoState) throw new Error('convertTreeToLatest returned no undo state');
-      this.pushUndoEntryUnlocked({ kind: 'spec', state: raw.undoState });
+      this.pushUndoEntryUnlocked({ kind: 'spec', state: undoState });
       await this.refreshBuildInfoUnlocked();
       const after = res.stats;
       const list = <T>(value: T[] | undefined): T[] => (Array.isArray(value) ? value : []);
@@ -688,12 +701,32 @@ export class BuildSession {
         droppedMasteryCount: raw.droppedMasteryCount ?? 0,
         droppedMasteries: list(raw.droppedMasteries),
         droppedMasteriesOmitted: raw.droppedMasteriesOmitted ?? 0,
+        droppedTattooCount: raw.droppedTattooCount ?? 0,
         droppedTattoos: list(raw.droppedTattoos),
+        droppedTattoosOmitted: raw.droppedTattoosOmitted ?? 0,
         before,
         after,
         diff: computeDiff(before, after),
       };
     });
+  }
+
+  /**
+   * After a failed convert: the bridge already swaps the old spec back when
+   * activating the new one fails, but a failure after a successful swap (e.g.
+   * while building the report) would leave the tree converted with no undo
+   * entry. Put the captured spec back whenever the tree version moved.
+   */
+  private async rollBackTreeUnlocked(state: SpecState & { treeVersion: string }): Promise<void> {
+    try {
+      const info = await this.bridge.send<{ ok: true; info: BuildInfo }>({ cmd: 'getBuildInfo' });
+      if (info.info.treeVersion !== state.treeVersion) {
+        await this.bridge.send({ cmd: 'restoreSpecState', state });
+      }
+      await this.refreshBuildInfoUnlocked();
+    } catch (rollbackError) {
+      console.error('[pob-mcp] could not roll back a failed tree conversion:', rollbackError);
+    }
   }
 
   async getPassiveTree(): Promise<PassiveTreeInfo> {
@@ -1985,7 +2018,6 @@ interface RawTreeConversion {
   converted: boolean;
   fromVersion: string;
   toVersion: string;
-  undoState?: SpecState;
   allocatedBefore?: number;
   allocatedAfter?: number;
   pointsBefore?: number;
@@ -1999,7 +2031,9 @@ interface RawTreeConversion {
   droppedMasteryCount?: number;
   droppedMasteries?: DroppedMastery[];
   droppedMasteriesOmitted?: number;
+  droppedTattooCount?: number;
   droppedTattoos?: Array<{ nodeId: number; name: string }>;
+  droppedTattoosOmitted?: number;
 }
 
 export type TreeConversionResult =
@@ -2021,7 +2055,9 @@ export type TreeConversionResult =
       droppedMasteryCount: number;
       droppedMasteries: DroppedMastery[];
       droppedMasteriesOmitted: number;
+      droppedTattooCount: number;
       droppedTattoos: Array<{ nodeId: number; name: string }>;
+      droppedTattoosOmitted: number;
       before: Stats;
       after: Stats;
       diff: StatDiff;

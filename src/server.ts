@@ -352,7 +352,7 @@ tools.engine<Record<string, never>>(
   'convert_tree_to_latest',
   {
     description:
-      "Convert the build's active passive tree to Path of Building's latest tree version (keeping a ruthless/alternate tree sub-type, like PoB's own convert button), so node advice targets the current league. PERMANENTLY mutates the build (use undo_last_change to revert). Reports the old/new tree version, allocated node counts, the nodes and mastery selections lost in the conversion (lists capped at 50, with an omitted count) and key stat deltas. A build already on the latest tree is left unchanged.",
+      "Convert the build's active passive tree to Path of Building's latest tree version (keeping a ruthless/alternate tree sub-type, like PoB's own convert button), so node advice targets the current league. PERMANENTLY mutates the build (use undo_last_change to revert). Reports the old/new tree version, allocated node and point counts, `lostNodes` (allocated before, not after), `changedNodes` (still allocated but renamed on the new tree), `droppedMasteries` (selections the new tree no longer offers on that node), `droppedTattoos` (tattoos the new tree lacks) and key stat deltas. Each list is capped at 50 with a total count and an omitted count. A build already on the latest tree is left unchanged.",
     inputSchema: {},
   },
   async (_args, session) => {

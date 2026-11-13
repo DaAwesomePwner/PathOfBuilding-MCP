@@ -61,7 +61,7 @@ Three layers, three responsibilities:
 - `find_best_next_nodes` — scans every reachable unallocated node, ranks by your chosen stat (Life, CombinedDPS, TotalEHP, etc.). ~26s on a typical end-game build.
 - `find_worst_allocated_nodes` — finds your least valuable Normal nodes (skips keystones, ascendancy, sockets, masteries; refuses to disconnect the tree).
 - `evaluate_keystone` — toggle any keystone, return full stat diff.
-- `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes and mastery selections lost (capped at 50 each, with an omitted count) and key stat deltas. Already on the latest tree → no change.
+- `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
 ### Skill gems and links (7)
 - `list_skill_groups` — every socket group with active gem, supports, slot, isMainSkill flag.

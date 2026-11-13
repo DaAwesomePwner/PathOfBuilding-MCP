@@ -1,6 +1,18 @@
 // Integration test for convert_tree_to_latest: OccVortex.xml is saved on tree
 // 3_13, so it is converted to the engine's latest tree, undone, reconverted,
 // exported and reloaded, and reset.
+//
+// ConvertTreeMasteries.xml was produced through the engine from OccVortex
+// (PoB's own convert, AllocNode pathing, RestoreUndoState and SaveDB; never
+// hand-edited). It has two specs:
+//   1 (active): tree 3_24, mastery selections {12382,47642} and {12125,34242}
+//     (both still offered on those nodes in 3_29), {38921,41322} (Block
+//     Mastery: effect 41322 no longer exists in 3_29) and {2841,64381} (Life
+//     Mastery: 3_29 offers 64381 only on other nodes, so PoB keeps the
+//     selection but the node no longer offers it), and the tattoo
+//     "Tattoo of the Arohongui Makanga" on node 1031.
+//   2: PoB "Copy + Convert" of spec 1 onto 3_28_alternate with secondary
+//     ascendancy 4 (Chaos Bloodline), which 3_29 has no alternate tree for.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
@@ -12,6 +24,21 @@ import { setupTestEnv } from './_skip.js';
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
 const FIXTURE_TREE_VERSION = '3_13';
+const MASTERY_FIXTURE = path.resolve(testDir, 'fixtures', 'ConvertTreeMasteries.xml');
+const GONE_MASTERY = { nodeId: 38921, effectId: 41322 };
+const MOVED_MASTERY = { nodeId: 2841, effectId: 64381 };
+const TATTOO = '1031=Tattoo of the Arohongui Makanga';
+
+const RING = `Rarity: RARE
+Convert Test Ring
+Coral Ring
+Item Level: 63
+LevelReq: 64
+Implicits: 1
++30 to maximum Life
++150 to maximum Life
++50 to maximum Mana
++30% to all Elemental Resistances`;
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -64,6 +91,7 @@ function engineLatestTreeVersion(pobPath: string): string {
 interface SpecInfo {
   specCount: number;
   activeSpec: string;
+  title: string;
   treeVersion: string;
   classId: string;
   ascendClassId: string;
@@ -71,6 +99,9 @@ interface SpecInfo {
   nodes: string;
   masteryEffects: string;
   sockets: string;
+  overrides: string;
+  /** The other specs, which a convert must leave untouched. */
+  inactive: string;
 }
 
 function attr(tag: string, name: string): string {
@@ -81,22 +112,18 @@ function sortedList(raw: string, re: RegExp): string {
   return [...raw.matchAll(re)].map((m) => m[0]).sort().join(',');
 }
 
-/** The active <Spec> of an exported build, with lists normalised to sorted order. */
-function parseSpec(xml: string): SpecInfo {
-  const tree = /<Tree\b([^>]*)>([\s\S]*?)<\/Tree>/.exec(xml);
-  assert(tree, 'exported XML has no <Tree> element');
-  const activeSpec = attr(tree[1], 'activeSpec') || '1';
-  const specs = [...tree[2].matchAll(/<Spec\b([^>]*)>([\s\S]*?)<\/Spec>/g)];
-  assert(specs.length > 0, 'exported XML has no <Spec> element');
-  const [, specTag, body] = specs[Number(activeSpec) - 1];
+function parseOneSpec(specTag: string, body: string): Omit<SpecInfo, 'specCount' | 'activeSpec' | 'inactive'> {
   const sockets = [...body.matchAll(/<Socket\b([^>]*)\/>/g)]
     .map((m) => `${attr(m[1], 'nodeId')}=${attr(m[1], 'itemId')}`)
     .filter((s) => !s.endsWith('=0'))
     .sort()
     .join(',');
+  const overrides = [...body.matchAll(/<Override\b([^>]*)>/g)]
+    .map((m) => `${attr(m[1], 'nodeId')}=${attr(m[1], 'dn')}`)
+    .sort()
+    .join(',');
   return {
-    specCount: specs.length,
-    activeSpec,
+    title: attr(specTag, 'title'),
     treeVersion: attr(specTag, 'treeVersion'),
     classId: attr(specTag, 'classId'),
     ascendClassId: attr(specTag, 'ascendClassId'),
@@ -104,6 +131,24 @@ function parseSpec(xml: string): SpecInfo {
     nodes: sortedList(attr(specTag, 'nodes'), /\d+/g),
     masteryEffects: sortedList(attr(specTag, 'masteryEffects'), /\{\d+,\d+\}/g),
     sockets,
+    overrides,
+  };
+}
+
+/** The active <Spec> of an exported build, with lists normalised to sorted order. */
+function parseSpec(xml: string): SpecInfo {
+  const tree = /<Tree\b([^>]*)>([\s\S]*?)<\/Tree>/.exec(xml);
+  assert(tree, 'exported XML has no <Tree> element');
+  const activeSpec = attr(tree[1], 'activeSpec') || '1';
+  const specs = [...tree[2].matchAll(/<Spec\b([^>]*)>([\s\S]*?)<\/Spec>/g)];
+  assert(specs.length > 0, 'exported XML has no <Spec> element');
+  const active = Number(activeSpec) - 1;
+  const inactive = specs.filter((_, i) => i !== active).map((m) => parseOneSpec(m[1], m[2]));
+  return {
+    specCount: specs.length,
+    activeSpec,
+    ...parseOneSpec(specs[active][1], specs[active][2]),
+    inactive: JSON.stringify(inactive),
   };
 }
 
@@ -169,8 +214,11 @@ interface ConvertResult {
   lostNodesOmitted?: number;
   changedNodes?: unknown[];
   droppedMasteryCount?: number;
-  droppedMasteries?: unknown[];
+  droppedMasteries?: Array<{ nodeId: number; name?: string; effectId: number; effect?: string }>;
   droppedMasteriesOmitted?: number;
+  droppedTattooCount?: number;
+  droppedTattoos?: Array<{ nodeId: number; name: string }>;
+  droppedTattoosOmitted?: number;
   keyDeltas?: Record<string, number>;
 }
 
@@ -291,7 +339,79 @@ async function main(): Promise<void> {
     assert(stillLatest.spec.treeVersion === latest, 'undoing set_config changed the tree version');
     await call(client, 'undo_last_change');
     assertSameState(await treeState(client), original, 'after config + convert undo');
-    log('PASS: convert undo interleaves with other undo entries');
+    log('PASS: convert undo interleaves with a config undo entry');
+
+    // 7. swap_item -> convert -> undo x2: each undo restores its own layer.
+    await call(client, 'load_build', { source: xml });
+    await call(client, 'swap_item', { slot: 'Ring 1', itemText: RING });
+    const afterSwap = await treeState(client);
+    assert(afterSwap.stats.Life !== original.stats.Life, 'test ring did not change Life');
+    await callJson<ConvertResult>(client, 'convert_tree_to_latest');
+    assert((await treeState(client)).spec.treeVersion === latest, 'convert after swap did not reach latest');
+    await call(client, 'undo_last_change');
+    assertSameState(await treeState(client), afterSwap, 'after undoing convert (ring still equipped)');
+    await call(client, 'undo_last_change');
+    assertSameState(await treeState(client), original, 'after undoing swap_item');
+    log('PASS: swap_item -> convert -> undo x2 restores each layer bit-exact');
+
+    // 8. Masteries + tattoo on 3_24 (fixture spec 1).
+    const masteryXml = readFileSync(MASTERY_FIXTURE, 'utf8');
+    await call(client, 'load_build', { source: masteryXml });
+    const m0 = await treeState(client);
+    assert(m0.spec.treeVersion === '3_24', `mastery fixture loaded on ${m0.spec.treeVersion}`);
+    assert(m0.spec.specCount === 2, `mastery fixture has ${m0.spec.specCount} specs`);
+    const key = (m: { nodeId: number; effectId: number }): string => `{${m.nodeId},${m.effectId}}`;
+    const origMasteries = m0.spec.masteryEffects.match(/\{\d+,\d+\}/g) ?? [];
+    assert(
+      origMasteries.length === 4 && origMasteries.includes(key(GONE_MASTERY)) && origMasteries.includes(key(MOVED_MASTERY)),
+      `fixture masteries: ${m0.spec.masteryEffects}`,
+    );
+    assert(m0.spec.overrides === TATTOO, `fixture tattoo: ${m0.spec.overrides}`);
+    const mc = await callJson<ConvertResult>(client, 'convert_tree_to_latest');
+    assert(mc.status === 'converted' && mc.fromVersion === '3_24' && mc.toVersion === latest, `mastery convert: ${mc.fromVersion} -> ${mc.toVersion}`);
+    const dropped = mc.droppedMasteries ?? [];
+    assert(mc.droppedMasteryCount === dropped.length + (mc.droppedMasteriesOmitted ?? 0), 'droppedMasteryCount mismatch');
+    for (const want of [GONE_MASTERY, MOVED_MASTERY]) {
+      const reported = dropped.find((d) => d.nodeId === want.nodeId);
+      assert(reported && reported.effectId === want.effectId, `${key(want)} not reported dropped: ${JSON.stringify(dropped)}`);
+      assert(typeof reported.name === 'string' && typeof reported.effect === 'string', `${key(want)} lacks name/effect text`);
+    }
+    assert(dropped.length === 2, `expected exactly the 2 fixture masteries dropped, got ${JSON.stringify(dropped)}`);
+    const m1 = await treeState(client);
+    const afterMasteries = m1.spec.masteryEffects.match(/\{\d+,\d+\}/g) ?? [];
+    const droppedKeys = new Set(dropped.map((d) => `{${d.nodeId},${d.effectId}}`));
+    // PoB itself keeps the moved selection (its effect exists elsewhere on 3_29),
+    // which is why the report has to check the node's own offer list.
+    assert(afterMasteries.includes(key(MOVED_MASTERY)), `PoB no longer keeps ${key(MOVED_MASTERY)}; fixture assumption broken`);
+    assert(!afterMasteries.includes(key(GONE_MASTERY)), `${key(GONE_MASTERY)} survived the convert`);
+    for (const sel of origMasteries) {
+      if (!droppedKeys.has(sel)) {
+        assert(afterMasteries.includes(sel), `mastery ${sel} not reported dropped but missing after convert`);
+      }
+    }
+    assert((mc.droppedTattooCount ?? -1) === 0 && (mc.droppedTattoos ?? []).length === 0, `tattoo dropped: ${JSON.stringify(mc.droppedTattoos)}`);
+    assert(m1.spec.overrides === TATTOO, `tattoo after convert: ${m1.spec.overrides}`);
+    assert(m1.spec.specCount === 2 && m1.spec.inactive === m0.spec.inactive, 'convert changed the inactive spec');
+    await call(client, 'undo_last_change');
+    assertSameState(await treeState(client), m0, 'mastery fixture after undo');
+    log(`PASS: 3_24 masteries: gone and moved selections reported dropped, kept ones survive (${m1.spec.masteryEffects}), tattoo kept, undo exact`);
+
+    // 9. Secondary ascendancy on 3_28_alternate (fixture spec 2, made active).
+    assert(/<Tree activeSpec="1">/.test(masteryXml), 'mastery fixture: unexpected <Tree> tag');
+    await call(client, 'load_build', { source: masteryXml.replace('<Tree activeSpec="1">', '<Tree activeSpec="2">') });
+    const b0 = await treeState(client);
+    assert(b0.spec.treeVersion === '3_28_alternate', `bloodline spec on ${b0.spec.treeVersion}`);
+    assert(b0.spec.secondaryAscendClassId === '4', `bloodline spec secondary ascendancy ${b0.spec.secondaryAscendClassId}`);
+    const bc = await callJson<ConvertResult>(client, 'convert_tree_to_latest');
+    assert(bc.status === 'converted' && bc.toVersion === latest, `bloodline convert -> ${bc.toVersion}`);
+    const b1 = await treeState(client);
+    assert(b1.spec.treeVersion === latest && b1.spec.inactive === b0.spec.inactive, 'bloodline convert: wrong version or touched spec 1');
+    // 3_29 supports secondary ascendancies; PoB's own convert would drop it
+    // (CreateUndoState reads a field that does not exist), this tool keeps it.
+    assert(b1.spec.secondaryAscendClassId === '4', `bloodline lost on convert: ${b1.spec.secondaryAscendClassId}`);
+    await call(client, 'undo_last_change');
+    assertSameState(await treeState(client), b0, 'bloodline fixture after undo');
+    log(`PASS: 3_28_alternate bloodline -> ${latest} keeps secondary ascendancy 4; undo restores the 3_28_alternate spec exactly`);
 
     log('ALL CONVERT-TREE TESTS PASSED');
   } finally {
