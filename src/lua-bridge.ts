@@ -1,7 +1,6 @@
-import { Buffer } from 'buffer';
 import { ChildProcess, spawn } from 'child_process';
 import path from 'path';
-import { deflateRawSync, inflateRawSync, inflateSync } from 'zlib';
+import { decodeBuildCode, fetchBuildFromURL } from './build-source.js';
 import { ResolvedPaths } from './paths.js';
 import { startTimer } from './timing.js';
 import { UserError } from './validation.js';
@@ -44,52 +43,8 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
-export function encodeBuildCode(xml: string): string {
-  const compressed = deflateRawSync(Buffer.from(xml, 'utf-8'));
-  return compressed.toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
-}
-
-export function decodeBuildCode(code: string): string {
-  if (!code.trim()) {
-    throw new UserError('Build code is empty');
-  }
-
-  const normalized = code.trim().replace(/-/g, '+').replace(/_/g, '/');
-  const buffer = Buffer.from(normalized, 'base64');
-
-  try {
-    return inflateRawSync(buffer).toString('utf-8');
-  } catch {
-    return inflateSync(buffer).toString('utf-8');
-  }
-}
-
-export async function fetchBuildFromURL(url: string): Promise<string> {
-  if (url.includes('pastebin.com')) {
-    const id = url.split('/').filter(Boolean).pop();
-    if (!id) {
-      throw new UserError(`Unable to determine pastebin id from URL: ${url}`);
-    }
-    const rawUrl = `https://pastebin.com/raw/${id}`;
-    const resp = await fetch(rawUrl);
-    if (!resp.ok) {
-      throw new UserError(`Failed to fetch pastebin build: ${resp.status} ${resp.statusText}`);
-    }
-    const code = await resp.text();
-    return decodeBuildCode(code.trim());
-  }
-
-  if (url.includes('pobb.in')) {
-    const resp = await fetch(url, { headers: { Accept: 'text/plain' } });
-    if (!resp.ok) {
-      throw new UserError(`Failed to fetch pobb.in build: ${resp.status} ${resp.statusText}`);
-    }
-    const code = await resp.text();
-    return decodeBuildCode(code.trim());
-  }
-
-  throw new UserError(`Unsupported URL: ${url}`);
-}
+// Build-code and URL handling lives in build-source.ts; re-exported for existing importers.
+export { decodeBuildCode, encodeBuildCode, fetchBuildFromURL } from './build-source.js';
 
 function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
   if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();

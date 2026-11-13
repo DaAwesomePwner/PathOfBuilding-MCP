@@ -96,13 +96,9 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 
 ## Robustness and security
 
-- **URL build loading (confirmed).** `src/lua-bridge.ts:58-83`,
-  `src/validation.ts:42`: substring host check allows SSRF
-  (`http://169.254.169.254/?pobb.in`), no timeout or size cap, fetch runs under the
-  session lock, pobb.in fetches the HTML page instead of `/pob/<id>`, poe.ninja
-  unsupported.
-- **Build-code decoding (confirmed).** `src/lua-bridge.ts:51-55`: no
-  `maxOutputLength` on inflate; malformed codes surface as "Internal error".
+- **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
+  pastebin links (`parseBuildURL` in `src/validation.ts`); poe.ninja links are
+  refused with a UserError.
 - **Crash breaker never trips (confirmed).** Strikes reset after 5 successful
   commands and timeouts never count (`src/lua-bridge.ts:104,176-182,253-259`).
 - **Respawn restores the wrong build (confirmed).** After a crash the originally
