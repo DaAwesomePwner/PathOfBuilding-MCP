@@ -378,7 +378,7 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   'simulate_passive_change',
   {
     description:
-      'Temporarily allocate or deallocate passive nodes and return the stat diff. Always restores the original tree afterward. Validates that the resulting tree is connected.',
+      'Temporarily allocate or deallocate passive nodes and return the stat diff. Always restores the original tree afterward. Validates that the resulting tree is connected. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class\'s ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start.',
     inputSchema: {
       allocate: z
         .array(z.union([z.string(), z.number().int()]))

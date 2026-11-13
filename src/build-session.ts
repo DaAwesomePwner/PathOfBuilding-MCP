@@ -1495,22 +1495,18 @@ export class BuildSession {
     if (mainIndex < 0) mainIndex = 0;
     const groupNumber = mainIndex + 1;
 
-    const skillsSnap = await this.snapshotSkillsUnlocked();
-    let dps = 0;
-    try {
-      // Replace the entire main group atomically: one Lua call, one OnFrame recalc.
-      // Avoids N removeGem + M addGem calls each triggering a full PoB recalculation.
+    // Replace the entire main group atomically: one Lua call, one OnFrame recalc.
+    // Avoids N removeGem + M addGem calls each triggering a full PoB recalculation.
+    // A probe error stays visible when the restore fails too (probeThenRestore).
+    return this.withSkillsProbeUnlocked(async () => {
       const gems = [
         { name: activeSkill, level: 20, quality: 20 },
         ...supports.map((sup) => ({ name: sup, level: 20, quality: 20 })),
       ];
       await this.bridge.send({ cmd: 'replaceSocketGroup', groupIndex: groupNumber, gems });
       const stats = await this.bridge.getStats();
-      dps = toNumber(stats.CombinedDPS);
-    } finally {
-      await this.restoreSkillsUnlocked(skillsSnap);
-    }
-    return dps;
+      return toNumber(stats.CombinedDPS);
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1796,8 +1792,10 @@ export class BuildSession {
       // can't accumulate across slots.
       const fullSnap = await this.snapshotAllUnlocked();
 
+      // Both restores go through probeThenRestore: a restore failure is an
+      // internal error that keeps the probe's error as its cause.
       const out: UpgradeSuggestion[] = [];
-      try {
+      await probeThenRestore(async () => {
         for (const slot of focusSlots) {
           const item = itemsBySlot.get(slot) ?? null;
           if (!item) {
@@ -1815,16 +1813,16 @@ export class BuildSession {
           }
           let dpsLoss = 0;
           let ehpLoss = 0;
-          try {
-            await this.bridge.send({ cmd: 'unequipItem', slot });
-            const without = await this.bridge.getStats();
-            dpsLoss = toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS);
-            ehpLoss = toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP);
-          } catch {
-            /* ignore — slot may not exist; will record zero contribution */
-          } finally {
-            await this.restoreAllUnlocked(fullSnap);
-          }
+          await probeThenRestore(async () => {
+            try {
+              await this.bridge.send({ cmd: 'unequipItem', slot });
+              const without = await this.bridge.getStats();
+              dpsLoss = toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS);
+              ehpLoss = toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP);
+            } catch {
+              /* ignore — slot may not exist; will record zero contribution */
+            }
+          }, () => this.restoreAllUnlocked(fullSnap));
           out.push({
             slot,
             currentItem: item,
@@ -1836,10 +1834,8 @@ export class BuildSession {
             suggestedMods: getSuggestedMods(slot, archetype, budget),
           });
         }
-      } finally {
         // Belt-and-suspenders final restore in case any iteration's restore was skipped.
-        await this.restoreAllUnlocked(fullSnap);
-      }
+      }, () => this.restoreAllUnlocked(fullSnap));
 
       out.sort((a, b) => {
         if (a.empty && !b.empty) return -1;
@@ -2311,18 +2307,18 @@ export interface GemDataInfo {
   color?: number;
 }
 
+/**
+ * Opaque, JSON-safe skills state produced by the bridge's snapshotSkills and
+ * fed back to restoreSkills: every skill set (groups and gem instances with
+ * all their plain fields as sorted [key, value] pairs), the set order, the
+ * active set, the skills tab settings and the main socket group. Equal
+ * states encode to equal JSON.
+ */
 export interface SkillsSnapshot {
+  version: number;
+  activeSkillSetId: number;
   mainSocketGroup?: number;
-  groups: Array<{
-    label?: string;
-    slotName?: string;
-    enabled?: boolean;
-    source?: string | null;
-    mainActiveSkill?: number;
-    mainActiveSkillCalcs?: number;
-    includeInFullDPS?: boolean;
-    gemList: Array<Record<string, unknown>>;
-  }>;
+  [key: string]: unknown;
 }
 
 export interface SupportCandidate {

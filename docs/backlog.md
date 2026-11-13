@@ -50,17 +50,13 @@ for later.
 
 ## What-if restore exactness
 
-Passive-tree restore is exact (masteries, tattoos, socketed jewels, extra
-nodes, tree version: `restoreTreeState` in `lua/bridge.lua`), and so is item
-restore (items re-selected by id in every slot the engine has, probe items
-deleted, unfitting or unparseable items refused: `restoreItemsState` and
-`equipItemInSlot`). The items below are the remaining gaps (skills, batch
-commands).
-
-- **Skills snapshot misses fields (confirmed).** `lua/bridge.lua:1224-1299` omits
-  `imbuedSupport`, `groupCount`, `skillMinion*`, `skillMineCountCalcs`.
-- **Batch commands validate mid-mutation (confirmed).** `replaceSocketGroup`,
-  `allocNodes` (`lua/bridge.lua:781-803,1138-1165`) can leave partial state.
+No open items. Tree, item and skills restores are exact
+(`restoreTreeState`, `restoreItemsState`, `restoreSkills` in
+`lua/bridge.lua`), and the batch commands (`replaceSocketGroup`,
+`allocNodes`, `deallocNodes`) check the whole batch before changing anything.
+One known difference remains: a tree restore that has to re-import nodes
+puts back the same node set in a different `allocNodes` order, so the saved
+node list and tree URL can come out reordered.
 
 ## Robustness and security
 
