@@ -621,6 +621,19 @@ end
 
 build = mainObject.main.modes["BUILD"]
 
+-- A source clone runs PoB in dev mode: switching away from the BUILD mode
+-- (every load does) autosaves the open build to `~~temp~~.xml` in the clone's
+-- build directory. The write guard refuses that, PoB opens an error popup and
+-- the load is reported as failed. Stop PoB from trying instead of relaxing the
+-- guard. Settings.xml can set the flag back to false, so it is re-asserted
+-- before every build switch. Harmless for an installed layout (not dev mode).
+local function suppressDevAutoSave()
+	if mainObject.main then
+		mainObject.main.disableDevAutoSave = true
+	end
+end
+suppressDevAutoSave()
+
 -- A build whose load aborted part-way leaves a TreeTab with no active spec on
 -- the (reused) Build module. The next Build:Init constructs ConfigTab before
 -- replacing TreeTab, and ConfigTab -> SyncLoadouts indexes the stale tab and
@@ -635,6 +648,7 @@ end
 
 function newBuild()
 	scrubStaleBuildState()
+	suppressDevAutoSave()
 	mainObject.main:SetMode("BUILD", false, "Help, I'm stuck in Path of Building!")
 	runCallback("OnFrame")
 	build = mainObject.main.modes["BUILD"]
@@ -642,6 +656,7 @@ end
 
 function loadBuildFromXML(xmlText, name)
 	scrubStaleBuildState()
+	suppressDevAutoSave()
 	mainObject.main:SetMode("BUILD", false, name or "", xmlText)
 	runCallback("OnFrame")
 	build = mainObject.main.modes["BUILD"]

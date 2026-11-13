@@ -17,16 +17,18 @@ it plausible.
   tree, so node advice targets the old league. Call
   `build.treeTab:ConvertToVersion(latestTreeVersion, ...)` (`Classes/TreeTab.lua`),
   push to the undo stack, report nodes lost.
-- **Source-clone layout cannot boot (confirmed).** LuaJIT is spawned with the
-  working directory at `POB_PATH` (`src/lua-bridge.ts:271`) but PoB loads files
-  relative to `src/`. Spawn from the script path and set
-  `main.disableDevAutoSave = true` (dev mode autosaves `~~temp~~.xml`).
 
 ## Found during the launch-critical fixes
 
 Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
 for later.
 
+- **PoB `dev` branch does not parse under plain LuaJIT.** `src/Modules/Main.lua:342`
+  (`count += 1`, added in upstream commit `c38c8f6b`, 2026-08-23) uses Lua 5.3
+  syntax, so a clone of the default branch fails to boot with `'=' expected
+  near '+'`. Release tags (checked: `v2.67.2`) work. Needs an upstream fix, or
+  a source transform in `bridge.lua`'s module loader. `POB_SOURCE_PATH` for
+  `npm run test:source-clone` should point at a release tag until then.
 - **Jewel-supported nodes lost on undo (confirmed).** `restoreAllUnlocked`
   (`src/build-session.ts`) restores the tree before items and ignores the
   bridge's `missingNodeIds`. Undo after unequipping an Intuitive Leap, Thread
@@ -41,8 +43,6 @@ for later.
   detected; only missing nodes are reported.
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
   install are not normalised. Network-path installs get no zlib.
-- **Source-clone dev autosave** is blocked by the write guard, PoB opens a
-  popup and the next load is reported as failed.
 - **`__proto__` dropped by the input schema.** `z.record` removes the key
   before `set_config`/`toggle_buffs` validate it, so the call quietly does
   nothing.
