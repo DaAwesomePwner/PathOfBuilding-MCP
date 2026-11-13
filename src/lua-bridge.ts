@@ -1,8 +1,9 @@
-import { Buffer } from 'buffer';
 import { ChildProcess, spawn } from 'child_process';
 import path from 'path';
-import { deflateRawSync, inflateRawSync, inflateSync } from 'zlib';
+import { decodeBuildCode, fetchBuildFromURL } from './build-source.js';
+import { circuitOpen } from './engine-messages.js';
 import { ResolvedPaths } from './paths.js';
+import { inspectPoBInstall } from './pob-install.js';
 import { startTimer } from './timing.js';
 import { UserError } from './validation.js';
 
@@ -44,52 +45,8 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
-export function encodeBuildCode(xml: string): string {
-  const compressed = deflateRawSync(Buffer.from(xml, 'utf-8'));
-  return compressed.toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
-}
-
-export function decodeBuildCode(code: string): string {
-  if (!code.trim()) {
-    throw new UserError('Build code is empty');
-  }
-
-  const normalized = code.trim().replace(/-/g, '+').replace(/_/g, '/');
-  const buffer = Buffer.from(normalized, 'base64');
-
-  try {
-    return inflateRawSync(buffer).toString('utf-8');
-  } catch {
-    return inflateSync(buffer).toString('utf-8');
-  }
-}
-
-export async function fetchBuildFromURL(url: string): Promise<string> {
-  if (url.includes('pastebin.com')) {
-    const id = url.split('/').filter(Boolean).pop();
-    if (!id) {
-      throw new UserError(`Unable to determine pastebin id from URL: ${url}`);
-    }
-    const rawUrl = `https://pastebin.com/raw/${id}`;
-    const resp = await fetch(rawUrl);
-    if (!resp.ok) {
-      throw new UserError(`Failed to fetch pastebin build: ${resp.status} ${resp.statusText}`);
-    }
-    const code = await resp.text();
-    return decodeBuildCode(code.trim());
-  }
-
-  if (url.includes('pobb.in')) {
-    const resp = await fetch(url, { headers: { Accept: 'text/plain' } });
-    if (!resp.ok) {
-      throw new UserError(`Failed to fetch pobb.in build: ${resp.status} ${resp.statusText}`);
-    }
-    const code = await resp.text();
-    return decodeBuildCode(code.trim());
-  }
-
-  throw new UserError(`Unsupported URL: ${url}`);
-}
+// Build-code and URL handling lives in build-source.ts; re-exported for existing importers.
+export { decodeBuildCode, encodeBuildCode, fetchBuildFromURL } from './build-source.js';
 
 function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
   if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
@@ -100,6 +57,17 @@ function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
       resolve();
     });
   });
+}
+
+/**
+ * Directory LuaJIT is spawned in. PoB loads its files relative to the directory
+ * holding Launch.lua: the install root for an installed layout, `src/` for a
+ * source clone. Layout detection is `inspectPoBInstall`'s; anything it does not
+ * accept keeps the install root (the engine will not boot from it anyway).
+ */
+export function bridgeWorkingDir(pobPath: string): string {
+  const inspected = inspectPoBInstall(pobPath);
+  return inspected.ok && inspected.info.layout === 'source' ? path.join(pobPath, 'src') : pobPath;
 }
 
 export class LuaBridge {
@@ -144,10 +112,7 @@ export class LuaBridge {
       return;
     }
     if (this.crashCount >= this.maxCrashes) {
-      throw new Error(
-        `Lua engine has crashed ${this.crashCount} times — refusing to restart. ` +
-          `Restart the server process to clear this state.`,
-      );
+      throw new Error(circuitOpen(this.crashCount));
     }
     if (this.starting) {
       return this.starting;
@@ -345,10 +310,11 @@ export class LuaBridge {
 
   private async spawnProcess(): Promise<void> {
     const bridgePath = this.bridgeLua;
-    // Run from the install root. For a compiled install Launch.lua + Modules/
-    // live at the root; for a source clone bridge.lua sets package.path to
-    // resolve src/* relative to POB_PATH, so cwd at the root works either way.
-    const cwd = this.pobPath;
+    // Run from the directory holding Launch.lua: PoB opens Modules/, Data/ and
+    // manifest.xml relative to the working directory. That is the install root
+    // for an installed layout and `src/` for a source clone (bridge.lua sets
+    // package.path for both, but cannot change the process's working directory).
+    const cwd = bridgeWorkingDir(this.pobPath);
 
     this.stderrLines.length = 0;
     this.stdoutBuffer = '';

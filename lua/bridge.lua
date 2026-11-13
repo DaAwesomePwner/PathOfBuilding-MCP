@@ -16,7 +16,22 @@ local function fileExists(p)
 	return false
 end
 
-local IS_FLAT_INSTALL = fileExists(POB_PATH .. "/Launch.lua")
+-- The rule mirrors `detectLayout` in src/pob-install.ts, which also picks the
+-- working directory LuaJIT is spawned in, so the two cannot disagree: installed
+-- only when Launch.lua and Modules/Build.lua are both at the root; otherwise a
+-- source clone when both are under src/. Any other shape keeps the older
+-- behaviour (flat when the root has Launch.lua, else src/).
+local function hasPoBFiles(base)
+	return fileExists(base .. "/Launch.lua") and fileExists(base .. "/Modules/Build.lua")
+end
+local IS_FLAT_INSTALL
+if hasPoBFiles(POB_PATH) then
+	IS_FLAT_INSTALL = true
+elseif hasPoBFiles(POB_PATH .. "/src") then
+	IS_FLAT_INSTALL = false
+else
+	IS_FLAT_INSTALL = fileExists(POB_PATH .. "/Launch.lua")
+end
 local SCRIPT_PATH = IS_FLAT_INSTALL and POB_PATH or (POB_PATH .. "/src")
 local REPO_ROOT = POB_PATH  -- kept for the legacy GetWorkDir/GetUserPath/GetRuntimePath helpers below
 
@@ -400,6 +415,31 @@ local function createUtf8Fallback()
 	return utf8Fallback
 end
 
+-- The host/graphics stubs below (callbacks, image handles, rendering, input and
+-- console functions) are adapted from src/HeadlessWrapper.lua in Path of
+-- Building Community (https://github.com/PathOfBuildingCommunity/PathOfBuilding),
+-- which is MIT licensed:
+--
+--   Copyright (c) 2016 David Gowor
+--
+--   Permission is hereby granted, free of charge, to any person obtaining a copy
+--   of this software and associated documentation files (the "Software"), to deal
+--   in the Software without restriction, including without limitation the rights
+--   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+--   copies of the Software, and to permit persons to whom the Software is
+--   furnished to do so, subject to the following conditions:
+--
+--   The above copyright notice and this permission notice shall be included in all
+--   copies or substantial portions of the Software.
+--
+--   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+--   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+--   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+--   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+--   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+--   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+--   SOFTWARE.
+
 -- Callbacks
 local callbackTable = { }
 local mainObject
@@ -579,10 +619,12 @@ local dkjson = require("dkjson")
 -- Mark an error as "user input" so the TS side surfaces it verbatim
 -- rather than wrapping it as "Internal error: ...". The marker is the
 -- magic prefix __USER__ on the message; the JSON dispatcher strips it
--- and sets userError = true in the response.
+-- and sets userError = true in the response. Level 0 keeps Lua from
+-- prepending "<script path>:<line>:", whose shape depends on the bridge
+-- script's path and would hide the marker.
 local USER_ERROR_PREFIX = "__USER__"
 local function userError(msg)
-  error(USER_ERROR_PREFIX .. msg)
+  error(USER_ERROR_PREFIX .. msg, 0)
 end
 
 local function encodeJSON(obj)
@@ -621,6 +663,19 @@ end
 
 build = mainObject.main.modes["BUILD"]
 
+-- A source clone runs PoB in dev mode: switching away from the BUILD mode
+-- (every load does) autosaves the open build to `~~temp~~.xml` in the clone's
+-- build directory. The write guard refuses that, PoB opens an error popup and
+-- the load is reported as failed. Stop PoB from trying instead of relaxing the
+-- guard. Settings.xml can set the flag back to false, so it is re-asserted
+-- before every build switch. Harmless for an installed layout (not dev mode).
+local function suppressDevAutoSave()
+	if mainObject.main then
+		mainObject.main.disableDevAutoSave = true
+	end
+end
+suppressDevAutoSave()
+
 -- A build whose load aborted part-way leaves a TreeTab with no active spec on
 -- the (reused) Build module. The next Build:Init constructs ConfigTab before
 -- replacing TreeTab, and ConfigTab -> SyncLoadouts indexes the stale tab and
@@ -635,6 +690,7 @@ end
 
 function newBuild()
 	scrubStaleBuildState()
+	suppressDevAutoSave()
 	mainObject.main:SetMode("BUILD", false, "Help, I'm stuck in Path of Building!")
 	runCallback("OnFrame")
 	build = mainObject.main.modes["BUILD"]
@@ -642,6 +698,7 @@ end
 
 function loadBuildFromXML(xmlText, name)
 	scrubStaleBuildState()
+	suppressDevAutoSave()
 	mainObject.main:SetMode("BUILD", false, name or "", xmlText)
 	runCallback("OnFrame")
 	build = mainObject.main.modes["BUILD"]
@@ -2290,17 +2347,18 @@ while true do
 	else
 		local ok, result = pcall(dispatch, cmd)
 		if not ok then
-			-- Strip Lua source path/line prefixes (e.g. ".../bridge.lua:411: ") so
-			-- the surface error message is user-friendly. This MUST happen before
-			-- the userError prefix check because Lua wraps thrown errors with
-			-- source-location prefixes; after stripping, __USER__ appears at start.
+			-- userError() throws at level 0, so its message starts with the marker
+			-- and carries no source prefix. Any other error is wrapped by Lua with
+			-- a source path/line prefix (e.g. ".../bridge.lua:411: "); strip it so
+			-- the surface error message is user-friendly.
 			local msg = tostring(result)
-			msg = msg:gsub("^%.%.%.[^:]*%.lua:%d+:%s*", "")
-			msg = msg:gsub("^[^:]*%.lua:%d+:%s*", "")
 			local userFlag = false
 			if msg:sub(1, #USER_ERROR_PREFIX) == USER_ERROR_PREFIX then
 				msg = msg:sub(#USER_ERROR_PREFIX + 1)
 				userFlag = true
+			else
+				msg = msg:gsub("^%.%.%.[^:]*%.lua:%d+:%s*", "")
+				msg = msg:gsub("^[^:]*%.lua:%d+:%s*", "")
 			end
 			if userFlag then
 				respond({ error = msg, userError = true })

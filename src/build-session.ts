@@ -1,11 +1,5 @@
-import {
-  BuildInfo,
-  decodeBuildCode,
-  encodeBuildCode,
-  fetchBuildFromURL,
-  LuaBridge,
-  Stats,
-} from './lua-bridge.js';
+import { encodeBuildCode, resolveBuildSource } from './build-source.js';
+import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { UserError } from './validation.js';
 
 export interface ItemSnapshot {
@@ -148,17 +142,13 @@ export class BuildSession {
   // ------------------------------------------------------------------
 
   async loadBuild(source: string): Promise<BuildInfo> {
+    // Download and decode outside the lock: a slow pobb.in/pastebin fetch must
+    // not block other engine calls. Only the engine load and state swap are serialised.
+    // Recorded choice: concurrent loadBuild calls therefore finish in completion
+    // order, not call order (a slow URL load started first can land after, and
+    // replace, a build code loaded later).
+    const xml = await resolveBuildSource(source);
     return this.withLock(async () => {
-      const trimmed = source.trim();
-      let xml: string;
-      if (/^https?:\/\//i.test(trimmed)) {
-        xml = await fetchBuildFromURL(trimmed);
-      } else if (trimmed.startsWith('<?xml') || trimmed.startsWith('<PathOfBuilding')) {
-        xml = trimmed;
-      } else {
-        xml = decodeBuildCode(trimmed);
-      }
-
       const info = await this.bridge.loadBuildXML(xml);
       this.originalXML = xml;
       this.buildInfo = info;
@@ -180,6 +170,11 @@ export class BuildSession {
       this.snapshots.clear();
       return info;
     });
+  }
+
+  /** True once a build has been loaded into this session. */
+  hasBuild(): boolean {
+    return this.buildInfo !== null;
   }
 
   async getBuildInfo(): Promise<BuildInfo> {

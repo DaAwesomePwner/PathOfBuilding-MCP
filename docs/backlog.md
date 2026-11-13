@@ -17,16 +17,18 @@ it plausible.
   tree, so node advice targets the old league. Call
   `build.treeTab:ConvertToVersion(latestTreeVersion, ...)` (`Classes/TreeTab.lua`),
   push to the undo stack, report nodes lost.
-- **Source-clone layout cannot boot (confirmed).** LuaJIT is spawned with the
-  working directory at `POB_PATH` (`src/lua-bridge.ts:271`) but PoB loads files
-  relative to `src/`. Spawn from the script path and set
-  `main.disableDevAutoSave = true` (dev mode autosaves `~~temp~~.xml`).
 
 ## Found during the launch-critical fixes
 
 Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
 for later.
 
+- **PoB `dev` branch does not parse under plain LuaJIT.** `src/Modules/Main.lua:342`
+  (`count += 1`, added in upstream commit `c38c8f6b`, 2026-08-23) uses Lua 5.3
+  syntax, so a clone of the default branch fails to boot with `'=' expected
+  near '+'`. Release tags (checked: `v2.67.2`) work. Needs an upstream fix, or
+  a source transform in `bridge.lua`'s module loader. `POB_SOURCE_PATH` for
+  `npm run test:source-clone` should point at a release tag until then.
 - **Jewel-supported nodes lost on undo (confirmed).** `restoreAllUnlocked`
   (`src/build-session.ts`) restores the tree before items and ignores the
   bridge's `missingNodeIds`. Undo after unequipping an Intuitive Leap, Thread
@@ -41,8 +43,6 @@ for later.
   detected; only missing nodes are reported.
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
   install are not normalised. Network-path installs get no zlib.
-- **Source-clone dev autosave** is blocked by the write guard, PoB opens a
-  popup and the next load is reported as failed.
 - **`__proto__` dropped by the input schema.** `z.record` removes the key
   before `set_config`/`toggle_buffs` validate it, so the call quietly does
   nothing.
@@ -54,16 +54,10 @@ for later.
 - **Manifest read hiccup looks like an install change**, which lets a later
   `reload_engine` reset the crash count.
 - **Mapped network drive letters** are accepted by `configure_pob_path`.
-- **"No build loaded" is matched by message text** in
-  `src/engine-manager.ts`; add a `hasBuild()` accessor to `BuildSession`.
 - **After `reload_engine`, `reset_build` returns to the reloaded build**, not
   the originally loaded one.
 - **Registry and `where luajit` probes run synchronously** after connect.
-- **Unused `circuitOpen()`** in `src/engine-messages.ts`;
-  `src/engine-manager.ts` is well past the ~200-line guideline.
-- **Breaker error text.** When the crash breaker is open the bridge's own error
-  says only to restart the server; it should also say that a Path of Building
-  update followed by `reload_engine` clears it.
+- **`src/engine-manager.ts` is well past the ~200-line guideline.**
 
 ## What-if restore exactness
 
@@ -96,13 +90,9 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 
 ## Robustness and security
 
-- **URL build loading (confirmed).** `src/lua-bridge.ts:58-83`,
-  `src/validation.ts:42`: substring host check allows SSRF
-  (`http://169.254.169.254/?pobb.in`), no timeout or size cap, fetch runs under the
-  session lock, pobb.in fetches the HTML page instead of `/pob/<id>`, poe.ninja
-  unsupported.
-- **Build-code decoding (confirmed).** `src/lua-bridge.ts:51-55`: no
-  `maxOutputLength` on inflate; malformed codes surface as "Internal error".
+- **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
+  pastebin links (`parseBuildURL` in `src/validation.ts`); poe.ninja links are
+  refused with a UserError.
 - **Crash breaker never trips (confirmed).** Strikes reset after 5 successful
   commands and timeouts never count (`src/lua-bridge.ts:104,176-182,253-259`).
 - **Respawn restores the wrong build (confirmed).** After a crash the originally
@@ -117,9 +107,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 - **Protocol framing.** No request ids between TS and Lua, so one stray stdout
   line desynchronises responses. No `'error'` listener on the child's stdin
   (EPIPE, plausible).
-- **User errors misreported (plausible).** With a short bridge path the Lua error
-  prefix keeps the drive letter and the `__USER__` check fails
-  (`lua/bridge.lua:253-255,1558-1559`). Use `error(msg, 0)`.
 - **`arg[1]` leaks into PoB (confirmed).** `Modules/Main.lua` treats it as a
   `pob://` link; clear `arg` before loading `Launch.lua`.
 - **`allocNode` silently no-ops** when a node has no path; check `node.alloc`.
@@ -148,9 +135,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
   `bridge.shutdown()`, `server.close()` not called.
 - **Duplicate payloads.** `diagnose_build` and `suggest_upgrades` return the data
   twice; JSON is pretty-printed everywhere.
-- **`swap_gem` description says it does not push undo**, contradicting
-  `CLAUDE.md`; `undo_last_change` mentions a non-existent `allocate_node` tool.
-- **`snapshot_and_compare` leaks a `__current_compare__` snapshot.**
 - **Unbounded growth** of `stderrLines` and labelled snapshots.
 
 ## Tests and CI
@@ -162,8 +146,3 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 - **No tests** for the crash breaker, timeout recovery, stdin-EOF shutdown, or
   that all tools are registered. `test/` is not type-checked.
 - **Nightly run against PoB's `dev` branch** to catch internal API changes early.
-
-## Licensing
-
-- **Attribution.** The host stub block in `lua/bridge.lua` is adapted from PoB's
-  MIT-licensed `HeadlessWrapper.lua`; add an attribution line.

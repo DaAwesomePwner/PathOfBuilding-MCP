@@ -31,7 +31,7 @@ Three layers, three responsibilities:
 - **Version-aware.** If PoB updates itself on disk (new league), tools refuse to run on the stale in-memory engine and point at `reload_engine`.
 - **Serial execution.** A mutex guarantees only one operation runs at a time. PoB is fundamentally a single-threaded singleton with shared global state.
 - **Snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `suggest_upgrades`, etc. all wrap their probes in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
-- **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly 3 times, the server refuses further restarts and forces you to restart the whole MCP server. Prevents silent respawn loops eating your session.
+- **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
 ## The 36 tools
@@ -164,7 +164,7 @@ For an interactive iteration loop:
 - **Simulation tools never persist.** `simulate_*`, `compare_*`, `evaluate_*`, `find_*` always restore the state in `finally`, even if the operation throws. Verified bit-exact across 70+ tests.
 - **Build code round-trip is lossless.** `export_build({ format: "code" })` produces a string you can paste back into PoB-the-app or back into `load_build`. Same for `format: "xml"`.
 - **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; full-tree scans 16-26s.
-- **Crash circuit breaker.** After 3 unexpected exits the server refuses to respawn LuaJIT and tells you to restart Claude Desktop. Prevents respawn loops.
+- **Crash circuit breaker.** After 3 unexpected exits the server refuses to respawn LuaJIT and tells you to restart the MCP server (or update Path of Building and call `reload_engine`). Prevents respawn loops.
 - **PoB updates.** When PoB updates itself (new league), tools stop with *"Path of Building was updated on disk from X to Y"*. `reload_engine` restarts the engine and reloads your build; undo history is cleared.
 
 ## Troubleshooting quick reference
@@ -175,7 +175,7 @@ For an interactive iteration loop:
 | `Could not find a luajit executable` | Install LuaJIT separately, then `configure_pob_path` with `luajitPath`, or set `LUAJIT_PATH`. |
 | `… is Path of Building for Path of Exile 2` | Use the PoE1 install (folder without "(PoE2)"). |
 | `Path of Building was updated on disk from X to Y` | Call `reload_engine`. |
-| `Lua engine has crashed 3 times` | Restart Claude Desktop. Check stderr (visible in Claude logs) for the cause. |
+| `Lua engine has crashed 3 times` | Restart the MCP server (restarting Claude Desktop does this), or update Path of Building and call `reload_engine`. Check stderr (visible in Claude logs) for the cause. |
 | `Lua bridge timeout after 60000ms` | A command stuck. The `cmd` name is in the error message; check Lua side for bugs. |
 | `Build code is too short to be a real PoB build` | You probably pasted only the URL prefix or a fragment. |
 | `Item text must start with a "Rarity: ..." line` | Use the PoB *Copy* button (right-click → Copy item) — gives the exact format. |

@@ -55,10 +55,15 @@ export function bootFailed(paths: ResolvedPaths, error: string): string {
   );
 }
 
-export function circuitOpen(): string {
+/**
+ * The crash count is kept per (PoB path, LuaJIT path) pair (CrashLedger), so calling
+ * configure_pob_path or reload_engine with the same paths does not clear it.
+ */
+export function circuitOpen(crashCount: number): string {
   return (
-    'The Lua engine has crashed 3 times with these paths and the crash breaker is open. ' +
-    'Restart the MCP server process, or call configure_pob_path with a different PoB/LuaJIT path.'
+    `Lua engine has crashed ${crashCount} times — refusing to restart. ` +
+    'Restart the MCP server process to clear this state, or update Path of Building ' +
+    'and then call reload_engine (the count clears once the install has changed on disk).'
   );
 }
 
