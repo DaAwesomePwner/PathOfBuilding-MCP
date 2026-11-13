@@ -657,11 +657,16 @@ end
 -- Test faults for any command: exitOn_<cmd> ends the process, hangOn_<cmd>
 -- stalls and failOn_<cmd> raises an error before running it. exitAfterChange
 -- ends the process on the first command after a successful build change
--- (equipItem, unequipItem, setConfig, convertTreeToLatest).
+-- (equipItem, unequipItem, setConfig, convertTreeToLatest); failAfterChange
+-- instead raises an error on that command, once per change.
 local TEST_CHANGE_COMMANDS = { equipItem = true, unequipItem = true, setConfig = true, convertTreeToLatest = true }
 local testChangeDone = false
 local function testFaultsForCommand(name)
 	if TEST_FAULTS.exitAfterChange and testChangeDone then os.exit(3) end
+	if TEST_FAULTS.failAfterChange and testChangeDone then
+		testChangeDone = false
+		error("test fault: the command after a change failed", 0)
+	end
 	if TEST_FAULTS["exitOn_" .. tostring(name)] then os.exit(3) end
 	if TEST_FAULTS["hangOn_" .. tostring(name)] then testFaultStall() end
 	if TEST_FAULTS["failOn_" .. tostring(name)] then error("test fault: " .. tostring(name) .. " failed", 0) end

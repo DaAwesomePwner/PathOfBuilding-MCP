@@ -343,7 +343,7 @@ export class EngineManager {
         build: null,
         buildError: c.error,
         ...(c.xml ? { buildCode: encodeBuildCode(c.xml) } : {}),
-        buildNote: msg.carryLoadFailedNote(c.error),
+        buildNote: msg.carryLoadFailedNote(c.error) + (exp?.note ? ` ${exp.note}` : ''),
       };
     }
     if (c?.info) return { buildReloaded: true, build: c.info, ...(exp?.note ? { buildNote: exp.note } : {}) };

@@ -35,6 +35,16 @@
 //      rejected load puts the last committed build back.
 //  12. A restore that fails is reported as failed again at a later crash
 //      (never as "no build"); reset_build still recovers.
+//  13. A change the engine applied whose call then failed with the engine
+//      alive is committed anyway: the error says so, undo reverts it, and a
+//      later crash restores it.
+//  14. reset_build after a crash: blank respawn, no replay, the original
+//      build, a one-time engineRestart note.
+//  11 and 14 check the commands actually sent, so a skipped replay is proven.
+//  15. Engine swap export after a crash whose restart replay kills the engine
+//      again: the last accepted build is carried with a note naming the
+//      missing change (no engine stderr in it), one more strike, no live
+//      process; with the breaker then open, no process is started at all.
 //   3 also: an engine swap with the breaker open carries the last accepted
 //      build with a note naming the committed changes it lacks.
 import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, mkdirSync } from 'fs';
@@ -460,21 +470,38 @@ async function test10FailedCommit(): Promise<void> {
   log('PASS 10');
 }
 
+/** Record the name of every command the bridge sends from now on (including its own replay). */
+function recordCommands(bridge: LuaBridge, badXmlText = badXml): string[] {
+  const sent: string[] = [];
+  const b = bridge as unknown as { send: (cmd: { cmd?: string; xml?: string }, t?: number) => Promise<unknown> };
+  const real = b.send.bind(bridge);
+  b.send = (cmd, t) => {
+    sent.push(String(cmd?.cmd) + (cmd?.cmd === 'loadXML' && cmd.xml === badXmlText ? ':rejected' : ''));
+    return real(cmd, t);
+  };
+  return sent;
+}
+
 async function test11LoadAfterCrash(): Promise<void> {
   log('Test 11: load_build after a crash skips the replay; a rejected one restores the committed build');
   const bridge = newBridge();
   const { session } = await primedSession(bridge);
   await session.swapItemWithDiff('Ring 1', RING_A);
   const committed = await state(session);
+  const sent = recordCommands(bridge);
   await crash(bridge);
   await rejection(session.loadBuild(badXml));
+  // Blank respawn, the rejected load first, then the committed build put back.
+  assert(JSON.stringify(sent) === JSON.stringify(['loadXML:rejected', 'loadXML', 'equipItem', 'getBuildInfo']), `commands after a crash + rejected load: ${sent}`);
   await expectRestart('after a rejected load', session.getStats(), /strike 1 of 3/, /build was restored/);
   assertSame('rejected load after a crash', await state(session), committed);
 
   await crash(bridge);
   bridge.setTestFaults('exitOn_equipItem'); // replaying the committed swap would now kill the engine
   const spawns = bridge.getSpawnCount();
+  sent.length = 0;
   const info = await session.loadBuild(occXml);
+  assert(JSON.stringify(sent) === JSON.stringify(['loadXML']), `a load after a crash sends only the load: ${sent}`);
   assert(/stopped unexpectedly/.test(info.engineRestart ?? '') && /strike 2 of 3/.test(info.engineRestart ?? ''), `load note: ${info.engineRestart}`);
   assert(bridge.getCrashCount() === 2 && bridge.getSpawnCount() === spawns + 1, 'the load must not replay the old build');
   assert((await session.getBuildInfo()).engineRestart === undefined, 'the note is not cached in the build info');
@@ -500,6 +527,83 @@ async function test12LostRestore(): Promise<void> {
   log('PASS 12');
 }
 
+async function test13AppliedButFailed(): Promise<void> {
+  log('Test 13: a change applied before its call failed (engine alive) is committed and said so');
+  const cases: Array<[string, (s: BuildSession) => Promise<unknown>]> = [
+    ['swap_item', (s) => s.swapItemWithDiff('Ring 1', RING_A)],
+    ['set_config', (s) => s.setConfigWithUndo({ usePowerCharges: true })],
+    ['convert_tree_to_latest', (s) => s.convertTreeToLatest()],
+  ];
+  for (const [name, change] of cases) {
+    const bridge = newBridge(120_000, 'failAfterChange');
+    const { session, base } = await primedSession(bridge);
+    const e = await rejection(change(session));
+    assert(!(e instanceof UserError) && /test fault/.test(e.message) && /WAS applied/.test(e.message) && /undo_last_change/.test(e.message), `${name}: ${e.message}`);
+    assert(bridge.isRunning() && session.undoStackDepth() === 1 && bridge.committedCount() === 1, `${name}: the applied change is committed`);
+    const applied = await state(session);
+    assert(canonicalXml(applied.xml) !== canonicalXml(base.xml), `${name}: the export must show the change`);
+    await session.undoLastChange();
+    assert(bridge.committedCount() === 0, `${name}: undo drops it from the journal`);
+    assertSame(`${name}: undone`, await state(session), base);
+  }
+  // A later crash restores it.
+  const bridge = newBridge(120_000, 'failAfterChange');
+  const { session } = await primedSession(bridge);
+  await rejection(session.swapItemWithDiff('Ring 1', RING_A));
+  const applied = await state(session);
+  assert(applied.xml.includes('Crash Recovery Ring'), 'the swap is in the live build');
+  bridge.setTestFaults(undefined);
+  await crash(bridge);
+  await expectRestart('crash after an applied-but-failed swap', session.getStats(), /build was restored/, /Undo history was cleared \(1 entry\)/);
+  assertSame('restored with the applied change', await state(session), applied);
+  log('PASS 13');
+}
+
+async function test14ResetAfterCrash(): Promise<void> {
+  log('Test 14: reset_build after a crash: no replay, the original build, a one-time note');
+  const bridge = newBridge();
+  const { session, base } = await primedSession(bridge);
+  await session.swapItemWithDiff('Ring 1', RING_A);
+  const sent = recordCommands(bridge);
+  await crash(bridge);
+  bridge.setTestFaults('exitOn_equipItem'); // a replay of the swap would kill the engine
+  const info = await session.resetBuild();
+  assert(JSON.stringify(sent) === JSON.stringify(['loadXML']), `reset after a crash sends only the load: ${sent}`);
+  assert(/stopped unexpectedly/.test(info.engineRestart ?? '') && /strike 1 of 3/.test(info.engineRestart ?? ''), `reset note: ${info.engineRestart}`);
+  assert(bridge.getCrashCount() === 1, 'no strike from the reset');
+  assertSame('reset_build after a crash', await state(session), base); // no notice: given once, in the reset result
+  assert((await session.resetBuild()).engineRestart === undefined, 'the note is given once');
+  bridge.setTestFaults(undefined);
+  log('PASS 14');
+}
+
+async function test15SwapExportReplayCrash(): Promise<void> {
+  log('Test 15: engine-swap export when the restart replay crashes, then with the breaker open');
+  const bridge = newBridge();
+  const { session } = await primedSession(bridge);
+  const accepted = bridge.getRecoveryXML();
+  assert(accepted !== null, 'a build was accepted');
+  await session.swapItemWithDiff('Ring 1', RING_A);
+  await crash(bridge); // strike 1
+  bridge.setTestFaults('exitOn_equipItem'); // replaying the committed swap kills the restarted engine
+  const spawns = bridge.getSpawnCount();
+  const r1 = await session.exportForEngineSwap();
+  assert(r1.xml === accepted, 'the carried XML must be the last accepted build');
+  assert(/failed again while being restarted/.test(r1.note ?? '') && /WITHOUT the 1 committed change made since that load/.test(r1.note ?? ''), `note: ${r1.note}`);
+  assert(!/Stderr|exited|code=/.test(r1.note ?? ''), `engine details must stay out of the note: ${r1.note}`);
+  assert(bridge.getCrashCount() === 2, `exactly one more strike, got ${bridge.getCrashCount()}`);
+  assert(bridge.getSpawnCount() === spawns + 1 && !bridge.isRunning() && bridge.getPid() === undefined, 'the restarted engine is gone');
+
+  // Third strike the same way, then the breaker is open: no process may start.
+  await session.exportForEngineSwap();
+  assert(bridge.isCircuitOpen() && bridge.getPid() === undefined, `breaker open after strike 3 (${bridge.getCrashCount()})`);
+  const openSpawns = bridge.getSpawnCount();
+  const r2 = await session.exportForEngineSwap();
+  assert(r2.xml === accepted && /not restarted again after too many crashes/.test(r2.note ?? '') && /WITHOUT the 1 committed change/.test(r2.note ?? ''), `breaker-open note: ${r2.note}`);
+  assert(bridge.getSpawnCount() === openSpawns && bridge.getPid() === undefined && bridge.getCrashCount() === 3, 'no process may start with the breaker open');
+  log('PASS 15');
+}
+
 async function main(): Promise<void> {
   try {
     await test1Breaker();
@@ -513,6 +617,9 @@ async function main(): Promise<void> {
     await test10FailedCommit();
     await test11LoadAfterCrash();
     await test12LostRestore();
+    await test13AppliedButFailed();
+    await test14ResetAfterCrash();
+    await test15SwapExportReplayCrash();
   } finally {
     const pids = bridges.map((b) => b.getPid()).filter((p): p is number => p !== undefined);
     for (const b of bridges) await b.dispose().catch(() => undefined);

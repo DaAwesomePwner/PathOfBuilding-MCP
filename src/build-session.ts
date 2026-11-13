@@ -1,5 +1,5 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
-import { carriedWithoutChanges, engineRestarted } from './engine-messages.js';
+import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { UserError } from './validation.js';
 
@@ -315,17 +315,24 @@ export class BuildSession {
       if (!this.bridge.isRunning() && !rec.lostError && rec.xml) {
         if (rec.committed === 0) return { xml: rec.xml };
         if (!this.bridge.isCircuitOpen()) {
-          await this.bridge.start();
+          try {
+            await this.bridge.start();
+          } catch (e) {
+            // The restart (or its replay) failed: carry what is known, say what is missing.
+            console.error('[pob-mcp] restarting the engine to export the build for an engine swap failed:', (e as Error).message);
+            return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'restartFailed') };
+          }
           this.bridge.takeRespawnReport(); // the swap result reports the restart itself
           rec = this.bridge.getRecoveryState();
         }
       }
       if (rec.lostError && rec.xml) {
-        return { xml: rec.xml, note: carriedWithoutChanges(-1, `could not restore the build (${rec.lostError})`) };
+        console.error('[pob-mcp] the build was lost at an earlier restart:', rec.lostError);
+        return { xml: rec.xml, note: carriedWithoutChanges(-1, 'buildLost') };
       }
       if (!this.bridge.isRunning()) {
         if (!rec.xml) return { xml: null };
-        return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'could not be restarted to replay them (too many crashes)') };
+        return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'breakerOpen') };
       }
       if (!this.buildInfo && !rec.xml) return { xml: null };
       const result = await this.bridge.send<{ ok: true; xml: string }>({ cmd: 'exportXML' });
@@ -334,20 +341,23 @@ export class BuildSession {
   }
 
   /**
-   * Run the rest of a committed change (the engine already applied it) and
-   * only then commit it: push its undo entry and record its command for
-   * replay after a crash. When the rest fails: with the engine gone, nothing
-   * is committed (the restarted engine will not have the change); with the
-   * engine alive the change is live, so the undo entry is still pushed to
-   * revert it, but the command is never replayed.
+   * Run the rest of a change the engine already applied (stats, build info,
+   * the report), then commit it: push its undo entry and record its command
+   * for replay after a crash. When the rest fails with the engine gone,
+   * nothing is committed (the restarted engine will not have the change).
+   * With the engine alive the change is in the live build, so it is
+   * committed all the same (undo reverts it, a later crash restores it) and
+   * the internal error says so.
    */
   private async commitAfterUnlocked<T>(entry: UndoEntry, journal: number, command: object, rest: () => Promise<T>): Promise<T> {
     let result: T;
     try {
       result = await rest();
     } catch (err) {
-      if (this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
-      throw err;
+      if (!this.bridge.isRunning()) throw err;
+      this.pushUndoEntryUnlocked(entry, journal);
+      this.bridge.recordCommitted(command);
+      throw new Error(appliedButFailed((err as Error).message), { cause: err });
     }
     this.pushUndoEntryUnlocked(entry, journal);
     this.bridge.recordCommitted(command);
@@ -1772,11 +1782,17 @@ export class BuildSession {
     return this.withLock(async () => {
       // Validate before the undo push so a rejected call changes nothing.
       await this.validateConfigOptionsUnlocked(options);
-      const configSnap = await this.snapshotConfigUnlocked();
-      const command = { cmd: 'setConfig', options: { ...options } };
-      return this.commitAfterUnlocked({ kind: 'config', snapshot: configSnap }, this.bridge.committedCount(), command, async () => {
-        const before = await this.bridge.getStats();
+      const entry: UndoEntry = { kind: 'config', snapshot: await this.snapshotConfigUnlocked() };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      try {
         await this.bridge.setConfig(options);
+      } catch (err) {
+        // The change may be partly applied: undo can revert it, but it is never replayed.
+        if (this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+        throw err;
+      }
+      return this.commitAfterUnlocked(entry, journal, { cmd: 'setConfig', options: { ...options } }, async () => {
         const after = await this.bridge.getStats();
         return { before, after, diff: computeDiff(before, after) };
       });
