@@ -31,8 +31,9 @@
 //      exists (injected by the same wrapper) is an internal error naming
 //      reset_build, not a silent difference.
 //   7. Batch-command rollbacks, with failures injected inside the engine
-//      through POB_MCP_TEST_FAULTS (read by bridge.lua at start, only in
-//      engine processes this test starts): a batch that fails after changing
+//      through POB_MCP_TEST_FAULTS (read by bridge.lua at start; set only by
+//      the LuaBridge `testFaults` option, for engine processes this test
+//      starts, never from the environment): a batch that fails after changing
 //      the tree or group is rolled back and stays a user error; a rollback
 //      that throws or leaves the tree different is an internal error naming
 //      reset_build that keeps the original message without the user-error
@@ -82,18 +83,15 @@ function installSeam(bridge: LuaBridge): void {
   }) as LuaBridge['send'];
 }
 
-/** A second engine process started with test-only faults (POB_MCP_TEST_FAULTS, read by bridge.lua at start). */
+/**
+ * A second engine process started with test-only faults. Only the LuaBridge
+ * `testFaults` option passes POB_MCP_TEST_FAULTS to the child (bridge.lua reads
+ * it at start); the server's own environment value never reaches it.
+ */
 async function faultySession(paths: ReturnType<typeof setupTestEnv>['paths'], faults: string, xml: string): Promise<{ bridge: LuaBridge; session: BuildSession }> {
-  const previous = process.env.POB_MCP_TEST_FAULTS;
-  process.env.POB_MCP_TEST_FAULTS = faults;
-  const bridge = new LuaBridge(paths, 120_000);
+  const bridge = new LuaBridge(paths, 120_000, { testFaults: faults });
   const session = new BuildSession(bridge);
-  try {
-    await session.loadBuild(xml);
-  } finally {
-    if (previous === undefined) delete process.env.POB_MCP_TEST_FAULTS;
-    else process.env.POB_MCP_TEST_FAULTS = previous;
-  }
+  await session.loadBuild(xml);
   return { bridge, session };
 }
 

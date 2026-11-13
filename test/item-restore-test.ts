@@ -34,6 +34,9 @@
 //  13. Item identity tokens differ between engine processes, so a snapshot
 //      from an engine that has since crashed or been replaced (same build,
 //      same ids) is refused by the new one.
+//  14. On a new engine: load_build, swap_item, set_config, then the FIRST
+//      load_build PoB rejects, then two undos: items, slot ids, config, tree
+//      and Life / CombinedDPS / TotalEHP are back to the loaded build.
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -739,6 +742,55 @@ async function main(): Promise<void> {
       await otherBridge.shutdown();
     }
     log('PASS: tokens are per engine process; a foreign snapshot is refused');
+
+    // ---------------------------------------------------------------- 14
+    log('Test 14: fresh load, swap_item, set_config, the FIRST failed load_build, two undos');
+    {
+      // A new engine, so the rejected load really is the first one it sees
+      // (Test 12 primes with a failed load before taking its baselines).
+      const freshBridge = new LuaBridge(paths, 120_000);
+      const fresh = new BuildSession(freshBridge);
+      // Key-order independent JSON (the bridge writes Lua tables in table order).
+      const stable = (v: unknown): string =>
+        Array.isArray(v) ? `[${v.map(stable).join(',')}]`
+        : v && typeof v === 'object' ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable((v as Record<string, unknown>)[k])}`).join(',')}}`
+        : JSON.stringify(v);
+      const snapshot = async (): Promise<{ items: string; config: string; tree: string; stats: Stats }> => {
+        const items = (await freshBridge.send<{ state: ItemsState }>({ cmd: 'captureItemsState' })).state;
+        const spec = (await freshBridge.send<{ state: Record<string, unknown> }>({ cmd: 'captureSpecState' })).state;
+        return {
+          items: stable({ itemOrder: items.itemOrder, slots: [...items.slots].sort((x, y) => x[0].localeCompare(y[0])) }),
+          config: stable(await freshBridge.getConfig()),
+          tree: stable(spec),
+          stats: await fresh.getStats(),
+        };
+      };
+      try {
+        await fresh.loadBuild(occXml);
+        const loaded = await snapshot();
+        await fresh.swapItemWithDiff('Ring 1', RING_A);
+        await fresh.setConfigWithUndo({ usePowerCharges: true });
+        let err: unknown = null;
+        try {
+          await fresh.loadBuild(occXml.replace(/treeVersion="3_13"/g, 'treeVersion="9_99"'));
+        } catch (e) {
+          err = e;
+        }
+        assert(err instanceof Error && /previously loaded build is still active/.test(err.message), `first failed load: ${String(err)}`);
+        await fresh.undoLastChange();
+        await fresh.undoLastChange();
+        const back = await snapshot();
+        assert(back.items === loaded.items, `items / slot ids after two undos\n  expected ${loaded.items}\n  actual   ${back.items}`);
+        assert(back.config === loaded.config, `config after two undos\n  expected ${loaded.config}\n  actual   ${back.config}`);
+        assert(back.tree === loaded.tree, `tree after two undos\n  expected ${loaded.tree}\n  actual   ${back.tree}`);
+        for (const key of ['Life', 'CombinedDPS', 'TotalEHP'] as const) {
+          assert(back.stats[key] === loaded.stats[key], `${key} after two undos: ${back.stats[key]} != ${loaded.stats[key]}`);
+        }
+      } finally {
+        await freshBridge.shutdown();
+      }
+    }
+    log('PASS: the first failed load keeps undo working back to the loaded build');
 
     log('ALL ITEM RESTORE TESTS PASSED');
   } finally {

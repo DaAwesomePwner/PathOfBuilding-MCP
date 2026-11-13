@@ -27,9 +27,6 @@ for later.
   `npm run test:source-clone` should point at a release tag until then.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
-- **Rejected build recorded for respawn.** `LuaBridge.lastLoadedXML` is set
-  before the load succeeds, so a crash restart replays a build the engine
-  refused.
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
   install are not normalised. Network-path installs get no zlib.
 - **`__proto__` dropped by the input schema.** `z.record` removes the key
@@ -63,11 +60,6 @@ node list and tree URL can come out reordered.
 - **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
   pastebin links (`parseBuildURL` in `src/validation.ts`); poe.ninja links are
   refused with a UserError.
-- **Crash breaker never trips (confirmed).** Strikes reset after 5 successful
-  commands and timeouts never count (`src/lua-bridge.ts:104,176-182,253-259`).
-- **Respawn restores the wrong build (confirmed).** After a crash the originally
-  loaded XML is reloaded, dropping committed changes; `lastLoadedXML` is set
-  before the load succeeds; a failed startup leaves a live unready process.
 - **Swallowed errors give wrong answers (confirmed).** Empty `catch {}` in
   `compareSupports`, `suggestUpgrades`, `compareScenarios`
   (`src/build-session.ts:998,1364,1490`) turn failures into zero deltas.
@@ -113,6 +105,6 @@ node list and tree URL can come out reordered.
 - **Fixture is pinned to tree `3_13`** (`test/fixtures/OccVortex.xml`) with
   hardcoded gem names in `test/phase5-test.ts`; assert on structure, add a
   current-league fixture.
-- **No tests** for the crash breaker, timeout recovery, stdin-EOF shutdown, or
-  that all tools are registered. `test/` is not type-checked.
+- **No tests** for stdin-EOF shutdown, or that all tools are registered.
+  `test/` is not type-checked.
 - **Nightly run against PoB's `dev` branch** to catch internal API changes early.

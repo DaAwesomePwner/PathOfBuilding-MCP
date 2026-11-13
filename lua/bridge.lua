@@ -647,6 +647,26 @@ for name in tostring(os.getenv("POB_MCP_TEST_FAULTS") or ""):gmatch("[%w_]+") do
 	TEST_FAULTS[name] = true
 end
 
+-- Test fault: stall without answering (a hung engine). Bounded, so a process
+-- nobody kills still ends on its own.
+local function testFaultStall()
+	local deadline = os.clock() + 300
+	while os.clock() < deadline do end
+end
+
+-- Test faults for any command: exitOn_<cmd> ends the process, hangOn_<cmd>
+-- stalls and failOn_<cmd> raises an error before running it. exitAfterChange
+-- ends the process on the first command after a successful build change
+-- (equipItem, unequipItem, setConfig, convertTreeToLatest).
+local TEST_CHANGE_COMMANDS = { equipItem = true, unequipItem = true, setConfig = true, convertTreeToLatest = true }
+local testChangeDone = false
+local function testFaultsForCommand(name)
+	if TEST_FAULTS.exitAfterChange and testChangeDone then os.exit(3) end
+	if TEST_FAULTS["exitOn_" .. tostring(name)] then os.exit(3) end
+	if TEST_FAULTS["hangOn_" .. tostring(name)] then testFaultStall() end
+	if TEST_FAULTS["failOn_" .. tostring(name)] then error("test fault: " .. tostring(name) .. " failed", 0) end
+end
+
 local function encodeJSON(obj)
 	local ok, encoded = pcall(dkjson.encode, obj)
 	if ok and type(encoded) == "string" then
@@ -1603,6 +1623,9 @@ local function convertTreeToLatest()
 	convertState.overrideNames = overrideNames
 	local droppedOverrides = installSpec(toVersion, convertState)
 	local newSpec = build.spec
+	-- Test faults: the engine dies or hangs with the new spec already active.
+	if TEST_FAULTS.convertExitsAfterSwap then os.exit(3) end
+	if TEST_FAULTS.convertHangsAfterSwap then testFaultStall() end
 
 	local lost, changed = { }, { }
 	for _, id in ipairs(state.hashList) do
@@ -3499,6 +3522,7 @@ local function dispatch(cmd)
 	if not entry then
 		userError("Unknown command: " .. tostring(cmd.cmd))
 	end
+	testFaultsForCommand(cmd.cmd)
 	local expectBuild = not NO_BUILD_REQUIRED[cmd.cmd]
 	-- Any leftover state from an earlier command must not be attributed to
 	-- this one.
@@ -3513,6 +3537,7 @@ local function dispatch(cmd)
 	local popupsBefore = currentPopups()
 	local ok, body = pcall(function()
 		local b = entry.handler(cmd)
+		if TEST_CHANGE_COMMANDS[cmd.cmd] then testChangeDone = true end
 		if entry.mutating then
 			b.stats = getStats()
 		end
@@ -3542,6 +3567,10 @@ do
 	end
 	clearPoBErrorState()
 end
+
+-- Test faults: a startup that never becomes ready, or that fails.
+if TEST_FAULTS.hangOnStart then testFaultStall() end
+if TEST_FAULTS.failOnStart then error("test fault: startup failed", 0) end
 
 respond({ ok = true, ready = true })
 
