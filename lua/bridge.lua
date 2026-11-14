@@ -3032,9 +3032,57 @@ local TRADE_PSEUDO_MAP = {
 	["3261801346"] = "pseudo.pseudo_total_dexterity",
 	["328541901"] = "pseudo.pseudo_total_intelligence",
 }
+-- The stat hash PoB's FinishQuery keys pseudoMap / ignoredStats by.
+local function tradeStatHash(id)
+	return type(id) == "string" and not id:find("^pseudo%.") and id:match("^[a-z]+%.stat_(%d+)$") or nil
+end
 local function tradePseudoFor(id)
-	local hash = type(id) == "string" and not id:find("^pseudo%.") and id:match("^[a-z]+%.stat_(%d+)$")
+	local hash = tradeStatHash(id)
 	return hash and TRADE_PSEUDO_MAP[hash] or nil
+end
+-- PoB's FinishQuery also drops these stats from the weights (their value is
+-- already in the pseudo totals above): all elemental resistances, all
+-- attributes (literal hashes there) and every hybrid resistance / attribute
+-- (hashed there with HashStats from these name patterns). Built the same way,
+-- keyed by hash, valued by the pseudo totals that count the stat.
+local TRADE_IGNORED_LITERAL = {
+	["2901986750"] = { "fire", "cold", "lightning" }, -- % all elemental resistances
+	["1379411836"] = { "strength", "dexterity", "intelligence" }, -- all attributes
+	["2897413282"] = { "strength", "dexterity", "intelligence" },
+}
+local tradeIgnored = nil
+local function tradeIgnoredFor(id)
+	if not tradeIgnored then
+		local attributes = { strength = true, dexterity = true, intelligence = true }
+		local pseudoOf = function(name)
+			return "pseudo.pseudo_total_" .. name .. (attributes[name] and "" or "_resistance")
+		end
+		tradeIgnored = { }
+		local function add(hash, names)
+			local list, seen = { }, { }
+			for _, name in ipairs(names) do
+				local pseudo = pseudoOf(name)
+				if not seen[pseudo] then seen[pseudo] = true list[#list + 1] = pseudo end
+			end
+			tradeIgnored[tostring(hash)] = list
+		end
+		for hash, names in pairs(TRADE_IGNORED_LITERAL) do add(hash, names) end
+		local resElements = { "fire", "cold", "lightning", "chaos" }
+		for _, elem1 in ipairs(resElements) do
+			for _, elem2 in ipairs(resElements) do
+				add(HashStats({ string.format("%s_and_%s_damage_resistance_%%", elem1, elem2) }), { elem1, elem2 })
+			end
+		end
+		local attributeElements = { "dexterity", "strength", "intelligence" }
+		for _, elem1 in ipairs(attributeElements) do
+			for _, elem2 in ipairs(attributeElements) do
+				add(HashStats({ string.format("base_%s_and_%s", elem1, elem2) }), { elem1, elem2 })
+				add(HashStats({ string.format("additional_%s_and_%s", elem1, elem2) }), { elem1, elem2 })
+			end
+		end
+	end
+	local hash = tradeStatHash(id)
+	return hash and tradeIgnored[hash] or nil
 end
 local tradeState = nil
 
@@ -3138,6 +3186,17 @@ local function runTradeQuery(cmd)
 	local slot = tradeSlotOrError(cmd.slot, st.helpers)
 	local statWeights = tradeStatWeights(cmd.statWeights)
 	local idTexts = tradeIdTexts(st, cmd.tradeIds)
+	-- A weight on a stat PoB leaves out of the weights would count it twice
+	-- (the pseudo totals already include it): name the totals to adjust.
+	for _, id in ipairs(cmd.adjustmentIds or { }) do
+		local totals = tradeIgnoredFor(id)
+		if totals then
+			userError("weightAdjustments cannot weigh " .. id .. " (" .. tostring(st.texts[id])
+				.. "): Path of Building leaves it out of weighted searches because "
+				.. table.concat(totals, ", ") .. " already count it; adjust "
+				.. (#totals > 1 and "those" or "that") .. " instead (it is still valid in requiredMods)")
+		end
+	end
 	local o = cmd.options or { }
 	local tradeTypeIndex = nil
 	for i, t in ipairs(TRADE_TYPES) do if t == o.tradeType then tradeTypeIndex = i end end
@@ -3244,16 +3303,21 @@ local function searchTradeMods(cmd)
 	for _, pseudo in pairs(TRADE_PSEUDO_MAP) do preferredPseudo[pseudo] = true end
 	-- Only ids generate_trade_search accepts (present in TradeSiteStats.lua).
 	-- Single resistances/attributes point at their pseudo total, which is
-	-- listed first: PoB weighs those stats through the pseudo filter.
+	-- listed first: PoB weighs those stats through the pseudo filter. Stats
+	-- PoB leaves out of the weights (all/hybrid resistances and attributes)
+	-- stay listed with weightable = false and the totals that count them.
 	local function add(id, text, kind)
 		if seen[id] or not st.texts[id] then return end
 		seen[id] = true
 		if text:lower():find(needle, 1, true) then
-			found[#found + 1] = {
+			local entry = {
 				tradeId = id, text = text, type = kind,
 				preferred = preferredPseudo[id] or nil,
 				preferredTradeId = tradePseudoFor(id),
 			}
+			local totals = tradeIgnoredFor(id)
+			if totals then entry.weightable, entry.preferredTradeIds = false, totals end
+			found[#found + 1] = entry
 		end
 	end
 	for _, kind in ipairs({ "Explicit", "Implicit", "Corrupted" }) do
