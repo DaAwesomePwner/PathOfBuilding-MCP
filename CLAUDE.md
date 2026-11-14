@@ -33,10 +33,12 @@ npm run test:phase7   # diagnostics / upgrades / export / snapshots
 npm run test:integrity  # bit-exact snapshot/restore stress
 npm run test:crash-recovery  # crash breaker, timeouts, respawn restores the last committed build
 npm run test:errors   # input validation paths
-npm run test:all      # everything (over 10 min)
+npm run test:all      # everything, in parallel (~2.5 min on a desktop); `npm run test:all -- bridge phase4` runs a subset
 ```
 
 Single test: `tsx test/<file>.ts` — they're plain Node scripts.
+
+`test:all` is `scripts/run-tests.mjs`: it runs every `test:*` script of `package.json` (a new one is picked up automatically; its command must be `tsx test/<file>.ts`), several at a time, each in its own process, and prints each script's output when it ends. `--jobs N` or `TEST_JOBS=N` sets how many run at once (default: CPU count, at most 6). A test script must therefore not depend on what other scripts are doing on the machine; one that has to (`test:startup` counts every LuaJIT process) is listed in `EXCLUSIVE` in the runner and runs alone at the end. While implementing, run only the scripts that cover the change; run `test:all` once before a push or PR.
 
 Path resolution order: **env var → saved config (`configure_pob_path`) → auto-detect probe table** (`src/paths.ts`, `src/luajit-paths.ts`). Errors list everything probed.
 

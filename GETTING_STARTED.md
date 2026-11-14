@@ -135,7 +135,7 @@ npm run typecheck        # tsc --noEmit
 npm run test:paths       # unit tests, no PoB needed
 npm run test:startup     # starts dist/server.js unconfigured, then configure_pob_path / reload_engine (needs PoB for the last part)
 npm run test:bridge      # Lua bridge end-to-end (needs POB_PATH + luajit)
-npm run test:all         # full suite, ~3 min
+npm run test:all         # full suite, in parallel, ~2.5 min
 ```
 
 Tests print `SKIPPED:` and exit 0 when no PoB install is found or luajit is missing.
