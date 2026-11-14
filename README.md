@@ -128,6 +128,8 @@ npm run test:all
 
 If `POB_PATH` is unset and auto-detect fails, the integration tests print `SKIPPED:` and exit 0 — unless `REQUIRE_POB=1` is set, in which case they fail. `test:source-clone` additionally needs `POB_SOURCE_PATH` pointing at a PoB git clone. `npm run test:paths` and the first two parts of `npm run test:startup` need no PoB install. The tests never read or write your real saved config (`test:startup` uses a temp `POB_MCP_CONFIG_DIR`).
 
+`test:all` runs the test scripts in parallel (`scripts/run-tests.mjs`). `npm run test:all -- bridge phase4` runs only those scripts, and `--jobs 1` (or `TEST_JOBS=1`) runs them one at a time.
+
 Single test file:
 
 ```bash

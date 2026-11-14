@@ -605,21 +605,25 @@ async function test15SwapExportReplayCrash(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // The cases share nothing but the read-only fixture: each starts its own
+  // engines with its own strike count. They run in three lanes of similar
+  // length so the file takes about a third of the time; log lines of
+  // different lanes interleave. (Test 9 sets POB_MCP_TEST_FAULTS in this
+  // process's environment for a moment; the bridge strips it for every child,
+  // so the other lanes' engines never see it.)
+  const lanes: Array<Array<() => Promise<void>>> = [
+    // test8 has a 15 s boot and command timeout, so it does not start at the busiest moment.
+    [test3Manager, test8Convert, test5Rejected, test9Env],
+    [test10FailedCommit, test13AppliedButFailed, test4And7Committed, test6Startup],
+    [test11LoadAfterCrash, test12LostRestore, test15SwapExportReplayCrash, test1Breaker, test2Timeout, test14ResetAfterCrash],
+  ];
   try {
-    await test1Breaker();
-    await test2Timeout();
-    await test3Manager();
-    await test4And7Committed();
-    await test5Rejected();
-    await test6Startup();
-    await test8Convert();
-    await test9Env();
-    await test10FailedCommit();
-    await test11LoadAfterCrash();
-    await test12LostRestore();
-    await test13AppliedButFailed();
-    await test14ResetAfterCrash();
-    await test15SwapExportReplayCrash();
+    const outcomes = await Promise.allSettled(lanes.map(async (lane) => {
+      for (const test of lane) await test();
+    }));
+    const failures = outcomes.filter((o): o is PromiseRejectedResult => o.status === 'rejected');
+    for (const f of failures.slice(1)) console.error('FAIL (another lane):', f.reason instanceof Error ? f.reason.stack ?? f.reason.message : f.reason);
+    if (failures.length > 0) throw failures[0].reason;
   } finally {
     const pids = bridges.map((b) => b.getPid()).filter((p): p is number => p !== undefined);
     for (const b of bridges) await b.dispose().catch(() => undefined);
