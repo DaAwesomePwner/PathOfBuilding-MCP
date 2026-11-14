@@ -36,6 +36,9 @@ function killTree(child) {
   }
 }
 
+// If the runner itself dies (an uncaught error), nothing may be left running.
+process.on('exit', () => { for (const child of running) killTree(child); });
+
 // The scripts are in their own process groups on POSIX, so an interrupt of
 // the runner has to be passed on.
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -161,7 +164,7 @@ await new Promise((resolve) => {
   let active = 0;
   const fill = () => {
     for (let i = 0; i < queue.length;) {
-      const slots = Math.min(SLOTS[queue[i]] ?? 1, jobCount);
+      const slots = Math.min(Object.hasOwn(SLOTS, queue[i]) ? SLOTS[queue[i]] : 1, jobCount);
       if (slots > free) { i++; continue; }
       const [name] = queue.splice(i, 1);
       free -= slots;
