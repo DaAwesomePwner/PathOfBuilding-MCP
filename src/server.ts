@@ -7,6 +7,7 @@ import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
 import type { Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
+import { registerTradeTools } from './trade-search.js';
 import { createToolRegistrar } from './tool-registry.js';
 import { UserError, validateBuildSource, validateItemText, validateSlot } from './validation.js';
 
@@ -105,6 +106,7 @@ const server = new McpServer({
 const tools = createToolRegistrar(server, engine);
 
 registerEngineTools(tools, engine);
+registerTradeTools(tools);
 
 tools.engine<{ source: string }>(
   'load_build',
