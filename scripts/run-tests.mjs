@@ -50,6 +50,11 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 // machine to prove an engine swap leaves exactly one.
 const EXCLUSIVE = ['startup'];
 
+// How many of the `--jobs` slots a script takes. test:crash-recovery runs its
+// cases in three lanes, so it keeps three engines busy at once. Running more
+// engines than cores makes engine commands slow enough to hit their timeouts.
+const SLOTS = { 'crash-recovery': 3 };
+
 // Longest first, so the slow scripts never end up queued behind each other.
 // Scripts not listed here still run, after these.
 const SLOWEST_FIRST = [
@@ -142,20 +147,32 @@ const { names, jobCount } = parseArgs(process.argv.slice(2), tests);
 const startedAll = Date.now();
 const queue = names.filter((n) => !EXCLUSIVE.includes(n));
 const alone = names.filter((n) => EXCLUSIVE.includes(n));
-const lanes = Math.min(jobCount, queue.length);
-console.log(`run-tests: ${names.length} script(s), ${Math.max(lanes, 1)} at a time${alone.length > 0 && queue.length > 0 ? `, then ${alone.map((n) => `test:${n}`).join(', ')} alone` : ''}`);
+console.log(`run-tests: ${names.length} script(s), ${jobCount} slot(s)${alone.length > 0 && queue.length > 0 ? `, then ${alone.map((n) => `test:${n}`).join(', ')} alone` : ''}`);
 
 const results = [];
-async function worker() {
-  for (let name = queue.shift(); name !== undefined; name = queue.shift()) {
-    const result = await runOne(name, tests.get(name));
-    results.push(result);
-    report(result);
-  }
+async function run(name) {
+  const result = await runOne(name, tests.get(name));
+  results.push(result);
+  report(result);
 }
-await Promise.all(Array.from({ length: lanes }, worker));
-queue.push(...alone);
-await worker();
+// Start the first queued script that fits the free slots, until none is left.
+await new Promise((resolve) => {
+  let free = jobCount;
+  let active = 0;
+  const fill = () => {
+    for (let i = 0; i < queue.length;) {
+      const slots = Math.min(SLOTS[queue[i]] ?? 1, jobCount);
+      if (slots > free) { i++; continue; }
+      const [name] = queue.splice(i, 1);
+      free -= slots;
+      active++;
+      run(name).then(() => { free += slots; active--; fill(); });
+    }
+    if (active === 0 && queue.length === 0) resolve();
+  };
+  fill();
+});
+for (const name of alone) await run(name);
 
 const failed = results.filter((r) => r.code !== 0);
 const skipped = results.filter((r) => r.code === 0 && /^SKIPPED/m.test(r.output));
