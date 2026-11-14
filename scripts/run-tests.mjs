@@ -10,7 +10,7 @@
 // Output is buffered per script and printed when that script ends, so logs do
 // not interleave. Exit code is 1 when any script fails.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,12 +20,43 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_DEFAULT_JOBS = 6;
 // A script still running after this is killed and reported as failed with the
 // output it produced, so a hang shows which script hung.
-const SCRIPT_TIMEOUT_MS = 15 * 60_000;
+// TEST_SCRIPT_TIMEOUT_MS overrides it (used to try the timeout path by hand).
+const SCRIPT_TIMEOUT_MS = Number(process.env.TEST_SCRIPT_TIMEOUT_MS) > 0 ? Number(process.env.TEST_SCRIPT_TIMEOUT_MS) : 15 * 60_000;
+const isWindows = process.platform === 'win32';
+const running = new Set();
+
+// Kills a test script together with everything it started (its LuaJIT engines,
+// a built server). Killing only the script would skip its own cleanup and
+// leave a stuck engine running. On POSIX each script is its own process group.
+function killTree(child) {
+  if (child.pid === undefined) return;
+  if (isWindows) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+  else {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+  }
+}
+
+// If the runner itself dies (an uncaught error), nothing may be left running.
+process.on('exit', () => { for (const child of running) killTree(child); });
+
+// The scripts are in their own process groups on POSIX, so an interrupt of
+// the runner has to be passed on.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    for (const child of running) killTree(child);
+    process.exit(130);
+  });
+}
 
 // Scripts that cannot share the machine with other engines. They run one at a
 // time after everything else. test:startup counts every LuaJIT process on the
 // machine to prove an engine swap leaves exactly one.
 const EXCLUSIVE = ['startup'];
+
+// How many of the `--jobs` slots a script takes. test:crash-recovery runs its
+// cases in three lanes, so it keeps three engines busy at once. Running more
+// engines than cores makes engine commands slow enough to hit their timeouts.
+const SLOTS = { 'crash-recovery': 3 };
 
 // Longest first, so the slow scripts never end up queued behind each other.
 // Scripts not listed here still run, after these.
@@ -83,18 +114,21 @@ function runOne(name, file) {
       cwd: root,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: !isWindows,
     });
+    running.add(child);
     child.stdout.on('data', (c) => chunks.push(c));
     child.stderr.on('data', (c) => chunks.push(c));
     const done = (code, note) => resolve({
       name, code, note, seconds: (Date.now() - started) / 1000, output: Buffer.concat(chunks).toString('utf8'),
     });
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, SCRIPT_TIMEOUT_MS);
-    child.on('error', (e) => { clearTimeout(timer); done(1, `could not start: ${e.message}`); });
+    const timer = setTimeout(() => { timedOut = true; killTree(child); }, SCRIPT_TIMEOUT_MS);
+    child.on('error', (e) => { clearTimeout(timer); running.delete(child); done(1, `could not start: ${e.message}`); });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      if (timedOut) done(1, `killed after ${SCRIPT_TIMEOUT_MS / 60_000} min`);
+      running.delete(child);
+      if (timedOut) done(1, `killed with its child processes after ${Math.round(SCRIPT_TIMEOUT_MS / 1000)} s`);
       else done(code ?? 1, signal ? `killed by ${signal}` : undefined);
     });
   });
@@ -116,20 +150,32 @@ const { names, jobCount } = parseArgs(process.argv.slice(2), tests);
 const startedAll = Date.now();
 const queue = names.filter((n) => !EXCLUSIVE.includes(n));
 const alone = names.filter((n) => EXCLUSIVE.includes(n));
-const lanes = Math.min(jobCount, queue.length);
-console.log(`run-tests: ${names.length} script(s), ${Math.max(lanes, 1)} at a time${alone.length > 0 && queue.length > 0 ? `, then ${alone.map((n) => `test:${n}`).join(', ')} alone` : ''}`);
+console.log(`run-tests: ${names.length} script(s), ${jobCount} slot(s)${alone.length > 0 && queue.length > 0 ? `, then ${alone.map((n) => `test:${n}`).join(', ')} alone` : ''}`);
 
 const results = [];
-async function worker() {
-  for (let name = queue.shift(); name !== undefined; name = queue.shift()) {
-    const result = await runOne(name, tests.get(name));
-    results.push(result);
-    report(result);
-  }
+async function run(name) {
+  const result = await runOne(name, tests.get(name));
+  results.push(result);
+  report(result);
 }
-await Promise.all(Array.from({ length: lanes }, worker));
-queue.push(...alone);
-await worker();
+// Start the first queued script that fits the free slots, until none is left.
+await new Promise((resolve) => {
+  let free = jobCount;
+  let active = 0;
+  const fill = () => {
+    for (let i = 0; i < queue.length;) {
+      const slots = Math.min(Object.hasOwn(SLOTS, queue[i]) ? SLOTS[queue[i]] : 1, jobCount);
+      if (slots > free) { i++; continue; }
+      const [name] = queue.splice(i, 1);
+      free -= slots;
+      active++;
+      run(name).then(() => { free += slots; active--; fill(); });
+    }
+    if (active === 0 && queue.length === 0) resolve();
+  };
+  fill();
+});
+for (const name of alone) await run(name);
 
 const failed = results.filter((r) => r.code !== 0);
 const skipped = results.filter((r) => r.code === 0 && /^SKIPPED/m.test(r.output));

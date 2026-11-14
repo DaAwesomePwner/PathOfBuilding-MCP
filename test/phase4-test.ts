@@ -34,7 +34,9 @@ function isError(result: unknown): boolean {
 }
 
 async function call(client: Client, name: string, args: Record<string, unknown> = {}): Promise<unknown> {
-  return client.callTool({ name, arguments: args });
+  // find_best_next_nodes takes about 40 s on a CI runner, close to the client's
+  // default 60 s request timeout; other test scripts run at the same time.
+  return client.callTool({ name, arguments: args }, undefined, { timeout: 180_000 });
 }
 
 function approxEq(a: unknown, b: unknown, tol = 1e-3): boolean {
