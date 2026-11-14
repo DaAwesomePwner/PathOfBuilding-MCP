@@ -98,7 +98,7 @@ The server exposes 39 MCP tools. See [`GETTING_STARTED.md`](./GETTING_STARTED.md
 - **Gems:** `list_skill_groups`, `lookup_gem`, `list_available_supports`, `swap_gem`, `compare_supports`, `evaluate_gem_levels`, `find_optimal_links`.
 - **Config / scenarios:** `get_config`, `set_config`, `list_scenarios`, `simulate_scenario`, `compare_scenarios`, `toggle_buffs`.
 - **State / analysis:** `undo_last_change`, `snapshot_and_compare`, `diagnose_build`.
-- **Trade:** `generate_trade_search` (runs PoB's own weighted trade query generator for a gear or flask slot and returns a pathofexile.com trade search URL sorted by weighted sum, with the weights so they can be adjusted, plus required mods and a minimum; read-only, no network access — the link is only opened by you), `search_trade_mods` (find trade stat ids for a slot by text).
+- **Trade:** `generate_trade_search` (runs PoB's own weighted trade query generator for a gear or flask slot and returns a pathofexile.com trade search URL sorted by weighted sum, with the weights so they can be adjusted, plus required mods and a minimum; read-only, no network access — the link is only opened by you), `search_trade_mods` (find trade stat ids for a slot by text; all/hybrid resistance and attribute ids come back with `weightable: false` and the pseudo totals to weight instead in `preferredTradeIds` — they still work as required mods).
 
 ## Troubleshooting
 

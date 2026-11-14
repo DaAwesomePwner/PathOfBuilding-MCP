@@ -19,8 +19,15 @@ export interface TradeQueryRaw {
 export interface TradeModsResult {
   itemCategory: string | null;
   total: number;
-  /** `preferred`: a pseudo total PoB weighs that stat through (listed first); `preferredTradeId`: use it instead. */
-  mods: { tradeId: string; text: string; type: 'Explicit' | 'Implicit' | 'Corrupted' | 'Pseudo'; preferred?: true; preferredTradeId?: string }[];
+  /**
+   * `preferred`: a pseudo total PoB weighs that stat through (listed first); `preferredTradeId`: use it instead.
+   * `weightable: false`: PoB leaves the stat out of weighted searches (all/hybrid resistances and attributes, counted
+   * by the pseudo totals in `preferredTradeIds`), so weightAdjustments refuse it; it still works in requiredMods.
+   */
+  mods: {
+    tradeId: string; text: string; type: 'Explicit' | 'Implicit' | 'Corrupted' | 'Pseudo';
+    preferred?: true; preferredTradeId?: string; weightable?: false; preferredTradeIds?: string[];
+  }[];
 }
 
 const MAX_FILTERS = 36; // PoB's MAX_FILTERS (TradeQueryGenerator.lua)
@@ -31,7 +38,7 @@ const INFLUENCES = ['shaper', 'elder', 'warlord', 'hunter', 'crusader', 'redeeme
 const CURRENCIES = ['chaos-equivalent', 'chaos', 'divine', 'alch', 'alt', 'chrome', 'exalted', 'blessed', 'chisel',
   'gcp', 'jewellers', 'scour', 'regret', 'fusing', 'chance', 'regal', 'vaal'] as const;
 const ELDRITCH_SLOTS = new Set(['Body Armour', 'Helmet', 'Gloves', 'Boots']);
-const TRADE_ID_RE =/^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+)?$/;
+const TRADE_ID_RE = /^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+)?$/;
 
 const tradeId = z.string().max(80).describe('Trade stat id, e.g. "explicit.stat_3299347043" or "pseudo.pseudo_total_life" (find ids with search_trade_mods).');
 
@@ -64,9 +71,9 @@ export const tradeSearchSchema = {
     .describe('What to optimise, as PoB stat names with multipliers (default FullDPS 1.0 + TotalEHP 0.5, like PoB). Unknown names list the valid ones.'),
   tradeType: z.enum(TRADE_TYPES).optional().describe('Listing status filter (default "available" = instant buyout and in-person).'),
   includeCorrupted: z.boolean().optional().describe('Weigh corrupted implicits (default: true unless the current item is corrupted).'),
-  includeEldritch: z.enum(ELDRITCH).optional().describe('Body/helmet/gloves/boots only: eldritch implicit handling (default "copyCurrent" = no eldritch weights).'),
+  includeEldritch: z.enum(ELDRITCH).optional().describe('Body/helmet/gloves/boots: eldritch implicit handling (default "copyCurrent" = no eldritch weights; "keep..." weighs them). Other slots accept only "copyCurrent" / "remove", which change nothing there.'),
   includeScourge: z.boolean().optional().describe('Weigh scourge mods (default: true only in Standard/Hardcore).'),
-  includeTalisman: z.boolean().optional().describe('Amulet only: weigh talisman implicits (default false).'),
+  includeTalisman: z.boolean().optional().describe('Amulet: weigh talisman implicits (default false). Other slots accept only false.'),
   includeMirrored: z.boolean().optional().describe('Allow mirrored items (default true).'),
   influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences.'),
   maxPrice: z.object({ amount: z.number().int().positive().max(1_000_000), currency: z.enum(CURRENCIES).optional() }).optional()
@@ -77,7 +84,7 @@ export const tradeSearchSchema = {
   requiredMods: z.array(z.object({ tradeId, min: z.number().optional() })).max(10).optional()
     .describe('Hard requirements: every listed mod must be present (with at least `min` when given).'),
   weightAdjustments: z.array(z.object({ tradeId, weight: z.number().min(-1000).max(1000) })).max(MAX_FILTERS).optional()
-    .describe('Applied after PoB computes its weights: replaces a filter\'s weight, adds a missing filter, or removes it (weight 0). Adjusted/added filters are never dropped by the 36-filter cap. Use it e.g. to add resistance weight when PoB scores capped resists as 0 but the replaced item provided them. Single resistance/attribute ids apply to their pseudo total (e.g. pseudo.pseudo_total_fire_resistance), the filter PoB weighs them through.'),
+    .describe('Applied after PoB computes its weights: replaces a filter\'s weight, adds a missing filter, or removes it (weight 0). Adjusted/added filters are never dropped by the 36-filter cap. Use it e.g. to add resistance weight when PoB scores capped resists as 0 but the replaced item provided them. Single resistance/attribute ids apply to their pseudo total (e.g. pseudo.pseudo_total_fire_resistance), the filter PoB weighs them through. All/hybrid resistance and attribute ids are refused (PoB leaves them out because the pseudo totals count them; adjust those totals instead).'),
   minWeightedSum: z.number().optional().describe('Override the minimum weighted sum (default: PoB\'s, half the current item\'s estimated weighted value).'),
 };
 
@@ -109,20 +116,26 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
   checkTradeIds((args.weightAdjustments ?? []).map((m) => m.tradeId), 'weightAdjustments');
   if (args.sockets !== undefined && /Flask/.test(args.slot)) throw new UserError('sockets is not available for flask slots');
   if (args.links !== undefined && /Flask|Belt|Ring|Amulet/.test(args.slot)) throw new UserError(`links is not available for ${args.slot}`);
-  // PoB only offers these options on their slots: refuse instead of dropping them silently.
-  if (args.includeEldritch !== undefined && !ELDRITCH_SLOTS.has(args.slot)) {
-    throw new UserError(`includeEldritch only applies to ${[...ELDRITCH_SLOTS].join(', ')}, not ${args.slot}`);
+  // PoB only offers these options on their slots. Elsewhere a value that changes nothing there is accepted
+  // (eldritch weights come only from "keep..."; talisman mods only from includeTalisman true); the rest
+  // is refused instead of being dropped silently.
+  if (args.includeEldritch?.startsWith('keep') && !ELDRITCH_SLOTS.has(args.slot)) {
+    throw new UserError(`includeEldritch "${args.includeEldritch}" only applies to ${[...ELDRITCH_SLOTS].join(', ')}, not ${args.slot} ` +
+      '(there "copyCurrent" and "remove" are accepted and change nothing)');
   }
   if (args.includeEldritch?.startsWith('keep') && (args.influences?.length ?? 0) > 0) {
     throw new UserError('includeEldritch "keep..." cannot be combined with influences: influenced items have no eldritch implicits, so PoB skips those weights');
   }
-  if (args.includeTalisman !== undefined && args.slot !== 'Amulet') throw new UserError(`includeTalisman only applies to Amulet, not ${args.slot}`);
+  if (args.includeTalisman === true && args.slot !== 'Amulet') {
+    throw new UserError(`includeTalisman true only applies to Amulet, not ${args.slot} (false is accepted and changes nothing)`);
+  }
   const currency = args.maxPrice?.currency ?? 'chaos-equivalent';
   return {
     cmd: 'tradeQuery',
     slot: args.slot,
     statWeights: weights,
     tradeIds: [...(args.requiredMods ?? []), ...(args.weightAdjustments ?? [])].map((m) => m.tradeId),
+    adjustmentIds: (args.weightAdjustments ?? []).map((m) => m.tradeId),
     options: {
       tradeType: args.tradeType ?? 'available',
       includeCorrupted: args.includeCorrupted,
@@ -277,7 +290,9 @@ export function registerTradeTools(tools: ToolRegistrar): void {
       description:
         'Find trade stat ids for mods that can appear on the item in a slot (explicit, implicit, corrupted) plus pseudo stats, by ' +
         'case-insensitive text match. Use the ids in generate_trade_search requiredMods / weightAdjustments. For single resistances and ' +
-        'attributes PoB weighs the pseudo total: those pseudo ids are listed first (preferred: true) and the other entries name it in preferredTradeId.',
+        'attributes PoB weighs the pseudo total: those pseudo ids are listed first (preferred: true) and the other entries name it in preferredTradeId. ' +
+        'All/hybrid resistances and attributes are marked weightable: false (PoB counts them in the pseudo totals named in preferredTradeIds; ' +
+        'weight those instead) but are valid in requiredMods.',
       inputSchema: {
         slot: z.string().min(1).describe('Gear or flask slot, e.g. "Helmet" or "Ring 1".'),
         query: z.string().trim().min(1).max(100).describe('Text to look for, e.g. "life" or "fire resistance".'),

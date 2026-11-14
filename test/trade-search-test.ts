@@ -1,11 +1,12 @@
 /**
  * generate_trade_search / search_trade_mods: URL shape, weighted query, weight
  * adjustments surviving the filter cap, required mods, min override, input
- * errors, and the build left unchanged.
+ * errors, the bridge's copy of PoB's pseudoMap / ignoredStats still matching
+ * the installed TradeQueryGenerator.lua, and the build left unchanged.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -13,6 +14,7 @@ import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
+const bridgePath = path.resolve(testDir, '..', 'lua', 'bridge.lua');
 const LEAGUE = 'Settlers of Kalguur';
 const SEARCH_PREFIX = 'https://www.pathofexile.com/trade/search/Settlers%20of%20Kalguur?q=';
 
@@ -41,6 +43,46 @@ interface Query {
 }
 const FIRE_RES_EXPLICIT = 'explicit.stat_3372524247';
 const FIRE_RES_PSEUDO = 'pseudo.pseudo_total_fire_resistance';
+const ALL_ELE_RES = 'explicit.stat_2901986750';
+const ALL_ATTRIBUTES = 'explicit.stat_1379411836';
+interface TradeMod {
+  tradeId: string; text: string; type: string; preferred?: boolean; preferredTradeId?: string; weightable?: boolean; preferredTradeIds?: string[];
+}
+
+/** The `local <name> = { ... }` table literal that starts after `from` in Lua source (braces balanced, none in strings). */
+function luaTable(source: string, name: string, from = 0): string {
+  const start = source.indexOf(`local ${name} = {`, from);
+  assert(start >= 0, `local ${name} table not found`);
+  let depth = 0;
+  for (let i = source.indexOf('{', start); i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1);
+  }
+  throw new Error(`local ${name} table is not closed`);
+}
+/** `["<digits>"] = "<string>"` entries of a Lua table literal, sorted by key. */
+function luaStringEntries(table: string): [string, string][] {
+  return [...table.matchAll(/\["(\d+)"\]\s*=\s*"([^"]*)"/g)].map((m): [string, string] => [m[1], m[2]]).sort();
+}
+/** `["<digits>"] =` keys of a Lua table literal, sorted. */
+function luaKeys(table: string): string[] {
+  return [...table.matchAll(/\["(\d+)"\]\s*=/g)].map((m) => m[1]).sort();
+}
+/** FinishQuery lines that build PoB's hybrid resistance / attribute hashes; the bridge repeats them. */
+const IGNORED_PATTERN_LINES = [
+  'local resElements = { "fire", "cold", "lightning", "chaos" }',
+  'string.format("%s_and_%s_damage_resistance_%%", elem1, elem2)',
+  'local attributeElements = { "dexterity", "strength", "intelligence" }',
+  'string.format("base_%s_and_%s", elem1, elem2)',
+  'string.format("additional_%s_and_%s", elem1, elem2)',
+];
+/** Read-only: the installed PoB's TradeQueryGenerator.lua (installed layout or source clone). */
+function pobGeneratorSource(pobPath: string): string {
+  const file = [path.join(pobPath, 'Classes', 'TradeQueryGenerator.lua'), path.join(pobPath, 'src', 'Classes', 'TradeQueryGenerator.lua')]
+    .find((f) => existsSync(f));
+  assert(file, `TradeQueryGenerator.lua not found under ${pobPath}`);
+  return readFileSync(file, 'utf8');
+}
 
 let client: Client;
 async function call(name: string, args: Record<string, unknown> = {}): Promise<ToolResp> {
@@ -145,6 +187,65 @@ async function main(): Promise<void> {
     }, /more than once/);
     log('PASS');
 
+    log('Test 4c0: bridge pseudoMap / ignoredStats match the installed TradeQueryGenerator.lua');
+    const pobSource = pobGeneratorSource(paths.pobPath);
+    const bridgeSource = readFileSync(bridgePath, 'utf8');
+    const finish = pobSource.indexOf('function TradeQueryGeneratorClass:FinishQuery()');
+    assert(finish >= 0, 'FinishQuery not found in TradeQueryGenerator.lua');
+    const pobPseudo = luaStringEntries(luaTable(pobSource, 'pseudoMap', finish));
+    const bridgePseudo = luaStringEntries(luaTable(bridgeSource, 'TRADE_PSEUDO_MAP'));
+    assert(pobPseudo.length === 7, `PoB's pseudoMap should have 7 entries: ${JSON.stringify(pobPseudo)}`);
+    assert(JSON.stringify(pobPseudo) === JSON.stringify(bridgePseudo),
+      `TRADE_PSEUDO_MAP drifted from PoB's pseudoMap:\n  PoB    ${JSON.stringify(pobPseudo)}\n  bridge ${JSON.stringify(bridgePseudo)}`);
+    const pobIgnored = luaKeys(luaTable(pobSource, 'ignoredStats', finish));
+    const bridgeIgnored = luaKeys(luaTable(bridgeSource, 'TRADE_IGNORED_LITERAL'));
+    assert(pobIgnored.length === 3 && JSON.stringify(pobIgnored) === JSON.stringify(bridgeIgnored),
+      `TRADE_IGNORED_LITERAL drifted from PoB's ignoredStats: PoB ${pobIgnored}, bridge ${bridgeIgnored}`);
+    for (const line of IGNORED_PATTERN_LINES) {
+      assert(pobSource.includes(line) && bridgeSource.includes(line), `hybrid ignoredStats pattern drifted (PoB / bridge): ${line}`);
+    }
+    log(`PASS: ${pobPseudo.length} pseudoMap entries, ${pobIgnored.length} literal ignored stats, hybrid patterns match`);
+
+    log('Test 4c1: every single resistance / attribute id maps to its pseudo total');
+    const mapped = pobPseudo.map(([hash, pseudo], i) => ({ from: `explicit.stat_${hash}`, to: pseudo, weight: 1.5 + i }));
+    const all7 = await search({ weightAdjustments: mapped.map((m) => ({ tradeId: m.from, weight: m.weight })) });
+    const all7q = decodeQuery(all7.url).query.stats[0].filters;
+    for (const m of mapped) {
+      const hash = m.from.slice('explicit.stat_'.length);
+      const hits = all7q.filter((f) => f.id === m.to || f.id.endsWith(`.stat_${hash}`));
+      assert(hits.length === 1 && hits[0].id === m.to && hits[0].value?.weight === m.weight, `${m.from}: one ${m.to} filter: ${JSON.stringify(hits)}`);
+      const f = all7.filters.find((x) => x.tradeId === m.to);
+      assert(f?.mappedFrom === m.from && f.weight === m.weight, `${m.from}: response filter ${JSON.stringify(f)}`);
+    }
+    log('PASS');
+
+    log('Test 4c2: all / hybrid resistance and attribute ids are refused as weights, accepted as required mods');
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, weightAdjustments: [{ tradeId: ALL_ELE_RES, weight: 1 }] },
+      /cannot weigh explicit\.stat_2901986750.*pseudo_total_fire_resistance, pseudo\.pseudo_total_cold_resistance, pseudo\.pseudo_total_lightning_resistance.*requiredMods/);
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, weightAdjustments: [{ tradeId: ALL_ATTRIBUTES, weight: 1 }] },
+      /pseudo_total_strength, pseudo\.pseudo_total_dexterity, pseudo\.pseudo_total_intelligence/);
+    const ringRes = await ok<{ mods: TradeMod[] }>('search_trade_mods', { slot: 'Ring 1', query: 'resistances', limit: 100 });
+    const fireCold = ringRes.mods.find((m) => m.text === '+#% to Fire and Cold Resistances' && m.type === 'Explicit');
+    assert(fireCold?.weightable === false && JSON.stringify(fireCold.preferredTradeIds) === JSON.stringify([FIRE_RES_PSEUDO, 'pseudo.pseudo_total_cold_resistance']),
+      `hybrid resistance is marked unweightable with its totals: ${JSON.stringify(fireCold)}`);
+    assert(ringRes.mods.find((m) => m.tradeId === ALL_ELE_RES)?.weightable === false, 'all elemental resistances marked unweightable');
+    assert(ringRes.mods.filter((m) => m.weightable === false).every((m) => (m.preferredTradeIds?.length ?? 0) >= 2), 'unweightable entries name their totals');
+    assert(ringRes.mods.filter((m) => m.preferred).every((m) => m.weightable === undefined), 'pseudo totals stay weightable');
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, weightAdjustments: [{ tradeId: fireCold.tradeId, weight: 1 }] },
+      /pseudo_total_fire_resistance, pseudo\.pseudo_total_cold_resistance already count it/);
+    const amuletAttr = await ok<{ mods: TradeMod[] }>('search_trade_mods', { slot: 'Amulet', query: 'strength and dexterity', limit: 100 });
+    const strDex = amuletAttr.mods.find((m) => m.type === 'Explicit');
+    assert(strDex?.weightable === false && JSON.stringify(strDex.preferredTradeIds) === '["pseudo.pseudo_total_strength","pseudo.pseudo_total_dexterity"]',
+      `hybrid attribute is marked unweightable: ${JSON.stringify(strDex)}`);
+    await userError('generate_trade_search', { slot: 'Amulet', league: LEAGUE, weightAdjustments: [{ tradeId: strDex.tradeId, weight: 1 }] },
+      /pseudo_total_strength, pseudo\.pseudo_total_dexterity already count it/);
+    const reqIgnored = await ok<Search>('generate_trade_search', {
+      slot: 'Ring 1', league: LEAGUE, requiredMods: [{ tradeId: ALL_ELE_RES, min: 10 }, { tradeId: fireCold.tradeId }, { tradeId: ALL_ATTRIBUTES }],
+    });
+    const reqAnd = decodeQuery(reqIgnored.url).query.stats.find((g) => g.type === 'and')?.filters.map((f) => f.id) ?? [];
+    assert([ALL_ELE_RES, fireCold.tradeId, ALL_ATTRIBUTES].every((id) => reqAnd.includes(id)), `required ids kept exactly: ${reqAnd}`);
+    log('PASS');
+
     log('Test 4c: PoB dialog options on Body Armour');
     const opts = await ok<Search>('generate_trade_search', {
       slot: 'Body Armour', league: LEAGUE, tradeType: 'securable', influences: ['shaper', 'elder'], includeMirrored: false,
@@ -192,11 +293,19 @@ async function main(): Promise<void> {
     await userError('generate_trade_search', { slot: 'Helmet', league: '   ' }, /league/);
     await userError('search_trade_mods', { slot: 'Nope', query: 'life' }, /Unsupported slot/);
     for (const league of ['.', '..', ' . ']) await userError('generate_trade_search', { slot: 'Helmet', league }, /league/);
-    await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, includeTalisman: true }, /includeTalisman only applies to Amulet/);
-    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, includeEldritch: 'keepRegular' }, /includeEldritch only applies/);
+    await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, includeTalisman: true }, /includeTalisman true only applies to Amulet/);
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, includeEldritch: 'keepRegular' }, /includeEldritch "keepRegular" only applies/);
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, includeEldritch: 'keepRegularPresence' }, /only applies/);
     await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, includeEldritch: 'keepRegular', influences: ['hunter'] }, /influences/);
     await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, links: 4 }, /links is not available/);
     await userError('generate_trade_search', { slot: 'Flask 1', league: LEAGUE, sockets: 1 }, /sockets is not available/);
+    log('PASS');
+
+    log('Test 6b: off-slot options that change nothing are accepted');
+    for (const includeEldritch of ['copyCurrent', 'remove']) {
+      const noop = await ok<Search>('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, realm: 'xbox', includeTalisman: false, includeEldritch });
+      assert(noop.url === xbox.url, `Ring 1 with includeTalisman false / includeEldritch ${includeEldritch} should equal the default search`);
+    }
     log('PASS');
 
     log('Test 7: search_trade_mods');
@@ -211,6 +320,32 @@ async function main(): Promise<void> {
     assert(fireMods.mods.find((m) => m.tradeId === FIRE_RES_EXPLICIT)?.preferredTradeId === FIRE_RES_PSEUDO, 'explicit fire res points at the pseudo id');
     const few = await ok<{ mods: unknown[]; total: number }>('search_trade_mods', { slot: 'Helmet', query: 'life', limit: 3 });
     assert(few.mods.length === 3 && few.total === mods.total, 'limit caps the list, total does not change');
+    log('PASS');
+
+    log('Test 7b: ids from search_trade_mods are accepted by generate_trade_search');
+    let unweightable = 0;
+    for (const query of ['life', 'resistance', 'attack speed']) {
+      const found = await ok<{ mods: TradeMod[] }>('search_trade_mods', { slot: 'Gloves', query, limit: 10 });
+      assert(found.mods.length > 0, `search_trade_mods found nothing for "${query}" on Gloves`);
+      // Every id as a required mod; weightable ids also as weights (one per filter they land on).
+      const targets = new Set<string>();
+      const weightAdjustments = found.mods.filter((m) => {
+        const target = m.preferredTradeId ?? m.tradeId;
+        if (m.weightable === false || targets.has(target)) return false;
+        targets.add(target);
+        return true;
+      }).map((m) => ({ tradeId: m.tradeId, weight: 1 }));
+      unweightable += found.mods.filter((m) => m.weightable === false).length;
+      const r = await call('generate_trade_search', {
+        slot: 'Gloves', league: LEAGUE, requiredMods: found.mods.map((m) => ({ tradeId: m.tradeId })), weightAdjustments,
+      });
+      assert(!r.isError, `"${query}" ids should be accepted: ${text(r)}`);
+      const gq = decodeQuery((JSON.parse(text(r)) as Search).url).query;
+      const required = gq.stats.find((g) => g.type === 'and')?.filters.map((f) => f.id) ?? [];
+      assert(found.mods.every((m) => required.includes(m.tradeId)), `"${query}": every id is a required mod`);
+      assert([...targets].every((id) => gq.stats[0].filters.some((f) => f.id === id)), `"${query}": every weightable id is weighted`);
+    }
+    assert(unweightable > 0, 'the queries should cover at least one unweightable id');
     log('PASS');
 
     log('Test 8: build unchanged');
