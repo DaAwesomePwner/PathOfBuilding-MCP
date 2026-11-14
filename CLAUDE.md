@@ -32,6 +32,7 @@ npm run test:phase6   # config / scenarios
 npm run test:phase7   # diagnostics / upgrades / export / snapshots
 npm run test:integrity  # bit-exact snapshot/restore stress
 npm run test:crash-recovery  # crash breaker, timeouts, respawn restores the last committed build
+npm run test:trade    # generate_trade_search / search_trade_mods (PoB's weighted trade query generator)
 npm run test:errors   # input validation paths
 npm run test:all      # everything, in parallel (~2.5 min on a desktop); `npm run test:all -- bridge phase4` runs a subset
 ```
@@ -66,7 +67,7 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 | Engine manager | `src/engine-manager.ts` | Owns the LuaBridge + BuildSession pair. Lazy/background boot, `run()` gate (unconfigured / updating / stale → `EngineNotReadyError`), `configure()`, `reload()` (export build → dispose old bridge → boot → reload build), `info()`. |
 | Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
 | BuildSession | `src/build-session.ts` | TS class owning the LuaJIT subprocess. Snapshot/restore, undo stack, `withTemporaryChange`, async mutex, build-code/URL/XML loading, higher-level workflows. |
-| MCP server | `src/server.ts`, `src/tool-registry.ts`, `src/engine-tools.ts` | Registers 37 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. `tools.engine(...)` handlers run inside `engine.run()` (shared gate slot + readiness checks) and receive the live session; `tools.plain(...)` handlers (configure_pob_path, get_engine_info, reload_engine, list_scenarios) work without an engine. |
+| MCP server | `src/server.ts`, `src/tool-registry.ts`, `src/engine-tools.ts` | Registers 39 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. `tools.engine(...)` handlers run inside `engine.run()` (shared gate slot + readiness checks) and receive the live session; `tools.plain(...)` handlers (configure_pob_path, get_engine_info, reload_engine, list_scenarios) work without an engine. |
 
 ## Non-negotiable invariants
 

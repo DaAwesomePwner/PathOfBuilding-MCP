@@ -34,7 +34,7 @@ Three layers, three responsibilities:
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 37 tools
+## The 39 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -86,6 +86,10 @@ Three layers, three responsibilities:
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
 - `undo_last_change` — pops the undo stack (works for swap/unequip/swap_gem/set_config/convert_tree_to_latest/etc.).
 - `reset_build` — discard everything, return to the originally loaded state.
+
+### Trade searches (2)
+- `generate_trade_search` — PoB's "weighted search" for a gear or flask slot: every candidate mod is simulated on the build to get a weight, and you get a pathofexile.com trade URL sorted by weighted sum (highest first). Options mirror PoB's dialog (trade type, corrupted/eldritch/scourge/talisman mods, influences, max price/level, sockets/links); `weightAdjustments` replace/add/remove weights (pinned against the 36-filter cap), `requiredMods` are hard minimums, `minWeightedSum` overrides PoB's default. Read-only, takes a few seconds.
+- `search_trade_mods` — find trade stat ids for a slot by text (`"life"`, `"fire resistance"`), for use in `requiredMods` / `weightAdjustments`.
 
 ## Setup
 
@@ -157,6 +161,12 @@ For an interactive iteration loop:
 2. User pastes the proposed item text.
 3. Claude calls `compare_items({ slot: "Body Armour", items: [user_text, current_text] })` — ranked diff with no permanent change.
 4. If user wants to commit it, Claude calls `swap_item({ slot, itemText })`. `undo_last_change` rolls back if needed.
+
+To shop for an upgrade on the trade site:
+
+1. `generate_trade_search({ slot: "Helmet", league: "Standard" })` — returns `url` plus the weighted `filters` (`weight` ≈ stat-score gain per point of the mod) and `minWeightedSum` (half the current helmet's estimated value).
+2. PoB scores already-capped stats as 0, so if the current helmet carries 40% fire resistance the search would happily replace it with none. Claude finds the id with `search_trade_mods({ slot: "Helmet", query: "fire resistance" })` and calls again with `weightAdjustments: [{ tradeId: "pseudo.pseudo_total_fire_resistance", weight: 2 }]`, or makes it a hard requirement with `requiredMods: [{ tradeId: "pseudo.pseudo_total_fire_resistance", min: 35 }]`.
+3. The user opens the returned URL; results are sorted by weighted sum, best first.
 
 ## Important behavior to know
 
