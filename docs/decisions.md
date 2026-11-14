@@ -6,7 +6,7 @@ decisions, one line each, current state only.
 ## Scope
 
 - Only the launch-critical fix set shipped for the new-league PoB update; every other 2026-11-12 review finding lives in `docs/backlog.md`. Why: the user said a new Path of Exile 1 update was due the next day and chose to postpone the rest. (2026-11-12, launch-critical-fixes, docs/backlog.md)
-- Postponed by the user, not rejected: poe.ninja build links, the install DLL locks, tests/CI and docs polish. Why: outside the launch-critical set; the `convert_tree_to_latest` tool, what-if restore exactness (tree, items, skills) and the crash-breaker fixes have since shipped. (2026-11-13, backlog-restore-and-breaker, c9b63635) Replaces: the same list including `convert_tree_to_latest`, what-if restore exactness and crash-breaker tuning (2026-11-13)
+- Postponed by the user, not rejected: poe.ninja build links, the install DLL locks, the remaining test gaps and docs polish. Why: outside the launch-critical set; URL-loading hardening, the CI workflow, the `convert_tree_to_latest` tool, what-if restore exactness (tree, items, skills) and the crash-breaker fixes have since shipped, and poe.ninja support is a new feature left in the backlog. (2026-11-13, backlog-restore-and-breaker, c9b63635) Replaces: the same list including `convert_tree_to_latest`, what-if restore exactness and crash-breaker tuning (2026-11-13)
 
 ## Engine and PoB install
 
@@ -32,3 +32,8 @@ decisions, one line each, current state only.
 - The three-strike crash count is kept per resolved (PoB path, LuaJIT path) pair and clears only when that install changes on disk. Why: reconfiguring must not be a way around the breaker, and a PoB update must be a way out. (2026-11-12, launch-critical-fixes, a4b9218e)
 - A crash-breaker strike is any LuaJIT exit that was not requested, any bridge command timeout (the process is killed) and any failed or hung startup; successful commands never forgive strikes. Why: strikes used to reset after five successful commands and timeouts never counted, so the breaker could not trip. (2026-11-13, backlog-restore-and-breaker, f1df96f9)
 - `POB_MCP_TEST_FAULTS` (fault injection in `lua/bridge.lua`) is test-only: the server strips it from the LuaJIT child's environment and only a `LuaBridge` option or its test-only setter (`setTestFaults`) can set it; a fault may only raise an error, exit the process or stall. Why: tests need to fail the engine at exact points, and a stray client environment must not be able to turn faults on. (2026-11-13, backlog-restore-and-breaker, f1df96f9)
+
+## Repository and CI
+
+- The repository is public with its git history as it was; no history rewrite. Why: the user accepted the commit identities already in history, and GitHub keeps pull-request refs that a rewrite cannot clear. (2026-11-13, make-repo-public-add-ci, 4a5463fd)
+- CI runs the full suite with `REQUIRE_POB=1` against a pinned Path of Building release and a pinned LuaJIT, on Ubuntu and Windows; the workflow uses `pull_request` (never `pull_request_target`), read-only permissions, no secrets, and actions pinned to commit SHAs. Why: fork pull requests run it, and a silent skip must not pass. (2026-11-13, make-repo-public-add-ci, 4a5463fd)

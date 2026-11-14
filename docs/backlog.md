@@ -130,7 +130,6 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
 
 ## Tests and CI
 
-- **Skipped tests exit 0.** Add a `REQUIRE_POB=1` mode and a CI workflow.
 - **Fixture is pinned to tree `3_13`** (`test/fixtures/OccVortex.xml`) with
   hardcoded gem names in `test/phase5-test.ts`; assert on structure, add a
   current-league fixture.

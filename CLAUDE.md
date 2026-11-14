@@ -17,7 +17,8 @@ npm run typecheck     # tsc --noEmit
 npm run dev           # tsx src/server.ts (no build needed)
 npm run start         # node dist/server.js (built artifacts)
 
-# Tests — POB_PATH must point at a real PoB install, or each integration test prints SKIPPED and exits 0.
+# Tests — POB_PATH must point at a real PoB install, or each integration test prints SKIPPED and exits 0
+# (with REQUIRE_POB=1 it fails instead; CI sets it).
 npm run test:paths    # unit tests for paths / discovery / config store (no LuaJIT needed)
 npm run test:startup  # builds, starts dist/server.js unconfigured, configure_pob_path, saved config, reload_engine, elicitation
 npm run test:safety   # engine safety tests
@@ -32,7 +33,7 @@ npm run test:phase7   # diagnostics / upgrades / export / snapshots
 npm run test:integrity  # bit-exact snapshot/restore stress
 npm run test:crash-recovery  # crash breaker, timeouts, respawn restores the last committed build
 npm run test:errors   # input validation paths
-npm run test:all      # everything (~3 min)
+npm run test:all      # everything (over 10 min)
 ```
 
 Single test: `tsx test/<file>.ts` — they're plain Node scripts.
@@ -44,6 +45,7 @@ Env vars:
 - `LUAJIT_PATH` — `luajit` binary or a folder containing it. The Windows PoB installer does **not** ship `luajit.exe` (only `lua51.dll`); probes `<POB_PATH>/runtime/`, `%LOCALAPPDATA%\Programs\LuaJIT\bin`, scoop, Homebrew, `/usr/{local/,}bin`, then PATH.
 - `POB_MCP_CONFIG_DIR` — overrides the saved-config dir (default `%APPDATA%\pob-mcp-server`, `~/Library/Application Support/pob-mcp-server`, `$XDG_CONFIG_HOME|~/.config/pob-mcp-server`). Tests must always set it to a temp dir.
 - `POB_TIMING=1` — per-command timing on stderr.
+- `REQUIRE_POB=1` — tests only: a missing PoB, LuaJIT or `POB_SOURCE_PATH` fails the test instead of printing `SKIPPED` and exiting 0 (`skipOrFail` in `test/_skip.ts`). CI (`.github/workflows/ci.yml`) sets it and points `POB_SOURCE_PATH` at a clone of the pinned `POB_TAG` and `POB_PATH` at a copy flattened into the installed layout.
 
 ## Architecture
 
