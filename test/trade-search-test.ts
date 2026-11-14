@@ -68,14 +68,25 @@ function luaStringEntries(table: string): [string, string][] {
 function luaKeys(table: string): string[] {
   return [...table.matchAll(/\["(\d+)"\]\s*=/g)].map((m) => m[1]).sort();
 }
-/** FinishQuery lines that build PoB's hybrid resistance / attribute hashes; the bridge repeats them. */
-const IGNORED_PATTERN_LINES = [
+/** FinishQuery's element lists for PoB's hybrid resistance / attribute hashes; the bridge repeats them. */
+const IGNORED_ELEMENT_LINES = [
   'local resElements = { "fire", "cold", "lightning", "chaos" }',
-  'string.format("%s_and_%s_damage_resistance_%%", elem1, elem2)',
   'local attributeElements = { "dexterity", "strength", "intelligence" }',
+];
+/** FinishQuery's hybrid stat names, each hashed straight into ignoredStats; the bridge repeats them. */
+const IGNORED_FORMAT_CALLS = [
+  'string.format("%s_and_%s_damage_resistance_%%", elem1, elem2)',
   'string.format("base_%s_and_%s", elem1, elem2)',
   'string.format("additional_%s_and_%s", elem1, elem2)',
 ];
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** The source of a Lua function, from its `function`/`local function` line to the next top-level one. */
+function luaFunctionBody(source: string, header: string): string {
+  const start = source.indexOf(header);
+  assert(start >= 0, `${header} not found`);
+  const next = source.slice(start + header.length).search(/\r?\n(local )?function /);
+  return next < 0 ? source.slice(start) : source.slice(start, start + header.length + next);
+}
 /** Read-only: the installed PoB's TradeQueryGenerator.lua (installed layout or source clone). */
 function pobGeneratorSource(pobPath: string): string {
   const file = [path.join(pobPath, 'Classes', 'TradeQueryGenerator.lua'), path.join(pobPath, 'src', 'Classes', 'TradeQueryGenerator.lua')]
@@ -190,19 +201,25 @@ async function main(): Promise<void> {
     log('Test 4c0: bridge pseudoMap / ignoredStats match the installed TradeQueryGenerator.lua');
     const pobSource = pobGeneratorSource(paths.pobPath);
     const bridgeSource = readFileSync(bridgePath, 'utf8');
-    const finish = pobSource.indexOf('function TradeQueryGeneratorClass:FinishQuery()');
-    assert(finish >= 0, 'FinishQuery not found in TradeQueryGenerator.lua');
-    const pobPseudo = luaStringEntries(luaTable(pobSource, 'pseudoMap', finish));
+    const finishQuery = luaFunctionBody(pobSource, 'function TradeQueryGeneratorClass:FinishQuery()');
+    const bridgeIgnoredFn = luaFunctionBody(bridgeSource, 'local function tradeIgnoredFor(id)');
+    const pobPseudo = luaStringEntries(luaTable(finishQuery, 'pseudoMap'));
     const bridgePseudo = luaStringEntries(luaTable(bridgeSource, 'TRADE_PSEUDO_MAP'));
     assert(pobPseudo.length === 7, `PoB's pseudoMap should have 7 entries: ${JSON.stringify(pobPseudo)}`);
     assert(JSON.stringify(pobPseudo) === JSON.stringify(bridgePseudo),
       `TRADE_PSEUDO_MAP drifted from PoB's pseudoMap:\n  PoB    ${JSON.stringify(pobPseudo)}\n  bridge ${JSON.stringify(bridgePseudo)}`);
-    const pobIgnored = luaKeys(luaTable(pobSource, 'ignoredStats', finish));
+    const pobIgnored = luaKeys(luaTable(finishQuery, 'ignoredStats'));
     const bridgeIgnored = luaKeys(luaTable(bridgeSource, 'TRADE_IGNORED_LITERAL'));
     assert(pobIgnored.length === 3 && JSON.stringify(pobIgnored) === JSON.stringify(bridgeIgnored),
       `TRADE_IGNORED_LITERAL drifted from PoB's ignoredStats: PoB ${pobIgnored}, bridge ${bridgeIgnored}`);
-    for (const line of IGNORED_PATTERN_LINES) {
-      assert(pobSource.includes(line) && bridgeSource.includes(line), `hybrid ignoredStats pattern drifted (PoB / bridge): ${line}`);
+    for (const line of IGNORED_ELEMENT_LINES) {
+      assert(finishQuery.includes(line) && bridgeIgnoredFn.includes(line), `hybrid ignoredStats element list drifted (PoB FinishQuery / bridge): ${line}`);
+    }
+    for (const call of IGNORED_FORMAT_CALLS) {
+      // PoB: `stats = { <call> }` then `ignoredStats[tostring(HashStats(stats))] = true`; bridge: `add(HashStats({ <call> }), ...)`.
+      const feedsIgnored = new RegExp(`${escapeRe(call)}\\s*\\}\\s*\\n\\s*ignoredStats\\[tostring\\(HashStats\\(stats\\)\\)\\] = true`);
+      assert(feedsIgnored.test(finishQuery), `PoB FinishQuery no longer hashes ${call} into ignoredStats`);
+      assert(bridgeIgnoredFn.includes(`add(HashStats({ ${call} })`), `bridge tradeIgnoredFor no longer hashes ${call}`);
     }
     log(`PASS: ${pobPseudo.length} pseudoMap entries, ${pobIgnored.length} literal ignored stats, hybrid patterns match`);
 
@@ -306,6 +323,14 @@ async function main(): Promise<void> {
       const noop = await ok<Search>('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, realm: 'xbox', includeTalisman: false, includeEldritch });
       assert(noop.url === xbox.url, `Ring 1 with includeTalisman false / includeEldritch ${includeEldritch} should equal the default search`);
     }
+    log('PASS');
+
+    log('Test 6c: weight 0 on an id PoB leaves out of the weights changes nothing');
+    const zeroIgnored = await ok<Search>('generate_trade_search', {
+      slot: 'Ring 1', league: LEAGUE, realm: 'xbox', weightAdjustments: [{ tradeId: ALL_ELE_RES, weight: 0 }, { tradeId: ALL_ATTRIBUTES, weight: 0 }],
+    });
+    assert(zeroIgnored.url === xbox.url && zeroIgnored.filterBudget === xbox.filterBudget, 'weight 0 on ignored ids should equal the default search');
+    assert(!zeroIgnored.filters.some((f) => f.source !== 'pob'), 'nothing is added or pinned');
     log('PASS');
 
     log('Test 7: search_trade_mods');
