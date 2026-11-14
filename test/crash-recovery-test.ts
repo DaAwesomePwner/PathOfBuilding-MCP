@@ -612,7 +612,8 @@ async function main(): Promise<void> {
   // process's environment for a moment; the bridge strips it for every child,
   // so the other lanes' engines never see it.)
   const lanes: Array<Array<() => Promise<void>>> = [
-    [test8Convert, test3Manager, test5Rejected, test9Env],
+    // test8 has a 15 s boot and command timeout, so it does not start at the busiest moment.
+    [test3Manager, test8Convert, test5Rejected, test9Env],
     [test10FailedCommit, test13AppliedButFailed, test4And7Committed, test6Startup],
     [test11LoadAfterCrash, test12LostRestore, test15SwapExportReplayCrash, test1Breaker, test2Timeout, test14ResetAfterCrash],
   ];

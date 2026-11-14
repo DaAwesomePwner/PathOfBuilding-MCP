@@ -18,6 +18,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_DEFAULT_JOBS = 6;
+// A script still running after this is killed and reported as failed with the
+// output it produced, so a hang shows which script hung.
+const SCRIPT_TIMEOUT_MS = 15 * 60_000;
 
 // Scripts that cannot share the machine with other engines. They run one at a
 // time after everything else. test:startup counts every LuaJIT process on the
@@ -53,7 +56,7 @@ function parseArgs(argv, tests) {
   const wanted = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--jobs' || arg === '-j') jobs = argv[++i];
+    if (arg === '--jobs' || arg === '-j') jobs = argv[++i] ?? '';
     else if (arg.startsWith('--jobs=')) jobs = arg.slice('--jobs='.length);
     else if (arg.startsWith('-')) fail(`unknown option ${arg}`);
     else wanted.push(arg.replace(/^test:/, ''));
@@ -86,8 +89,14 @@ function runOne(name, file) {
     const done = (code, note) => resolve({
       name, code, note, seconds: (Date.now() - started) / 1000, output: Buffer.concat(chunks).toString('utf8'),
     });
-    child.on('error', (e) => done(1, `could not start: ${e.message}`));
-    child.on('close', (code, signal) => done(code ?? 1, signal ? `killed by ${signal}` : undefined));
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, SCRIPT_TIMEOUT_MS);
+    child.on('error', (e) => { clearTimeout(timer); done(1, `could not start: ${e.message}`); });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) done(1, `killed after ${SCRIPT_TIMEOUT_MS / 60_000} min`);
+      else done(code ?? 1, signal ? `killed by ${signal}` : undefined);
+    });
   });
 }
 
@@ -130,4 +139,4 @@ for (const r of results.sort((a, b) => b.seconds - a.seconds)) {
 }
 if (skipped.length > 0) console.log(`printed SKIPPED: ${skipped.map((r) => `test:${r.name}`).join(', ')}`);
 if (failed.length > 0) console.log(`FAILED: ${failed.map((r) => `test:${r.name}`).join(', ')}`);
-process.exit(failed.length > 0 ? 1 : 0);
+process.exitCode = failed.length > 0 ? 1 : 0;
