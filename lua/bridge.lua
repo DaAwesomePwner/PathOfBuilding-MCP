@@ -3006,6 +3006,245 @@ local function restoreSkills(snap)
 	end
 end
 
+-- ---------------------------------------------------------------------------
+-- Weighted trade searches: PoB's own TradeQueryGenerator, run headless.
+-- StartQuery normally opens a progress popup and lets OnFrame drive the weight
+-- coroutine; here the popup calls are neutralised for the duration of the
+-- command and the coroutine is driven to completion synchronously (GetTime is
+-- stubbed to 0, so it never yields early). Nothing is downloaded or written:
+-- the generator's mod data (Data/QueryMods.lua) and the trade stat list
+-- (Data/TradeSiteStats.lua) must already be in the install.
+-- ---------------------------------------------------------------------------
+local TRADE_TYPES = { "securable", "available", "onlineleague", "online", "any" }
+local ELDRITCH_SLOTS = { ["Body Armour"] = true, ["Helmet"] = true, ["Gloves"] = true, ["Boots"] = true }
+local ELDRITCH_OPTIONS = { "Copy Current", "Keep regular", "Keep regular+presence", "Remove" }
+local PSEUDO_IGNORED = { "^pseudo%.lake", "^pseudo%.pseudo_lake", "^pseudo%.pseudo_logbook", "^pseudo%.pseudo_temple",
+	"^pseudo%.pseudo_map", "^pseudo%.pseudo_ritual" }
+local tradeState = nil
+
+local function findUpvalue(fn, name)
+	for i = 1, 255 do
+		local n, v = debug.getupvalue(fn, i)
+		if n == nil then return nil end
+		if n == name then return i, v end
+	end
+end
+
+local function tradeStateOrError()
+	if tradeState then return tradeState end
+	-- InitMods would download the stat list and save QueryMods.lua into the
+	-- install when the file is missing: refuse before it gets the chance.
+	for _, file in ipairs({ "Data/QueryMods.lua", "Data/TradeSiteStats.lua" }) do
+		local h = raw_io_open(file, "rb")
+		if not h then
+			userError("This Path of Building install has no " .. file
+				.. ", which trade searches need; update or reinstall Path of Building")
+		end
+		h:close()
+	end
+	local gen = new("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	local _, helpers = findUpvalue(gen.StartQuery, "tradeHelpers")
+	helpers = helpers or LoadModule("Classes/TradeHelpers")
+	local texts, pseudo = { }, { }
+	for _, cat in ipairs(helpers.getTradeStats() or { }) do
+		for _, entry in ipairs(cat.entries or { }) do
+			if type(entry.id) == "string" and type(entry.text) == "string" then
+				if texts[entry.id] == nil then texts[entry.id] = entry.text end
+				if cat.id == "pseudo" then pseudo[#pseudo + 1] = entry end
+			end
+		end
+	end
+	tradeState = { gen = gen, helpers = helpers, texts = texts, pseudo = pseudo }
+	return tradeState
+end
+
+-- Gear and flask slots PoB can build a weighted search for (no jewel sockets).
+local function tradeSlotOrError(slotName, helpers)
+	local supported = { }
+	for _, slot in ipairs(build.itemsTab.orderedSlots or { }) do
+		local name = slot.slotName
+		if name and not name:find("Jewel") and not name:find("Abyssal") and not name:find("Socket")
+			and helpers.getTradeCategory(name, nil) then
+			supported[#supported + 1] = name
+		end
+	end
+	if type(slotName) ~= "string" or not listContains(supported, slotName) then
+		userError("Unsupported slot for a trade search: " .. tostring(slotName)
+			.. ". Supported slots: " .. table.concat(supported, ", "))
+	end
+	return build.itemsTab.slots[slotName]
+end
+
+local function tradeStatWeights(requested)
+	local valid, names = { }, { }
+	for _, entry in ipairs(data.powerStatList) do
+		if entry.stat and not entry.ignoreForItems and entry.label ~= "Name" and not valid[entry.stat] then
+			valid[entry.stat] = entry
+			names[#names + 1] = entry.stat
+		end
+	end
+	local out = { }
+	for _, w in ipairs(requested or { }) do
+		local entry = valid[w.stat]
+		if not entry then
+			userError("Unknown stat weight '" .. tostring(w.stat) .. "'. Valid stats: " .. table.concat(names, ", "))
+		end
+		out[#out + 1] = { stat = entry.stat, label = entry.label, transform = entry.transform, weightMult = tonumber(w.weight) }
+	end
+	if #out == 0 then userError("statWeights must name at least one stat") end
+	return out
+end
+
+local function tradeIdTexts(st, ids)
+	local out = { }
+	for _, id in ipairs(ids or { }) do
+		local text = st.texts[id]
+		if not text then
+			userError("Unknown trade stat id '" .. tostring(id) .. "'; use search_trade_mods to find valid ids")
+		end
+		out[#out + 1] = { id = id, text = text }
+	end
+	return out
+end
+
+local function influenceIndex(name)
+	if name == nil then return 1 end
+	for i, info in ipairs(itemLib.influenceInfo.default) do
+		if info.display:lower() == tostring(name):lower() then return i + 1 end
+	end
+	userError("Unknown influence '" .. tostring(name) .. "'")
+end
+
+local function runTradeQuery(cmd)
+	local st = tradeStateOrError()
+	local slot = tradeSlotOrError(cmd.slot, st.helpers)
+	local statWeights = tradeStatWeights(cmd.statWeights)
+	local idTexts = tradeIdTexts(st, cmd.tradeIds)
+	local o = cmd.options or { }
+	local tradeTypeIndex = nil
+	for i, t in ipairs(TRADE_TYPES) do if t == o.tradeType then tradeTypeIndex = i end end
+	if not tradeTypeIndex then userError("Unknown tradeType '" .. tostring(o.tradeType) .. "'") end
+	local item = build.itemsTab.items[slot.selItemId]
+	local queryStr, category = st.helpers.getTradeCategory(slot.slotName, item)
+	local influences = o.influences or { }
+	local options = {
+		statWeights = statWeights,
+		includeCorrupted = o.includeCorrupted,
+		includeMirrored = o.includeMirrored ~= false,
+		includeScourge = o.includeScourge == true,
+		influence1 = influenceIndex(influences[1]),
+		influence2 = influenceIndex(influences[2]),
+		maxPrice = tonumber(o.maxPrice),
+		maxPriceType = o.maxPriceType,
+		maxLevel = tonumber(o.maxLevel),
+		sockets = tonumber(o.sockets),
+		links = tonumber(o.links),
+	}
+	-- PoB's popup defaults: corrupted mods unless the current item is already
+	-- corrupted; eldritch choice and talisman toggle only on their slots.
+	if options.includeCorrupted == nil then options.includeCorrupted = not (item and item.corrupted) end
+	if ELDRITCH_SLOTS[slot.slotName] then
+		options.includeEldritch = ELDRITCH_OPTIONS[tonumber(o.eldritchIndex) or 1] or ELDRITCH_OPTIONS[1]
+	end
+	if slot.slotName == "Amulet" then options.includeTalisman = o.includeTalisman == true end
+
+	local gen = st.gen
+	gen.itemsTab = build.itemsTab
+	gen.queryTab = { itemsTab = build.itemsTab }
+	gen.lastMaxPrice, gen.lastMaxPriceTypeIndex, gen.lastMaxLevel = nil, nil, nil
+	gen.tradeTypeIndex = tradeTypeIndex
+	gen.calcContext = { }
+	local captured = nil
+	gen.requesterContext = nil
+	gen.requesterCallback = function(_ctx, json, errMsg) captured = { json = json, err = errMsg } end
+	-- Lift PoB's 36-filter cap so every weight comes back; the caller applies
+	-- the cap after its own adjustments.
+	local maxIdx, maxOrig = findUpvalue(gen.FinishQuery, "MAX_FILTERS")
+	local openOrig, closeOrig = rawget(main, "OpenPopup"), rawget(main, "ClosePopup")
+	main.OpenPopup = function() return { } end
+	main.ClosePopup = function() end
+	if maxIdx then debug.setupvalue(gen.FinishQuery, maxIdx, 100000) end
+	local started = os.clock()
+	local ok, err = pcall(function()
+		gen:StartQuery(slot, options)
+		local co = gen.calcContext.co
+		if not co then
+			userError("Path of Building cannot build a weighted trade search for the item in " .. slot.slotName)
+		end
+		while coroutine.status(co) ~= "dead" do
+			local resumed, msg = coroutine.resume(co, gen)
+			if not resumed then error("trade weight calculation failed: " .. tostring(msg), 0) end
+		end
+		gen.calcContext.co = nil
+		gen:FinishQuery()
+	end)
+	local elapsed = os.clock() - started
+	if maxIdx then debug.setupvalue(gen.FinishQuery, maxIdx, maxOrig) end
+	main.OpenPopup, main.ClosePopup = openOrig, closeOrig
+	gen.calcContext = { }
+	gen.requesterCallback = nil
+	if not ok then error(err, 0) end
+	if not captured or type(captured.json) ~= "string" then
+		error("Path of Building produced no trade query", 0)
+	end
+	local decoded = dkjson.decode(captured.json)
+	local weightGroup = decoded and decoded.query and decoded.query.stats and decoded.query.stats[1]
+	for _, f in ipairs(weightGroup and weightGroup.filters or { }) do
+		if type(f.id) == "string" and st.texts[f.id] then idTexts[#idTexts + 1] = { id = f.id, text = st.texts[f.id] } end
+	end
+	local used = { }
+	for _, w in ipairs(statWeights) do used[#used + 1] = { stat = w.stat, label = w.label, weight = w.weightMult } end
+	return {
+		queryJson = captured.json,
+		pobMessage = captured.err or dkjson.null,
+		capLifted = maxIdx ~= nil,
+		itemCategory = category or dkjson.null,
+		categoryQuery = queryStr or dkjson.null,
+		currentItem = item and (item.title or item.name) or dkjson.null,
+		statWeights = used,
+		texts = idTexts,
+		calcSeconds = elapsed,
+	}
+end
+
+local function searchTradeMods(cmd)
+	local st = tradeStateOrError()
+	local slot = tradeSlotOrError(cmd.slot, st.helpers)
+	local item = build.itemsTab.items[slot.selItemId]
+	local _, category = st.helpers.getTradeCategory(slot.slotName, item)
+	local needle = tostring(cmd.query or ""):lower()
+	local found, seen = { }, { }
+	local function add(id, text, kind)
+		if seen[id] then return end
+		seen[id] = true
+		if text:lower():find(needle, 1, true) then found[#found + 1] = { tradeId = id, text = text, type = kind } end
+	end
+	for _, kind in ipairs({ "Explicit", "Implicit", "Corrupted" }) do
+		for _, md in pairs(st.gen.modData[kind] or { }) do
+			if category and md[category] ~= nil and md.tradeMod and type(md.tradeMod.id) == "string" then
+				add(md.tradeMod.id, tostring(md.tradeMod.text), kind)
+			end
+		end
+	end
+	for _, entry in ipairs(st.pseudo) do
+		local ignored = false
+		for _, pattern in ipairs(PSEUDO_IGNORED) do
+			if entry.id:find(pattern) then ignored = true break end
+		end
+		if not ignored then add(entry.id, entry.text, "Pseudo") end
+	end
+	local order = { Explicit = 1, Implicit = 2, Corrupted = 3, Pseudo = 4 }
+	table.sort(found, function(a, b)
+		if a.type ~= b.type then return order[a.type] < order[b.type] end
+		if a.text ~= b.text then return a.text < b.text end
+		return a.tradeId < b.tradeId
+	end)
+	local limit = tonumber(cmd.limit) or 25
+	local mods = { }
+	for i = 1, math.min(limit, #found) do mods[i] = found[i] end
+	return { itemCategory = category or dkjson.null, total = #found, mods = mods }
+end
+
 -- Commands that do not need a loaded build (everything else requires PoB to
 -- be in BUILD mode before and after the command).
 local NO_BUILD_REQUIRED = {
@@ -3395,6 +3634,14 @@ local DISPATCH = {
 				passiveTreeSummary = getPassiveTreeSummary(),
 			}
 		end,
+	},
+
+	-- Trade searches (read-only: the build is never changed)
+	tradeQuery = {
+		handler = function(cmd) return runTradeQuery(cmd) end,
+	},
+	searchTradeMods = {
+		handler = function(cmd) return searchTradeMods(cmd) end,
 	},
 
 	-- Utility

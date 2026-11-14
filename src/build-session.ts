@@ -1,7 +1,11 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
+import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
 import { UserError } from './validation.js';
+
+/** Bridge timeout for a trade query: it runs one calculation per candidate mod. */
+const TRADE_QUERY_TIMEOUT_MS = 180_000;
 
 /**
  * The engine was restarted after a crash or timeout since the last tool call.
@@ -856,6 +860,32 @@ export class BuildSession {
         cmd: 'listEquippedItems',
       });
       return result.items;
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Trade searches (read-only: PoB's TradeQueryGenerator on the live build)
+  // ------------------------------------------------------------------
+
+  /**
+   * Runs PoB's weighted trade query generator for one slot. It simulates every
+   * candidate mod on the build (about 1-1.5s on the OccVortex fixture, far
+   * longer on heavy builds), hence the long bridge timeout. Changes nothing.
+   */
+  async generateTradeQuery(command: Record<string, unknown>): Promise<TradeQueryRaw> {
+    return this.withLock(async () => {
+      const result = await this.bridge.send<{ ok: true } & TradeQueryRaw>(
+        { ...command, cmd: 'tradeQuery' },
+        TRADE_QUERY_TIMEOUT_MS,
+      );
+      return result;
+    });
+  }
+
+  async searchTradeMods(slot: string, query: string, limit: number): Promise<TradeModsResult> {
+    return this.withLock(async () => {
+      const result = await this.bridge.send<{ ok: true } & TradeModsResult>({ cmd: 'searchTradeMods', slot, query, limit });
+      return { itemCategory: result.itemCategory, total: result.total, mods: result.mods };
     });
   }
 
