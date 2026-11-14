@@ -10,7 +10,7 @@
 // Output is buffered per script and printed when that script ends, so logs do
 // not interleave. Exit code is 1 when any script fails.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,7 +20,30 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_DEFAULT_JOBS = 6;
 // A script still running after this is killed and reported as failed with the
 // output it produced, so a hang shows which script hung.
-const SCRIPT_TIMEOUT_MS = 15 * 60_000;
+// TEST_SCRIPT_TIMEOUT_MS overrides it (used to try the timeout path by hand).
+const SCRIPT_TIMEOUT_MS = Number(process.env.TEST_SCRIPT_TIMEOUT_MS) > 0 ? Number(process.env.TEST_SCRIPT_TIMEOUT_MS) : 15 * 60_000;
+const isWindows = process.platform === 'win32';
+const running = new Set();
+
+// Kills a test script together with everything it started (its LuaJIT engines,
+// a built server). Killing only the script would skip its own cleanup and
+// leave a stuck engine running. On POSIX each script is its own process group.
+function killTree(child) {
+  if (child.pid === undefined) return;
+  if (isWindows) spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+  else {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+  }
+}
+
+// The scripts are in their own process groups on POSIX, so an interrupt of
+// the runner has to be passed on.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    for (const child of running) killTree(child);
+    process.exit(130);
+  });
+}
 
 // Scripts that cannot share the machine with other engines. They run one at a
 // time after everything else. test:startup counts every LuaJIT process on the
@@ -83,18 +106,21 @@ function runOne(name, file) {
       cwd: root,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: !isWindows,
     });
+    running.add(child);
     child.stdout.on('data', (c) => chunks.push(c));
     child.stderr.on('data', (c) => chunks.push(c));
     const done = (code, note) => resolve({
       name, code, note, seconds: (Date.now() - started) / 1000, output: Buffer.concat(chunks).toString('utf8'),
     });
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, SCRIPT_TIMEOUT_MS);
-    child.on('error', (e) => { clearTimeout(timer); done(1, `could not start: ${e.message}`); });
+    const timer = setTimeout(() => { timedOut = true; killTree(child); }, SCRIPT_TIMEOUT_MS);
+    child.on('error', (e) => { clearTimeout(timer); running.delete(child); done(1, `could not start: ${e.message}`); });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      if (timedOut) done(1, `killed after ${SCRIPT_TIMEOUT_MS / 60_000} min`);
+      running.delete(child);
+      if (timedOut) done(1, `killed with its child processes after ${Math.round(SCRIPT_TIMEOUT_MS / 1000)} s`);
       else done(code ?? 1, signal ? `killed by ${signal}` : undefined);
     });
   });
