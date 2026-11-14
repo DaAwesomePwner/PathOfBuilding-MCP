@@ -13,10 +13,6 @@ it plausible.
   while the MCP server is running. Until fixed, stop the MCP server before
   updating PoB. Options: load native modules from a private temp copy, use the
   pure-Lua UTF-8 fallback, or shut the engine down when idle.
-- **`convert_tree_to_latest` tool.** A build saved on an old tree stays on that
-  tree, so node advice targets the old league. Call
-  `build.treeTab:ConvertToVersion(latestTreeVersion, ...)` (`Classes/TreeTab.lua`),
-  push to the undo stack, report nodes lost.
 
 ## Found during the launch-critical fixes
 
@@ -29,18 +25,8 @@ for later.
   near '+'`. Release tags (checked: `v2.67.2`) work. Needs an upstream fix, or
   a source transform in `bridge.lua`'s module loader. `POB_SOURCE_PATH` for
   `npm run test:source-clone` should point at a release tag until then.
-- **Jewel-supported nodes lost on undo (confirmed).** `restoreAllUnlocked`
-  (`src/build-session.ts`) restores the tree before items and ignores the
-  bridge's `missingNodeIds`. Undo after unequipping an Intuitive Leap, Thread
-  of Hope or Impossible Escape leaves the nodes it supported unallocated.
-  Restore the tree again once items are back.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
-- **Rejected build recorded for respawn.** `LuaBridge.lastLoadedXML` is set
-  before the load succeeds, so a crash restart replays a build the engine
-  refused.
-- **`allocExtendedNodes` extras** re-allocated by PoB on restore are not
-  detected; only missing nodes are reported.
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
   install are not normalised. Network-path installs get no zlib.
 - **`__proto__` dropped by the input schema.** `z.record` removes the key
@@ -61,49 +47,54 @@ for later.
 
 ## What-if restore exactness
 
-The mastery and hash-override items touch `restoreTreeFromList`, which the
-launch-critical tree-restore fix rewrites; do them on top of that fix.
+Tree, item and skills restores are exact for the active build
+(`restoreTreeState`, `restoreItemsState`, `restoreSkills` in
+`lua/bridge.lua`), and the batch commands (`replaceSocketGroup`,
+`allocNodes`, `deallocNodes`) check the whole batch before changing anything.
+Two smaller gaps are listed under "Found during the restore and crash-recovery
+work" (explosion gems in inactive skill sets, the unchecked
+`replaceSocketGroup` rollback). One known difference remains: a tree restore that has to re-import nodes
+puts back the same node set in a different `allocNodes` order, so the saved
+node list and tree URL can come out reordered.
 
-- **Mastery selections lost on tree restore (confirmed).** The TS tree snapshot
-  (`src/build-session.ts:17-19,260-276`) stores node ids only. Deallocating a node
-  upstream of a mastery clears its selection, and the restore then skips that
-  mastery. Snapshot `masterySelections` (or use PoB's `CreateUndoState`).
-- **Item restore duplicates the item (confirmed).** `restoreSlotUnlocked`
-  (`src/build-session.ts:219-229`) re-adds the item instead of re-selecting
-  `snapshot.itemId`; exports grow and ids churn. Probe items are never deleted.
-- **Item that does not fit its slot (confirmed).** `equipItemInSlot` in
-  `lua/bridge.lua` does not check `IsItemValidForSlot`; PoB silently empties the
-  slot. Return a user error instead. (The related wrong-item-on-id-gap bug was
-  fixed in `8477d676`.)
-- **Stale display item on parse failure.** `CreateDisplayItemFromRaw` leaves the
-  previous display item in place when parsing fails; clear `displayItem` before
-  calling it.
-- **Skills snapshot misses fields (confirmed).** `lua/bridge.lua:1224-1299` omits
-  `imbuedSupport`, `groupCount`, `skillMinion*`, `skillMineCountCalcs`.
-- **Hardcoded slot list (confirmed).** `DEFAULT_TRACKED_SLOTS`
-  (`src/build-session.ts:45-63`) lacks `Ring 3`, `Graft 1`, `Graft 2`, jewel and
-  abyss sockets; snapshots and undo skip them. Take slots from `getValidSlots`.
-- **Batch commands validate mid-mutation (confirmed).** `replaceSocketGroup`,
-  `allocNodes` (`lua/bridge.lua:781-803,1138-1165`) can leave partial state.
-- **Tattoo/hash-override exactness (plausible).** Restore reuses current
-  `hashOverrides`, not the snapshot's.
+## Found during the restore and crash-recovery work
+
+Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
+
+- **Replay journal is unbounded.** After a crash the engine replays every
+  committed change since the last load, so recovery time grows with them.
+  Folding the journal into a new baseline needs an export, which re-parses
+  every item in the live build.
+- **Partial change is not journaled.** If a mutation command itself fails with
+  the engine still alive, the undo entry is kept but the change is never
+  recorded for replay; a later crash restores the build without it.
+- **Explosion gems in inactive skill sets** lose their settings on a skills
+  restore without any report; the relink-or-refuse check covers the active set
+  only.
+- **`replaceSocketGroup` rollback is not checked for exactness** (the tree
+  rollback is).
+- **Untested failure paths.** The `convert_tree_to_latest` rollback, a LuaJIT
+  exit or timeout during a what-if restore, and the "build lost" engine-swap
+  carry have no test; each needs a fault from the `POB_MCP_TEST_FAULTS` seam.
+- **Node list order after a tree re-import.** See "What-if restore exactness";
+  the restore tests compare that list as a set where a re-import happened.
+- **Wording.** A failed-restore reply can name `reset_build` twice; the
+  swap-carry note says "failed again while being restarted" even when no
+  process ever started.
 
 ## Robustness and security
 
 - **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
   pastebin links (`parseBuildURL` in `src/validation.ts`); poe.ninja links are
   refused with a UserError.
-- **Crash breaker never trips (confirmed).** Strikes reset after 5 successful
-  commands and timeouts never count (`src/lua-bridge.ts:104,176-182,253-259`).
-- **Respawn restores the wrong build (confirmed).** After a crash the originally
-  loaded XML is reloaded, dropping committed changes; `lastLoadedXML` is set
-  before the load succeeds; a failed startup leaves a live unready process.
 - **Swallowed errors give wrong answers (confirmed).** Empty `catch {}` in
   `compareSupports`, `suggestUpgrades`, `compareScenarios`
   (`src/build-session.ts:998,1364,1490`) turn failures into zero deltas.
-- **Undo edge cases (confirmed).** Entry pushed before a mutation and not removed
-  on failure; `undoLastChange` pops before restoring; a throwing restore in
-  `finally` hides the original error.
+- **Undo edge cases (confirmed).** `undoLastChange` pops the entry before
+  restoring, so a failed restore loses it. `set_config` pushes an undo entry
+  even when the bridge refuses the change with a user error (`swap_item` does
+  not). (Fixed 2026-11-13: entries are pushed only after the call succeeds, and
+  a failing what-if restore no longer hides the probe's error.)
 - **Protocol framing.** No request ids between TS and Lua, so one stray stdout
   line desynchronises responses. No `'error'` listener on the child's stdin
   (EPIPE, plausible).
@@ -142,6 +133,6 @@ launch-critical tree-restore fix rewrites; do them on top of that fix.
 - **Fixture is pinned to tree `3_13`** (`test/fixtures/OccVortex.xml`) with
   hardcoded gem names in `test/phase5-test.ts`; assert on structure, add a
   current-league fixture.
-- **No tests** for the crash breaker, timeout recovery, stdin-EOF shutdown, or
-  that all tools are registered. `test/` is not type-checked.
+- **No tests** for stdin-EOF shutdown, or that all tools are registered.
+  `test/` is not type-checked.
 - **Nightly run against PoB's `dev` branch** to catch internal API changes early.

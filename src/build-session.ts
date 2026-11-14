@@ -1,6 +1,18 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
+import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { UserError } from './validation.js';
+
+/**
+ * The engine was restarted after a crash or timeout since the last tool call.
+ * Thrown once, by the first locked call after the restart, which does nothing else.
+ */
+export class EngineRestartedError extends UserError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EngineRestartedError';
+  }
+}
 
 export interface ItemSnapshot {
   slot: string;
@@ -8,8 +20,117 @@ export interface ItemSnapshot {
   itemId: number | null;
 }
 
+/**
+ * Item state of the active item set from the bridge's captureItemsState: the
+ * item id in every non-socket equipment slot the engine has (weapon swap,
+ * Ring 3, grafts, flasks, abyssal sockets included) and the build's item list
+ * in order. Passive-tree jewel sockets are not in it: the tree state owns them.
+ */
+export interface ItemsState {
+  /** [slot name, item id] for every occupied non-socket slot. */
+  slots: Array<[string, number]>;
+  itemOrder: number[];
+  /**
+   * Identity token of each item in `itemOrder` (bridge-side, per item object):
+   * a restore is refused, before anything changes, when an id no longer
+   * names the item it named at capture: a snapshot taken before the engine
+   * was restarted or the build was reloaded.
+   */
+  itemTokens: string[];
+}
+
+/** What the bridge's restoreItemsState found. */
+export interface ItemsRestoreReport {
+  exact: boolean;
+  mismatches?: string[];
+  /** Items added since the capture (probe items) that were deleted. */
+  removedItemIds?: number[];
+}
+
+/** Slot names PoB gives passive-tree jewel sockets ("Jewel <node id>"). */
+function isJewelSocketSlot(slot: string): boolean {
+  return /^Jewel \d+$/.test(slot);
+}
+
 export interface TreeSnapshot {
   allocatedNodeIds: number[];
+  /** Tree version the snapshot was taken on; restoring onto another version rebuilds the spec. */
+  treeVersion: string;
+  /**
+   * Full spec state from the bridge's captureSpecState: nodes, mastery
+   * selections, tattoos (hash overrides), socketed jewels, class,
+   * ascendancies and tree version. Restored exactly by restoreTreeState.
+   */
+  state: SpecState;
+}
+
+/** What the bridge's restoreTreeState / verifyTreeState found after a restore. */
+export interface TreeRestoreReport {
+  exact: boolean;
+  /** Wanted nodes PoB did not allocate. */
+  missingNodeIds?: number[];
+  /** Wanted cluster-jewel nodes whose subgraph does not exist (jewel missing). */
+  pendingNodeIds?: number[];
+  /** Allocated nodes the snapshot does not have. */
+  extraNodeIds?: number[];
+  /** Nodes PoB re-allocated on its own during the restore that were deallocated again. */
+  correctedExtraNodeIds?: number[];
+  /** Mastery, tattoo, jewel, class, ascendancy or tree-version differences. */
+  mismatches?: string[];
+}
+
+/**
+ * Run a what-if probe, then restore. A probe error (UserError or not) is
+ * thrown unchanged when the restore succeeds. When the restore fails too, the
+ * build may be left changed, so the result is always an internal (non-user)
+ * error, reported with the "Internal error ... reset_build" advice; its text
+ * holds both messages and the probe's error is the `cause`. A restore failure
+ * after a successful probe is thrown as is.
+ */
+async function probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promise<void>): Promise<T> {
+  let result: T;
+  try {
+    result = await probe();
+  } catch (probeError) {
+    try {
+      await restore();
+    } catch (restoreError) {
+      throw withRestoreFailure(probeError, restoreError);
+    }
+    throw probeError;
+  }
+  await restore();
+  return result;
+}
+
+/** A load result's one-time engine-restart note is not part of the cached build info. */
+function withoutRestartNote(info: BuildInfo): BuildInfo {
+  const { engineRestart: _note, ...rest } = info;
+  return rest;
+}
+
+function withRestoreFailure(probeError: unknown, restoreError: unknown): Error {
+  const text = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+  const message = `${text(probeError)} (restoring the build afterwards also failed: ${text(restoreError)})`;
+  return new Error(message, { cause: probeError });
+}
+
+function describeTreeMismatch(report: TreeRestoreReport): string {
+  const ids = (list: number[]): string => list.slice(0, 10).join(', ') + (list.length > 10 ? ', ...' : '');
+  const parts: string[] = [];
+  if (report.missingNodeIds?.length) {
+    parts.push(`${report.missingNodeIds.length} node(s) not allocated (${ids(report.missingNodeIds)})`);
+  }
+  if (report.pendingNodeIds?.length) {
+    parts.push(`${report.pendingNodeIds.length} cluster node(s) without their jewel graph (${ids(report.pendingNodeIds)})`);
+  }
+  if (report.extraNodeIds?.length) {
+    parts.push(`${report.extraNodeIds.length} extra node(s) allocated (${ids(report.extraNodeIds)})`);
+  }
+  if (report.mismatches?.length) {
+    parts.push(report.mismatches.slice(0, 10).join('; ') + (report.mismatches.length > 10 ? '; ...' : ''));
+  }
+  return parts.join('; ') || 'unknown difference';
 }
 
 export interface ConfigSnapshot {
@@ -17,16 +138,29 @@ export interface ConfigSnapshot {
 }
 
 export interface FullSnapshot {
-  items: Map<string, ItemSnapshot>;
+  items: ItemsState;
   tree: TreeSnapshot;
   config: ConfigSnapshot;
   skills: SkillsSnapshot;
   stats: Stats;
 }
 
-export type UndoEntry =
+/**
+ * Opaque, JSON-safe state of a whole passive spec (tree version, class,
+ * ascendancies, allocated nodes, masteries, jewels, tattoos) produced by the
+ * bridge's captureSpecState and fed back to restoreSpecState.
+ */
+export type SpecState = Record<string, unknown>;
+
+export type UndoEntry = (
   | { kind: 'full'; snapshot: FullSnapshot }
-  | { kind: 'config'; snapshot: ConfigSnapshot };
+  | { kind: 'config'; snapshot: ConfigSnapshot }
+  /** Tree-version change: restores the whole spec, version included. */
+  | { kind: 'spec'; state: SpecState }
+) & {
+  /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
+  journal?: number;
+};
 
 export interface StatDelta {
   before: number | string | boolean | null | undefined;
@@ -35,26 +169,6 @@ export interface StatDelta {
 }
 
 export type StatDiff = Record<string, StatDelta>;
-
-export const DEFAULT_TRACKED_SLOTS = [
-  'Weapon 1',
-  'Weapon 2',
-  'Weapon 1 Swap',
-  'Weapon 2 Swap',
-  'Helmet',
-  'Body Armour',
-  'Gloves',
-  'Boots',
-  'Amulet',
-  'Ring 1',
-  'Ring 2',
-  'Belt',
-  'Flask 1',
-  'Flask 2',
-  'Flask 3',
-  'Flask 4',
-  'Flask 5',
-];
 
 class AsyncMutex {
   private queue: Array<() => void> = [];
@@ -109,18 +223,18 @@ export class BuildSession {
   private readonly mutex = new AsyncMutex();
   private readonly snapshots = new Map<string, { stats: Stats; timestamp: number }>();
   private readonly undoStack: UndoEntry[] = [];
-  private readonly trackedSlots: string[];
   private readonly maxUndo: number;
   private configMetaCache: Map<string, ConfigVarMetadata> | null = null;
   private originalXML: string | null = null;
   private buildInfo: BuildInfo | null = null;
+  /** Undo history was dropped by an engine restart (named when undo finds the stack empty). */
+  private undoClearedByRestart = false;
 
   constructor(
     bridge: LuaBridge,
-    options: { trackedSlots?: string[]; maxUndo?: number } = {},
+    options: { maxUndo?: number } = {},
   ) {
     this.bridge = bridge;
-    this.trackedSlots = options.trackedSlots ?? DEFAULT_TRACKED_SLOTS;
     this.maxUndo = options.maxUndo ?? 20;
   }
 
@@ -128,13 +242,126 @@ export class BuildSession {
   // Locking
   // ------------------------------------------------------------------
 
+  /**
+   * Serialise an engine operation. A dead engine is restarted only here,
+   * before the operation starts (the restart reloads the last committed
+   * build; the first call after it reports it and stops). While the operation
+   * runs the bridge refuses to respawn, so a crash or timeout part-way
+   * through fails the call instead of letting it continue, or roll back,
+   * against a fresh engine.
+   */
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.mutex.acquire();
+    try {
+      await this.bridge.start();
+      this.handleRespawnUnlocked();
+      this.bridge.setRespawnHeld(true);
+      try {
+        return await fn();
+      } finally {
+        this.bridge.setRespawnHeld(false);
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** load_build / reset_build replace the whole build, so they skip the restart notice. */
+  private async withLoadLock<T>(fn: () => Promise<T>): Promise<T> {
     const release = await this.mutex.acquire();
     try {
       return await fn();
     } finally {
       release();
     }
+  }
+
+  /**
+   * After a respawn: undo entries refer to the old process (item identity
+   * tokens, ids) and are dropped; labelled snapshots hold only stats and are
+   * kept. Throws the one-time notice.
+   */
+  private handleRespawnUnlocked(): void {
+    const report = this.bridge.takeRespawnReport();
+    if (!report) return;
+    const undoEntriesCleared = this.undoStack.length;
+    this.undoStack.length = 0;
+    this.undoClearedByRestart = true;
+    this.configMetaCache = null;
+    this.buildInfo = report.restored === 'build' ? (report.info ?? this.buildInfo) : null;
+    throw new EngineRestartedError(
+      engineRestarted({
+        crashCount: report.crashCount,
+        restored: report.restored,
+        error: report.error,
+        undoEntriesCleared,
+        snapshotsKept: this.snapshots.size,
+      }),
+    );
+  }
+
+  /**
+   * The build to carry over an engine swap (which already holds the gate
+   * exclusively). Live engine: its export. Engine gone after a crash: the
+   * accepted build XML if nothing was committed since; otherwise the engine
+   * is restarted here (replaying the committed changes) just to export it.
+   * When that is impossible (breaker open) or the build was already lost at
+   * an earlier restart, the last accepted build is carried with a note
+   * saying what is missing.
+   */
+  async exportForEngineSwap(): Promise<{ xml: string | null; note?: string }> {
+    return this.withLoadLock(async () => {
+      let rec = this.bridge.getRecoveryState();
+      if (!this.bridge.isRunning() && !rec.lostError && rec.xml) {
+        if (rec.committed === 0) return { xml: rec.xml };
+        if (!this.bridge.isCircuitOpen()) {
+          try {
+            await this.bridge.start();
+          } catch (e) {
+            // The restart (or its replay) failed: carry what is known, say what is missing.
+            console.error('[pob-mcp] restarting the engine to export the build for an engine swap failed:', (e as Error).message);
+            return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'restartFailed') };
+          }
+          this.bridge.takeRespawnReport(); // the swap result reports the restart itself
+          rec = this.bridge.getRecoveryState();
+        }
+      }
+      if (rec.lostError && rec.xml) {
+        console.error('[pob-mcp] the build was lost at an earlier restart:', rec.lostError);
+        return { xml: rec.xml, note: carriedWithoutChanges(-1, 'buildLost') };
+      }
+      if (!this.bridge.isRunning()) {
+        if (!rec.xml) return { xml: null };
+        return { xml: rec.xml, note: carriedWithoutChanges(rec.committed, 'breakerOpen') };
+      }
+      if (!this.buildInfo && !rec.xml) return { xml: null };
+      const result = await this.bridge.send<{ ok: true; xml: string }>({ cmd: 'exportXML' });
+      return { xml: result.xml };
+    });
+  }
+
+  /**
+   * Run the rest of a change the engine already applied (stats, build info,
+   * the report), then commit it: push its undo entry and record its command
+   * for replay after a crash. When the rest fails with the engine gone,
+   * nothing is committed (the restarted engine will not have the change).
+   * With the engine alive the change is in the live build, so it is
+   * committed all the same (undo reverts it, a later crash restores it) and
+   * the internal error says so.
+   */
+  private async commitAfterUnlocked<T>(entry: UndoEntry, journal: number, command: object, rest: () => Promise<T>): Promise<T> {
+    let result: T;
+    try {
+      result = await rest();
+    } catch (err) {
+      if (!this.bridge.isRunning()) throw err;
+      this.pushUndoEntryUnlocked(entry, journal);
+      this.bridge.recordCommitted(command);
+      throw new Error(appliedButFailed((err as Error).message), { cause: err });
+    }
+    this.pushUndoEntryUnlocked(entry, journal);
+    this.bridge.recordCommitted(command);
+    return result;
   }
 
   // ------------------------------------------------------------------
@@ -148,12 +375,14 @@ export class BuildSession {
     // order, not call order (a slow URL load started first can land after, and
     // replace, a build code loaded later).
     const xml = await resolveBuildSource(source);
-    return this.withLock(async () => {
+    return this.withLoadLock(async () => {
+      // The bridge records the build for crash recovery only once it is accepted.
       const info = await this.bridge.loadBuildXML(xml);
       this.originalXML = xml;
-      this.buildInfo = info;
+      this.buildInfo = withoutRestartNote(info);
       this.configMetaCache = null;
       this.undoStack.length = 0;
+      this.undoClearedByRestart = false;
       this.snapshots.clear();
       return info;
     });
@@ -162,11 +391,12 @@ export class BuildSession {
   async resetBuild(): Promise<BuildInfo> {
     if (!this.originalXML) throw new UserError('No build loaded — call load_build first');
     const xml = this.originalXML;
-    return this.withLock(async () => {
+    return this.withLoadLock(async () => {
       const info = await this.bridge.loadBuildXML(xml);
-      this.buildInfo = info;
+      this.buildInfo = withoutRestartNote(info);
       this.configMetaCache = null;
       this.undoStack.length = 0;
+      this.undoClearedByRestart = false;
       this.snapshots.clear();
       return info;
     });
@@ -214,7 +444,21 @@ export class BuildSession {
     return this.withLock(() => this.restoreSlotUnlocked(snapshot));
   }
 
+  /**
+   * Put one slot back: re-select the snapshot's item id when the build still
+   * holds that item, else (id gone or reused) equip the item text. Items added
+   * since are not removed here; probes use the full item state instead.
+   */
   private async restoreSlotUnlocked(snapshot: ItemSnapshot): Promise<void> {
+    if (snapshot.itemId !== null) {
+      const res = await this.bridge.send<{ ok: true; selected: boolean }>({
+        cmd: 'selectItem',
+        slot: snapshot.slot,
+        itemId: snapshot.itemId,
+        itemText: snapshot.itemText ?? undefined,
+      });
+      if (res.selected) return;
+    }
     if (snapshot.itemText) {
       await this.bridge.send({
         cmd: 'equipItem',
@@ -224,6 +468,58 @@ export class BuildSession {
     } else {
       await this.bridge.send({ cmd: 'unequipItem', slot: snapshot.slot });
     }
+  }
+
+  private async captureItemsStateUnlocked(): Promise<ItemsState> {
+    const result = await this.bridge.send<{ ok: true; state: ItemsState }>({ cmd: 'captureItemsState' });
+    const state = result.state;
+    if (!state || !Array.isArray(state.slots) || !Array.isArray(state.itemOrder) || !Array.isArray(state.itemTokens)) {
+      throw new Error('captureItemsState returned a malformed item state');
+    }
+    return state;
+  }
+
+  /** Restore without judging the result (callers check `exact`). */
+  private async restoreItemsStateUnlocked(state: ItemsState): Promise<ItemsRestoreReport> {
+    return this.bridge.send<{ ok: true } & ItemsRestoreReport>({ cmd: 'restoreItemsState', state });
+  }
+
+  private assertItemsExact(report: ItemsRestoreReport): void {
+    if (report.exact !== true) {
+      const detail = (report.mismatches ?? []).slice(0, 10).join('; ') || 'unknown difference';
+      throw new Error(`Item restore was not exact (${detail}); call reset_build to return to the loaded build`);
+    }
+  }
+
+  /**
+   * Restore the tree (which owns passive-tree jewel sockets), run `between`
+   * (config), restore the item state (which deletes items added since, so the
+   * tree must no longer reference them), re-check the tree once items are
+   * back (restoring it again if an item change moved it), run `after`
+   * (skills), and only then throw if the tree or the items are not exact.
+   */
+  private async restoreTreeAndItemsUnlocked(
+    tree: TreeSnapshot,
+    items: ItemsState,
+    between?: () => Promise<void>,
+    after?: () => Promise<void>,
+  ): Promise<void> {
+    // A snapshot whose item ids no longer name its items (taken before the
+    // engine was restarted or the build was reloaded) is refused before the
+    // tree, which holds jewel item ids, or anything else is touched.
+    await this.bridge.send({ cmd: 'checkItemsState', state: items });
+    // A tree the probe did not touch is left alone: re-importing it would
+    // only reshuffle PoB's allocNodes table (and so the order of the exported
+    // node list) and cost a recalculation.
+    let treeReport = await this.verifyTreeUnlocked(tree);
+    if (!treeReport.exact) treeReport = await this.restoreTreeStateUnlocked(tree);
+    if (between) await between();
+    const itemsReport = await this.restoreItemsStateUnlocked(items);
+    if (treeReport.exact) treeReport = await this.verifyTreeUnlocked(tree);
+    if (!treeReport.exact) treeReport = await this.restoreTreeStateUnlocked(tree);
+    if (after) await after();
+    this.assertTreeExact(treeReport);
+    this.assertItemsExact(itemsReport);
   }
 
   async equipItem(slot: string, itemText: string): Promise<Stats> {
@@ -256,21 +552,50 @@ export class BuildSession {
   }
 
   private async snapshotTreeUnlocked(): Promise<TreeSnapshot> {
-    const result = await this.bridge.send<{ ok: true; nodeIds: number[] }>({
-      cmd: 'getAllocatedNodes',
-    });
-    return { allocatedNodeIds: [...result.nodeIds] };
+    const result = await this.bridge.send<{
+      ok: true;
+      state: SpecState & { nodeIds?: unknown; treeVersion?: unknown };
+    }>({ cmd: 'captureSpecState' });
+    const { nodeIds, treeVersion } = result.state ?? {};
+    if (!Array.isArray(nodeIds) || typeof treeVersion !== 'string') {
+      throw new Error('captureSpecState returned a malformed tree state');
+    }
+    return { allocatedNodeIds: [...(nodeIds as number[])], treeVersion, state: result.state };
   }
 
+  /** Restore a tree snapshot exactly; throws when the engine cannot reproduce it. */
   async restoreTree(snapshot: TreeSnapshot): Promise<void> {
     return this.withLock(() => this.restoreTreeUnlocked(snapshot));
   }
 
   private async restoreTreeUnlocked(snapshot: TreeSnapshot): Promise<void> {
-    await this.bridge.send({
-      cmd: 'restoreTreeFromList',
-      nodeIds: snapshot.allocatedNodeIds,
+    // An unchanged tree is left alone (see restoreTreeAndItemsUnlocked).
+    if ((await this.verifyTreeUnlocked(snapshot)).exact) return;
+    this.assertTreeExact(await this.restoreTreeStateUnlocked(snapshot));
+  }
+
+  /** Restore without judging the result (restoreAll checks again once items are back). */
+  private async restoreTreeStateUnlocked(snapshot: TreeSnapshot): Promise<TreeRestoreReport> {
+    const result = await this.bridge.send<{ ok: true } & TreeRestoreReport>({
+      cmd: 'restoreTreeState',
+      state: snapshot.state,
     });
+    return result;
+  }
+
+  private async verifyTreeUnlocked(snapshot: TreeSnapshot): Promise<TreeRestoreReport> {
+    return this.bridge.send<{ ok: true } & TreeRestoreReport>({
+      cmd: 'verifyTreeState',
+      state: snapshot.state,
+    });
+  }
+
+  private assertTreeExact(report: TreeRestoreReport): void {
+    if (report.exact !== true) {
+      throw new Error(
+        `Passive tree restore was not exact (${describeTreeMismatch(report)}); call reset_build to return to the loaded build`,
+      );
+    }
   }
 
   async allocNode(nodeId: number): Promise<Stats> {
@@ -337,15 +662,8 @@ export class BuildSession {
   }
 
   private async snapshotAllUnlocked(): Promise<FullSnapshot> {
-    // One bridge round-trip for all tracked slots instead of N.
-    const batched = await this.bridge.send<{ ok: true; items: ItemSnapshot[] }>({
-      cmd: 'snapshotAllItems',
-      slots: this.trackedSlots,
-    });
-    const items = new Map<string, ItemSnapshot>();
-    for (const snap of batched.items) {
-      items.set(snap.slot, snap);
-    }
+    // One bridge round-trip for every equipment slot the engine has.
+    const items = await this.captureItemsStateUnlocked();
     const tree = await this.snapshotTreeUnlocked();
     const config = await this.snapshotConfigUnlocked();
     const skills = await this.snapshotSkillsUnlocked();
@@ -358,15 +676,21 @@ export class BuildSession {
   }
 
   private async restoreAllUnlocked(snapshot: FullSnapshot): Promise<void> {
-    // Order matters: restore tree first (cheap, atomic), then config, then items.
-    // Skills are restored last because re-equipping items may add duplicate
-    // granted-skill groups; the skills snapshot fully replaces the gem list.
-    await this.restoreTreeUnlocked(snapshot.tree);
-    await this.restoreConfigUnlocked(snapshot.config);
-    for (const item of snapshot.items.values()) {
-      await this.restoreSlotUnlocked(item);
-    }
-    await this.restoreSkillsUnlocked(snapshot.skills);
+    // Order matters: restore tree first (cheap, atomic; it also puts socketed
+    // jewels back, which PoB keeps on the spec and which the tree state alone
+    // owns), then config, then items: every slot re-selects its snapshot item
+    // id and items added since are deleted. Once items are back the tree is
+    // checked again and, if an item change moved it (or the first pass could
+    // not finish without them), restored a second time; a tree or item state
+    // that still differs is an error, never a silent difference. Skills are
+    // restored last because item changes may add or drop granted-skill
+    // groups; the skills snapshot fully replaces the gem list.
+    await this.restoreTreeAndItemsUnlocked(
+      snapshot.tree,
+      snapshot.items,
+      () => this.restoreConfigUnlocked(snapshot.config),
+      () => this.restoreSkillsUnlocked(snapshot.skills),
+    );
   }
 
   // ------------------------------------------------------------------
@@ -378,11 +702,10 @@ export class BuildSession {
   ): Promise<T> {
     return this.withLock(async () => {
       const snapshot = await this.snapshotAllUnlocked();
-      try {
-        return await changeFn(this.bridge);
-      } finally {
-        await this.restoreAllUnlocked(snapshot);
-      }
+      return probeThenRestore(
+        () => changeFn(this.bridge),
+        () => this.restoreAllUnlocked(snapshot),
+      );
     });
   }
 
@@ -399,38 +722,35 @@ export class BuildSession {
    */
   private async withTreeProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotTreeUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreTreeUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreTreeUnlocked(snap));
   }
 
   private async withSkillsProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotSkillsUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreSkillsUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreSkillsUnlocked(snap));
   }
 
   private async withConfigProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotConfigUnlocked();
-    try {
-      return await fn();
-    } finally {
-      await this.restoreConfigUnlocked(snap);
-    }
+    return probeThenRestore(fn, () => this.restoreConfigUnlocked(snap));
   }
 
+  /**
+   * Item probe on one slot. The whole item state is captured, not just the
+   * slot: equipping can empty other slots (a two-hander clears Weapon 2, an
+   * item with fewer abyssal sockets clears abyss jewels), and the probe's item
+   * must be deleted afterwards. A passive-tree jewel socket also needs the
+   * tree state, which owns those sockets (and the nodes that depend on them).
+   */
   private async withSlotProbeUnlocked<T>(slot: string, fn: () => Promise<T>): Promise<T> {
-    const snap = await this.snapshotSlotUnlocked(slot);
-    try {
-      return await fn();
-    } finally {
-      await this.restoreSlotUnlocked(snap);
+    const items = await this.captureItemsStateUnlocked();
+    if (!isJewelSocketSlot(slot)) {
+      return probeThenRestore(fn, async () => {
+        this.assertItemsExact(await this.restoreItemsStateUnlocked(items));
+      });
     }
+    const tree = await this.snapshotTreeUnlocked();
+    return probeThenRestore(fn, () => this.restoreTreeAndItemsUnlocked(tree, items));
   }
 
   // ------------------------------------------------------------------
@@ -464,28 +784,49 @@ export class BuildSession {
   async pushUndo(): Promise<void> {
     return this.withLock(async () => {
       const snapshot = await this.snapshotAllUnlocked();
-      this.undoStack.push({ kind: 'full', snapshot });
-      while (this.undoStack.length > this.maxUndo) {
-        this.undoStack.shift();
-      }
+      this.pushUndoEntryUnlocked({ kind: 'full', snapshot });
     });
   }
 
   async undoLastChange(): Promise<Stats> {
     return this.withLock(async () => {
       const entry = this.undoStack.pop();
-      if (!entry) throw new UserError('Nothing to undo — the undo stack is empty');
+      if (!entry) {
+        throw new UserError(
+          'Nothing to undo — the undo stack is empty' +
+            (this.undoClearedByRestart
+              ? ' (earlier undo history was cleared when the engine was restarted after a crash; ' +
+                'reset_build still returns to the originally loaded build)'
+              : ''),
+        );
+      }
       if (entry.kind === 'full') {
         await this.restoreAllUnlocked(entry.snapshot);
+      } else if (entry.kind === 'spec') {
+        await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
+        await this.refreshBuildInfoUnlocked();
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
+      // The commands this entry's change and any later ones recorded are reverted.
+      if (entry.journal !== undefined) this.bridge.truncateCommitted(entry.journal);
       return this.bridge.getStats();
     });
   }
 
   undoStackDepth(): number {
     return this.undoStack.length;
+  }
+
+  private pushUndoEntryUnlocked(entry: UndoEntry, journal = this.bridge.committedCount()): void {
+    this.undoStack.push({ ...entry, journal });
+    while (this.undoStack.length > this.maxUndo) this.undoStack.shift();
+  }
+
+  /** Re-read class / tree version after a change that can alter them. */
+  private async refreshBuildInfoUnlocked(): Promise<void> {
+    const result = await this.bridge.send<{ ok: true; info: BuildInfo }>({ cmd: 'getBuildInfo' });
+    this.buildInfo = result.info;
   }
 
   // ------------------------------------------------------------------
@@ -544,27 +885,33 @@ export class BuildSession {
   }
 
   async swapItemWithDiff(slot: string, itemText: string): Promise<StatDiffResult> {
-    return this.withLock(async () => {
-      // Capture undo point before mutation (inline; pushUndo would re-acquire lock)
-      const undoSnap = await this.snapshotAllUnlocked();
-      this.undoStack.push({ kind: 'full', snapshot: undoSnap });
-      while (this.undoStack.length > this.maxUndo) this.undoStack.shift();
-
-      const before = await this.bridge.getStats();
-      await this.bridge.send({ cmd: 'equipItem', slot, itemText });
-      const after = await this.bridge.getStats();
-      return { before, after, diff: computeDiff(before, after) };
-    });
+    return this.withLock(() => this.itemMutationWithUndoUnlocked({ cmd: 'equipItem', slot, itemText }));
   }
 
   async unequipItemWithDiff(slot: string): Promise<StatDiffResult> {
-    return this.withLock(async () => {
-      const undoSnap = await this.snapshotAllUnlocked();
-      this.undoStack.push({ kind: 'full', snapshot: undoSnap });
-      while (this.undoStack.length > this.maxUndo) this.undoStack.shift();
+    return this.withLock(() => this.itemMutationWithUndoUnlocked({ cmd: 'unequipItem', slot }));
+  }
 
-      const before = await this.bridge.getStats();
-      await this.bridge.send({ cmd: 'unequipItem', slot });
+  /**
+   * A committed item change with a full undo entry. The replaced item stays in
+   * the build, so undo re-selects it by id (and deletes the added one). The
+   * snapshot is taken before the change; it is not pushed when the bridge
+   * refuses the change with a UserError, which it does before touching the
+   * build (unknown slot, item that does not fit, unparseable text).
+   */
+  private async itemMutationWithUndoUnlocked(command: Record<string, unknown>): Promise<StatDiffResult> {
+    const undoSnap = await this.snapshotAllUnlocked();
+    const before = undoSnap.stats;
+    const entry: UndoEntry = { kind: 'full', snapshot: undoSnap };
+    const journal = this.bridge.committedCount();
+    try {
+      await this.bridge.send(command);
+    } catch (err) {
+      // A refusal changed nothing; any other failure may have (undo reverts it) unless the engine is gone.
+      if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+      throw err;
+    }
+    return this.commitAfterUnlocked(entry, journal, command, async () => {
       const after = await this.bridge.getStats();
       return { before, after, diff: computeDiff(before, after) };
     });
@@ -625,6 +972,96 @@ export class BuildSession {
   // ------------------------------------------------------------------
   // Phase 4: passive tree analysis
   // ------------------------------------------------------------------
+
+  /**
+   * Move the active passive tree to PoB's latest tree version (keeping a
+   * ruthless/alternate sub-type, like PoB's own convert button). Pushes a
+   * spec-level undo entry carrying the old version; a no-op (already latest)
+   * pushes nothing.
+   */
+  async convertTreeToLatest(): Promise<TreeConversionResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    return this.withLock(async () => {
+      const before = await this.bridge.getStats();
+      // Undo state is taken before anything changes, so a conversion can never
+      // land without one.
+      const captured = await this.bridge.send<{ ok: true; state: SpecState & { treeVersion?: unknown } }>({
+        cmd: 'captureSpecState',
+      });
+      const treeVersion = captured.state?.treeVersion;
+      if (typeof treeVersion !== 'string') {
+        throw new Error('captureSpecState returned no tree version');
+      }
+      const undoState = { ...captured.state, treeVersion };
+      const spawn = this.bridge.getSpawnCount();
+      let res: { ok: true; result: RawTreeConversion; stats: Stats };
+      try {
+        res = await this.bridge.send({ cmd: 'convertTreeToLatest' });
+      } catch (err) {
+        await this.rollBackTreeUnlocked(undoState, spawn);
+        throw err;
+      }
+      const raw = res.result;
+      if (!raw.converted) {
+        return { converted: false, fromVersion: raw.fromVersion, toVersion: raw.toVersion };
+      }
+      const command = { cmd: 'convertTreeToLatest' };
+      return this.commitAfterUnlocked({ kind: 'spec', state: undoState }, this.bridge.committedCount(), command, async () => {
+        await this.refreshBuildInfoUnlocked();
+        const after = res.stats;
+        const list = <T>(value: T[] | undefined): T[] => (Array.isArray(value) ? value : []);
+        return {
+          converted: true,
+          fromVersion: raw.fromVersion,
+          toVersion: raw.toVersion,
+          allocatedBefore: raw.allocatedBefore ?? 0,
+          allocatedAfter: raw.allocatedAfter ?? 0,
+          pointsBefore: raw.pointsBefore,
+          pointsAfter: raw.pointsAfter,
+          lostNodeCount: raw.lostNodeCount ?? 0,
+          lostNodes: list(raw.lostNodes),
+          lostNodesOmitted: raw.lostNodesOmitted ?? 0,
+          changedNodeCount: raw.changedNodeCount ?? 0,
+          changedNodes: list(raw.changedNodes),
+          changedNodesOmitted: raw.changedNodesOmitted ?? 0,
+          droppedMasteryCount: raw.droppedMasteryCount ?? 0,
+          droppedMasteries: list(raw.droppedMasteries),
+          droppedMasteriesOmitted: raw.droppedMasteriesOmitted ?? 0,
+          droppedTattooCount: raw.droppedTattooCount ?? 0,
+          droppedTattoos: list(raw.droppedTattoos),
+          droppedTattoosOmitted: raw.droppedTattoosOmitted ?? 0,
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
+      });
+    });
+  }
+
+  /**
+   * After a failed convert: the bridge already swaps the old spec back when
+   * activating the new one fails, but a failure after a successful swap (e.g.
+   * while building the report) would leave the tree converted with no undo
+   * entry. Put the captured spec back whenever the tree version moved.
+   * Skipped when the engine process stopped (crash, or killed after a
+   * timeout) or was replaced: the captured spec belongs to the old process,
+   * and the restarted engine reloads the last committed build anyway.
+   */
+  private async rollBackTreeUnlocked(state: SpecState & { treeVersion: string }, spawn: number): Promise<void> {
+    if (!this.bridge.isRunning() || this.bridge.getSpawnCount() !== spawn) {
+      console.error('[pob-mcp] tree conversion failed and the engine stopped; no rollback on a restarted engine');
+      return;
+    }
+    try {
+      const info = await this.bridge.send<{ ok: true; info: BuildInfo }>({ cmd: 'getBuildInfo' });
+      if (info.info.treeVersion !== state.treeVersion) {
+        await this.bridge.send({ cmd: 'restoreSpecState', state });
+      }
+      await this.refreshBuildInfoUnlocked();
+    } catch (rollbackError) {
+      console.error('[pob-mcp] could not roll back a failed tree conversion:', rollbackError);
+    }
+  }
 
   async getPassiveTree(): Promise<PassiveTreeInfo> {
     return this.withLock(async () => {
@@ -1219,22 +1656,18 @@ export class BuildSession {
     if (mainIndex < 0) mainIndex = 0;
     const groupNumber = mainIndex + 1;
 
-    const skillsSnap = await this.snapshotSkillsUnlocked();
-    let dps = 0;
-    try {
-      // Replace the entire main group atomically: one Lua call, one OnFrame recalc.
-      // Avoids N removeGem + M addGem calls each triggering a full PoB recalculation.
+    // Replace the entire main group atomically: one Lua call, one OnFrame recalc.
+    // Avoids N removeGem + M addGem calls each triggering a full PoB recalculation.
+    // A probe error stays visible when the restore fails too (probeThenRestore).
+    return this.withSkillsProbeUnlocked(async () => {
       const gems = [
         { name: activeSkill, level: 20, quality: 20 },
         ...supports.map((sup) => ({ name: sup, level: 20, quality: 20 })),
       ];
       await this.bridge.send({ cmd: 'replaceSocketGroup', groupIndex: groupNumber, gems });
       const stats = await this.bridge.getStats();
-      dps = toNumber(stats.CombinedDPS);
-    } finally {
-      await this.restoreSkillsUnlocked(skillsSnap);
-    }
-    return dps;
+      return toNumber(stats.CombinedDPS);
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1349,15 +1782,20 @@ export class BuildSession {
     return this.withLock(async () => {
       // Validate before the undo push so a rejected call changes nothing.
       await this.validateConfigOptionsUnlocked(options);
-      const configSnap = await this.snapshotConfigUnlocked();
-      this.undoStack.push({ kind: 'config', snapshot: configSnap });
-      while (this.undoStack.length > this.maxUndo) {
-        this.undoStack.shift();
-      }
+      const entry: UndoEntry = { kind: 'config', snapshot: await this.snapshotConfigUnlocked() };
+      const journal = this.bridge.committedCount();
       const before = await this.bridge.getStats();
-      await this.bridge.setConfig(options);
-      const after = await this.bridge.getStats();
-      return { before, after, diff: computeDiff(before, after) };
+      try {
+        await this.bridge.setConfig(options);
+      } catch (err) {
+        // The change may be partly applied: undo can revert it, but it is never replayed.
+        if (this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+        throw err;
+      }
+      return this.commitAfterUnlocked(entry, journal, { cmd: 'setConfig', options: { ...options } }, async () => {
+        const after = await this.bridge.getStats();
+        return { before, after, diff: computeDiff(before, after) };
+      });
     });
   }
 
@@ -1520,8 +1958,10 @@ export class BuildSession {
       // can't accumulate across slots.
       const fullSnap = await this.snapshotAllUnlocked();
 
+      // Both restores go through probeThenRestore: a restore failure is an
+      // internal error that keeps the probe's error as its cause.
       const out: UpgradeSuggestion[] = [];
-      try {
+      await probeThenRestore(async () => {
         for (const slot of focusSlots) {
           const item = itemsBySlot.get(slot) ?? null;
           if (!item) {
@@ -1539,16 +1979,16 @@ export class BuildSession {
           }
           let dpsLoss = 0;
           let ehpLoss = 0;
-          try {
-            await this.bridge.send({ cmd: 'unequipItem', slot });
-            const without = await this.bridge.getStats();
-            dpsLoss = toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS);
-            ehpLoss = toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP);
-          } catch {
-            /* ignore — slot may not exist; will record zero contribution */
-          } finally {
-            await this.restoreAllUnlocked(fullSnap);
-          }
+          await probeThenRestore(async () => {
+            try {
+              await this.bridge.send({ cmd: 'unequipItem', slot });
+              const without = await this.bridge.getStats();
+              dpsLoss = toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS);
+              ehpLoss = toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP);
+            } catch {
+              /* ignore — slot may not exist; will record zero contribution */
+            }
+          }, () => this.restoreAllUnlocked(fullSnap));
           out.push({
             slot,
             currentItem: item,
@@ -1560,10 +2000,8 @@ export class BuildSession {
             suggestedMods: getSuggestedMods(slot, archetype, budget),
           });
         }
-      } finally {
         // Belt-and-suspenders final restore in case any iteration's restore was skipped.
-        await this.restoreAllUnlocked(fullSnap);
-      }
+      }, () => this.restoreAllUnlocked(fullSnap));
 
       out.sort((a, b) => {
         if (a.empty && !b.empty) return -1;
@@ -1892,6 +2330,74 @@ export interface PassiveTreeSummary {
   ascendClassName?: string | null;
 }
 
+export interface ConvertedNode {
+  id: number;
+  name?: string;
+  type?: string;
+}
+
+export interface RenamedNode {
+  id: number;
+  oldName?: string;
+  newName?: string;
+}
+
+export interface DroppedMastery {
+  nodeId: number;
+  name?: string;
+  effectId: number;
+  effect?: string;
+}
+
+interface RawTreeConversion {
+  converted: boolean;
+  fromVersion: string;
+  toVersion: string;
+  allocatedBefore?: number;
+  allocatedAfter?: number;
+  pointsBefore?: number;
+  pointsAfter?: number;
+  lostNodeCount?: number;
+  lostNodes?: ConvertedNode[];
+  lostNodesOmitted?: number;
+  changedNodeCount?: number;
+  changedNodes?: RenamedNode[];
+  changedNodesOmitted?: number;
+  droppedMasteryCount?: number;
+  droppedMasteries?: DroppedMastery[];
+  droppedMasteriesOmitted?: number;
+  droppedTattooCount?: number;
+  droppedTattoos?: Array<{ nodeId: number; name: string }>;
+  droppedTattoosOmitted?: number;
+}
+
+export type TreeConversionResult =
+  | { converted: false; fromVersion: string; toVersion: string }
+  | {
+      converted: true;
+      fromVersion: string;
+      toVersion: string;
+      allocatedBefore: number;
+      allocatedAfter: number;
+      pointsBefore?: number;
+      pointsAfter?: number;
+      lostNodeCount: number;
+      lostNodes: ConvertedNode[];
+      lostNodesOmitted: number;
+      changedNodeCount: number;
+      changedNodes: RenamedNode[];
+      changedNodesOmitted: number;
+      droppedMasteryCount: number;
+      droppedMasteries: DroppedMastery[];
+      droppedMasteriesOmitted: number;
+      droppedTattooCount: number;
+      droppedTattoos: Array<{ nodeId: number; name: string }>;
+      droppedTattoosOmitted: number;
+      before: Stats;
+      after: Stats;
+      diff: StatDiff;
+    };
+
 export interface PassiveTreeInfo {
   allocatedNodes: TreeNodeInfo[];
   keystones: TreeNodeInfo[];
@@ -1967,18 +2473,18 @@ export interface GemDataInfo {
   color?: number;
 }
 
+/**
+ * Opaque, JSON-safe skills state produced by the bridge's snapshotSkills and
+ * fed back to restoreSkills: every skill set (groups and gem instances with
+ * all their plain fields as sorted [key, value] pairs), the set order, the
+ * active set, the skills tab settings and the main socket group. Equal
+ * states encode to equal JSON.
+ */
 export interface SkillsSnapshot {
+  version: number;
+  activeSkillSetId: number;
   mainSocketGroup?: number;
-  groups: Array<{
-    label?: string;
-    slotName?: string;
-    enabled?: boolean;
-    source?: string | null;
-    mainActiveSkill?: number;
-    mainActiveSkillCalcs?: number;
-    includeInFullDPS?: boolean;
-    gemList: Array<Record<string, unknown>>;
-  }>;
+  [key: string]: unknown;
 }
 
 export interface SupportCandidate {

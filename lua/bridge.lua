@@ -627,6 +627,51 @@ local function userError(msg)
   error(USER_ERROR_PREFIX .. msg, 0)
 end
 
+-- A command failed and putting things back failed too: always an internal
+-- error (the build may have changed, so the client is pointed at
+-- reset_build), keeping the original message without the user-error marker.
+local function failedRecoveryError(err, what, detail)
+	local msg = tostring(err)
+	if msg:sub(1, #USER_ERROR_PREFIX) == USER_ERROR_PREFIX then
+		msg = msg:sub(#USER_ERROR_PREFIX + 1)
+	end
+	error(msg .. " (" .. what .. " also failed: " .. tostring(detail) .. ")", 0)
+end
+
+-- Test-only fault injection, read once from the environment of the LuaJIT
+-- process (never from a command, so MCP tool arguments cannot reach it).
+-- POB_MCP_TEST_FAULTS is a comma-separated list of fault names; see the
+-- uses of TEST_FAULTS below. Unset in normal use.
+local TEST_FAULTS = { }
+for name in tostring(os.getenv("POB_MCP_TEST_FAULTS") or ""):gmatch("[%w_]+") do
+	TEST_FAULTS[name] = true
+end
+
+-- Test fault: stall without answering (a hung engine). Bounded, so a process
+-- nobody kills still ends on its own.
+local function testFaultStall()
+	local deadline = os.clock() + 300
+	while os.clock() < deadline do end
+end
+
+-- Test faults for any command: exitOn_<cmd> ends the process, hangOn_<cmd>
+-- stalls and failOn_<cmd> raises an error before running it. exitAfterChange
+-- ends the process on the first command after a successful build change
+-- (equipItem, unequipItem, setConfig, convertTreeToLatest); failAfterChange
+-- instead raises an error on that command, once per change.
+local TEST_CHANGE_COMMANDS = { equipItem = true, unequipItem = true, setConfig = true, convertTreeToLatest = true }
+local testChangeDone = false
+local function testFaultsForCommand(name)
+	if TEST_FAULTS.exitAfterChange and testChangeDone then os.exit(3) end
+	if TEST_FAULTS.failAfterChange and testChangeDone then
+		testChangeDone = false
+		error("test fault: the command after a change failed", 0)
+	end
+	if TEST_FAULTS["exitOn_" .. tostring(name)] then os.exit(3) end
+	if TEST_FAULTS["hangOn_" .. tostring(name)] then testFaultStall() end
+	if TEST_FAULTS["failOn_" .. tostring(name)] then error("test fault: " .. tostring(name) .. " failed", 0) end
+end
+
 local function encodeJSON(obj)
 	local ok, encoded = pcall(dkjson.encode, obj)
 	if ok and type(encoded) == "string" then
@@ -843,26 +888,355 @@ local function getItemInSlot(slotName)
 	}
 end
 
+-- Why ItemsTab:IsItemValidForSlot refused `item` for `slotName`.
+local function slotRefusalReason(tab, item, slotName)
+	local kind = item.type or (item.base and item.base.type) or "unknown"
+	if slotName:match("^Jewel %d+$") then
+		if kind ~= "Jewel" then
+			return "only jewels go in passive tree jewel sockets"
+		end
+		return "this jewel does not fit that socket (no such socket node, cluster jewel too large, or charm/socket mismatch)"
+	end
+	if slotName == "Weapon 2" or slotName == "Weapon 2 Swap" then
+		local mainSlot = slotName == "Weapon 2" and "Weapon 1" or "Weapon 1 Swap"
+		local entry = tab.activeItemSet[mainSlot]
+		local mainItem = entry and tab.items[entry.selItemId or 0]
+		if mainItem then
+			return "a " .. kind .. " cannot be used alongside the " .. tostring(mainItem.base and mainItem.base.type or mainItem.type)
+				.. " in " .. mainSlot
+		end
+		return "a " .. kind .. " cannot go in the off-hand slot"
+	end
+	return "a " .. kind .. " item does not go in that slot"
+end
+
+-- Parse item text exactly as ItemsTab:CreateDisplayItemFromRaw does (without
+-- normalising), but never through the items tab's displayItem: a parse
+-- failure can then never leave an earlier display item behind to be equipped.
+local function parseItemText(itemRaw, slotName)
+	local ok, item = pcall(new, "Item", itemRaw)
+	if not ok then
+		userError("Could not parse the item text for " .. slotName .. ": " .. stripColorCodes(tostring(item)))
+	end
+	if not (item and item.base) then
+		userError("Could not parse the item text for " .. slotName .. ": Path of Building does not recognise its base type")
+	end
+	return item
+end
+
+-- Everything that stops `item` going into `slot`, checked before anything is
+-- changed. PoB's PopulateSlots would otherwise silently empty the slot.
+local function assertItemFitsSlot(tab, slot, item)
+	local slotName = slot.slotName
+	if not tab:IsItemValidForSlot(item, slotName) then
+		userError(string.format("%s cannot be equipped in %s: %s", tostring(item.name or "This item"), slotName,
+			slotRefusalReason(tab, item, slotName)))
+	end
+	local parent = slot.parentSlot
+	if parent then
+		local index = 0
+		for i, s in ipairs(parent.abyssalSocketList or { }) do
+			if s == slot then index = i end
+		end
+		local parentItem = tab.items[parent.selItemId or 0]
+		local count = parentItem and parentItem.abyssalSocketCount or 0
+		if index > count then
+			userError(string.format("%s cannot be equipped in %s: the item in %s has %d abyssal socket(s)",
+				tostring(item.name or "This item"), slotName, parent.slotName, count))
+		end
+	end
+end
+
+-- Remove an item that nothing refers to from the build (no undo state, no
+-- slot repopulation; callers repopulate once).
+local function removeUnusedItem(tab, id)
+	tab.items[id] = nil
+	for i = #tab.itemOrderList, 1, -1 do
+		if tab.itemOrderList[i] == id then table.remove(tab.itemOrderList, i) end
+	end
+end
+
 local function equipItemInSlot(slotName, itemRaw)
-	local slot = build.itemsTab.slots[slotName]
+	local tab = build.itemsTab
+	local slot = tab.slots[slotName]
 	if not slot then
 		userError("Unknown slot: " .. tostring(slotName))
 	end
-	build.itemsTab:CreateDisplayItemFromRaw(itemRaw)
-	if not build.itemsTab.displayItem then
-		userError("Failed to parse item raw text")
-	end
-	-- AddItem gives the item the lowest free id (not the highest), and
-	-- AddDisplayItem clears displayItem, so keep the object to read its id.
-	local newItem = build.itemsTab.displayItem
-	build.itemsTab:AddDisplayItem(true) -- noAutoEquip = true
-	if not newItem.id or build.itemsTab.items[newItem.id] ~= newItem then
-		error("Path of Building did not add the item (ItemsTab:AddDisplayItem changed)")
+	local newItem = parseItemText(itemRaw, slotName)
+	assertItemFitsSlot(tab, slot, newItem)
+	-- AddItem gives the item the lowest free id (not the highest).
+	local previousId = slot.selItemId or 0
+	tab:AddItem(newItem, true) -- noAutoEquip = true
+	if not newItem.id or tab.items[newItem.id] ~= newItem then
+		error("Path of Building did not add the item (ItemsTab:AddItem changed)")
 	end
 	slot:SetSelItemId(newItem.id)
 	build.buildFlag = true
-	build.itemsTab:PopulateSlots()
+	tab:PopulateSlots()
+	if slot.selItemId ~= newItem.id then
+		-- Not expected after assertItemFitsSlot; put the slot back rather than
+		-- leave it silently empty.
+		slot:SetSelItemId(previousId)
+		removeUnusedItem(tab, newItem.id)
+		tab:PopulateSlots()
+		runCallback("OnFrame")
+		error("Path of Building did not keep the item in " .. slotName .. " (slot validation changed?)")
+	end
 	runCallback("OnFrame")
+end
+
+-- Re-select an item the build already holds. Returns false (changing
+-- nothing) when `itemId` is gone or now holds a different item than `itemRaw`.
+local function selectItemInSlot(slotName, itemId, itemRaw)
+	local tab = build.itemsTab
+	local slot = tab.slots[slotName]
+	if not slot then
+		userError("Unknown slot: " .. tostring(slotName))
+	end
+	local item = tab.items[itemId or 0]
+	if not item or (itemRaw ~= nil and item.raw ~= itemRaw) then
+		return false
+	end
+	assertItemFitsSlot(tab, slot, item)
+	slot:SetSelItemId(item.id)
+	build.buildFlag = true
+	tab:PopulateSlots()
+	runCallback("OnFrame")
+	return true
+end
+
+-- Item state of the active item set: the item id in every equipment slot
+-- that is not a passive-tree jewel socket (weapons and weapon swap, armour,
+-- jewellery including Ring 3, grafts, flasks, abyssal sockets), taken from
+-- the engine's own slot list, plus the build's item list in order. Jewel
+-- sockets are deliberately left out: PoB keeps them on the passive spec
+-- (spec.jewels), and the tree state (captureSpecState / restoreTreeState)
+-- owns them.
+-- Identity tokens for item objects (weak keys: a collected item's token goes
+-- with it, and tokens are never reused), so a captured id can be checked to
+-- still name the very item it named at capture time, cheaply.
+local itemTokens = setmetatable({ }, { __mode = "k" })
+-- Tokens are "<process tag>:<counter>". The tag is made once per engine
+-- process, at its first token (after PoB has booted and a build is loaded),
+-- from the wall clock, the CPU time used so far, the Lua heap size and the
+-- addresses of fresh objects (which address-space randomisation varies), so
+-- tokens from an engine that has since crashed or been replaced never match
+-- this one's by coincidence. PoB's math.random state is left alone.
+local itemTokenTag = nil
+local function makeItemTokenTag()
+	local function address(obj)
+		local text = tostring(obj)
+		return text:match("0x(%x+)") or text:match("(%x+)$") or "0"
+	end
+	return string.format("%x-%x-%x-%s-%s", os.time(), math.floor(os.clock() * 1e6),
+		math.floor(collectgarbage("count") * 1024), address({ }), address(function() end))
+end
+local nextItemToken = 0
+local function itemToken(item)
+	if not item then return "" end
+	local token = itemTokens[item]
+	if not token then
+		itemTokenTag = itemTokenTag or makeItemTokenTag()
+		nextItemToken = nextItemToken + 1
+		token = itemTokenTag .. ":" .. nextItemToken
+		itemTokens[item] = token
+	end
+	return token
+end
+
+-- Token, and raw text to check it against, of every item that has one: kept
+-- across a reload of the same build (the failed-load recovery in loadXML).
+local function itemIdentities()
+	local out = { }
+	for id, item in pairs(build and build.itemsTab and build.itemsTab.items or { }) do
+		local token = itemTokens[item]
+		if token then out[id] = { token = token, raw = item.raw } end
+	end
+	return out
+end
+
+-- After the build was reloaded from its own SaveDB output, every item is a
+-- new object with the same id: give each the token its predecessor had, but
+-- only where the reloaded item has the same text, so undo entries and
+-- snapshots of that build stay valid while anything else still mismatches.
+-- The texts compare equal even for items PoB re-serialises (crafted mods,
+-- variants, rolled ranges): ItemsTab:Save rewrites each item's raw text
+-- (BuildAndParseRaw) before writing it, `identities` is read after that
+-- SaveDB, and the reloaded item's raw text is exactly the saved text.
+local function carryItemIdentities(identities)
+	local carried = 0
+	for id, item in pairs(build and build.itemsTab and build.itemsTab.items or { }) do
+		local known = identities[id]
+		if known and item.raw == known.raw then
+			itemTokens[item] = known.token
+			carried = carried + 1
+		end
+	end
+	return carried
+end
+
+local function captureItemsState()
+	local tab = build.itemsTab
+	local slots = { }
+	for _, slot in ipairs(tab.orderedSlots) do
+		local id = slot.selItemId or 0
+		if not slot.nodeId and id ~= 0 then
+			slots[#slots + 1] = { slot.slotName, id }
+		end
+	end
+	local order, tokens = { }, { }
+	for i, id in ipairs(tab.itemOrderList) do
+		order[i] = id
+		tokens[i] = itemToken(tab.items[id])
+	end
+	return { slots = slots, itemOrder = order, itemTokens = tokens }
+end
+
+-- Refuse (internal error, before anything changes) a captured item state
+-- whose ids no longer name the captured items: a snapshot taken before the
+-- engine was restarted or the build was reloaded, which replaces every item
+-- object while keeping the same ids. (The bridge's own failed-load recovery
+-- carries identities over, see carryItemIdentities.)
+local function checkItemsState(state)
+	if type(state) ~= "table" or type(state.itemOrder) ~= "table" or type(state.itemTokens) ~= "table"
+		or #state.itemTokens ~= #state.itemOrder then
+		error("Item snapshot is malformed; nothing was restored; call reset_build to return to the loaded build", 0)
+	end
+	local tab = build.itemsTab
+	for i, id in ipairs(state.itemOrder) do
+		local item = tab.items[id]
+		if not item or itemTokens[item] ~= state.itemTokens[i] then
+			error("Item snapshot does not match the build (item " .. tostring(id) .. " is "
+				.. (item and "a different item" or "gone") .. ": the snapshot was taken before the engine was "
+				.. "restarted or the build was reloaded); nothing was restored; call reset_build to return to "
+				.. "the loaded build", 0)
+		end
+	end
+end
+
+-- Where the build still refers to item `id`.
+local function itemReferences(tab, id)
+	local refs = { }
+	for slotName, slot in pairs(tab.slots) do
+		if slot.selItemId == id then refs[#refs + 1] = slotName end
+	end
+	for setId, itemSet in pairs(tab.itemSets or { }) do
+		if itemSet ~= tab.activeItemSet then
+			for slotName, entry in pairs(itemSet) do
+				if type(entry) == "table" and entry.selItemId == id then
+					refs[#refs + 1] = "item set " .. tostring(setId) .. " " .. tostring(slotName)
+				end
+			end
+		end
+	end
+	for i, spec in ipairs(build.treeTab and build.treeTab.specList or { build.spec }) do
+		for nodeId, itemId in pairs(spec.jewels or { }) do
+			if itemId == id then refs[#refs + 1] = "tree " .. i .. " socket " .. tostring(nodeId) end
+		end
+	end
+	table.sort(refs)
+	return refs
+end
+
+-- Put a captureItemsState state back: every non-socket slot re-selects the
+-- captured item id (by id, so nothing is re-added), items added since the
+-- capture (probe items, the item a swap added) are deleted, and the item
+-- order is the captured one. Snapshot items are never deleted, so ids held
+-- by older snapshots (tree states, undo entries) stay valid. Returns
+-- { exact, mismatches?, removedItemIds? }.
+local function restoreItemsState(state)
+	if type(state) ~= "table" or type(state.slots) ~= "table" or type(state.itemOrder) ~= "table" then
+		error("restoreItemsState: malformed item state")
+	end
+	checkItemsState(state)
+	local tab = build.itemsTab
+	local mismatches = { }
+	local want = { }
+	for _, pair in ipairs(state.slots) do
+		local name, id = pair[1], pair[2]
+		if type(name) ~= "string" or type(id) ~= "number" then
+			error("restoreItemsState: malformed slot entry")
+		end
+		if not tab.slots[name] or tab.slots[name].nodeId then
+			mismatches[#mismatches + 1] = "slot " .. name .. " does not exist"
+		elseif not tab.items[id] then
+			mismatches[#mismatches + 1] = "item " .. id .. " for " .. name .. " no longer exists"
+		end
+		want[name] = id
+	end
+	local keep = { }
+	for _, id in ipairs(state.itemOrder) do keep[id] = true end
+
+	local changed = false
+	for _, slot in ipairs(tab.orderedSlots) do
+		if not slot.nodeId then
+			local id = want[slot.slotName] or 0
+			if not tab.items[id] then id = 0 end
+			if (slot.selItemId or 0) ~= id then
+				slot:SetSelItemId(id)
+				changed = true
+			end
+		end
+	end
+
+	local extra = { }
+	for id in pairs(tab.items) do
+		if not keep[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	local removed = { }
+	for _, id in ipairs(extra) do
+		local refs = itemReferences(tab, id)
+		if #refs > 0 then
+			mismatches[#mismatches + 1] = "item " .. id .. " added since the snapshot is still in use (" .. table.concat(refs, ", ") .. ")"
+		else
+			removeUnusedItem(tab, id)
+			removed[#removed + 1] = id
+		end
+	end
+
+	local orderMatches = #tab.itemOrderList == #state.itemOrder
+	for i, id in ipairs(state.itemOrder) do
+		if tab.itemOrderList[i] ~= id then orderMatches = false end
+	end
+	if not orderMatches then
+		-- Same items, different order: put the captured order back (in place;
+		-- the item list control holds this table).
+		local sameItems = true
+		for _, id in ipairs(state.itemOrder) do
+			if not tab.items[id] then sameItems = false end
+		end
+		for id in pairs(tab.items) do
+			if not keep[id] then sameItems = false end
+		end
+		if sameItems then
+			for i = #tab.itemOrderList, 1, -1 do tab.itemOrderList[i] = nil end
+			for i, id in ipairs(state.itemOrder) do tab.itemOrderList[i] = id end
+		else
+			mismatches[#mismatches + 1] = "item list differs from the snapshot"
+		end
+	end
+
+	if changed or #removed > 0 then
+		tab:PopulateSlots()
+		build.buildFlag = true
+		runCallback("OnFrame")
+	end
+	for _, slot in ipairs(tab.orderedSlots) do
+		if not slot.nodeId then
+			local id = want[slot.slotName] or 0
+			if tab.items[id] and (slot.selItemId or 0) ~= id then
+				mismatches[#mismatches + 1] = slot.slotName .. " holds item " .. tostring(slot.selItemId) .. ", expected " .. id
+			end
+		end
+	end
+	local report = { exact = #mismatches == 0 }
+	if #mismatches > 0 then
+		report.mismatches = mismatches
+		STDERR:write("[pob-mcp] warning: item restore is not exact: ", encodeJSON(report), "\n")
+	end
+	if #removed > 0 then report.removedItemIds = removed end
+	return report
 end
 
 local function unequipSlot(slotName)
@@ -1000,6 +1374,546 @@ local function restoreTreeFromIds(nodeIds)
 			" node(s) unallocated: ", table.concat(shown, ", "), (#missing > 20 and ", ..." or ""), "\n")
 	end
 	return missing
+end
+
+-- ---------------------------------------------------------------------------
+-- Tree version conversion
+-- ---------------------------------------------------------------------------
+
+local CONVERT_LIST_CAP = 50
+
+local function listContains(list, value)
+	for _, v in pairs(list or { }) do
+		if v == value then return true end
+	end
+	return false
+end
+
+-- The version PoB's own "Convert to <latest>" button targets: latestTreeVersion
+-- (keeping any suffix the current version already has after it), then
+-- ConvertToVersion keeps a ruthless/alternate sub-type when the latest tree
+-- has that variant (TreeTab.lua getLatestTreeVersion + ConvertToVersion).
+local function latestConvertTarget(curVersion)
+	local latest = rawget(_G, "latestTreeVersion")
+	if type(latest) ~= "string" or type(curVersion) ~= "string" then
+		error("Tree convert failed: latestTreeVersion or the spec's treeVersion is missing (PoB GameVersions changed?)")
+	end
+	local version = latest .. (curVersion:match("^" .. latest .. "(.*)") or "")
+	local subType = curVersion:match("(_%l+_?%l*)")
+	if subType and not version:match(subType) and listContains(rawget(_G, "treeVersionList"), version .. subType) then
+		version = version .. subType
+	end
+	return version
+end
+
+-- Lua-native copy of everything a spec needs to be rebuilt on any version.
+-- Unlike PassiveSpec:CreateUndoState this keeps the secondary ascendancy
+-- (CreateUndoState reads a field that does not exist), the title and jewels.
+local function captureSpecState(spec)
+	local hashList = { }
+	for id in pairs(spec.allocNodes or { }) do hashList[#hashList + 1] = id end
+	table.sort(hashList)
+	return {
+		treeVersion = spec.treeVersion,
+		title = spec.title,
+		classId = spec.curClassId,
+		ascendClassId = spec.curAscendClassId,
+		secondaryAscendClassId = spec.curSecondaryAscendClassId,
+		hashList = hashList,
+		masteryEffects = shallowCopy(spec.masterySelections),
+		hashOverrides = shallowCopy(spec.hashOverrides),
+		jewels = shallowCopy(spec.jewels),
+	}
+end
+
+local function sortedPairs(map, valueFn)
+	local out = { }
+	for k, v in pairs(map or { }) do out[#out + 1] = { k, valueFn and valueFn(v) or v } end
+	table.sort(out, function(a, b) return a[1] < b[1] end)
+	return out
+end
+
+-- Override (tattoo) tables seen by encodeSpecState, keyed by tree version,
+-- node id and name, so an in-place tree restore can put back the very table
+-- PoB had instead of a rebuilt copy. Bounded by the distinct (version, node,
+-- tattoo) triples ever captured.
+local overrideRegistry = { }
+local function overrideKey(treeVersion, nodeId, dn)
+	return tostring(treeVersion) .. "\0" .. tostring(nodeId) .. "\0" .. tostring(dn)
+end
+
+-- JSON-safe form of a captured state (integer-keyed maps become pair arrays;
+-- tattoo overrides are carried by name, the way PassiveSpec:Load reads them).
+local function encodeSpecState(state)
+	local overrides = { }
+	for nodeId, node in pairs(state.hashOverrides or { }) do
+		overrides[#overrides + 1] = { nodeId = nodeId, dn = node.dn }
+		overrideRegistry[overrideKey(state.treeVersion, nodeId, node.dn)] = node
+	end
+	table.sort(overrides, function(a, b) return a.nodeId < b.nodeId end)
+	return {
+		treeVersion = state.treeVersion,
+		title = state.title,
+		classId = state.classId,
+		ascendClassId = state.ascendClassId,
+		secondaryAscendClassId = state.secondaryAscendClassId,
+		nodeIds = state.hashList,
+		masteryEffects = sortedPairs(state.masteryEffects),
+		jewels = sortedPairs(state.jewels),
+		hashOverrides = overrides,
+	}
+end
+
+local function decodeIdPairs(list, what)
+	local out = { }
+	if list == nil then return out end
+	if type(list) ~= "table" then error("Tree restore failed: " .. what .. " is not an array") end
+	for _, pair in ipairs(list) do
+		local k, v = type(pair) == "table" and tonumber(pair[1]), type(pair) == "table" and tonumber(pair[2])
+		if not (k and v) then error("Tree restore failed: malformed " .. what .. " entry") end
+		out[k] = v
+	end
+	return out
+end
+
+local function decodeSpecState(encoded)
+	if type(encoded) ~= "table" or type(encoded.treeVersion) ~= "string" or tonumber(encoded.classId) == nil then
+		error("Tree restore failed: malformed spec state")
+	end
+	local hashList = { }
+	for _, id in ipairs(encoded.nodeIds or { }) do
+		local n = tonumber(id)
+		if not n then error("Tree restore failed: malformed node id") end
+		hashList[#hashList + 1] = n
+	end
+	local overrideNames = { }
+	for _, o in ipairs(encoded.hashOverrides or { }) do
+		if type(o) == "table" and tonumber(o.nodeId) and type(o.dn) == "string" then
+			overrideNames[tonumber(o.nodeId)] = o.dn
+		end
+	end
+	return {
+		treeVersion = encoded.treeVersion,
+		title = type(encoded.title) == "string" and encoded.title or nil,
+		classId = tonumber(encoded.classId),
+		ascendClassId = tonumber(encoded.ascendClassId) or 0,
+		secondaryAscendClassId = tonumber(encoded.secondaryAscendClassId) or 0,
+		hashList = hashList,
+		masteryEffects = decodeIdPairs(encoded.masteryEffects, "masteryEffects"),
+		jewels = decodeIdPairs(encoded.jewels, "jewels"),
+		overrideNames = overrideNames,
+	}
+end
+
+-- Replace the active spec with a new PassiveSpec on `version` built from
+-- `state` (TreeTab:ConvertToVersion with remove=true, minus the popup). Tattoo
+-- overrides given by name are looked up in the target tree like
+-- PassiveSpec:Load does; ones that tree lacks are dropped and returned.
+local function installSpec(version, state)
+	local treeTab = build.treeTab
+	if not (treeTab and type(treeTab.specList) == "table" and treeTab.activeSpec and type(treeTab.SetActiveSpec) == "function") then
+		error("Tree convert failed: build.treeTab spec list is unavailable (PoB TreeTab changed?)")
+	end
+	local versions = rawget(_G, "treeVersions")
+	if type(versions) ~= "table" or not versions[version] then
+		error("Tree convert failed: unknown tree version " .. tostring(version))
+	end
+	local newSpec = new("PassiveSpec", build, version)
+	newSpec.title = state.title
+	newSpec.jewels = shallowCopy(state.jewels)
+	local overrides = shallowCopy(state.hashOverrides)
+	local droppedOverrides = { }
+	for nodeId, dn in pairs(state.overrideNames or { }) do
+		local tattoo = newSpec.tree.tattoo and newSpec.tree.tattoo.nodes and newSpec.tree.tattoo.nodes[dn]
+		if tattoo then
+			overrides[nodeId] = copyTable(tattoo, true)
+			overrides[nodeId].id = nodeId
+		else
+			droppedOverrides[#droppedOverrides + 1] = { nodeId = nodeId, name = dn }
+		end
+	end
+	newSpec:RestoreUndoState({
+		classId = state.classId,
+		ascendClassId = state.ascendClassId,
+		secondaryAscendClassId = state.secondaryAscendClassId,
+		hashList = state.hashList,
+		hashOverrides = overrides,
+		masteryEffects = shallowCopy(state.masteryEffects),
+		treeVersion = version,
+	}, version)
+	newSpec:BuildClusterJewelGraphs()
+
+	-- Swap the spec in. Launch.lua's OnFrame catches errors into promptMsg
+	-- instead of throwing, so both channels count as failure; on failure the
+	-- previous spec goes back so the build is left exactly as it was.
+	local index = treeTab.activeSpec
+	local previousSpec = treeTab.specList[index]
+	local promptBefore = mainObject.promptMsg
+	local function activate(spec)
+		treeTab.specList[index] = spec
+		treeTab:SetActiveSpec(index)
+		if build.spec ~= spec then
+			error("TreeTab:SetActiveSpec did not activate the spec (PoB TreeTab changed?)", 0)
+		end
+		build.buildFlag = true
+		runCallback("OnFrame")
+		if mainObject.promptMsg ~= promptBefore then
+			error(stripColorCodes(tostring(mainObject.promptMsg)):gsub("%s+", " "), 0)
+		end
+	end
+	local ok, err = pcall(activate, newSpec)
+	if not ok then
+		mainObject.promptMsg = promptBefore
+		local restored, restoreErr = pcall(activate, previousSpec)
+		if not restored then
+			mainObject.promptMsg = promptBefore
+			error("Tree change to " .. tostring(version) .. " failed (" .. tostring(err)
+				.. ") and restoring the previous tree also failed (" .. tostring(restoreErr) .. "); call reset_build", 0)
+		end
+		error("Tree change to " .. tostring(version) .. " failed; the previous tree was restored: " .. tostring(err), 0)
+	end
+	return droppedOverrides
+end
+
+-- True when `effectId` is one of the effects the tree offers on that mastery node.
+local function nodeOffersMasteryEffect(node, effectId)
+	for _, effect in ipairs(node and node.masteryEffects or { }) do
+		if effect.effect == effectId then return true end
+	end
+	return false
+end
+
+local function masteryEffectText(spec, effectId)
+	local effect = spec.tree and spec.tree.masteryEffects and spec.tree.masteryEffects[effectId]
+	if effect and type(effect.sd) == "table" then
+		return table.concat(effect.sd, " / ")
+	end
+	return nil
+end
+
+local function cappedList(list)
+	local shown = { }
+	for i = 1, math.min(#list, CONVERT_LIST_CAP) do shown[i] = list[i] end
+	return shown, math.max(0, #list - CONVERT_LIST_CAP)
+end
+
+local function countKeys(map)
+	local n = 0
+	for _ in pairs(map or { }) do n = n + 1 end
+	return n
+end
+
+-- Move the active spec to the latest tree. Returns { converted = false } when
+-- it is already there; otherwise a report of what the conversion lost. The
+-- caller takes its undo state (captureSpecState command) before calling this.
+local function convertTreeToLatest()
+	local oldSpec = build.spec
+	if type(oldSpec) ~= "table" or type(oldSpec.treeVersion) ~= "string" then
+		error("Tree convert failed: build.spec is unavailable (PoB Build module changed?)")
+	end
+	local fromVersion = oldSpec.treeVersion
+	local toVersion = latestConvertTarget(fromVersion)
+	if toVersion == fromVersion then
+		return { converted = false, fromVersion = fromVersion, toVersion = toVersion }
+	end
+	local state = captureSpecState(oldSpec)
+	local oldNodes = { }
+	for id, node in pairs(oldSpec.allocNodes) do oldNodes[id] = node end
+	local oldPoints = oldSpec.CountAllocNodes and oldSpec:CountAllocNodes() or nil
+
+	local overrideNames = { }
+	for nodeId, node in pairs(state.hashOverrides) do overrideNames[nodeId] = node.dn end
+	local convertState = shallowCopy(state)
+	convertState.hashOverrides = { }
+	convertState.overrideNames = overrideNames
+	local droppedOverrides = installSpec(toVersion, convertState)
+	local newSpec = build.spec
+	-- Test faults: the engine dies or hangs with the new spec already active.
+	if TEST_FAULTS.convertExitsAfterSwap then os.exit(3) end
+	if TEST_FAULTS.convertHangsAfterSwap then testFaultStall() end
+
+	local lost, changed = { }, { }
+	for _, id in ipairs(state.hashList) do
+		local before = oldNodes[id]
+		local after = newSpec.allocNodes[id]
+		if not after then
+			lost[#lost + 1] = { id = id, name = before.dn, type = before.type }
+		elseif before.dn ~= after.dn then
+			changed[#changed + 1] = { id = id, oldName = before.dn, newName = after.dn }
+		end
+	end
+	local droppedMasteries = { }
+	for _, pair in ipairs(sortedPairs(state.masteryEffects)) do
+		local nodeId, effectId = pair[1], pair[2]
+		-- PoB keeps a selection whose effect exists anywhere on the new tree, even
+		-- when that node no longer offers it; count that as dropped too.
+		if newSpec.masterySelections[nodeId] ~= effectId or not newSpec.allocNodes[nodeId]
+			or not nodeOffersMasteryEffect(newSpec.nodes[nodeId], effectId) then
+			local node = oldNodes[nodeId] or oldSpec.nodes[nodeId]
+			droppedMasteries[#droppedMasteries + 1] = {
+				nodeId = nodeId,
+				name = node and node.dn,
+				effectId = effectId,
+				effect = masteryEffectText(oldSpec, effectId),
+			}
+		end
+	end
+	local lostShown, lostOmitted = cappedList(lost)
+	local changedShown, changedOmitted = cappedList(changed)
+	local masteryShown, masteryOmitted = cappedList(droppedMasteries)
+	local tattooShown, tattooOmitted = cappedList(droppedOverrides)
+	local newPoints = newSpec.CountAllocNodes and newSpec:CountAllocNodes() or nil
+	return {
+		converted = true,
+		fromVersion = fromVersion,
+		toVersion = newSpec.treeVersion,
+		allocatedBefore = #state.hashList,
+		allocatedAfter = countKeys(newSpec.allocNodes),
+		pointsBefore = oldPoints,
+		pointsAfter = newPoints,
+		lostNodeCount = #lost,
+		lostNodes = lostShown,
+		lostNodesOmitted = lostOmitted,
+		changedNodeCount = #changed,
+		changedNodes = changedShown,
+		changedNodesOmitted = changedOmitted,
+		droppedMasteryCount = #droppedMasteries,
+		droppedMasteries = masteryShown,
+		droppedMasteriesOmitted = masteryOmitted,
+		droppedTattooCount = #droppedOverrides,
+		droppedTattoos = tattooShown,
+		droppedTattoosOmitted = tattooOmitted,
+	}
+end
+
+local function restoreSpecState(encoded)
+	local state = decodeSpecState(encoded)
+	local dropped = installSpec(state.treeVersion, state)
+	if #dropped > 0 then
+		STDERR:write("[pob-mcp] warning: tree restore could not find ", tostring(#dropped), " tattoo(s) on tree ",
+			state.treeVersion, "\n")
+	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Exact tree restore for what-if probes and undo
+-- ---------------------------------------------------------------------------
+
+local function sortedKeys(set)
+	local out = { }
+	for id in pairs(set) do out[#out + 1] = id end
+	table.sort(out)
+	return out
+end
+
+local function socketedJewel(map, nodeId)
+	local itemId = map and map[nodeId]
+	if itemId == 0 then return nil end
+	return itemId
+end
+
+-- Every way the active spec differs from a decoded state. Wanted node ids the
+-- spec does not know (cluster subgraph nodes whose jewel graph is not built)
+-- are `pending`; allocated ids the state does not list are `extra`.
+local function treeStateDifferences(spec, state)
+	local want = { }
+	for _, id in ipairs(state.hashList) do want[id] = true end
+	local missing, pending, extra = { }, { }, { }
+	for id in pairs(want) do
+		if not spec.allocNodes[id] then
+			if spec.nodes[id] then missing[id] = true else pending[id] = true end
+		end
+	end
+	for id in pairs(spec.allocNodes) do
+		if not want[id] then extra[id] = true end
+	end
+	local mismatches = { }
+	local function check(what, have, wanted)
+		if have ~= wanted then
+			mismatches[#mismatches + 1] = what .. " is " .. tostring(have) .. ", expected " .. tostring(wanted)
+		end
+	end
+	check("tree version", spec.treeVersion, state.treeVersion)
+	check("class", spec.curClassId, state.classId)
+	check("ascendancy", spec.curAscendClassId or 0, state.ascendClassId)
+	check("secondary ascendancy", spec.curSecondaryAscendClassId or 0, state.secondaryAscendClassId)
+	local selections = spec.masterySelections or { }
+	local ids = shallowCopy(state.masteryEffects)
+	for id in pairs(selections) do ids[id] = true end
+	for _, id in ipairs(sortedKeys(ids)) do
+		check("mastery " .. id, selections[id], state.masteryEffects[id])
+	end
+	local overrides = spec.hashOverrides or { }
+	ids = shallowCopy(state.overrideNames)
+	for id in pairs(overrides) do ids[id] = true end
+	for _, id in ipairs(sortedKeys(ids)) do
+		check("tattoo on node " .. id, overrides[id] and overrides[id].dn, state.overrideNames[id])
+	end
+	ids = shallowCopy(state.jewels)
+	for id in pairs(spec.jewels or { }) do ids[id] = true end
+	for _, id in ipairs(sortedKeys(ids)) do
+		check("jewel in socket " .. id, socketedJewel(spec.jewels, id), socketedJewel(state.jewels, id))
+	end
+	return { missing = sortedKeys(missing), pending = sortedKeys(pending), extra = sortedKeys(extra), mismatches = mismatches }
+end
+
+local function treeStateReport(diff, corrected)
+	local report = { exact = #diff.missing == 0 and #diff.pending == 0 and #diff.extra == 0 and #diff.mismatches == 0 }
+	if #diff.missing > 0 then report.missingNodeIds = diff.missing end
+	if #diff.pending > 0 then report.pendingNodeIds = diff.pending end
+	if #diff.extra > 0 then report.extraNodeIds = diff.extra end
+	if #diff.mismatches > 0 then report.mismatches = diff.mismatches end
+	if corrected and #corrected > 0 then report.correctedExtraNodeIds = corrected end
+	return report
+end
+
+local function verifyTreeState(encoded)
+	if type(build.spec) ~= "table" then
+		error("Tree verify failed: build.spec is unavailable (PoB Build module changed?)")
+	end
+	return treeStateReport(treeStateDifferences(build.spec, decodeSpecState(encoded)))
+end
+
+-- Override tables for a same-version restore: the exact table captured
+-- earlier when known, else the named tattoo from this tree (as
+-- PassiveSpec:Load does). Unresolvable ones are left out and show up as a
+-- mismatch in the report.
+local function resolveOverrides(spec, overrideNames)
+	local overrides = { }
+	for nodeId, dn in pairs(overrideNames) do
+		local key = overrideKey(spec.treeVersion, nodeId, dn)
+		local node = overrideRegistry[key]
+		if not node then
+			local tattoo = spec.tree and spec.tree.tattoo and spec.tree.tattoo.nodes and spec.tree.tattoo.nodes[dn]
+			if tattoo then
+				node = copyTable(tattoo, true)
+				node.id = nodeId
+				overrideRegistry[key] = node
+			end
+		end
+		overrides[nodeId] = node
+	end
+	return overrides
+end
+
+-- Put the socketed jewels back (they live on the spec in PoB) before the node
+-- list is applied: Intuitive Leap-like support and cluster graphs come from
+-- them. Ids are restored as captured, even ones whose item no longer exists
+-- (PoB's own TreeTab:SetActiveSpec does the same and its tree code skips
+-- them), so a snapshot compares equal to the state it was taken from.
+-- Returns true when anything changed.
+local function restoreSpecJewels(spec, wanted)
+	local jewels = shallowCopy(wanted)
+	local changed = false
+	for nodeId in pairs(jewels) do
+		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
+	end
+	for nodeId in pairs(spec.jewels or { }) do
+		if socketedJewel(spec.jewels, nodeId) ~= socketedJewel(jewels, nodeId) then changed = true end
+	end
+	if not changed then return false end
+	-- Updated in place: PassiveSpec:Save writes <Sockets> in this table's
+	-- iteration order, which a fresh table would reshuffle.
+	if type(spec.jewels) ~= "table" then spec.jewels = { } end
+	for nodeId in pairs(spec.jewels) do
+		if jewels[nodeId] == nil then spec.jewels[nodeId] = nil end
+	end
+	for nodeId, itemId in pairs(jewels) do spec.jewels[nodeId] = itemId end
+	for nodeId, slot in pairs(build.itemsTab and build.itemsTab.sockets or { }) do
+		slot.selItemId = jewels[nodeId] or 0
+	end
+	return true
+end
+
+-- Replace the active tree with a captured spec state (captureSpecState):
+-- nodes, masteries, tattoos, class, ascendancies, jewels and tree version.
+-- Same version: restored in place through PassiveSpec:RestoreUndoState,
+-- feeding it the captured masteries and tattoos (not the current ones).
+-- Other version: the spec is rebuilt (restoreSpecState). Afterwards the result
+-- is compared with the state; nodes PoB re-allocated on its own (cluster
+-- nodes ImportFromNodeList re-allocates from allocExtendedNodes) are
+-- deallocated, dropped from allocExtendedNodes (so only the first restore
+-- after such a node's deallocation has to correct it) and listed in
+-- correctedExtraNodeIds, and anything still different is reported.
+local function restoreTreeState(encoded)
+	local spec = build.spec
+	if type(spec) ~= "table" or type(spec.RestoreUndoState) ~= "function" then
+		error("Tree restore failed: build.spec or PassiveSpec:RestoreUndoState is unavailable (PoB changed?)")
+	end
+	local state = decodeSpecState(encoded)
+	local before = state.treeVersion == spec.treeVersion and treeStateDifferences(spec, state)
+	local jewelsOnly = before and #before.missing == 0 and #before.pending == 0 and #before.extra == 0
+		and #before.mismatches > 0
+	if jewelsOnly then
+		for _, text in ipairs(before.mismatches) do
+			if not text:find("^jewel in socket ") then jewelsOnly = false end
+		end
+	end
+	if jewelsOnly then
+		-- Only socketed jewels differ (an item probe on a jewel socket): put
+		-- them back without re-importing the node list, which would reshuffle
+		-- PoB's allocNodes table and so the order of the saved node list.
+		restoreSpecJewels(spec, state.jewels)
+		spec:BuildClusterJewelGraphs()
+		if build.itemsTab.PopulateSlots then build.itemsTab:PopulateSlots() end
+		local diff = treeStateDifferences(spec, state)
+		if #diff.missing == 0 and #diff.pending == 0 and #diff.extra == 0 and #diff.mismatches == 0 then
+			build.buildFlag = true
+			runCallback("OnFrame")
+			return treeStateReport(diff)
+		end
+		-- Something else moved with the jewels: fall through to the full restore.
+	end
+	if state.treeVersion ~= spec.treeVersion then
+		restoreSpecState(encoded)
+		spec = build.spec
+	else
+		local jewelsChanged = restoreSpecJewels(spec, state.jewels)
+		local ok, err = pcall(spec.RestoreUndoState, spec, {
+			classId = state.classId,
+			ascendClassId = state.ascendClassId,
+			secondaryAscendClassId = state.secondaryAscendClassId,
+			hashList = state.hashList,
+			hashOverrides = resolveOverrides(spec, state.overrideNames),
+			masteryEffects = shallowCopy(state.masteryEffects),
+			treeVersion = state.treeVersion,
+		}, state.treeVersion)
+		if not ok then
+			error("Tree restore failed in PassiveSpec:RestoreUndoState (PoB API may have changed): " .. tostring(err))
+		end
+		if jewelsChanged then
+			spec:BuildClusterJewelGraphs()
+			if build.itemsTab.PopulateSlots then build.itemsTab:PopulateSlots() end
+		end
+	end
+
+	local diff = treeStateDifferences(spec, state)
+	local corrected = { }
+	if #diff.extra > 0 then
+		local extended = { }
+		for _, id in ipairs(diff.extra) do
+			local node = spec.allocNodes[id]
+			if node and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+				spec:DeallocSingleNode(node)
+				extended[id] = true
+				corrected[#corrected + 1] = id
+			end
+		end
+		if type(spec.allocExtendedNodes) == "table" then
+			for i = #spec.allocExtendedNodes, 1, -1 do
+				if extended[spec.allocExtendedNodes[i]] then table.remove(spec.allocExtendedNodes, i) end
+			end
+		end
+		spec:BuildAllDependsAndPaths()
+		diff = treeStateDifferences(spec, state)
+	end
+	build.buildFlag = true
+	runCallback("OnFrame")
+	local report = treeStateReport(diff, corrected)
+	if not report.exact then
+		STDERR:write("[pob-mcp] warning: tree restore is not exact: ", encodeJSON(report), "\n")
+	end
+	return report
 end
 
 local function getFullConfigInput()
@@ -1274,26 +2188,116 @@ local function getNodeInfo(arg)
 	return info
 end
 
-local function allocNodesBatch(nodeIds)
-	for _, id in ipairs(nodeIds or { }) do
-		local node = build.spec.nodes[id]
+-- Node batches are all-or-nothing: every id is checked against the current
+-- tree before the first node changes, so a user error leaves the build
+-- untouched (and its export byte-identical).
+local function nodeLabel(node)
+	return tostring(node.id) .. (node.dn and (" (" .. node.dn .. ")") or "")
+end
+
+local function batchNodes(nodeIds)
+	if type(nodeIds) ~= "table" then
+		userError("nodeIds must be an array of node ids")
+	end
+	local nodes = { }
+	for i, id in ipairs(nodeIds) do
+		local node = type(id) == "number" and build.spec.nodes[id] or nil
 		if not node then
 			userError("Unknown node id: " .. tostring(id))
 		end
-		build.spec:AllocNode(node)
+		nodes[i] = node
 	end
+	return nodes
+end
+
+-- Run a batch mutation; if it fails part-way (something the checks could not
+-- foresee), put the tree back as it was before the batch and re-raise. A
+-- rollback that throws or does not reproduce the tree is an internal error.
+local function withTreeRollback(fn)
+	local before = encodeSpecState(captureSpecState(build.spec))
+	local ok, err = pcall(function()
+		fn()
+		if TEST_FAULTS.batchFailsAfterChange then userError("test fault: batch failed after changing the tree") end
+	end)
+	if ok then return end
+	local target = before
+	if TEST_FAULTS.treeRollbackInexact then
+		-- Roll back to the state minus one Normal node, so the result differs.
+		target = shallowCopy(before)
+		target.nodeIds = { }
+		local dropped = false
+		for _, id in ipairs(before.nodeIds) do
+			local node = build.spec.nodes[id]
+			if not dropped and node and node.type == "Normal" then dropped = true else target.nodeIds[#target.nodeIds + 1] = id end
+		end
+	end
+	local restored, report = pcall(function()
+		if TEST_FAULTS.treeRollbackThrows then error("test fault: tree rollback threw", 0) end
+		restoreTreeState(target)
+		return verifyTreeState(before)
+	end)
+	if not restored then
+		failedRecoveryError(err, "rolling the passive tree back", report)
+	end
+	if not report.exact then
+		failedRecoveryError(err, "rolling the passive tree back", "the tree is not as before: " .. encodeJSON(report))
+	end
+	error(err, 0)
+end
+
+local function allocNodesBatch(nodeIds)
+	local nodes = batchNodes(nodeIds)
+	local choiceParent = { }
+	for _, node in ipairs(nodes) do
+		-- PassiveSpec:AllocNode silently does nothing for a node no path
+		-- reaches (another class's start, another ascendancy). Allocating a
+		-- node never removes a path, so checking up front is exact.
+		if not node.alloc and not node.path then
+			userError("Node " .. nodeLabel(node) .. " cannot be allocated: no path from the allocated tree reaches it")
+		end
+		-- Two options of one multiple-choice node: the second would silently
+		-- deallocate the first.
+		if node.isMultipleChoiceOption and node.linked and node.linked[1] then
+			local parent = node.linked[1]
+			local other = choiceParent[parent]
+			if other and other ~= node then
+				userError("Nodes " .. nodeLabel(other) .. " and " .. nodeLabel(node) .. " are options of the same choice; only one can be allocated")
+			end
+			choiceParent[parent] = node
+		end
+	end
+	withTreeRollback(function()
+		for _, node in ipairs(nodes) do
+			build.spec:AllocNode(node)
+		end
+		for _, node in ipairs(nodes) do
+			if not node.alloc then
+				userError("Node " .. nodeLabel(node) .. " could not be allocated")
+			end
+		end
+	end)
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
 
 local function deallocNodesBatch(nodeIds)
-	for _, id in ipairs(nodeIds or { }) do
-		local node = build.spec.nodes[id]
-		if not node then
-			userError("Unknown node id: " .. tostring(id))
+	local nodes = batchNodes(nodeIds)
+	for _, node in ipairs(nodes) do
+		if node.type == "ClassStart" or node.type == "AscendClassStart" then
+			userError("Node " .. nodeLabel(node) .. " is a class start and cannot be deallocated")
 		end
-		build.spec:DeallocNode(node)
+		-- Checked against the tree before the batch: a later node may lose its
+		-- allocation to an earlier one in the same batch (it depends on it),
+		-- which is the requested result anyway.
+		if not node.alloc then
+			userError("Node " .. nodeLabel(node) .. " is not allocated")
+		end
 	end
+	withTreeRollback(function()
+		for _, node in ipairs(nodes) do
+			build.spec:DeallocNode(node)
+		end
+	end)
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
@@ -1631,17 +2635,30 @@ end
 -- ProcessSocketGroup + OnFrame once. Used by testSupportCombinationLocked to
 -- avoid N_remove + N_add individual OnFrame calls (each ~55–65ms).
 -- cmd.gems is an array of { name, level, quality }.
+-- All-or-nothing: the group index and every gem are checked before the gem
+-- list changes, so a user error leaves the group untouched. Should the
+-- recalculation itself fail, the old gem list is put back.
 local function replaceSocketGroupImpl(groupIndex, gems)
 	local group, _ = getGroupAndGem(groupIndex, nil)
-	-- Wipe existing gem list in-place (mirrors what restoreSkills does per group)
-	for i = #group.gemList, 1, -1 do group.gemList[i] = nil end
-	-- Build new gems without triggering OnFrame
-	for _, gemSpec in ipairs(gems) do
+	if type(gems) ~= "table" then
+		userError("gems must be an array of { name, level, quality }")
+	end
+	local newGems = { }
+	for i, gemSpec in ipairs(gems) do
+		if type(gemSpec) ~= "table" then
+			userError("Gem " .. i .. " must be an object with a name")
+		end
 		local gemData, errMsg = findGemByName(gemSpec.name)
 		if not gemData then
 			userError("Gem lookup failed for '" .. tostring(gemSpec.name) .. "': " .. tostring(errMsg))
 		end
-		local newGem = {
+		for _, key in ipairs({ "level", "quality" }) do
+			local v = gemSpec[key]
+			if v ~= nil and (type(v) ~= "number" or v ~= v or v < 0 or v % 1 ~= 0) then
+				userError("Gem " .. i .. " (" .. gemData.name .. "): " .. key .. " must be a non-negative integer")
+			end
+		end
+		newGems[i] = {
 			nameSpec = gemData.name,
 			gemId = gemData.id,
 			skillId = gemData.grantedEffectId,
@@ -1652,12 +2669,31 @@ local function replaceSocketGroupImpl(groupIndex, gems)
 			enableGlobal2 = true,
 			count = 1,
 		}
-		table.insert(group.gemList, newGem)
+	end
+	local oldGems = { }
+	for i, gem in ipairs(group.gemList) do oldGems[i] = gem end
+	local function setGemList(list)
+		for i = #group.gemList, 1, -1 do group.gemList[i] = nil end
+		for i, gem in ipairs(list) do group.gemList[i] = gem end
+		build.skillsTab:ProcessSocketGroup(group)
+		build.buildFlag = true
+		runCallback("OnFrame")
 	end
 	-- Single recalc for the whole group
-	build.skillsTab:ProcessSocketGroup(group)
-	build.buildFlag = true
-	runCallback("OnFrame")
+	local ok, err = pcall(function()
+		setGemList(newGems)
+		if TEST_FAULTS.replaceFailsAfterChange then userError("test fault: replaceSocketGroup failed after changing the group") end
+	end)
+	if not ok then
+		local restored, restoreErr = pcall(function()
+			if TEST_FAULTS.replaceRollbackThrows then error("test fault: putting the old gems back threw", 0) end
+			setGemList(oldGems)
+		end)
+		if not restored then
+			failedRecoveryError(err, "putting the old gems back", restoreErr)
+		end
+		error(err, 0)
+	end
 end
 
 local function getGemByNameImpl(name)
@@ -1717,81 +2753,257 @@ local function setMainSocketGroupImpl(groupIndex)
 	runCallback("OnFrame")
 end
 
+-- ---------------------------------------------------------------------------
+-- Exact skills snapshot/restore for what-if probes and undo
+-- ---------------------------------------------------------------------------
+--
+-- A snapshot holds every skill set (id, title, order, the active one), the
+-- skills tab settings PoB saves (default gem level/quality, gem sorting and
+-- filters), the main socket group (and the Calcs tab's copy of it, which
+-- PoB clamps when groups disappear), and for every socket group and gem
+-- instance every field with a plain value (string, number, boolean). That
+-- is a superset of what SkillsTab:Save writes (label, slot, source, enabled,
+-- includeInFullDPS, groupCount, imbuedSupport, mainActiveSkill*, and per gem
+-- nameSpec, gemId, skillId, level, quality, enabled, enableGlobal1/2, count,
+-- skillPart*, skillStageCount*, skillMineCount*, skillMinion*,
+-- skillMinionItemSet*, skillMinionSkill*), so plain fields PoB adds later are
+-- carried without a change here. Table-valued fields are derived (gemData,
+-- grantedEffect, display lists, sourceItem) and are rebuilt by
+-- ProcessSocketGroup and the recalculation. The one exception is a
+-- monster-explosion gem's explodeSource, which CalcSetup uses to keep that
+-- gem's settings (and which the explosion calculation reads); it is relinked
+-- by its key (the source's modSource or id) to the live source with that key.
+-- When the active set has an explosion gem whose source no longer exists,
+-- PoB would recreate that gem with default settings, so the restore reports
+-- itself inexact instead of differing silently. Fields are stored as sorted
+-- [key, value] pairs so equal states encode to equal JSON.
+
+local SKILLS_SNAPSHOT_VERSION = 2
+local EXPLODE_SOURCE_KEY = "__explodeSourceKey"
+
+local function isPlainValue(v)
+	local t = type(v)
+	return t == "string" or t == "boolean" or (t == "number" and v == v and v ~= math.huge and v ~= -math.huge)
+end
+
+local function plainFields(tbl)
+	local keys = { }
+	for k, v in pairs(tbl) do
+		if type(k) == "string" and isPlainValue(v) then keys[#keys + 1] = k end
+	end
+	table.sort(keys)
+	local out = { }
+	for i, k in ipairs(keys) do out[i] = { k, tbl[k] } end
+	return out
+end
+
+local function explodeSourceKey(source)
+	if type(source) ~= "table" then return nil end
+	local key = source.modSource or source.id
+	if isPlainValue(key) then return key end
+	return nil
+end
+
+local function snapshotSocketGroup(group)
+	local gems = { }
+	for j, gem in ipairs(group.gemList or { }) do
+		local fields = plainFields(gem)
+		local key = explodeSourceKey(gem.explodeSource)
+		if key then fields[#fields + 1] = { EXPLODE_SOURCE_KEY, key } end
+		gems[j] = fields
+	end
+	return { fields = plainFields(group), gems = gems }
+end
+
+local SKILLS_TAB_SETTINGS = {
+	"defaultGemLevel", "defaultGemQuality", "sortGemsByDPS", "sortGemsByDPSField",
+	"showSupportGemTypes", "showLegacyGems",
+}
+
+local function skillsTabOrError()
+	local tab = build and build.skillsTab
+	if not (tab and tab.socketGroupList and tab.skillSets and tab.skillSetOrderList) then
+		error("Skills tab not available (PoB SkillsTab changed?)")
+	end
+	return tab
+end
+
 local function snapshotSkills()
-	local snap = { mainSocketGroup = build.mainSocketGroup, groups = { } }
-	if not (build and build.skillsTab and build.skillsTab.socketGroupList) then
-		return snap
+	local tab = skillsTabOrError()
+	local settings = { }
+	for _, key in ipairs(SKILLS_TAB_SETTINGS) do
+		if isPlainValue(tab[key]) then settings[#settings + 1] = { key, tab[key] } end
 	end
-	for i, group in ipairs(build.skillsTab.socketGroupList) do
-		local gemList = { }
-		for j, gem in ipairs(group.gemList or { }) do
-			gemList[j] = {
-				nameSpec = gem.nameSpec,
-				gemId = gem.gemId,
-				skillId = gem.skillId,
-				level = gem.level,
-				quality = gem.quality,
-				qualityId = gem.qualityId,
-				enabled = gem.enabled,
-				enableGlobal1 = gem.enableGlobal1,
-				enableGlobal2 = gem.enableGlobal2,
-				count = gem.count,
-				skillPart = gem.skillPart,
-				skillPartCalcs = gem.skillPartCalcs,
-				skillMineCount = gem.skillMineCount,
-				skillStageCount = gem.skillStageCount,
-				skillStageCountCalcs = gem.skillStageCountCalcs,
-				triggered = gem.triggered,
-			}
+	local setIds = { }
+	for id in pairs(tab.skillSets) do setIds[#setIds + 1] = id end
+	table.sort(setIds)
+	local sets = { }
+	for i, id in ipairs(setIds) do
+		local set = tab.skillSets[id]
+		local groups = { }
+		for j, group in ipairs(set.socketGroupList) do groups[j] = snapshotSocketGroup(group) end
+		sets[i] = { id = id, title = set.title, groups = groups }
+	end
+	local order = { }
+	for i, id in ipairs(tab.skillSetOrderList) do order[i] = id end
+	local calcsInput = build.calcsTab and build.calcsTab.input
+	return {
+		version = SKILLS_SNAPSHOT_VERSION,
+		activeSkillSetId = tab.activeSkillSetId,
+		mainSocketGroup = build.mainSocketGroup,
+		calcsSkillNumber = calcsInput and calcsInput.skill_number,
+		settings = settings,
+		order = order,
+		sets = sets,
+	}
+end
+
+-- Shape check of a whole snapshot before anything is changed, so a bad
+-- snapshot never leaves the skills half restored.
+local function checkSkillsSnapshot(snap)
+	local function bad(what)
+		error("Invalid skills snapshot: " .. what, 0)
+	end
+	local function checkFields(fields, where)
+		if type(fields) ~= "table" then bad(where .. " has no field list") end
+		for _, pair in ipairs(fields) do
+			if type(pair) ~= "table" or type(pair[1]) ~= "string" or not isPlainValue(pair[2]) then
+				bad(where .. " has a malformed field")
+			end
 		end
-		snap.groups[i] = {
-			label = group.label,
-			slot = group.slot,
-			enabled = group.enabled,
-			source = group.source,
-			mainActiveSkill = group.mainActiveSkill,
-			mainActiveSkillCalcs = group.mainActiveSkillCalcs,
-			includeInFullDPS = group.includeInFullDPS,
-			noSupports = group.noSupports,
-			gemList = gemList,
-		}
 	end
-	return snap
+	if type(snap) ~= "table" or snap.version ~= SKILLS_SNAPSHOT_VERSION then bad("unknown version") end
+	if type(snap.sets) ~= "table" or type(snap.order) ~= "table" then bad("no skill sets") end
+	checkFields(snap.settings, "settings")
+	local ids = { }
+	for i, set in ipairs(snap.sets) do
+		if type(set) ~= "table" or type(set.id) ~= "number" or type(set.groups) ~= "table" then
+			bad("skill set " .. i .. " is malformed")
+		end
+		ids[set.id] = true
+		for j, group in ipairs(set.groups) do
+			local where = "skill set " .. set.id .. " group " .. j
+			if type(group) ~= "table" or type(group.gems) ~= "table" then bad(where .. " is malformed") end
+			checkFields(group.fields, where)
+			for k, gem in ipairs(group.gems) do checkFields(gem, where .. " gem " .. k) end
+		end
+	end
+	for _, id in ipairs(snap.order) do
+		if not ids[id] then bad("the skill set order names an unknown set") end
+	end
+	if not ids[snap.activeSkillSetId] then bad("the active skill set is missing") end
+end
+
+local function fromFields(fields, target)
+	for _, pair in ipairs(fields) do target[pair[1]] = pair[2] end
+	return target
+end
+
+local function restoreSkillsTabSettings(tab, settings)
+	local controls = tab.controls or { }
+	for _, pair in ipairs(settings) do
+		local key, value = pair[1], pair[2]
+		if tab[key] ~= value then
+			tab[key] = value
+			-- Keep the (headless) controls in step, as SkillsTab:Load does.
+			if key == "defaultGemLevel" and controls.defaultLevel then
+				controls.defaultLevel:SelByValue(value, "gemLevel")
+			elseif key == "defaultGemQuality" and controls.defaultQuality then
+				controls.defaultQuality:SetText(value)
+			elseif key == "sortGemsByDPS" and controls.sortGemsByDPS then
+				controls.sortGemsByDPS.state = value
+			elseif key == "showLegacyGems" and controls.showLegacyGems then
+				controls.showLegacyGems.state = value
+			elseif key == "showSupportGemTypes" and controls.showSupportGemTypes then
+				controls.showSupportGemTypes:SelByValue(value, "show")
+			elseif key == "sortGemsByDPSField" and controls.sortGemsByDPSFieldControl then
+				controls.sortGemsByDPSFieldControl:SelByValue(value, "type")
+			end
+		end
+	end
 end
 
 local function restoreSkills(snap)
-	if not (build and build.skillsTab and build.skillsTab.socketGroupList) then
-		error("Skills tab not available")
-	end
-	if type(snap) ~= "table" or type(snap.groups) ~= "table" then
-		error("Invalid skills snapshot")
-	end
-	-- Wipe current groups; we mutate in place to preserve socketGroupList reference
-	local list = build.skillsTab.socketGroupList
-	for i = #list, 1, -1 do list[i] = nil end
-	for i, snapGroup in ipairs(snap.groups) do
-		local group = {
-			label = snapGroup.label,
-			slot = snapGroup.slot,
-			enabled = snapGroup.enabled,
-			source = snapGroup.source,
-			mainActiveSkill = snapGroup.mainActiveSkill,
-			mainActiveSkillCalcs = snapGroup.mainActiveSkillCalcs,
-			includeInFullDPS = snapGroup.includeInFullDPS,
-			noSupports = snapGroup.noSupports,
-			gemList = { },
-		}
-		for j, snapGem in ipairs(snapGroup.gemList) do
-			local g = { }
-			for k, v in pairs(snapGem) do g[k] = v end
-			group.gemList[j] = g
+	local tab = skillsTabOrError()
+	checkSkillsSnapshot(snap)
+
+	-- Live explosion sources, to relink restored explosion gems.
+	local explodeSources = { }
+	for _, set in pairs(tab.skillSets) do
+		for _, group in ipairs(set.socketGroupList) do
+			for _, source in ipairs(type(group.explodeSources) == "table" and group.explodeSources or { }) do
+				local key = explodeSourceKey(source)
+				if key then explodeSources[key] = source end
+			end
+			for _, gem in ipairs(group.gemList or { }) do
+				local key = explodeSourceKey(gem.explodeSource)
+				if key and not explodeSources[key] then explodeSources[key] = gem.explodeSource end
+			end
 		end
-		list[i] = group
-		build.skillsTab:ProcessSocketGroup(group)
 	end
+	local displayIndex
+	for i, group in ipairs(tab.socketGroupList) do
+		if group == tab.displayGroup then displayIndex = i end
+	end
+
+	-- Every set is rebuilt in place (the active set's socketGroupList table is
+	-- shared with the tab and its group list control); sets the probe added
+	-- are dropped.
+	local keep = { }
+	local unlinked = { }
+	for _, snapSet in ipairs(snap.sets) do
+		keep[snapSet.id] = true
+		local set = tab.skillSets[snapSet.id] or tab:NewSkillSet(snapSet.id)
+		set.title = snapSet.title
+		local list = set.socketGroupList
+		for i = #list, 1, -1 do list[i] = nil end
+		for i, snapGroup in ipairs(snapSet.groups) do
+			local group = fromFields(snapGroup.fields, { })
+			group.gemList = { }
+			for j, snapGem in ipairs(snapGroup.gems) do
+				local gem = fromFields(snapGem, { })
+				local key = gem[EXPLODE_SOURCE_KEY]
+				gem[EXPLODE_SOURCE_KEY] = nil
+				if key ~= nil then
+					gem.explodeSource = explodeSources[key]
+					if not gem.explodeSource and snapSet.id == snap.activeSkillSetId then
+						unlinked[#unlinked + 1] = "group " .. i .. " gem " .. j .. " (source " .. tostring(key) .. ")"
+					end
+				end
+				group.gemList[j] = gem
+			end
+			list[i] = group
+			tab:ProcessSocketGroup(group)
+		end
+	end
+	for id in pairs(tab.skillSets) do
+		if not keep[id] then tab.skillSets[id] = nil end
+	end
+	for i = #tab.skillSetOrderList, 1, -1 do tab.skillSetOrderList[i] = nil end
+	for i, id in ipairs(snap.order) do tab.skillSetOrderList[i] = id end
+
+	local activeSet = tab.skillSets[snap.activeSkillSetId]
+	if tab.activeSkillSetId ~= snap.activeSkillSetId or tab.socketGroupList ~= activeSet.socketGroupList then
+		tab:SetActiveSkillSet(snap.activeSkillSetId)
+	else
+		-- Added to PoB with imbued supports; older versions have no such map.
+		if type(tab.RebuildImbuedSupportBySlot) == "function" then
+			tab:RebuildImbuedSupportBySlot()
+		end
+		tab.displayGroup = tab.socketGroupList[displayIndex or 1]
+	end
+	restoreSkillsTabSettings(tab, snap.settings)
+
 	build.mainSocketGroup = snap.mainSocketGroup or 1
+	if build.calcsTab and build.calcsTab.input then
+		build.calcsTab.input.skill_number = snap.calcsSkillNumber
+	end
 	build.buildFlag = true
 	runCallback("OnFrame")
+	if #unlinked > 0 then
+		error("Skills restore was not exact (monster-explosion gem settings lost because their explosion source is gone: "
+			.. table.concat(unlinked, ", ") .. "); call reset_build to return to the loaded build", 0)
+	end
 end
 
 -- Commands that do not need a loaded build (everything else requires PoB to
@@ -1934,7 +3146,7 @@ local DISPATCH = {
 				-- rather than throwing; that must not be blamed on the new load.
 				local saveErr = mainObject.promptMsg
 				if okSave and type(prevXml) == "string" and not saveErr then
-					previous = { xml = prevXml, name = build.buildName }
+					previous = { xml = prevXml, name = build.buildName, identities = itemIdentities() }
 				else
 					local reason = saveErr and stripColorCodes(saveErr):gsub("%s+", " ")
 						or (okSave and "SaveDB returned no XML" or tostring(prevXml))
@@ -1949,6 +3161,9 @@ local DISPATCH = {
 					clearPoBErrorState()
 					local restoreFailure = tryLoadBuild(previous.xml, previous.name)
 					if not restoreFailure then
+						-- Same build, same item ids, new item objects: keep their
+						-- identities so the session's undo entries still apply.
+						carryItemIdentities(previous.identities)
 						error(failure .. " (the previously loaded build is still active)", 0)
 					end
 					STDERR:write("[pob-mcp] failed to restore previous build: ", (restoreFailure:gsub("\n", " ")), "\n")
@@ -2019,25 +3234,22 @@ local DISPATCH = {
 		handler = function(cmd) unequipSlot(cmd.slot) return { } end,
 		mutating = true,
 	},
-	snapshotAllItems = {
+	selectItem = {
+		-- Re-select an item the build already holds; `selected` is false (nothing
+		-- changed) when the id is gone or holds a different item than `itemText`.
 		handler = function(cmd)
-			if type(cmd.slots) ~= "table" then
-				userError("snapshotAllItems requires `slots` array")
-			end
-			local out = {}
-			for i = 1, #cmd.slots do
-				local slotName = cmd.slots[i]
-				local item = getItemInSlot(slotName)
-				-- Transform to ItemSnapshot shape: { slot, itemText, itemId }
-				-- (mirrors the logic in TS snapshotSlotUnlocked)
-				if item.itemId and item.itemId ~= 0 and item.raw then
-					out[i] = { slot = slotName, itemText = item.raw, itemId = item.itemId }
-				else
-					out[i] = { slot = slotName, itemText = dkjson.null, itemId = dkjson.null }
-				end
-			end
-			return { items = out }
+			return { selected = selectItemInSlot(cmd.slot, cmd.itemId, cmd.itemText) }
 		end,
+	},
+	captureItemsState = {
+		handler = function(_cmd) return { state = captureItemsState() } end,
+	},
+	restoreItemsState = {
+		handler = function(cmd) return restoreItemsState(cmd.state) end,
+	},
+	checkItemsState = {
+		-- Raises when the captured ids no longer name the captured items.
+		handler = function(cmd) checkItemsState(cmd.state) return { } end,
 	},
 
 	-- Passive tree
@@ -2083,6 +3295,29 @@ local DISPATCH = {
 			end
 			return { }
 		end,
+		mutating = true,
+	},
+	captureSpecState = {
+		handler = function(_cmd)
+			if type(build.spec) ~= "table" then
+				userError("No build loaded — call load_build first")
+			end
+			return { state = encodeSpecState(captureSpecState(build.spec)) }
+		end,
+	},
+	restoreTreeState = {
+		handler = function(cmd) return restoreTreeState(cmd.state) end,
+		mutating = true,
+	},
+	verifyTreeState = {
+		handler = function(cmd) return verifyTreeState(cmd.state) end,
+	},
+	convertTreeToLatest = {
+		handler = function(_cmd) return { result = convertTreeToLatest() } end,
+		mutating = true,
+	},
+	restoreSpecState = {
+		handler = function(cmd) restoreSpecState(cmd.state) return { } end,
 		mutating = true,
 	},
 
@@ -2292,6 +3527,7 @@ local function dispatch(cmd)
 	if not entry then
 		userError("Unknown command: " .. tostring(cmd.cmd))
 	end
+	testFaultsForCommand(cmd.cmd)
 	local expectBuild = not NO_BUILD_REQUIRED[cmd.cmd]
 	-- Any leftover state from an earlier command must not be attributed to
 	-- this one.
@@ -2306,6 +3542,7 @@ local function dispatch(cmd)
 	local popupsBefore = currentPopups()
 	local ok, body = pcall(function()
 		local b = entry.handler(cmd)
+		if TEST_CHANGE_COMMANDS[cmd.cmd] then testChangeDone = true end
 		if entry.mutating then
 			b.stats = getStats()
 		end
@@ -2335,6 +3572,10 @@ do
 	end
 	clearPoBErrorState()
 end
+
+-- Test faults: a startup that never becomes ready, or that fails.
+if TEST_FAULTS.hangOnStart then testFaultStall() end
+if TEST_FAULTS.failOnStart then error("test fault: startup failed", 0) end
 
 respond({ ok = true, ready = true })
 

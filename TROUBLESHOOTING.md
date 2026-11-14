@@ -61,7 +61,7 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 
 ## "Lua engine has crashed N times — refusing to restart"
 
-**Cause:** The luajit child process died unexpectedly three times for the same PoB/LuaJIT path pair. This circuit breaker stops rapid restart loops. The count is kept per path pair across engine swaps: `reload_engine` and `configure_pob_path` with the same paths are refused too, and a failed `configure_pob_path` to other paths does not reset it.
+**Cause:** The luajit child process failed three times for the same PoB/LuaJIT path pair: it exited unexpectedly, a command timed out (the process is killed), or a startup failed or hung. This circuit breaker stops rapid restart loops. Successful commands in between do not reset the count. The count is kept per path pair across engine swaps: `reload_engine` and `configure_pob_path` with the same paths are refused too, and a failed `configure_pob_path` to other paths does not reset it. `get_engine_info` shows `crashCount` and `circuitOpen`.
 
 **Fix:** Restart the MCP server process, or update Path of Building and then call `reload_engine` (a new `manifest.xml` version/mtime on disk starts a fresh count for that path pair). Calling `configure_pob_path` with the same paths does not clear it; a genuinely different PoB/LuaJIT path pair has its own count. If it recurs immediately, capture stderr (it is forwarded to the parent stderr by default) and inspect the failure. It is usually a malformed build XML or a missing data file in the loaded build.
 
@@ -69,11 +69,23 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 
 **Cause:** A single Lua command took longer than the default 60 s budget. Most legitimately long-running operations (`find_optimal_links`, `find_best_next_nodes` on huge trees) batch internally and stay under that limit, so a timeout usually means the engine is stuck on a single calc.
 
-**What the server does:** the stuck process is killed; the next tool call respawns and reloads the last build automatically. No state corruption — but the in-flight tool call returns an error.
+**What the server does:** the stuck process is killed and the timeout counts as one of the three strikes (see above); the in-flight tool call returns an error. The next tool call restarts the engine — see the next section.
 
 **Fix:**
 - Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter on `suggest_upgrades`.
 - If a specific build always times out, capture stderr (`POB_TIMING=1` helps) and try simplifying the build (remove very large jewel clusters, exotic skill setups) to isolate the offending data.
+
+## "The Path of Building engine stopped unexpectedly and was restarted"
+
+**Cause:** The LuaJIT engine crashed or hung (strike 1 or 2 of 3) and the server restarted it at the start of this tool call.
+
+**What the server did:** the new engine holds the build as it was after the last committed change (`load_build`, `reset_build`, `swap_item`, `unequip_item`, `set_config`, `convert_tree_to_latest` or `undo_last_change`); a change whose call failed when the engine stopped was not kept, and a `load_build` that PoB rejected is never restored. Undo history is cleared (its entries belonged to the old engine process); `undo_last_change` then says so. Labelled stat snapshots are kept. `reset_build` still returns to the originally loaded build. The call that reports this does nothing else. A `load_build` or `reset_build` after a crash does not fail: it loads normally and its result carries an `engineRestart` note with the strike count instead.
+
+**Fix:** retry the call. If the notice says the build could not be restored, call `reset_build` or `load_build`.
+
+An internal error ending in *"the change itself WAS applied and is kept in the build"* means a committed change went through but reading the result failed: the change stays (also across a later restart); call `undo_last_change` to revert it.
+
+A call that was running when the engine stopped fails with *"The Path of Building engine stopped during this call"*: it did not finish, and nothing it was doing is retried on the new engine.
 
 ## "Build code is empty" / "Invalid build code"
 

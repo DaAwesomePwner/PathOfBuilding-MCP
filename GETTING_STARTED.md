@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   36 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   37 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -22,7 +22,7 @@ Three layers, three responsibilities:
 | **Lua bridge** | `lua/bridge.lua` | Runs the real PoB engine in headless mode (stubs the graphics host and `dofile`s `<POB_PATH>/Launch.lua` or `<POB_PATH>/src/Launch.lua` depending on layout). Reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`, etc., and writes JSON responses to stdout. Knows nothing about MCP. |
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
-| **MCP server** | `src/server.ts` | Registers 36 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
+| **MCP server** | `src/server.ts` | Registers 37 tools via `@modelcontextprotocol/sdk`, validates inputs with Zod + a custom `UserError` class, formats responses. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -31,10 +31,10 @@ Three layers, three responsibilities:
 - **Version-aware.** If PoB updates itself on disk (new league), tools refuse to run on the stale in-memory engine and point at `reload_engine`.
 - **Serial execution.** A mutex guarantees only one operation runs at a time. PoB is fundamentally a single-threaded singleton with shared global state.
 - **Snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `suggest_upgrades`, etc. all wrap their probes in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
-- **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session.
+- **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 36 tools
+## The 37 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -55,12 +55,13 @@ Three layers, three responsibilities:
 - `unequip_item` — remove an item from a slot, **mutates**, returns diff.
 - `compare_items` — test 2-5 candidate items in a slot non-destructively. Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`.
 
-### Passive tree (5)
+### Passive tree (6)
 - `get_passive_tree` — every allocated node with stats, plus point counts and class info.
 - `simulate_passive_change` — temporarily allocate/deallocate by node ID or name. Validates connectivity. Always restored.
 - `find_best_next_nodes` — scans every reachable unallocated node, ranks by your chosen stat (Life, CombinedDPS, TotalEHP, etc.). ~26s on a typical end-game build.
 - `find_worst_allocated_nodes` — finds your least valuable Normal nodes (skips keystones, ascendancy, sockets, masteries; refuses to disconnect the tree).
 - `evaluate_keystone` — toggle any keystone, return full stat diff.
+- `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
 ### Skill gems and links (7)
 - `list_skill_groups` — every socket group with active gem, supports, slot, isMainSkill flag.
@@ -83,7 +84,7 @@ Three layers, three responsibilities:
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`.
 - `suggest_upgrades` — unequips each slot in turn to measure its DPS+EHP contribution, ranks by upgrade priority, suggests archetype-aware mods.
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
-- `undo_last_change` — pops the undo stack (works for swap/unequip/swap_gem/set_config/etc.).
+- `undo_last_change` — pops the undo stack (works for swap/unequip/swap_gem/set_config/convert_tree_to_latest/etc.).
 - `reset_build` — discard everything, return to the originally loaded state.
 
 ## Setup
@@ -112,7 +113,7 @@ To run the server in your MCP client, add this to `claude_desktop_config.json` (
 
 `POB_PATH` is optional. Paths resolve as **env var → saved config → auto-detect** (standard install folder, the installer's registry entry, common LuaJIT locations, `PATH`). If nothing is found the server still starts: just tell Claude where PoB is installed and it calls `configure_pob_path`, which saves the path to `%APPDATA%\pob-mcp-server\config.json` (macOS `~/Library/Application Support/pob-mcp-server/`, Linux `~/.config/pob-mcp-server/`).
 
-Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 36 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
+Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 37 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
 
 ### Environment variables
 
@@ -164,7 +165,7 @@ For an interactive iteration loop:
 - **Simulation tools never persist.** `simulate_*`, `compare_*`, `evaluate_*`, `find_*` always restore the state in `finally`, even if the operation throws. Verified bit-exact across 70+ tests.
 - **Build code round-trip is lossless.** `export_build({ format: "code" })` produces a string you can paste back into PoB-the-app or back into `load_build`. Same for `format: "xml"`.
 - **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; full-tree scans 16-26s.
-- **Crash circuit breaker.** After 3 unexpected exits the server refuses to respawn LuaJIT and tells you to restart the MCP server (or update Path of Building and call `reload_engine`). Prevents respawn loops.
+- **Crash circuit breaker.** After 3 strikes (unexpected exits, command timeouts or failed starts) the server refuses to respawn LuaJIT and tells you to restart the MCP server (or update Path of Building and call `reload_engine`). Prevents respawn loops. Earlier crashes restart the engine with the last committed build; the first call afterwards reports it and clears undo history.
 - **PoB updates.** When PoB updates itself (new league), tools stop with *"Path of Building was updated on disk from X to Y"*. `reload_engine` restarts the engine and reloads your build; undo history is cleared.
 
 ## Troubleshooting quick reference
@@ -191,4 +192,4 @@ Full troubleshooting guide: [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md)
 - **Tune performance**: set `POB_TIMING=1` and inspect the per-command histogram. `bridge.getStats` and `bridge.exportXML` dominate; everything else is sub-100ms typically.
 - **Pull upstream PoB updates**: `git fetch upstream && git merge upstream/dev`. `bridge.lua` only depends on stable PoB internals (`build.itemsTab`, `build.spec:CountAllocNodes`, etc.), so upstream churn rarely breaks anything.
 
-That's the whole picture: 36 tools, three layers, deterministic state, and a real PoB engine behind every number.
+That's the whole picture: 37 tools, three layers, deterministic state, and a real PoB engine behind every number.

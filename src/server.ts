@@ -131,6 +131,7 @@ tools.engine<{ source: string }>(
         ascendancy: info.ascendancy,
         level: info.level,
         mainSkill: info.mainSkill,
+        ...(info.engineRestart ? { engineRestart: info.engineRestart } : {}),
       };
     } finally {
       stop();
@@ -262,7 +263,7 @@ tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
-      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert).',
+      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, or text Path of Building cannot parse, is refused without changing anything.',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name.'),
       itemText: z
@@ -323,7 +324,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item or set_config). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -348,11 +349,37 @@ tools.engine<Record<string, never>>(
   },
 );
 
+tools.engine<Record<string, never>>(
+  'convert_tree_to_latest',
+  {
+    description:
+      "Convert the build's active passive tree to Path of Building's latest tree version (keeping a ruthless/alternate tree sub-type, like PoB's own convert button), so node advice targets the current league. PERMANENTLY mutates the build (use undo_last_change to revert). Reports the old/new tree version, allocated node and point counts, `lostNodes` (allocated before, not after), `changedNodes` (still allocated but renamed on the new tree), `droppedMasteries` (selections the new tree no longer offers on that node), `droppedTattoos` (tattoos the new tree lacks) and key stat deltas. Each list is capped at 50 with a total count and an omitted count. A build already on the latest tree is left unchanged.",
+    inputSchema: {},
+  },
+  async (_args, session) => {
+    const result = await session.convertTreeToLatest();
+    if (!result.converted) {
+      return {
+        status: 'already-latest',
+        treeVersion: result.fromVersion,
+        message: `The build is already on the latest tree (${result.fromVersion}); nothing was changed.`,
+      };
+    }
+    const { before: _before, after: _after, diff, ...rest } = result;
+    return {
+      status: 'converted',
+      ...rest,
+      keyDeltas: keyDeltas(diff),
+      undo: 'Call undo_last_change to return to the previous tree version.',
+    };
+  },
+);
+
 tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | number> }>(
   'simulate_passive_change',
   {
     description:
-      'Temporarily allocate or deallocate passive nodes and return the stat diff. Always restores the original tree afterward. Validates that the resulting tree is connected.',
+      'Temporarily allocate or deallocate passive nodes and return the stat diff. Always restores the original tree afterward. Validates that the resulting tree is connected. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class\'s ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start.',
     inputSchema: {
       allocate: z
         .array(z.union([z.string(), z.number().int()]))
@@ -847,6 +874,7 @@ tools.engine<Record<string, never>>(
       ascendancy: info.ascendancy,
       level: info.level,
       mainSkill: info.mainSkill,
+      ...(info.engineRestart ? { engineRestart: info.engineRestart } : {}),
     };
   },
 );

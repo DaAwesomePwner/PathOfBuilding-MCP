@@ -4,7 +4,7 @@
 
 An MCP server that exposes [Path of Building Community](https://pathofbuilding.community/)'s build-planning and calculation engine to LLM clients (Claude Desktop, Claude Code, and other [MCP](https://modelcontextprotocol.io/) hosts).
 
-The server runs PoB's real Lua calculation engine in headless mode and surfaces 36 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," and comparing alternatives.
+The server runs PoB's real Lua calculation engine in headless mode and surfaces 37 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," and comparing alternatives.
 
 ## Prerequisites
 
@@ -88,13 +88,13 @@ PoB updates itself in place. The server reads the PoB version from `manifest.xml
 
 ## Tools
 
-The server exposes 36 MCP tools. See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for a narrative tour with examples.
+The server exposes 37 MCP tools. See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for a narrative tour with examples.
 
 - **Engine setup:** `configure_pob_path`, `get_engine_info`, `reload_engine` (these work even when PoB is not configured).
 - **Build I/O:** `load_build`, `export_build` (summary, XML or PoB build code — round-trip lossless), `reset_build`.
 - **Inspection:** `get_stats`, `get_skill_breakdown`, `list_equipped_items`, `list_valid_slots`, `get_item_in_slot`.
 - **Items:** `swap_item`, `unequip_item`, `compare_items`, `suggest_upgrades`.
-- **Passive tree:** `get_passive_tree`, `simulate_passive_change`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`.
+- **Passive tree:** `get_passive_tree`, `simulate_passive_change`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `convert_tree_to_latest` (moves an old-league tree to PoB's latest tree, undoable, reports the nodes and masteries lost).
 - **Gems:** `list_skill_groups`, `lookup_gem`, `list_available_supports`, `swap_gem`, `compare_supports`, `evaluate_gem_levels`, `find_optimal_links`.
 - **Config / scenarios:** `get_config`, `set_config`, `list_scenarios`, `simulate_scenario`, `compare_scenarios`, `toggle_buffs`.
 - **State / analysis:** `undo_last_change`, `snapshot_and_compare`, `diagnose_build`.
@@ -106,7 +106,7 @@ See [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md). Common issues:
 - **"Path of Building is not configured"**: give the assistant your PoB folder (it calls `configure_pob_path`), or set `POB_PATH`.
 - **LuaJIT not found**: install LuaJIT separately (the Windows PoB installer has no `luajit.exe`), then pass `luajitPath` to `configure_pob_path` or set `LUAJIT_PATH`.
 - **"Path of Building was updated on disk"**: call `reload_engine`.
-- **Bridge timeout / crash**: see the troubleshooting doc. The server includes a three-strike circuit breaker per PoB/LuaJIT path pair; it survives `reload_engine` and failed `configure_pob_path` attempts and clears only on a server restart, a different path pair, or PoB changing on disk.
+- **Bridge timeout / crash**: see the troubleshooting doc. After a crash or a timeout the next tool call restarts the engine with the build as of the last committed change, clears undo history and says so once. The server includes a three-strike circuit breaker per PoB/LuaJIT path pair (unexpected exits, command timeouts and failed starts all count; successes in between do not reset it); it survives `reload_engine` and failed `configure_pob_path` attempts and clears only on a server restart, a different path pair, or PoB changing on disk.
 
 ## Development
 

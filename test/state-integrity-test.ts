@@ -188,9 +188,9 @@ async function main(): Promise<void> {
     log('PASS: snapshot/diff + 2x undo returns to baseline');
 
     // -----------------------------------------------------------------
-    // Test 7: batched snapshotAllItems via withTemporaryChange round-trip
+    // Test 7: batched item-state capture (captureItemsState) via withTemporaryChange round-trip
     // -----------------------------------------------------------------
-    log('Test 7: batched snapshotAllItems via withTemporaryChange round-trip');
+    log('Test 7: batched item-state capture (captureItemsState) via withTemporaryChange round-trip');
     // simulate_scenario uses withTemporaryChange which exercises the batched path.
     const before = await getKeyStats(client);
     await call(client, 'simulate_scenario', { scenario: 'uber_boss' });
