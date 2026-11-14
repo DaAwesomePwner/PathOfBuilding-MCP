@@ -24,15 +24,23 @@ function log(msg: string): void {
 }
 
 interface ToolResp { content?: Array<{ type: string; text: string }>; isError?: boolean }
-interface Filter { tradeId: string; text: string; weight: number; source: string }
+interface Filter { tradeId: string; text: string; weight: number; source: string; mappedFrom?: string }
 interface Search {
-  url: string; filters: Filter[]; minWeightedSum: number; pobDefaultMinWeightedSum: number;
+  url: string; filters: Filter[]; minWeightedSum: number; pobDefaultMinWeightedSum: number; itemCategory: string;
   droppedByCap: { count: number }; statWeights: { stat: string; weight: number }[]; calcSeconds: number;
+  filterBudget: number; capLifted: boolean;
 }
 interface Query {
-  query: { stats: { type: string; value?: { min?: number }; filters: { id: string; value?: { weight?: number; min?: number } }[] }[] };
+  query: {
+    stats: { type: string; value?: { min?: number }; filters: { id: string; value?: { weight?: number; min?: number } }[] }[];
+    status: { option: string };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    filters: Record<string, any>;
+  };
   sort: Record<string, string>;
 }
+const FIRE_RES_EXPLICIT = 'explicit.stat_3372524247';
+const FIRE_RES_PSEUDO = 'pseudo.pseudo_total_fire_resistance';
 
 let client: Client;
 async function call(name: string, args: Record<string, unknown> = {}): Promise<ToolResp> {
@@ -91,6 +99,9 @@ async function main(): Promise<void> {
     assert(base.filters.every((f) => f.source === 'pob' && f.text.length > 0), 'PoB filters carry text');
     assert(weights.value?.min === base.minWeightedSum && base.minWeightedSum === base.pobDefaultMinWeightedSum, 'default min is PoB\'s');
     assert(base.statWeights.map((w) => w.stat).join() === 'FullDPS,TotalEHP', 'PoB default stat weights');
+    assert(base.capLifted === true, 'PoB\'s 36-filter cap should be lifted so the full weight list comes back');
+    assert(base.filterBudget === 34 && weights.filters.length === 34 && base.droppedByCap.count > 0, 'the cap is hit: budget full, some dropped');
+    assert(q.query.status.option === 'available' && q.query.filters.type_filters.filters.category.option === 'armour.helmet', 'defaults');
     log(`PASS: ${weights.filters.length} filters, ${base.droppedByCap.count} dropped by cap, ${base.calcSeconds}s`);
 
     log('Test 2: realm xbox, Ring 1');
@@ -124,6 +135,43 @@ async function main(): Promise<void> {
     assert(adjusted.filters.find((f) => f.tradeId === replaced.tradeId)?.source === 'adjusted', 'adjusted source');
     log('PASS');
 
+    log('Test 4b: single-resistance adjustments target PoB\'s pseudo total');
+    const fire = await search({ weightAdjustments: [{ tradeId: FIRE_RES_EXPLICIT, weight: 2.5 }] });
+    const fireFilters = decodeQuery(fire.url).query.stats[0].filters.filter((f) => /stat_3372524247$|pseudo_total_fire_resistance$/.test(f.id));
+    assert(fireFilters.length === 1 && fireFilters[0].id === FIRE_RES_PSEUDO && fireFilters[0].value?.weight === 2.5, `one fire-res filter: ${JSON.stringify(fireFilters)}`);
+    assert(fire.filters.find((f) => f.tradeId === FIRE_RES_PSEUDO)?.mappedFrom === FIRE_RES_EXPLICIT, 'response says which id was mapped');
+    await userError('generate_trade_search', {
+      slot: 'Helmet', league: LEAGUE, weightAdjustments: [{ tradeId: FIRE_RES_EXPLICIT, weight: 1 }, { tradeId: FIRE_RES_PSEUDO, weight: 2 }],
+    }, /more than once/);
+    log('PASS');
+
+    log('Test 4c: PoB dialog options on Body Armour');
+    const opts = await ok<Search>('generate_trade_search', {
+      slot: 'Body Armour', league: LEAGUE, tradeType: 'securable', influences: ['shaper', 'elder'], includeMirrored: false,
+      maxPrice: { amount: 5, currency: 'divine' }, maxLevel: 80, sockets: 6, links: 6,
+    });
+    const oq = decodeQuery(opts.url).query;
+    assert(oq.status.option === 'securable', 'tradeType');
+    assert(oq.filters.trade_filters.filters.price.option === 'divine' && oq.filters.trade_filters.filters.price.max === 5, 'maxPrice + currency');
+    assert(oq.filters.req_filters.filters.lvl.max === 80, 'maxLevel');
+    const sock = oq.filters.socket_filters.filters;
+    assert(sock.sockets.min === 6 && sock.sockets.max === 6 && sock.links.min === 6 && sock.links.max === 6, 'sockets + links');
+    assert(oq.filters.misc_filters.filters.mirrored === false, 'includeMirrored false');
+    const infl = oq.stats.find((g) => g.type === 'and')?.filters.map((f) => f.id) ?? [];
+    assert(infl.includes('pseudo.pseudo_has_shaper_influence') && infl.includes('pseudo.pseudo_has_elder_influence'), `influences: ${infl}`);
+    assert(opts.filterBudget === 27 && oq.stats[0].filters.length <= 27, `budget shrinks with every extra filter: ${opts.filterBudget}`);
+    log('PASS');
+
+    log('Test 4d: weapon and flask slots');
+    const wand = await ok<Search>('generate_trade_search', { slot: 'Weapon 1', league: LEAGUE, maxPrice: { amount: 50 } });
+    const wq = decodeQuery(wand.url).query;
+    assert(wq.filters.type_filters.filters.category.option === 'weapon.wand', `weapon category: ${wand.itemCategory}`);
+    const price = wq.filters.trade_filters.filters.price;
+    assert(price.max === 50 && price.option === undefined, 'chaos-equivalent price has no currency option');
+    const flask = await ok<Search>('generate_trade_search', { slot: 'Flask 1', league: LEAGUE });
+    assert(decodeQuery(flask.url).query.filters.type_filters.filters.category.option === 'flask' && flask.filters.length > 0, 'flask search');
+    log('PASS');
+
     log('Test 5: requiredMods and minWeightedSum');
     const lifeId = 'explicit.stat_3299347043';
     const req = await search({ requiredMods: [{ tradeId: lifeId, min: 70 }, { tradeId: 'pseudo.pseudo_total_life' }], minWeightedSum: 123.5 });
@@ -143,6 +191,12 @@ async function main(): Promise<void> {
     await userError('generate_trade_search', { slot: 'Helmet', league: 'a/b' }, /league/);
     await userError('generate_trade_search', { slot: 'Helmet', league: '   ' }, /league/);
     await userError('search_trade_mods', { slot: 'Nope', query: 'life' }, /Unsupported slot/);
+    for (const league of ['.', '..', ' . ']) await userError('generate_trade_search', { slot: 'Helmet', league }, /league/);
+    await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, includeTalisman: true }, /includeTalisman only applies to Amulet/);
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, includeEldritch: 'keepRegular' }, /includeEldritch only applies/);
+    await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, includeEldritch: 'keepRegular', influences: ['hunter'] }, /influences/);
+    await userError('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, links: 4 }, /links is not available/);
+    await userError('generate_trade_search', { slot: 'Flask 1', league: LEAGUE, sockets: 1 }, /sockets is not available/);
     log('PASS');
 
     log('Test 7: search_trade_mods');
@@ -151,6 +205,10 @@ async function main(): Promise<void> {
     assert(mods.mods.every((m) => /^[a-z]+\.[a-z0-9_]+(\|[a-z0-9_]+)?$/.test(m.tradeId)), 'valid trade ids');
     assert(mods.mods.some((m) => m.tradeId === lifeId && m.type === 'Explicit'), '+# to maximum Life is listed');
     assert(mods.mods.some((m) => m.type === 'Pseudo'), 'pseudo stats are listed');
+    const fireMods = await ok<{ mods: { tradeId: string; preferred?: boolean; preferredTradeId?: string }[] }>(
+      'search_trade_mods', { slot: 'Helmet', query: 'fire resistance', limit: 100 });
+    assert(fireMods.mods[0]?.tradeId === FIRE_RES_PSEUDO && fireMods.mods[0].preferred === true, `pseudo total first: ${JSON.stringify(fireMods.mods[0])}`);
+    assert(fireMods.mods.find((m) => m.tradeId === FIRE_RES_EXPLICIT)?.preferredTradeId === FIRE_RES_PSEUDO, 'explicit fire res points at the pseudo id');
     const few = await ok<{ mods: unknown[]; total: number }>('search_trade_mods', { slot: 'Helmet', query: 'life', limit: 3 });
     assert(few.mods.length === 3 && few.total === mods.total, 'limit caps the list, total does not change');
     log('PASS');

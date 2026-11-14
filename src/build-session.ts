@@ -4,8 +4,13 @@ import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
 import { UserError } from './validation.js';
 
-/** Bridge timeout for a trade query: it runs one calculation per candidate mod. */
-const TRADE_QUERY_TIMEOUT_MS = 180_000;
+/**
+ * Bridge timeout for a trade query (one calculation per candidate mod).
+ * Measured 1-1.5s per slot on the OccVortex fixture; 90s leaves ~60x headroom
+ * for heavy builds without running far past common 60s MCP client timeouts,
+ * since a bridge timeout kills the engine and counts as a crash-breaker strike.
+ */
+const TRADE_QUERY_TIMEOUT_MS = 90_000;
 
 /**
  * The engine was restarted after a crash or timeout since the last tool call.

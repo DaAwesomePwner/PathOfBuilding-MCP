@@ -3020,6 +3020,22 @@ local ELDRITCH_SLOTS = { ["Body Armour"] = true, ["Helmet"] = true, ["Gloves"] =
 local ELDRITCH_OPTIONS = { "Copy Current", "Keep regular", "Keep regular+presence", "Remove" }
 local PSEUDO_IGNORED = { "^pseudo%.lake", "^pseudo%.pseudo_lake", "^pseudo%.pseudo_logbook", "^pseudo%.pseudo_temple",
 	"^pseudo%.pseudo_map", "^pseudo%.pseudo_ritual" }
+-- Copy of the pseudoMap in PoB's FinishQuery (a local there): weights for
+-- these single-resistance / single-attribute stats are merged into the
+-- pseudo "total" filter, so adjustments must target the pseudo id too.
+local TRADE_PSEUDO_MAP = {
+	["3372524247"] = "pseudo.pseudo_total_fire_resistance",
+	["4220027924"] = "pseudo.pseudo_total_cold_resistance",
+	["1671376347"] = "pseudo.pseudo_total_lightning_resistance",
+	["2923486259"] = "pseudo.pseudo_total_chaos_resistance",
+	["4080418644"] = "pseudo.pseudo_total_strength",
+	["3261801346"] = "pseudo.pseudo_total_dexterity",
+	["328541901"] = "pseudo.pseudo_total_intelligence",
+}
+local function tradePseudoFor(id)
+	local hash = type(id) == "string" and not id:find("^pseudo%.") and id:match("^[a-z]+%.stat_(%d+)$")
+	return hash and TRADE_PSEUDO_MAP[hash] or nil
+end
 local tradeState = nil
 
 local function findUpvalue(fn, name)
@@ -3103,6 +3119,8 @@ local function tradeIdTexts(st, ids)
 			userError("Unknown trade stat id '" .. tostring(id) .. "'; use search_trade_mods to find valid ids")
 		end
 		out[#out + 1] = { id = id, text = text }
+		local pseudo = tradePseudoFor(id)
+		if pseudo and st.texts[pseudo] then out[#out + 1] = { id = pseudo, text = st.texts[pseudo] } end
 	end
 	return out
 end
@@ -3203,6 +3221,14 @@ local function runTradeQuery(cmd)
 		currentItem = item and (item.title or item.name) or dkjson.null,
 		statWeights = used,
 		texts = idTexts,
+		pseudoMap = (function()
+			local list = { }
+			for _, id in ipairs(cmd.tradeIds or { }) do
+				local pseudo = tradePseudoFor(id)
+				if pseudo then list[#list + 1] = { from = id, to = pseudo } end
+			end
+			return list
+		end)(),
 		calcSeconds = elapsed,
 	}
 end
@@ -3214,10 +3240,21 @@ local function searchTradeMods(cmd)
 	local _, category = st.helpers.getTradeCategory(slot.slotName, item)
 	local needle = tostring(cmd.query or ""):lower()
 	local found, seen = { }, { }
+	local preferredPseudo = { }
+	for _, pseudo in pairs(TRADE_PSEUDO_MAP) do preferredPseudo[pseudo] = true end
+	-- Only ids generate_trade_search accepts (present in TradeSiteStats.lua).
+	-- Single resistances/attributes point at their pseudo total, which is
+	-- listed first: PoB weighs those stats through the pseudo filter.
 	local function add(id, text, kind)
-		if seen[id] then return end
+		if seen[id] or not st.texts[id] then return end
 		seen[id] = true
-		if text:lower():find(needle, 1, true) then found[#found + 1] = { tradeId = id, text = text, type = kind } end
+		if text:lower():find(needle, 1, true) then
+			found[#found + 1] = {
+				tradeId = id, text = text, type = kind,
+				preferred = preferredPseudo[id] or nil,
+				preferredTradeId = tradePseudoFor(id),
+			}
+		end
 	end
 	for _, kind in ipairs({ "Explicit", "Implicit", "Corrupted" }) do
 		for _, md in pairs(st.gen.modData[kind] or { }) do
@@ -3235,6 +3272,7 @@ local function searchTradeMods(cmd)
 	end
 	local order = { Explicit = 1, Implicit = 2, Corrupted = 3, Pseudo = 4 }
 	table.sort(found, function(a, b)
+		if (a.preferred or false) ~= (b.preferred or false) then return a.preferred == true end
 		if a.type ~= b.type then return order[a.type] < order[b.type] end
 		if a.text ~= b.text then return a.text < b.text end
 		return a.tradeId < b.tradeId
