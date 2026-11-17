@@ -944,8 +944,70 @@ local function getItemInSlot(slotName)
 	}
 end
 
+-- Slot checks shared by the item commands and the slot listings (one table,
+-- not separate top-level locals: the main chunk is close to LuaJIT's limit).
+local slotChecks = { }
+
+-- Slots Path of Building shows only on some passive tree versions: its
+-- ItemsTab gives them a `shown` function testing spec.treeVersion (Wickerman
+-- on 3.30, grafts on 3.27). Only these follow PoB's visibility here; weapon
+-- swap, Ring 3 and abyssal sockets are listed and accepted as before.
+-- `counted` says whether PoB's CalcSetup still uses an item left in the slot
+-- while it is hidden: grafts are skipped off 3.27, but its Wickerman check
+-- (`^Wickerman `) matches no slot name, so Viscera items keep counting.
+do
+	local wickerman = {
+		what = "the Wickerman slots (Head, Body, Arm, Leg)", tree = "3.30", counted = true,
+		remedy = "convert_tree_to_latest moves the build to the latest passive tree, where they are shown",
+	}
+	local graft = {
+		what = "the Graft slots", tree = "3.27", counted = false,
+		remedy = "they are usable only on a 3.27 tree; no tree conversion makes them available",
+	}
+	slotChecks.treeGated = {
+		Head = wickerman, Body = wickerman, Arm = wickerman, Leg = wickerman,
+		["Graft 1"] = graft, ["Graft 2"] = graft,
+	}
+end
+
+-- The tree gate of `slot` when PoB currently hides it, else nil. A slot
+-- without a `shown` property counts as shown (older PoB versions).
+function slotChecks.hiddenGate(slot)
+	local gate = slotChecks.treeGated[slot.slotName]
+	if not gate then return nil end
+	local shown = slot.shown
+	if type(shown) == "function" then shown = shown(slot) end
+	if shown == nil and slot.shown == nil then shown = true end
+	if shown then return nil end
+	return gate
+end
+
+-- Why PoB currently hides `slot`, or nil when it is shown.
+function slotChecks.hiddenReason(slot)
+	local gate = slotChecks.hiddenGate(slot)
+	if not gate then return nil end
+	local treeVersion = build.spec and build.spec.treeVersion or "unknown"
+	return string.format("Path of Building shows %s only on %s passive trees (this build uses tree %s)",
+		gate.what, gate.tree, (tostring(treeVersion):gsub("_", ".")))
+end
+
+-- The slot named `slotName`. Unknown slots are refused; with `equipping`,
+-- so is a slot PoB hides (removing an item from one is always allowed).
+function slotChecks.usableSlot(slotName, equipping)
+	local slot = build.itemsTab.slots[slotName]
+	if not slot then
+		userError("Unknown slot: " .. tostring(slotName))
+	end
+	local reason = equipping and slotChecks.hiddenReason(slot)
+	if reason then
+		userError(string.format("Cannot equip an item in %s: %s; %s", slotName, reason,
+			slotChecks.hiddenGate(slot).remedy))
+	end
+	return slot
+end
+
 -- Why ItemsTab:IsItemValidForSlot refused `item` for `slotName`.
-local function slotRefusalReason(tab, item, slotName)
+function slotChecks.refusalReason(tab, item, slotName)
 	local kind = item.type or (item.base and item.base.type) or "unknown"
 	if slotName:match("^Jewel %d+$") then
 		if kind ~= "Jewel" then
@@ -986,7 +1048,7 @@ local function assertItemFitsSlot(tab, slot, item)
 	local slotName = slot.slotName
 	if not tab:IsItemValidForSlot(item, slotName) then
 		userError(string.format("%s cannot be equipped in %s: %s", tostring(item.name or "This item"), slotName,
-			slotRefusalReason(tab, item, slotName)))
+			slotChecks.refusalReason(tab, item, slotName)))
 	end
 	local parent = slot.parentSlot
 	if parent then
@@ -1014,10 +1076,7 @@ end
 
 local function equipItemInSlot(slotName, itemRaw)
 	local tab = build.itemsTab
-	local slot = tab.slots[slotName]
-	if not slot then
-		userError("Unknown slot: " .. tostring(slotName))
-	end
+	local slot = slotChecks.usableSlot(slotName, true)
 	local newItem = parseItemText(itemRaw, slotName)
 	assertItemFitsSlot(tab, slot, newItem)
 	-- AddItem gives the item the lowest free id (not the highest).
@@ -1296,10 +1355,7 @@ local function restoreItemsState(state)
 end
 
 local function unequipSlot(slotName)
-	local slot = build.itemsTab.slots[slotName]
-	if not slot then
-		userError("Unknown slot: " .. tostring(slotName))
-	end
+	local slot = slotChecks.usableSlot(slotName, false)
 	slot:SetSelItemId(0)
 	build.buildFlag = true
 	build.itemsTab:PopulateSlots()
@@ -2449,7 +2505,7 @@ local function getValidSlots()
 		return result
 	end
 	for _, slot in ipairs(build.itemsTab.orderedSlots) do
-		if slot.slotName and not slot.slotName:find("Abyssal Socket") then
+		if slot.slotName and not slot.slotName:find("Abyssal Socket") and not slotChecks.hiddenReason(slot) then
 			local itemId = slot.selItemId or 0
 			local item = (itemId ~= 0) and build.itemsTab.items[itemId] or nil
 			table.insert(result, {
@@ -2486,13 +2542,23 @@ local function listEquippedItems()
 		return result
 	end
 	for _, slot in ipairs(build.itemsTab.orderedSlots) do
-		-- Skip abyssal sockets and inactive flask slots
+		-- Skip abyssal sockets. A slot PoB hides on this tree (Wickerman, grafts)
+		-- is listed only when it holds an item, marked hidden.
 		if slot.slotName and not slot.slotName:find("Abyssal Socket") then
 			local itemId = slot.selItemId or 0
 			if itemId ~= 0 then
 				local item = build.itemsTab.items[itemId]
 				if item then
+					local gate = slotChecks.hiddenGate(slot)
+					local note
+					if gate then
+						note = slotChecks.hiddenReason(slot) .. (gate.counted
+							and "; Path of Building still counts this item in its calculations. unequip_item removes it"
+							or "; Path of Building ignores this item in its calculations on this tree. unequip_item removes it")
+					end
 					table.insert(result, {
+						hidden = gate and true or nil,
+						note = note,
 						slot = slot.slotName,
 						itemId = itemId,
 						rarity = item.rarity,
@@ -3698,6 +3764,11 @@ local DISPATCH = {
 	unequipItem = {
 		handler = function(cmd) unequipSlot(cmd.slot) return { } end,
 		mutating = true,
+	},
+	checkSlotUsable = {
+		-- The same refusal equipItem gives for an unknown or hidden slot,
+		-- without changing anything (compare_items checks before probing).
+		handler = function(cmd) slotChecks.usableSlot(cmd.slot, true) return { } end,
 	},
 	selectItem = {
 		-- Re-select an item the build already holds; `selected` is false (nothing

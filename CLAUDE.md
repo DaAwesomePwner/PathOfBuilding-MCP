@@ -34,6 +34,7 @@ npm run test:phase7   # diagnostics / upgrades / export / snapshots
 npm run test:integrity  # bit-exact snapshot/restore stress
 npm run test:crash-recovery  # crash breaker, timeouts, respawn restores the last committed build
 npm run test:trade    # generate_trade_search / search_trade_mods (PoB's weighted trade query generator)
+npm run test:wickerman  # 3.30 Wickerman slots: tree-gated slot listing/refusal, Viscera game text
 npm run test:errors   # input validation paths
 npm run test:all      # everything, in parallel (~2.5 min on a desktop); `npm run test:all -- bridge phase4` runs a subset
 ```
@@ -95,7 +96,8 @@ All engine-backed tools follow this pattern.
 
 ## Conventions
 
-- **Item text format** in MCP tools comes from PoB's "Copy item" (right-click) — must start with a `Rarity:` line. The server validates strictly.
+- **Item text format** in MCP tools comes from PoB's "Copy item" (right-click) — must start with a `Rarity:` line. The server validates strictly. The one exception is Viscera (Wickerman) item text copied from the game: first line `Item Class: Viscera`, no `Rarity:` line (PoB parses it as Normal). A leading UTF-8 BOM is stripped before the text reaches the engine (`normalizeItemText`).
+- **Slot visibility.** Slots PoB shows only on some passive tree versions (Wickerman `Head`/`Body`/`Arm`/`Leg` on 3.30, `Graft 1`/`Graft 2` on 3.27; PoB's own `slot.shown`) are left out of `list_valid_slots` while hidden, and `swap_item` / `compare_items` into them are a `UserError` (naming the remedy) before any change. `unequip_item` on a hidden slot is allowed, and `list_equipped_items` lists an occupied hidden slot with `hidden: true` and a note: PoB still counts a hidden Wickerman item (CalcSetup's `^Wickerman ` check matches no slot name) but skips a hidden graft. Items already in a hidden slot are kept by export, probes and undo. Weapon swap, Ring 3 and abyssal sockets are listed and accepted regardless (`slotChecks` in `lua/bridge.lua`).
 - **Build code round-trip is lossless.** `export_build({format:"code"})` produces a base64 zlib string that `load_build` accepts back. Same for `xml`.
 
 ## Reference files

@@ -99,7 +99,16 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 ## "Item text must start with a `Rarity:` line"
 
-`swap_item` and `compare_items` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`.
+`swap_item` and `compare_items` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`. The one exception is a Viscera (Wickerman) item copied from the game, whose first line is `Item Class: Viscera` and which has no `Rarity:` line; it is accepted as is.
+
+## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
+
+The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
+
+- **Wickerman:** run `convert_tree_to_latest` to move the build to the 3.30 tree, then equip.
+- **Graft:** only a 3.27 tree shows them; no conversion helps (`convert_tree_to_latest` goes to the latest tree, not 3.27).
+
+An item already in a hidden slot is still listed by `list_equipped_items` (with `hidden: true` and a note) and `unequip_item` removes it. PoB still counts a hidden Wickerman item in its calculations; a hidden graft is ignored.
 
 ## State drift / unexpected stat values after multiple operations
 

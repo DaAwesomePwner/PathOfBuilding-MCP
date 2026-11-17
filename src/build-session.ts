@@ -2,7 +2,7 @@ import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
-import { UserError } from './validation.js';
+import { UserError, normalizeItemText } from './validation.js';
 
 /**
  * Bridge timeout for a trade query (one calculation per candidate mod).
@@ -920,6 +920,7 @@ export class BuildSession {
   }
 
   async swapItemWithDiff(slot: string, itemText: string): Promise<StatDiffResult> {
+    itemText = normalizeItemText(itemText);
     return this.withLock(() => this.itemMutationWithUndoUnlocked({ cmd: 'equipItem', slot, itemText }));
   }
 
@@ -954,13 +955,16 @@ export class BuildSession {
 
   async compareItems(slot: string, candidates: string[]): Promise<ComparisonResult> {
     return this.withLock(async () => {
+      // An unknown slot, or one PoB hides on this tree, is refused for the
+      // whole call rather than once per candidate.
+      await this.bridge.send({ cmd: 'checkSlotUsable', slot });
       // Snapshot the slot's current item — still needed for the result's baseline.item field.
       const baselineItem = await this.snapshotSlotUnlocked(slot);
       const baselineStats = await this.bridge.getStats();
 
       const results: ComparisonCandidate[] = [];
       for (let i = 0; i < candidates.length; i++) {
-        const itemText = candidates[i];
+        const itemText = normalizeItemText(candidates[i]);
         let candidateStats: Stats | null = null;
         let error: string | null = null;
         await this.withSlotProbeUnlocked(slot, async () => {
@@ -2282,6 +2286,10 @@ export interface ItemModLine {
 export interface EquippedItem {
   slot: string;
   itemId: number;
+  /** The slot is hidden by PoB on this passive tree (Wickerman off 3.30, grafts off 3.27). */
+  hidden?: boolean;
+  /** For a hidden slot: why, and whether PoB still counts the item. */
+  note?: string;
   rarity?: string;
   name?: string;
   title?: string;

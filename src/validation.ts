@@ -172,17 +172,31 @@ export function validateSlot(slot: unknown, validSlots?: string[]): string {
   return slot;
 }
 
+/**
+ * Item text as it goes to the engine: a leading UTF-8 byte order mark (some
+ * clipboards and editors add one) is removed, so PoB sees the real first line
+ * ("Rarity: ..." or "Item Class: Viscera").
+ */
+export function normalizeItemText(text: string): string {
+  return text.replace(/^﻿+/, '');
+}
+
 export function validateItemText(text: unknown): string {
   if (typeof text !== 'string') {
     throw new UserError('Item text must be a string');
   }
-  const trimmed = text.trim();
+  const trimmed = normalizeItemText(text).trim();
   if (trimmed.length === 0) {
     throw new UserError('Item text is empty');
   }
-  if (!/^Rarity\s*:/im.test(trimmed)) {
+  // The game copies Viscera (Wickerman) items without a Rarity line; PoB's
+  // parser reads "Item Class: Viscera" followed by no Rarity line as a
+  // Normal item (Item.lua), so that one item class is accepted without it.
+  const isViscera = /^Item Class:\s*Viscera\s*$/.test(trimmed.split(/\r?\n/, 1)[0].trim());
+  if (!isViscera && !/^Rarity\s*:/im.test(trimmed)) {
     throw new UserError(
-      'Item text must start with a "Rarity: ..." line (PoB item paste format)',
+      'Item text must start with a "Rarity: ..." line (PoB item paste format); only Viscera items copied from the game ' +
+        '(first line "Item Class: Viscera") may leave it out',
     );
   }
   return trimmed;
