@@ -48,6 +48,18 @@ package.cpath = POB_PATH .. "/?.dll;"
 	.. POB_PATH .. "/runtime/?.so;"
 	.. package.cpath
 
+-- PoB 2.68+ sources use compound assignment (`count += 1`), which only PoB's
+-- own patched LuaJIT parses. lua/compound-assign.lua rewrites a chunk only
+-- when stock LuaJIT rejects it, and hooks every way PoB compiles a file: the
+-- global loadfile and dofile (so LoadModule/PLoadModule below too) and the
+-- Lua-file searcher behind require. Loaded by path from this script's own
+-- directory, since package.path points at PoB.
+do
+	local source = debug.getinfo(1, "S").source
+	local dir = source:sub(1, 1) == "@" and source:sub(2):match("^(.*)[/\\][^/\\]*$") or "."
+	dofile(dir .. "/compound-assign.lua").install()
+end
+
 -- ---------------------------------------------------------------------------
 -- Protocol stream protection. stdout carries exactly one JSON object per line
 -- and nothing else. Anything PoB (or a library) prints goes to stderr instead.
@@ -691,6 +703,50 @@ local function respond(obj)
 	STDOUT:flush()
 end
 
+-- Creates a PoB class instance. PoB 2.68 split construction into
+-- new("X"):X(args...) and its new() raises on any extra argument; earlier
+-- versions take new("X", args...). The convention is read once, after boot:
+-- first from the loaded class tables (2.68's newClass gives every class an
+-- _unconstructedMeta; older ones never do), else from new()'s signature
+-- where LuaJIT reports it (the old new forwards a vararg; LuaJIT 2.0 omits
+-- isvararg). When neither tells, construction fails instead of guessing.
+-- One main-chunk local only: LuaJIT allows 200 and this chunk is close.
+local construct
+do
+	local newTakesConstructorArgs
+	local function detectConstructorConvention()
+		local classes = type(common) == "table" and type(common.classes) == "table" and common.classes
+		if classes then
+			local sawClass = false
+			for _, class in pairs(classes) do
+				if type(class) == "table" then
+					sawClass = true
+					if rawget(class, "_unconstructedMeta") ~= nil then return false end
+				end
+			end
+			if sawClass then return true end
+		end
+		local info = type(new) == "function" and debug.getinfo(new, "u")
+		if info and type(info.isvararg) == "boolean" then
+			return info.isvararg
+		end
+		return nil
+	end
+	function construct(className, ...)
+		if newTakesConstructorArgs == nil then
+			newTakesConstructorArgs = detectConstructorConvention()
+			if newTakesConstructorArgs == nil then
+				error("Cannot tell how this Path of Building version constructs classes (no loaded classes, and new() has no signature info)")
+			end
+		end
+		if newTakesConstructorArgs then
+			return new(className, ...)
+		end
+		local object = new(className)
+		return object[className](object, ...)
+	end
+end
+
 -- PoB colour escapes (^7, ^xRRGGBB) are noise in an error message.
 local function stripColorCodes(text)
 	return (tostring(text):gsub("%^x%x%x%x%x%x%x", ""):gsub("%^%d", ""))
@@ -914,7 +970,7 @@ end
 -- normalising), but never through the items tab's displayItem: a parse
 -- failure can then never leave an earlier display item behind to be equipped.
 local function parseItemText(itemRaw, slotName)
-	local ok, item = pcall(new, "Item", itemRaw)
+	local ok, item = pcall(construct, "Item", itemRaw)
 	if not ok then
 		userError("Could not parse the item text for " .. slotName .. ": " .. stripColorCodes(tostring(item)))
 	end
@@ -1518,7 +1574,7 @@ local function installSpec(version, state)
 	if type(versions) ~= "table" or not versions[version] then
 		error("Tree convert failed: unknown tree version " .. tostring(version))
 	end
-	local newSpec = new("PassiveSpec", build, version)
+	local newSpec = construct("PassiveSpec", build, version)
 	newSpec.title = state.title
 	newSpec.jewels = shallowCopy(state.jewels)
 	local overrides = shallowCopy(state.hashOverrides)
@@ -3106,7 +3162,7 @@ local function tradeStateOrError()
 		end
 		h:close()
 	end
-	local gen = new("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	local gen = construct("TradeQueryGenerator", { itemsTab = build.itemsTab })
 	local _, helpers = findUpvalue(gen.StartQuery, "tradeHelpers")
 	helpers = helpers or LoadModule("Classes/TradeHelpers")
 	local texts, pseudo = { }, { }
