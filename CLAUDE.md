@@ -20,6 +20,7 @@ npm run start         # node dist/server.js (built artifacts)
 # Tests — POB_PATH must point at a real PoB install, or each integration test prints SKIPPED and exits 0
 # (with REQUIRE_POB=1 it fails instead; CI sets it).
 npm run test:paths    # unit tests for paths / discovery / config store (no LuaJIT needed)
+npm run test:compound-assign  # unit tests for lua/compound-assign.lua (LuaJIT only, no PoB)
 npm run test:startup  # builds, starts dist/server.js unconfigured, configure_pob_path, saved config, reload_engine, elicitation
 npm run test:safety   # engine safety tests
 npm run test:bridge   # ~10s, Lua bridge round-trip — run first when debugging
@@ -65,7 +66,8 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 | Install inspection | `src/pob-install.ts` | Layout + `manifest.xml` version, PoE2 detection, install fingerprint (version + mtime), PoB self-updater state (`Update/opFile.txt` = staged, `Update/manifest.xml` without it = applying). Read-only. |
 | Config store | `src/config-store.ts` | Per-user `config.json` written by `configure_pob_path`. |
 | Engine manager | `src/engine-manager.ts` | Owns the LuaBridge + BuildSession pair. Lazy/background boot, `run()` gate (unconfigured / updating / stale → `EngineNotReadyError`), `configure()`, `reload()` (export build → dispose old bridge → boot → reload build), `info()`. |
-| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
+| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. PoB classes are created through `construct(className, ...)`, which picks PoB 2.68's `new("X"):X(...)` or the older `new("X", ...)` from `new`'s own signature. |
+| Lua syntax compat | `lua/compound-assign.lua` | PoB 2.68+ sources use compound assignment (`x += 1`, `s ..= t`), which only PoB's patched LuaJIT parses. Hooks the global `loadfile`/`dofile` and the `require` file searcher: the original source is compiled first, and only a chunk stock LuaJIT rejects is rewritten to `x = x + (1)` (newlines kept, so line numbers stay right); if that fails too, the original error is reported. Loaded by bridge.lua by path. |
 | BuildSession | `src/build-session.ts` | TS class owning the LuaJIT subprocess. Snapshot/restore, undo stack, `withTemporaryChange`, async mutex, build-code/URL/XML loading, higher-level workflows. |
 | MCP server | `src/server.ts`, `src/tool-registry.ts`, `src/engine-tools.ts` | Registers 39 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. `tools.engine(...)` handlers run inside `engine.run()` (shared gate slot + readiness checks) and receive the live session; `tools.plain(...)` handlers (configure_pob_path, get_engine_info, reload_engine, list_scenarios) work without an engine. |
 
