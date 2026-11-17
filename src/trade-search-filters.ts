@@ -35,6 +35,9 @@ function adjustmentTargets(args: TradeSearchArgs, raw: TradeQueryRaw): Map<strin
   return out;
 }
 
+/** The "and" filter id PoB (or the bridge, on PoB 2.68+) adds for a required influence. */
+export const influenceTradeId = (influence: string) => `pseudo.pseudo_has_${influence}_influence`;
+
 /**
  * How many weight filters fit next to the other filters, counted the way the PoB version counts:
  * PoB <= 2.67: 36 filters in all (2 base filters, each option filter, each influence / required mod);
@@ -43,7 +46,8 @@ function adjustmentTargets(args: TradeSearchArgs, raw: TradeQueryRaw): Map<strin
 function weightFilterBudget(args: TradeSearchArgs, raw: TradeQueryRaw): { budget: number; limit: string } {
   const optionFilters = (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
     + (args.sockets ? 1 : 0) + (args.links ? 1 : 0);
-  const andFilters = (args.influences?.length ?? 0) + (args.requiredMods?.length ?? 0);
+  // Distinct "and" ids: a required pseudo_has_<influence>_influence also named in influences is emitted once.
+  const andFilters = new Set([...(args.influences ?? []).map(influenceTradeId), ...(args.requiredMods ?? []).map((m) => m.tradeId)]).size;
   if (raw.capModel === 'complexity') {
     const c = TRADE_COMPLEXITY;
     const left = c.limit - c.weightGroup - c.typeFilters - c.andGroup - c.optionFilter * optionFilters - c.statFilter * andFilters;
@@ -92,11 +96,19 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   weightGroup.filters = kept.map((f) => ({ id: f.tradeId, value: { weight: round(f.weight) } }));
   weightGroup.value = { min: minWeightedSum };
   if (requiredMods.length > 0) {
-    // One "and" group: required mods join the influence filters when there are any.
+    // One "and" group: required mods join the influence filters when there are any; a required mod with the
+    // same id as an influence filter replaces it (keeping its min), so each id is emitted once.
     const filters = requiredMods.map((m) => (m.min === undefined ? { id: m.tradeId } : { id: m.tradeId, value: { min: m.min } }));
     const andGroup = query.query.stats.find((g) => g.type === 'and');
-    if (andGroup) andGroup.filters.push(...filters);
-    else query.query.stats.push({ type: 'and', filters });
+    if (!andGroup) query.query.stats.push({ type: 'and', filters });
+    else {
+      const existing = andGroup.filters as { id?: string }[];
+      for (const f of filters) {
+        const at = existing.findIndex((e) => e.id === f.id);
+        if (at >= 0) existing[at] = f;
+        else existing.push(f);
+      }
+    }
   }
   return { query, texts, kept, dropped, budget, pobDefaultMin, minWeightedSum };
 }

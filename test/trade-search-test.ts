@@ -185,12 +185,23 @@ async function main(): Promise<void> {
     if (base.capLifted) {
       assert(base.filterBudget === 34 && weights.filters.length === 34 && base.droppedByCap.count > 0, 'the cap is hit: budget full, some dropped');
     } else {
-      // TRADE_COMPLEXITY must match the costs in the installed FinishQuery.
-      for (const line of [`local complexityBudget = ${c.limit} - ${c.weightGroup} - ${c.typeFilters} - ${c.andGroup}`,
-        `if complexityBudget < ${c.reserve} then`, `complexityBudget = complexityBudget - ${c.statFilter}`,
-        `complexityBudget = complexityBudget - ${c.optionFilter}`]) {
-        assert(finishQuery.includes(line), `PoB FinishQuery no longer has: ${line}`);
-      }
+      // TRADE_COMPLEXITY must match every cost in the installed FinishQuery, in order: a changed cost or a new
+      // costed filter fails here.
+      const initial = [...finishQuery.matchAll(/local complexityBudget\s*=\s*([^\r\n]+)/g)].map((m) => m[1].trim());
+      assert(JSON.stringify(initial) === JSON.stringify([`${c.limit} - ${c.weightGroup} - ${c.typeFilters} - ${c.andGroup}`]),
+        `PoB FinishQuery's initial complexity budget changed: ${JSON.stringify(initial)}`);
+      const costs = [...finishQuery.matchAll(/complexityBudget\s*=\s*complexityBudget\s*-\s*([^\r\n]+)/g)].map((m) => m[1].trim());
+      const expectedCosts = [
+        '2', // each queryExtra key (special items only, never on gear slots)
+        String(c.statFilter), // each required mod
+        String(c.statFilter), // each blocked mod (not exposed)
+        ...Array<string>(6).fill(String(c.optionFilter)), // mirrored, price, account, level, sockets, links
+        String(c.statFilter), // each weight filter
+      ];
+      assert(JSON.stringify(costs) === JSON.stringify(expectedCosts),
+        `PoB FinishQuery's complexity costs changed:\n  PoB      ${JSON.stringify(costs)}\n  expected ${JSON.stringify(expectedCosts)}`);
+      const checks = [...finishQuery.matchAll(/complexityBudget\s*([<>]=?)\s*([^\s)]+)/g)].map((m) => `${m[1]} ${m[2]}`);
+      assert(JSON.stringify(checks) === JSON.stringify([`< ${c.reserve}`]), `PoB FinishQuery's complexity reserve changed: ${JSON.stringify(checks)}`);
       assert(base.filterBudget === 33 && weights.filters.length === 33, `complexity budget full: ${base.filterBudget} / ${weights.filters.length}`);
       assert(/capped weight list/.test(base.capWarning ?? ''), 'capWarning explains the capped list');
     }
@@ -343,6 +354,13 @@ async function main(): Promise<void> {
     const irAnd = decodeQuery(inflReq.url).query.stats.filter((g) => g.type === 'and');
     assert(irAnd.length === 1 && irAnd[0].filters.map((f) => f.id).join() === `pseudo.pseudo_has_hunter_influence,${lifeId}`,
       `influence and required mod share one "and" group: ${JSON.stringify(irAnd)}`);
+    // The influence filter also given as a required mod (with a min) is emitted once and counted once.
+    const hunter = 'pseudo.pseudo_has_hunter_influence';
+    const dup = await search({ influences: ['hunter'], requiredMods: [{ tradeId: hunter, min: 1 }, { tradeId: lifeId, min: 50 }] });
+    const dupAnd = decodeQuery(dup.url).query.stats.filter((g) => g.type === 'and');
+    assert(dupAnd.length === 1 && dupAnd[0].filters.length === 2 && dupAnd[0].filters.filter((f) => f.id === hunter).length === 1
+      && dupAnd[0].filters.find((f) => f.id === hunter)?.value?.min === 1, `influence filter emitted once: ${JSON.stringify(dupAnd)}`);
+    assert(dup.filterBudget === inflReq.filterBudget, `the duplicate is counted once: ${dup.filterBudget} vs ${inflReq.filterBudget}`);
     log('PASS');
 
     log('Test 6: input errors are user errors');

@@ -3350,9 +3350,14 @@ local function runTradeQuery(cmd)
 		end
 	end
 	if not pobAddsInfluences and #influences > 0 then
-		local andGroup = nil
+		-- Ids already in any group (a PoB that adds them itself under another
+		-- name) are not added again.
+		local andGroup, present = nil, { }
 		for _, group in ipairs(stats) do
-			if group.type == "and" then andGroup = group break end
+			if group.type == "and" and not andGroup then andGroup = group end
+			for _, f in ipairs(type(group.filters) == "table" and group.filters or { }) do
+				if type(f) == "table" and f.id ~= nil then present[f.id] = true end
+			end
 		end
 		if not andGroup then
 			andGroup = { type = "and", filters = { } }
@@ -3365,10 +3370,18 @@ local function runTradeQuery(cmd)
 					userError("This Path of Building's trade stat list (Data/TradeSiteStats.lua) has no " .. id
 						.. " filter, which the influence requirement needs; update Path of Building")
 				end
-				andGroup.filters[#andGroup.filters + 1] = { id = id }
+				if not present[id] then
+					present[id] = true
+					andGroup.filters[#andGroup.filters + 1] = { id = id }
+					changed = true
+				end
 			end
 		end
-		changed = true
+		if #andGroup.filters == 0 then
+			for i = #stats, 2, -1 do
+				if stats[i] == andGroup then table.remove(stats, i) end
+			end
+		end
 	end
 	if decoded.sort == nil then decoded.sort, changed = { ["statgroup.0"] = "desc" }, true end
 	if decoded.engine == nil then decoded.engine, changed = "new", true end
