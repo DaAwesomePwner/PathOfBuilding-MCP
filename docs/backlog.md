@@ -19,12 +19,6 @@ it plausible.
 Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
 for later.
 
-- **PoB `dev` branch does not parse under plain LuaJIT.** `src/Modules/Main.lua:342`
-  (`count += 1`, added in upstream commit `c38c8f6b`, 2026-08-23) uses Lua 5.3
-  syntax, so a clone of the default branch fails to boot with `'=' expected
-  near '+'`. Release tags (checked: `v2.67.2`) work. Needs an upstream fix, or
-  a source transform in `bridge.lua`'s module loader. `POB_SOURCE_PATH` for
-  `npm run test:source-clone` should point at a release tag until then.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
