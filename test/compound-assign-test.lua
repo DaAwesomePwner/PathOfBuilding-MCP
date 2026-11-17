@@ -187,6 +187,28 @@ case("operators inside strings and comments are untouched", function()
 	eq(env.eqs, true, "comparison operators")
 end)
 
+case("number exponents: sign only after the base's exponent letter", function()
+	-- In hex, `e` is a digit: `0xe--c` is 0xe followed by a comment.
+	local src = "a = 1\na += 0xe--c\nb = 2\nx = 1 x += 1e-2\ny = 0 y += 0x1p-1\nz = 0 z += 0xE+1\n"
+	local _, env = run(src)
+	eq(env.a, 15, "a += 0xe")
+	eq(env.b, 2, "b after the comment")
+	eq(env.x, 1.01, "x += 1e-2")
+	eq(env.y, 0.5, "y += 0x1p-1")
+	eq(env.z, 15, "z += 0xE+1")
+end)
+
+case("\\z in short strings", function()
+	local src = 's = "x"\ns ..= "a\\z\n      b" .. \'c\\z\n\'\nlocal t\nt.x = 1 -- line 6\n'
+	local fn = assert(CA.loadstring(src, "=zesc"))
+	local env = setmetatable({ }, { __index = _G })
+	setfenv(fn, env)
+	local ok, err = pcall(fn)
+	eq(env.s, "xabc", "s")
+	eq(ok, false, "runtime error raised")
+	assert(tostring(err):find("^zesc:6:"), "expected an error on line 6, got " .. tostring(err))
+end)
+
 case("line numbers are preserved", function()
 	local src = "local a = 0\na += 1\na += (1 +\n2)\nlocal t = { }\nt.x.y = 1 -- line 6\n"
 	local fn = assert(CA.loadstring(src, "=lines"))

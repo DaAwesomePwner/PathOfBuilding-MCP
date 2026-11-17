@@ -120,12 +120,15 @@ local function tokenize(src)
 			i = j
 		elseif isDigit(b) or (b == 46 and isDigit(s_byte(src, i + 1))) then
 			-- Same rule as LuaJIT's number scanner: identifier bytes and dots,
-			-- plus a sign right after an exponent letter.
+			-- plus a sign right after the exponent letter of the number's base
+			-- (e/E for decimal, p/P for hex: `0xe-1` is 0xe minus 1).
 			local j = i
 			local prev
+			local isHex = b == 48 and (s_byte(src, i + 1) == 120 or s_byte(src, i + 1) == 88)
+			local expLower = isHex and 112 or 101 -- "p" or "e"
 			while true do
 				local c = s_byte(src, j)
-				if isIdentByte(c) or c == 46 or ((c == 43 or c == 45) and (prev == 101 or prev == 69 or prev == 112 or prev == 80)) then
+				if isIdentByte(c) or c == 46 or ((c == 43 or c == 45) and prev and (prev == expLower or prev == expLower - 32)) then
 					prev = c
 					j = j + 1
 				else
@@ -144,6 +147,16 @@ local function tokenize(src)
 					local d = s_byte(src, j + 1)
 					if d == 13 and s_byte(src, j + 2) == 10 or d == 10 and s_byte(src, j + 2) == 13 then
 						j = j + 3
+					elseif d == 122 then -- "\z" skips the following whitespace, newlines included
+						j = j + 2
+						while true do
+							local w = s_byte(src, j)
+							if w == 32 or w == 9 or w == 10 or w == 13 or w == 11 or w == 12 then
+								j = j + 1
+							else
+								break
+							end
+						end
 					else
 						j = j + 2
 					end

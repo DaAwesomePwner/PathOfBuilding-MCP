@@ -705,20 +705,46 @@ end
 
 -- Creates a PoB class instance. PoB 2.68 split construction into
 -- new("X"):X(args...) and its new() raises on any extra argument; earlier
--- versions take new("X", args...). The convention is read once from new()
--- itself: the old one forwards a vararg to the constructor, the new one is
--- new(className, extraArg) with no vararg.
-local newTakesConstructorArgs
-local function construct(className, ...)
-	if newTakesConstructorArgs == nil then
-		local info = debug.getinfo(new, "u")
-		newTakesConstructorArgs = not (info and info.isvararg == false and (info.nparams or 0) >= 1)
+-- versions take new("X", args...). The convention is read once, after boot:
+-- first from the loaded class tables (2.68's newClass gives every class an
+-- _unconstructedMeta; older ones never do), else from new()'s signature
+-- where LuaJIT reports it (the old new forwards a vararg; LuaJIT 2.0 omits
+-- isvararg). When neither tells, construction fails instead of guessing.
+-- One main-chunk local only: LuaJIT allows 200 and this chunk is close.
+local construct
+do
+	local newTakesConstructorArgs
+	local function detectConstructorConvention()
+		local classes = type(common) == "table" and type(common.classes) == "table" and common.classes
+		if classes then
+			local sawClass = false
+			for _, class in pairs(classes) do
+				if type(class) == "table" then
+					sawClass = true
+					if rawget(class, "_unconstructedMeta") ~= nil then return false end
+				end
+			end
+			if sawClass then return true end
+		end
+		local info = type(new) == "function" and debug.getinfo(new, "u")
+		if info and type(info.isvararg) == "boolean" then
+			return info.isvararg
+		end
+		return nil
 	end
-	if newTakesConstructorArgs then
-		return new(className, ...)
+	function construct(className, ...)
+		if newTakesConstructorArgs == nil then
+			newTakesConstructorArgs = detectConstructorConvention()
+			if newTakesConstructorArgs == nil then
+				error("Cannot tell how this Path of Building version constructs classes (no loaded classes, and new() has no signature info)")
+			end
+		end
+		if newTakesConstructorArgs then
+			return new(className, ...)
+		end
+		local object = new(className)
+		return object[className](object, ...)
 	end
-	local object = new(className)
-	return object[className](object, ...)
 end
 
 -- PoB colour escapes (^7, ^xRRGGBB) are noise in an error message.
