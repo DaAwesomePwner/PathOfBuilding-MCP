@@ -2,7 +2,10 @@
  * generate_trade_search / search_trade_mods: URL shape, weighted query, weight
  * adjustments surviving the filter cap, required mods, min override, input
  * errors, the bridge's copy of PoB's pseudoMap / ignoredStats still matching
- * the installed TradeQueryGenerator.lua, and the build left unchanged.
+ * the installed TradeQueryGenerator.lua, and the build left unchanged. Runs on
+ * PoB <= 2.67 (36-filter cap, lifted by the bridge) and 2.68+ (PoB's own
+ * trade-site complexity budget): the expectations follow the bridge's capModel,
+ * cross-checked against the installed generator source.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -11,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { setupTestEnv } from './_skip.js';
+import { TRADE_COMPLEXITY } from '../src/trade-search-schema.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
@@ -30,7 +34,7 @@ interface Filter { tradeId: string; text: string; weight: number; source: string
 interface Search {
   url: string; filters: Filter[]; minWeightedSum: number; pobDefaultMinWeightedSum: number; itemCategory: string;
   droppedByCap: { count: number }; statWeights: { stat: string; weight: number }[]; calcSeconds: number;
-  filterBudget: number; capLifted: boolean;
+  filterBudget: number; capLifted: boolean; capModel: 'maxFilters' | 'complexity'; capWarning?: string;
 }
 interface Query {
   query: {
@@ -111,9 +115,27 @@ async function userError(name: string, args: Record<string, unknown>, expect: Re
   assert(!text(r).startsWith('Internal error'), `expected a user error, got: ${text(r)}`);
   assert(expect.test(text(r)), `error text ${JSON.stringify(text(r))} should match ${expect}`);
 }
+/** The query's complexity as PoB 2.68+'s FinishQuery counts it (the "and" group is always charged). */
+function queryComplexity(q: Query): number {
+  const c = TRADE_COMPLEXITY;
+  const f = q.query.filters;
+  const optionFilters = (f.misc_filters ? 1 : 0) + (f.trade_filters?.filters?.price ? 1 : 0) + (f.req_filters ? 1 : 0)
+    + (f.socket_filters?.filters?.sockets ? 1 : 0) + (f.socket_filters?.filters?.links ? 1 : 0);
+  return q.query.stats.reduce((sum, g) => sum + c.statFilter * g.filters.length,
+    c.weightGroup + c.typeFilters + c.andGroup + c.optionFilter * optionFilters);
+}
+/** Set from the first search: true when PoB caps by the trade site's complexity budget (2.68+). */
+let complexityCapped: boolean | undefined;
 function decodeQuery(url: string, prefix = SEARCH_PREFIX): Query {
   assert(url.startsWith(prefix), `url should start with ${prefix}: ${url.slice(0, 120)}`);
-  return JSON.parse(decodeURIComponent(url.slice(prefix.length))) as Query;
+  const q = JSON.parse(decodeURIComponent(url.slice(prefix.length))) as Query;
+  assert(q.query.stats[0]?.type === 'weight', 'first stat group should be the weight group');
+  assert(q.query.stats.slice(1).every((g) => g.filters.length > 0), `no empty stat groups: ${JSON.stringify(q.query.stats.map((g) => g.type))}`);
+  assert(q.query.stats.filter((g) => g.type === 'and').length <= 1, 'at most one "and" group');
+  if (complexityCapped) {
+    assert(queryComplexity(q) <= TRADE_COMPLEXITY.limit, `query complexity ${queryComplexity(q)} exceeds ${TRADE_COMPLEXITY.limit}`);
+  }
+  return q;
 }
 const search = (args: Record<string, unknown>) => ok<Search>('generate_trade_search', { slot: 'Helmet', league: LEAGUE, ...args });
 
@@ -139,9 +161,12 @@ async function main(): Promise<void> {
     await client.connect(transport);
     await ok('load_build', { source: readFileSync(fixturePath, 'utf8') });
     const before = await keyState();
+    const pobSource = pobGeneratorSource(paths.pobPath);
+    const finishQuery = luaFunctionBody(pobSource, 'function TradeQueryGeneratorClass:FinishQuery()');
 
     log('Test 1: default search for Helmet');
     const base = await search({});
+    complexityCapped = base.capModel === 'complexity';
     const q = decodeQuery(base.url);
     const weights = q.query.stats[0];
     assert(weights.type === 'weight', 'first stat group should be the weight group');
@@ -152,10 +177,36 @@ async function main(): Promise<void> {
     assert(base.filters.every((f) => f.source === 'pob' && f.text.length > 0), 'PoB filters carry text');
     assert(weights.value?.min === base.minWeightedSum && base.minWeightedSum === base.pobDefaultMinWeightedSum, 'default min is PoB\'s');
     assert(base.statWeights.map((w) => w.stat).join() === 'FullDPS,TotalEHP', 'PoB default stat weights');
-    assert(base.capLifted === true, 'PoB\'s 36-filter cap should be lifted so the full weight list comes back');
-    assert(base.filterBudget === 34 && weights.filters.length === 34 && base.droppedByCap.count > 0, 'the cap is hit: budget full, some dropped');
+    // The bridge's cap model must match the installed generator: a MAX_FILTERS upvalue (lifted) or the complexity budget.
+    const hasMaxFilters = /^local MAX_FILTERS\s*=\s*36\b/m.test(pobSource);
+    const c = TRADE_COMPLEXITY;
+    assert(base.capLifted === hasMaxFilters && base.capModel === (hasMaxFilters ? 'maxFilters' : 'complexity'),
+      `capLifted ${base.capLifted} / capModel ${base.capModel} should follow the installed generator (MAX_FILTERS: ${hasMaxFilters})`);
+    if (base.capLifted) {
+      assert(base.filterBudget === 34 && weights.filters.length === 34 && base.droppedByCap.count > 0, 'the cap is hit: budget full, some dropped');
+    } else {
+      // TRADE_COMPLEXITY must match every cost in the installed FinishQuery, in order: a changed cost or a new
+      // costed filter fails here.
+      const initial = [...finishQuery.matchAll(/local complexityBudget\s*=\s*([^\r\n]+)/g)].map((m) => m[1].trim());
+      assert(JSON.stringify(initial) === JSON.stringify([`${c.limit} - ${c.weightGroup} - ${c.typeFilters} - ${c.andGroup}`]),
+        `PoB FinishQuery's initial complexity budget changed: ${JSON.stringify(initial)}`);
+      const costs = [...finishQuery.matchAll(/complexityBudget\s*=\s*complexityBudget\s*-\s*([^\r\n]+)/g)].map((m) => m[1].trim());
+      const expectedCosts = [
+        '2', // each queryExtra key (special items only, never on gear slots)
+        String(c.statFilter), // each required mod
+        String(c.statFilter), // each blocked mod (not exposed)
+        ...Array<string>(6).fill(String(c.optionFilter)), // mirrored, price, account, level, sockets, links
+        String(c.statFilter), // each weight filter
+      ];
+      assert(JSON.stringify(costs) === JSON.stringify(expectedCosts),
+        `PoB FinishQuery's complexity costs changed:\n  PoB      ${JSON.stringify(costs)}\n  expected ${JSON.stringify(expectedCosts)}`);
+      const checks = [...finishQuery.matchAll(/complexityBudget\s*([<>]=?)\s*([^\s)]+)/g)].map((m) => `${m[1]} ${m[2]}`);
+      assert(JSON.stringify(checks) === JSON.stringify([`< ${c.reserve}`]), `PoB FinishQuery's complexity reserve changed: ${JSON.stringify(checks)}`);
+      assert(base.filterBudget === 33 && weights.filters.length === 33, `complexity budget full: ${base.filterBudget} / ${weights.filters.length}`);
+      assert(/capped weight list/.test(base.capWarning ?? ''), 'capWarning explains the capped list');
+    }
     assert(q.query.status.option === 'available' && q.query.filters.type_filters.filters.category.option === 'armour.helmet', 'defaults');
-    log(`PASS: ${weights.filters.length} filters, ${base.droppedByCap.count} dropped by cap, ${base.calcSeconds}s`);
+    log(`PASS: ${base.capModel} cap, ${weights.filters.length} filters, ${base.droppedByCap.count} dropped by cap, complexity ${queryComplexity(q)}, ${base.calcSeconds}s`);
 
     log('Test 2: realm xbox, Ring 1');
     const xbox = await ok<Search>('generate_trade_search', { slot: 'Ring 1', league: LEAGUE, realm: 'xbox' });
@@ -199,9 +250,7 @@ async function main(): Promise<void> {
     log('PASS');
 
     log('Test 4c0: bridge pseudoMap / ignoredStats match the installed TradeQueryGenerator.lua');
-    const pobSource = pobGeneratorSource(paths.pobPath);
     const bridgeSource = readFileSync(bridgePath, 'utf8');
-    const finishQuery = luaFunctionBody(pobSource, 'function TradeQueryGeneratorClass:FinishQuery()');
     const bridgeIgnoredFn = luaFunctionBody(bridgeSource, 'local function tradeIgnoredFor(id)');
     const pobPseudo = luaStringEntries(luaTable(finishQuery, 'pseudoMap'));
     const bridgePseudo = luaStringEntries(luaTable(bridgeSource, 'TRADE_PSEUDO_MAP'));
@@ -277,6 +326,7 @@ async function main(): Promise<void> {
     assert(oq.filters.misc_filters.filters.mirrored === false, 'includeMirrored false');
     const infl = oq.stats.find((g) => g.type === 'and')?.filters.map((f) => f.id) ?? [];
     assert(infl.includes('pseudo.pseudo_has_shaper_influence') && infl.includes('pseudo.pseudo_has_elder_influence'), `influences: ${infl}`);
+    // 36 - 2 - 5 options - 2 influences = 27; complexity: 200 - 62 - 5 x 3 - 2 x 4 = 115 leaves 27 weight filters.
     assert(opts.filterBudget === 27 && oq.stats[0].filters.length <= 27, `budget shrinks with every extra filter: ${opts.filterBudget}`);
     log('PASS');
 
@@ -299,6 +349,18 @@ async function main(): Promise<void> {
     assert(and?.filters.some((f) => f.id === 'pseudo.pseudo_total_life' && f.value === undefined), 'required mod without min');
     assert(rq.stats[0].value?.min === 123.5 && req.minWeightedSum === 123.5, 'min override applies');
     assert(rq.stats[0].filters.length + 2 <= 36, 'required mods count toward the cap');
+    assert(req.filterBudget === (req.capLifted ? 32 : 31), `required mods shrink the budget: ${req.filterBudget}`);
+    const inflReq = await search({ influences: ['hunter'], requiredMods: [{ tradeId: lifeId, min: 50 }] });
+    const irAnd = decodeQuery(inflReq.url).query.stats.filter((g) => g.type === 'and');
+    assert(irAnd.length === 1 && irAnd[0].filters.map((f) => f.id).join() === `pseudo.pseudo_has_hunter_influence,${lifeId}`,
+      `influence and required mod share one "and" group: ${JSON.stringify(irAnd)}`);
+    // The influence filter also given as a required mod (with a min) is emitted once and counted once.
+    const hunter = 'pseudo.pseudo_has_hunter_influence';
+    const dup = await search({ influences: ['hunter'], requiredMods: [{ tradeId: hunter, min: 1 }, { tradeId: lifeId, min: 50 }] });
+    const dupAnd = decodeQuery(dup.url).query.stats.filter((g) => g.type === 'and');
+    assert(dupAnd.length === 1 && dupAnd[0].filters.length === 2 && dupAnd[0].filters.filter((f) => f.id === hunter).length === 1
+      && dupAnd[0].filters.find((f) => f.id === hunter)?.value?.min === 1, `influence filter emitted once: ${JSON.stringify(dupAnd)}`);
+    assert(dup.filterBudget === inflReq.filterBudget, `the duplicate is counted once: ${dup.filterBudget} vs ${inflReq.filterBudget}`);
     log('PASS');
 
     log('Test 6: input errors are user errors');

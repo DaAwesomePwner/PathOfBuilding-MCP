@@ -3163,8 +3163,13 @@ local function tradeStateOrError()
 		h:close()
 	end
 	local gen = construct("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	-- The generator's own copy (PoB 2.68+ `require`s it; loading it again
+	-- would make a second instance), else the module as PoB loads it.
 	local _, helpers = findUpvalue(gen.StartQuery, "tradeHelpers")
-	helpers = helpers or LoadModule("Classes/TradeHelpers")
+	if not helpers then
+		local okRequire, mod = pcall(require, "Classes.TradeHelpers")
+		helpers = okRequire and type(mod) == "table" and mod or LoadModule("Classes/TradeHelpers")
+	end
 	local texts, pseudo = { }, { }
 	for _, cat in ipairs(helpers.getTradeStats() or { }) do
 		for _, entry in ipairs(cat.entries or { }) do
@@ -3290,9 +3295,14 @@ local function runTradeQuery(cmd)
 	local captured = nil
 	gen.requesterContext = nil
 	gen.requesterCallback = function(_ctx, json, errMsg) captured = { json = json, err = errMsg } end
-	-- Lift PoB's 36-filter cap so every weight comes back; the caller applies
-	-- the cap after its own adjustments.
+	-- PoB <= 2.67 caps the weights with a MAX_FILTERS upvalue: lift it so every
+	-- weight comes back and the caller applies the cap after its own
+	-- adjustments. PoB 2.68+ has no such upvalue: FinishQuery caps the weights
+	-- by the trade site's query complexity budget (a local), which stays.
 	local maxIdx, maxOrig = findUpvalue(gen.FinishQuery, "MAX_FILTERS")
+	-- PoB <= 2.67 adds the influence "and" filters itself (hasInfluenceModIds);
+	-- 2.68+ ignores influence1/influence2, so they are added below.
+	local pobAddsInfluences = findUpvalue(gen.FinishQuery, "hasInfluenceModIds") ~= nil
 	local openOrig, closeOrig = rawget(main, "OpenPopup"), rawget(main, "ClosePopup")
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
@@ -3317,20 +3327,78 @@ local function runTradeQuery(cmd)
 	gen.calcContext = { }
 	gen.requesterCallback = nil
 	if not ok then error(err, 0) end
-	if not captured or type(captured.json) ~= "string" then
+	-- PoB <= 2.67 hands the callback the full request as JSON; 2.68+ hands it
+	-- the bare query table (its callers wrap it). Normalised to the JSON form:
+	-- {query = {filters, status, stats}, sort = {statgroup.0 = desc}, engine}.
+	local raw = captured and captured.json
+	local decoded, queryJson, changed = nil, nil, false
+	if type(raw) == "string" then
+		decoded, queryJson = dkjson.decode(raw), raw
+	elseif type(raw) == "table" then
+		decoded, changed = type(raw.query) == "table" and raw or { query = raw }, true
+	end
+	local stats = type(decoded) == "table" and type(decoded.query) == "table" and decoded.query.stats
+	if type(stats) ~= "table" or type(stats[1]) ~= "table" or stats[1].type ~= "weight" then
 		error("Path of Building produced no trade query", 0)
 	end
-	local decoded = dkjson.decode(captured.json)
-	local weightGroup = decoded and decoded.query and decoded.query.stats and decoded.query.stats[1]
+	-- 2.68+ always sends weight, "and" and "not" groups: keep the weight
+	-- group, drop the empty others.
+	for i = #stats, 2, -1 do
+		if type(stats[i].filters) ~= "table" or #stats[i].filters == 0 then
+			table.remove(stats, i)
+			changed = true
+		end
+	end
+	if not pobAddsInfluences and #influences > 0 then
+		-- Ids already in any group (a PoB that adds them itself under another
+		-- name) are not added again.
+		local andGroup, present = nil, { }
+		for _, group in ipairs(stats) do
+			if group.type == "and" and not andGroup then andGroup = group end
+			for _, f in ipairs(type(group.filters) == "table" and group.filters or { }) do
+				if type(f) == "table" and f.id ~= nil then present[f.id] = true end
+			end
+		end
+		if not andGroup then
+			andGroup = { type = "and", filters = { } }
+			stats[#stats + 1] = andGroup
+		end
+		for _, idx in ipairs({ options.influence1, options.influence2 }) do
+			if idx > 1 then
+				local id = "pseudo.pseudo_has_" .. itemLib.influenceInfo.default[idx - 1].display:lower() .. "_influence"
+				if not st.texts[id] then
+					userError("This Path of Building's trade stat list (Data/TradeSiteStats.lua) has no " .. id
+						.. " filter, which the influence requirement needs; update Path of Building")
+				end
+				if not present[id] then
+					present[id] = true
+					andGroup.filters[#andGroup.filters + 1] = { id = id }
+					changed = true
+				end
+			end
+		end
+		if #andGroup.filters == 0 then
+			for i = #stats, 2, -1 do
+				if stats[i] == andGroup then table.remove(stats, i) end
+			end
+		end
+	end
+	if decoded.sort == nil then decoded.sort, changed = { ["statgroup.0"] = "desc" }, true end
+	if decoded.engine == nil then decoded.engine, changed = "new", true end
+	if changed then queryJson = dkjson.encode(decoded) end
+	local weightGroup = stats[1]
 	for _, f in ipairs(weightGroup and weightGroup.filters or { }) do
 		if type(f.id) == "string" and st.texts[f.id] then idTexts[#idTexts + 1] = { id = f.id, text = st.texts[f.id] } end
 	end
 	local used = { }
 	for _, w in ipairs(statWeights) do used[#used + 1] = { stat = w.stat, label = w.label, weight = w.weightMult } end
 	return {
-		queryJson = captured.json,
+		queryJson = queryJson,
 		pobMessage = captured.err or dkjson.null,
 		capLifted = maxIdx ~= nil,
+		-- "maxFilters": PoB's 36-filter count (lifted here); "complexity":
+		-- PoB 2.68+'s trade-site complexity budget, already applied.
+		capModel = maxIdx ~= nil and "maxFilters" or "complexity",
 		itemCategory = category or dkjson.null,
 		categoryQuery = queryStr or dkjson.null,
 		currentItem = item and (item.title or item.name) or dkjson.null,
