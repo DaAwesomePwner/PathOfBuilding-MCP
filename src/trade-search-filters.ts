@@ -1,6 +1,6 @@
-/** generate_trade_search: weight adjustments, the 36-filter cap (adjusted filters pinned), min override, required mods. */
+/** generate_trade_search: weight adjustments, the filter cap (adjusted filters pinned), min override, required mods. */
 import { UserError } from './validation.js';
-import { MAX_FILTERS, type TradeQueryRaw, type TradeSearchArgs } from './trade-search-schema.js';
+import { MAX_FILTERS, TRADE_COMPLEXITY, type TradeQueryRaw, type TradeSearchArgs } from './trade-search-schema.js';
 
 export const round = (n: number, digits = 4) => Number(n.toPrecision(digits));
 
@@ -35,6 +35,26 @@ function adjustmentTargets(args: TradeSearchArgs, raw: TradeQueryRaw): Map<strin
   return out;
 }
 
+/**
+ * How many weight filters fit next to the other filters, counted the way the PoB version counts:
+ * PoB <= 2.67: 36 filters in all (2 base filters, each option filter, each influence / required mod);
+ * PoB 2.68+: the trade site's complexity limit, with FinishQuery's costs (influences and required mods are "and" filters).
+ */
+function weightFilterBudget(args: TradeSearchArgs, raw: TradeQueryRaw): { budget: number; limit: string } {
+  const optionFilters = (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
+    + (args.sockets ? 1 : 0) + (args.links ? 1 : 0);
+  const andFilters = (args.influences?.length ?? 0) + (args.requiredMods?.length ?? 0);
+  if (raw.capModel === 'complexity') {
+    const c = TRADE_COMPLEXITY;
+    const left = c.limit - c.weightGroup - c.typeFilters - c.andGroup - c.optionFilter * optionFilters - c.statFilter * andFilters;
+    return {
+      budget: left < c.reserve ? 0 : Math.floor((left - c.reserve) / c.statFilter) + 1,
+      limit: `the trade site's query complexity limit of ${c.limit}`,
+    };
+  }
+  return { budget: MAX_FILTERS - 2 - optionFilters - andFilters, limit: `${MAX_FILTERS} filters` };
+}
+
 /** Applies weight adjustments, the filter cap (pinning adjusted filters), the min override and required mods. */
 export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): WeightedQuery {
   const texts = new Map(raw.texts.map((t) => [t.id, t.text]));
@@ -58,11 +78,9 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   }
 
   const requiredMods = args.requiredMods ?? [];
-  const extras = 2 + (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
-    + (args.sockets ? 1 : 0) + (args.links ? 1 : 0) + (args.influences?.length ?? 0) + requiredMods.length;
-  const budget = MAX_FILTERS - extras;
+  const { budget, limit } = weightFilterBudget(args, raw);
   if (pinned.length > budget) {
-    throw new UserError(`Too many weightAdjustments: ${pinned.length} filters are pinned but only ${budget} fit with the other filters (limit ${MAX_FILTERS}).`);
+    throw new UserError(`Too many weightAdjustments: ${pinned.length} filters are pinned but only ${budget} fit with the other filters (limit: ${limit}).`);
   }
   const kept = [...pinned, ...unpinned.slice(0, budget - pinned.length)].sort((a, b) => b.weight - a.weight);
   const dropped = unpinned.slice(budget - pinned.length);
@@ -74,10 +92,11 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   weightGroup.filters = kept.map((f) => ({ id: f.tradeId, value: { weight: round(f.weight) } }));
   weightGroup.value = { min: minWeightedSum };
   if (requiredMods.length > 0) {
-    query.query.stats.push({
-      type: 'and',
-      filters: requiredMods.map((m) => (m.min === undefined ? { id: m.tradeId } : { id: m.tradeId, value: { min: m.min } })),
-    });
+    // One "and" group: required mods join the influence filters when there are any.
+    const filters = requiredMods.map((m) => (m.min === undefined ? { id: m.tradeId } : { id: m.tradeId, value: { min: m.min } }));
+    const andGroup = query.query.stats.find((g) => g.type === 'and');
+    if (andGroup) andGroup.filters.push(...filters);
+    else query.query.stats.push({ type: 'and', filters });
   }
   return { query, texts, kept, dropped, budget, pobDefaultMin, minWeightedSum };
 }
