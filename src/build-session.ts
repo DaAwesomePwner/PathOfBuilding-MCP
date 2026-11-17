@@ -954,6 +954,9 @@ export class BuildSession {
 
   async compareItems(slot: string, candidates: string[]): Promise<ComparisonResult> {
     return this.withLock(async () => {
+      // An unknown slot, or one PoB hides on this tree, is refused for the
+      // whole call rather than once per candidate.
+      await this.bridge.send({ cmd: 'checkSlotUsable', slot });
       // Snapshot the slot's current item — still needed for the result's baseline.item field.
       const baselineItem = await this.snapshotSlotUnlocked(slot);
       const baselineStats = await this.bridge.getStats();
