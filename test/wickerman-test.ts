@@ -2,10 +2,13 @@
 //
 //   1. validateItemText accepts Viscera text copied from the game (first line
 //      "Item Class: Viscera", no Rarity line) and still refuses any other text
-//      without a Rarity line.
-//   2. On a pre-3.30 tree, Head/Body/Arm/Leg are not listed, and swap_item /
-//      unequip_item / compare_items into them are UserErrors that change
-//      nothing (no undo entry, export unchanged).
+//      without a Rarity line; a leading UTF-8 BOM is stripped.
+//   2. On a pre-3.30 tree, Head/Body/Arm/Leg and Graft 1/2 are not listed, and
+//      swap_item / compare_items into them are UserErrors naming the remedy
+//      that change nothing (no undo entry, export unchanged).
+//   2b. Grafts: listed and usable on a 3.27 tree; on another tree an equipped
+//      graft is listed by list_equipped_items as hidden (PoB ignores it) and
+//      unequip_item removes it.
 //   3. On a 3.30 tree (OccVortex converted to the latest tree; skipped when
 //      PoB has no 3.30 tree, e.g. 2.67.2) the slots are listed, a Viscera item
 //      from game text goes into its slot, stats recompute, a Viscera item in
@@ -13,7 +16,9 @@
 //      and the build round-trips through export_build code / xml.
 //   4. A build holding Viscera items on a tree that hides the slots keeps them
 //      exactly: export, a what-if probe, and swap + undo leave the hidden
-//      <Slot> entries unchanged.
+//      <Slot> entries unchanged. list_equipped_items shows them as hidden
+//      (PoB still counts them), and unequip_item removes one (stats change,
+//      undo restores the export).
 import { readFileSync } from 'fs';
 import { BuildSession } from '../src/build-session.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
@@ -38,6 +43,12 @@ Item Level: 83
 --------
 Gain 5% of Physical Damage as Extra Cold Damage (implicit)
 +20 to maximum Life (implicit)`;
+
+const GRAFT = `Rarity: NORMAL
+Battering Uulgraft
+Item Level: 80
+Implicits: 1
+8% reduced Enemy Stun Threshold`;
 
 const RING = `Rarity: RARE
 Wickerman Test Ring
@@ -87,6 +98,8 @@ function testValidation(): void {
   assert(validateItemText(VISCERA_HEAD) === VISCERA_HEAD, 'Viscera game text should be accepted');
   assert(validateItemText(`\n  ${VISCERA_ARM}\n`) === VISCERA_ARM, 'leading blank lines are trimmed');
   assert(validateItemText(RING) === RING, 'Rarity text still accepted');
+  assert(validateItemText('\uFEFF' + VISCERA_HEAD) === VISCERA_HEAD, 'a leading BOM is stripped (Viscera)');
+  assert(validateItemText('\uFEFF' + RING) === RING, 'a leading BOM is stripped (Rarity)');
   for (const bad of [
     'Item Class: Rings\nCoral Ring\n--------\n+30 to maximum Life',
     'Thaumaturge\'s Head\nItem Class: Viscera',
@@ -101,7 +114,7 @@ function testValidation(): void {
     assert(caught instanceof UserError, `should refuse ${JSON.stringify(bad)}`);
     assert(/Rarity/.test(caught.message) && /Item Class: Viscera/.test(caught.message), `message: ${caught.message}`);
   }
-  log('PASS: Viscera game text accepted; other text without Rarity refused, naming the exception');
+  log('PASS: Viscera game text accepted, BOM stripped; other text without Rarity refused, naming the exception');
 }
 
 async function main(): Promise<void> {
@@ -112,7 +125,7 @@ async function main(): Promise<void> {
   const bridge = new LuaBridge(paths, 120_000);
   const session = new BuildSession(bridge);
   try {
-    log('Test 2: pre-3.30 tree hides and refuses the Wickerman slots');
+    log('Test 2: pre-3.30 tree hides and refuses the Wickerman and Graft slots');
     await session.loadBuild(occXml);
     const oldTree = (await session.getBuildInfo()).treeVersion;
     assert(oldTree !== '3_30', `fixture should be on an old tree, got ${oldTree}`);
@@ -127,13 +140,17 @@ async function main(): Promise<void> {
       (err: unknown) => !(err instanceof UserError && /Unknown slot/.test(err.message)),
     );
     const hidden = (slot: string): RegExp =>
-      hasWickerman ? new RegExp(`${slot}.*3\\.30`) : new RegExp(`Unknown slot: ${slot}`);
+      hasWickerman ? new RegExp(`${slot}.*3\\.30.*convert_tree_to_latest`) : new RegExp(`Unknown slot: ${slot}`);
     if (!hasWickerman) log('  this Path of Building has no Wickerman slots: expecting "Unknown slot" refusals');
     const xml0 = await session.exportBuild('xml');
     const stats0 = await session.getStats();
     const msg = await expectUserError('swap_item into Head', () => session.swapItemWithDiff('Head', VISCERA_HEAD), hidden('Head'));
     log(`  refusal: ${msg}`);
-    await expectUserError('unequip_item on Arm', () => session.unequipItemWithDiff('Arm'), hidden('Arm'));
+    if (!hasWickerman) await expectUserError('unequip_item on Arm', () => session.unequipItemWithDiff('Arm'), hidden('Arm'));
+    const graftMsg = await expectUserError('swap_item into Graft 1', () => session.swapItemWithDiff('Graft 1', GRAFT),
+      /Graft 1.*3\.27.*no tree conversion/);
+    log(`  refusal: ${graftMsg}`);
+    await expectUserError('compare_items in Graft 2', () => session.compareItems('Graft 2', [GRAFT, GRAFT]), /Graft 2.*3\.27/);
     await expectUserError('compare_items in Leg', () => session.compareItems('Leg', [VISCERA_HEAD, VISCERA_ARM]), hidden('Leg'));
     await expectUserError('compare_items in an unknown slot', () => session.compareItems('Tail', [RING, RING]), /Unknown slot/);
     await expectUserError('nothing to undo', () => session.undoLastChange(), /[Nn]othing to undo|empty/);
@@ -141,6 +158,32 @@ async function main(): Promise<void> {
     assert(sameStats(await session.getStats(), stats0), 'refused changes must leave stats unchanged');
     assert(!(await session.listEquippedItems()).some((i) => WICKERMAN.includes(i.slot)), 'no Wickerman items listed');
     log('PASS: hidden, refused before any change');
+
+    log('Test 2b: Graft slots on a 3.27 tree, and a graft left on another tree');
+    const xml327 = occXml.replace(/treeVersion="3_13"/g, 'treeVersion="3_27"');
+    assert(xml327 !== occXml, 'fixture rewrite to 3_27 failed');
+    await session.loadBuild(xml327);
+    assert((await session.getBuildInfo()).treeVersion === '3_27', 'tree should be 3_27');
+    const slots327 = (await session.getValidSlots()).map((s) => s.slot);
+    assert(slots327.includes('Graft 1') && slots327.includes('Graft 2'), `grafts listed on 3_27: ${slots327.join(', ')}`);
+    for (const w of WICKERMAN) assert(!slots327.includes(w), `${w} listed on 3_27`);
+    await session.swapItemWithDiff('Graft 1', GRAFT);
+    const graft327 = (await session.listEquippedItems()).find((i) => i.slot === 'Graft 1');
+    assert(graft327 && graft327.baseName === 'Battering Uulgraft' && !graft327.hidden, `Graft 1 on 3_27: ${JSON.stringify(graft327)}`);
+    const xml326 = (await session.exportBuild('xml')).replace(/treeVersion="3_27"/g, 'treeVersion="3_26"');
+    await session.loadBuild(xml326);
+    assert(!(await session.getValidSlots()).some((s) => s.slot === 'Graft 1'), 'Graft 1 not listed on 3_26');
+    const graft326 = (await session.listEquippedItems()).find((i) => i.slot === 'Graft 1');
+    assert(graft326 && graft326.hidden === true && /3\.27/.test(graft326.note ?? '') && /ignores/.test(graft326.note ?? ''),
+      `hidden graft on 3_26: ${JSON.stringify({ hidden: graft326?.hidden, note: graft326?.note })}`);
+    log(`  note: ${graft326.note}`);
+    const ungraft = await session.unequipItemWithDiff('Graft 1');
+    assert(Object.keys(ungraft.diff).length === 0,
+      `PoB ignores a hidden graft, so removing it changes no stat: ${JSON.stringify(ungraft.diff)}`);
+    assert(!(await session.listEquippedItems()).some((i) => i.slot === 'Graft 1'), 'graft removed');
+    log('PASS: grafts listed and usable on 3.27; a hidden graft is listed as hidden and can be removed');
+
+    await session.loadBuild(occXml);
 
     log('Test 3: 3.30 tree lists and accepts the Wickerman slots');
     const conv = await session.convertTreeToLatest();
@@ -155,10 +198,11 @@ async function main(): Promise<void> {
     }
     const xmlConverted = await session.exportBuild('xml');
     const before = await session.getStats();
-    const head = await session.swapItemWithDiff('Head', VISCERA_HEAD);
+    const head = await session.swapItemWithDiff('Head', '\uFEFF' + VISCERA_HEAD);
     assert(head.after.Life !== before.Life && head.diff.Life, `Life should change: ${JSON.stringify(head.diff)}`);
     const headItem = (await session.listEquippedItems()).find((i) => i.slot === 'Head');
-    assert(headItem && headItem.baseName === "Thaumaturge's Head" && headItem.rarity === 'NORMAL',
+    assert(headItem && headItem.baseName === "Thaumaturge's Head" && headItem.rarity === 'NORMAL'
+      && headItem.raw === VISCERA_HEAD && !headItem.hidden,
       `Head item: ${JSON.stringify(headItem)}`);
     assert((await session.getValidSlots()).find((s) => s.slot === 'Head')?.occupied, 'Head occupied');
     await expectUserError('a head in the Arm slot', () => session.swapItemWithDiff('Arm', VISCERA_HEAD), /cannot be equipped in Arm/);
@@ -205,16 +249,31 @@ async function main(): Promise<void> {
       `hidden slots must keep their items: ${JSON.stringify([...hiddenIds].filter(([k]) => WICKERMAN.includes(k)))}`);
     const hiddenSlots = (await session.getValidSlots()).map((s) => s.slot);
     for (const w of WICKERMAN) assert(!hiddenSlots.includes(w), `${w} listed on 3_29`);
-    assert(!(await session.listEquippedItems()).some((i) => WICKERMAN.includes(i.slot)), 'hidden items not listed');
+    const hiddenItems = (await session.listEquippedItems()).filter((i) => WICKERMAN.includes(i.slot));
+    assert(hiddenItems.map((i) => i.slot).sort().join() === 'Arm,Head',
+      `hidden occupied slots listed: ${hiddenItems.map((i) => i.slot)}`);
+    for (const i of hiddenItems) {
+      assert(i.hidden === true && /3\.30/.test(i.note ?? '') && /still counts/.test(i.note ?? ''),
+        `${i.slot}: ${JSON.stringify(i.note)}`);
+    }
+    log(`  note: ${hiddenItems[0].note}`);
     const hiddenStats = await session.getStats();
-    await expectUserError('unequip a hidden slot', () => session.unequipItemWithDiff('Head'), /Head.*3\.30.*3\.29/);
+    await expectUserError('compare_items in a hidden slot', () => session.compareItems('Head', [VISCERA_HEAD, VISCERA_HEAD]),
+      /Head.*3\.30.*3\.29.*convert_tree_to_latest/);
     await session.compareItems('Ring 1', [RING, RING]);
     assert((await session.exportBuild('xml')) === xmlHidden, 'a probe keeps hidden slots exactly');
     await session.swapItemWithDiff('Ring 1', RING);
     await session.undoLastChange();
     assert((await session.exportBuild('xml')) === xmlHidden, 'swap + undo keeps hidden slots exactly');
     assert(sameStats(await session.getStats(), hiddenStats), 'stats unchanged after probe and undo');
-    log('PASS: hidden Viscera items survive export, probes and undo');
+    const unequipped = await session.unequipItemWithDiff('Head');
+    assert(unequipped.diff.Life && Number(unequipped.after.Life) < Number(hiddenStats.Life),
+      `removing the hidden Head changes Life: ${JSON.stringify(unequipped.diff)}`);
+    assert(slotIds(await session.exportBuild('xml')).get('Head') === '0', 'Head emptied');
+    await session.undoLastChange();
+    assert((await session.exportBuild('xml')) === xmlHidden, 'undo of the hidden unequip restores the export');
+    assert(sameStats(await session.getStats(), hiddenStats), 'undo of the hidden unequip restores stats');
+    log('PASS: hidden Viscera items survive export, probes and undo; listed as hidden; unequip removes one');
   } finally {
     await bridge.dispose();
   }

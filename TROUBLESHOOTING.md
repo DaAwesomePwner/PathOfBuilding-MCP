@@ -103,7 +103,12 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 ## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
 
-The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) exist only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees they are not listed by `list_valid_slots` and cannot be changed. Use `convert_tree_to_latest` to move the build to the current tree first.
+The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
+
+- **Wickerman:** run `convert_tree_to_latest` to move the build to the 3.30 tree, then equip.
+- **Graft:** only a 3.27 tree shows them; no conversion helps (`convert_tree_to_latest` goes to the latest tree, not 3.27).
+
+An item already in a hidden slot is still listed by `list_equipped_items` (with `hidden: true` and a note) and `unequip_item` removes it. PoB still counts a hidden Wickerman item in its calculations; a hidden graft is ignored.
 
 ## State drift / unexpected stat values after multiple operations
 

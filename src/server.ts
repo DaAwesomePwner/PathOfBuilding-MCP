@@ -182,7 +182,7 @@ tools.engine<Record<string, never>>(
   'list_equipped_items',
   {
     description:
-      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets.',
+      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. An item in a slot Path of Building hides on this passive tree (Wickerman Head/Body/Arm/Leg off 3.30, Graft 1/2 off 3.27) is listed with hidden: true and a note: PoB still counts a hidden Wickerman item in its calculations but ignores a hidden graft; unequip_item removes either.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -286,7 +286,7 @@ tools.engine<{ slot: string }>(
   'unequip_item',
   {
     description:
-      'Remove the item from a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert).',
+      'Remove the item from a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). Also works on a slot Path of Building hides on this passive tree (see list_equipped_items).',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name to clear.'),
     },
@@ -302,7 +302,7 @@ tools.engine<{ slot: string; items: string[] }>(
   'compare_items',
   {
     description:
-      'Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is tested sequentially with full state restoration; the build returns to its original state when finished.',
+      'Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is tested sequentially with full state restoration; the build returns to its original state when finished. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused.',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot to compare in.'),
       items: z

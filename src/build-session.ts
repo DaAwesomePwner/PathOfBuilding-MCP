@@ -2,7 +2,7 @@ import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
-import { UserError } from './validation.js';
+import { UserError, normalizeItemText } from './validation.js';
 
 /**
  * Bridge timeout for a trade query (one calculation per candidate mod).
@@ -920,6 +920,7 @@ export class BuildSession {
   }
 
   async swapItemWithDiff(slot: string, itemText: string): Promise<StatDiffResult> {
+    itemText = normalizeItemText(itemText);
     return this.withLock(() => this.itemMutationWithUndoUnlocked({ cmd: 'equipItem', slot, itemText }));
   }
 
@@ -963,7 +964,7 @@ export class BuildSession {
 
       const results: ComparisonCandidate[] = [];
       for (let i = 0; i < candidates.length; i++) {
-        const itemText = candidates[i];
+        const itemText = normalizeItemText(candidates[i]);
         let candidateStats: Stats | null = null;
         let error: string | null = null;
         await this.withSlotProbeUnlocked(slot, async () => {
@@ -2285,6 +2286,10 @@ export interface ItemModLine {
 export interface EquippedItem {
   slot: string;
   itemId: number;
+  /** The slot is hidden by PoB on this passive tree (Wickerman off 3.30, grafts off 3.27). */
+  hidden?: boolean;
+  /** For a hidden slot: why, and whether PoB still counts the item. */
+  note?: string;
   rarity?: string;
   name?: string;
   title?: string;

@@ -172,11 +172,20 @@ export function validateSlot(slot: unknown, validSlots?: string[]): string {
   return slot;
 }
 
+/**
+ * Item text as it goes to the engine: a leading UTF-8 byte order mark (some
+ * clipboards and editors add one) is removed, so PoB sees the real first line
+ * ("Rarity: ..." or "Item Class: Viscera").
+ */
+export function normalizeItemText(text: string): string {
+  return text.replace(/^﻿+/, '');
+}
+
 export function validateItemText(text: unknown): string {
   if (typeof text !== 'string') {
     throw new UserError('Item text must be a string');
   }
-  const trimmed = text.trim();
+  const trimmed = normalizeItemText(text).trim();
   if (trimmed.length === 0) {
     throw new UserError('Item text is empty');
   }
