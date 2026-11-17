@@ -88,7 +88,7 @@ Three layers, three responsibilities:
 - `reset_build` — discard everything, return to the originally loaded state.
 
 ### Trade searches (2)
-- `generate_trade_search` — PoB's "weighted search" for a gear or flask slot: every candidate mod is simulated on the build to get a weight, and you get a pathofexile.com trade URL sorted by weighted sum (highest first). Options mirror PoB's dialog (trade type, corrupted/eldritch/scourge/talisman mods, influences, max price/level, sockets/links); `weightAdjustments` replace/add/remove weights (pinned against the 36-filter cap), `requiredMods` are hard minimums, `minWeightedSum` overrides PoB's default. Read-only, takes a few seconds.
+- `generate_trade_search` — PoB's "weighted search" for a gear or flask slot: every candidate mod is simulated on the build to get a weight, and you get a pathofexile.com trade URL sorted by weighted sum (highest first). Options mirror PoB's dialog (trade type, corrupted/eldritch/scourge/talisman mods, influences, max price/level, sockets/links); `weightAdjustments` replace/add/remove weights (pinned against the filter cap: 36 filters on PoB 2.67 and older, the trade site's query complexity limit on PoB 2.68+; `capModel` says which), `requiredMods` are hard minimums, `minWeightedSum` overrides PoB's default. Read-only, takes a few seconds.
 - `search_trade_mods` — find trade stat ids for a slot by text (`"life"`, `"fire resistance"`), for use in `requiredMods` / `weightAdjustments`.
 
 ## Setup
