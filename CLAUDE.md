@@ -20,6 +20,7 @@ npm run start         # node dist/server.js (built artifacts)
 # Tests — POB_PATH must point at a real PoB install, or each integration test prints SKIPPED and exits 0
 # (with REQUIRE_POB=1 it fails instead; CI sets it).
 npm run test:paths    # unit tests for paths / discovery / config store (no LuaJIT needed)
+npm run test:compound-assign  # unit tests for lua/compound-assign.lua (LuaJIT only, no PoB)
 npm run test:startup  # builds, starts dist/server.js unconfigured, configure_pob_path, saved config, reload_engine, elicitation
 npm run test:safety   # engine safety tests
 npm run test:bridge   # ~10s, Lua bridge round-trip — run first when debugging
@@ -33,6 +34,7 @@ npm run test:phase7   # diagnostics / upgrades / export / snapshots
 npm run test:integrity  # bit-exact snapshot/restore stress
 npm run test:crash-recovery  # crash breaker, timeouts, respawn restores the last committed build
 npm run test:trade    # generate_trade_search / search_trade_mods (PoB's weighted trade query generator)
+npm run test:wickerman  # 3.30 Wickerman slots: tree-gated slot listing/refusal, Viscera game text
 npm run test:errors   # input validation paths
 npm run test:all      # everything, in parallel (~2.5 min on a desktop); `npm run test:all -- bridge phase4` runs a subset
 ```
@@ -65,7 +67,8 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 | Install inspection | `src/pob-install.ts` | Layout + `manifest.xml` version, PoE2 detection, install fingerprint (version + mtime), PoB self-updater state (`Update/opFile.txt` = staged, `Update/manifest.xml` without it = applying). Read-only. |
 | Config store | `src/config-store.ts` | Per-user `config.json` written by `configure_pob_path`. |
 | Engine manager | `src/engine-manager.ts` | Owns the LuaBridge + BuildSession pair. Lazy/background boot, `run()` gate (unconfigured / updating / stale → `EngineNotReadyError`), `configure()`, `reload()` (export build → dispose old bridge → boot → reload build), `info()`. |
-| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
+| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), `dofile`s `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. PoB classes are created through `construct(className, ...)`, which picks PoB 2.68's `new("X"):X(...)` or the older `new("X", ...)` from `new`'s own signature. |
+| Lua syntax compat | `lua/compound-assign.lua` | PoB 2.68+ sources use compound assignment (`x += 1`, `s ..= t`), which only PoB's patched LuaJIT parses. Hooks the global `loadfile`/`dofile` and the `require` file searcher: the original source is compiled first, and only a chunk stock LuaJIT rejects is rewritten to `x = x + (1)` (newlines kept, so line numbers stay right); if that fails too, the original error is reported. Loaded by bridge.lua by path. |
 | BuildSession | `src/build-session.ts` | TS class owning the LuaJIT subprocess. Snapshot/restore, undo stack, `withTemporaryChange`, async mutex, build-code/URL/XML loading, higher-level workflows. |
 | MCP server | `src/server.ts`, `src/tool-registry.ts`, `src/engine-tools.ts` | Registers 39 tools via `@modelcontextprotocol/sdk`, validates with Zod + `UserError`, formats responses. `tools.engine(...)` handlers run inside `engine.run()` (shared gate slot + readiness checks) and receive the live session; `tools.plain(...)` handlers (configure_pob_path, get_engine_info, reload_engine, list_scenarios) work without an engine. |
 
@@ -93,7 +96,8 @@ All engine-backed tools follow this pattern.
 
 ## Conventions
 
-- **Item text format** in MCP tools comes from PoB's "Copy item" (right-click) — must start with a `Rarity:` line. The server validates strictly.
+- **Item text format** in MCP tools comes from PoB's "Copy item" (right-click) — must start with a `Rarity:` line. The server validates strictly. The one exception is Viscera (Wickerman) item text copied from the game: first line `Item Class: Viscera`, no `Rarity:` line (PoB parses it as Normal). A leading UTF-8 BOM is stripped before the text reaches the engine (`normalizeItemText`).
+- **Slot visibility.** Slots PoB shows only on some passive tree versions (Wickerman `Head`/`Body`/`Arm`/`Leg` on 3.30, `Graft 1`/`Graft 2` on 3.27; PoB's own `slot.shown`) are left out of `list_valid_slots` while hidden, and `swap_item` / `compare_items` into them are a `UserError` (naming the remedy) before any change. `unequip_item` on a hidden slot is allowed, and `list_equipped_items` lists an occupied hidden slot with `hidden: true` and a note: PoB still counts a hidden Wickerman item (CalcSetup's `^Wickerman ` check matches no slot name) but skips a hidden graft. Items already in a hidden slot are kept by export, probes and undo. Weapon swap, Ring 3 and abyssal sockets are listed and accepted regardless (`slotChecks` in `lua/bridge.lua`).
 - **Build code round-trip is lossless.** `export_build({format:"code"})` produces a base64 zlib string that `load_build` accepts back. Same for `xml`.
 
 ## Reference files

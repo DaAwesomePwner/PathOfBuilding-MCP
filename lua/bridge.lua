@@ -48,6 +48,18 @@ package.cpath = POB_PATH .. "/?.dll;"
 	.. POB_PATH .. "/runtime/?.so;"
 	.. package.cpath
 
+-- PoB 2.68+ sources use compound assignment (`count += 1`), which only PoB's
+-- own patched LuaJIT parses. lua/compound-assign.lua rewrites a chunk only
+-- when stock LuaJIT rejects it, and hooks every way PoB compiles a file: the
+-- global loadfile and dofile (so LoadModule/PLoadModule below too) and the
+-- Lua-file searcher behind require. Loaded by path from this script's own
+-- directory, since package.path points at PoB.
+do
+	local source = debug.getinfo(1, "S").source
+	local dir = source:sub(1, 1) == "@" and source:sub(2):match("^(.*)[/\\][^/\\]*$") or "."
+	dofile(dir .. "/compound-assign.lua").install()
+end
+
 -- ---------------------------------------------------------------------------
 -- Protocol stream protection. stdout carries exactly one JSON object per line
 -- and nothing else. Anything PoB (or a library) prints goes to stderr instead.
@@ -691,6 +703,50 @@ local function respond(obj)
 	STDOUT:flush()
 end
 
+-- Creates a PoB class instance. PoB 2.68 split construction into
+-- new("X"):X(args...) and its new() raises on any extra argument; earlier
+-- versions take new("X", args...). The convention is read once, after boot:
+-- first from the loaded class tables (2.68's newClass gives every class an
+-- _unconstructedMeta; older ones never do), else from new()'s signature
+-- where LuaJIT reports it (the old new forwards a vararg; LuaJIT 2.0 omits
+-- isvararg). When neither tells, construction fails instead of guessing.
+-- One main-chunk local only: LuaJIT allows 200 and this chunk is close.
+local construct
+do
+	local newTakesConstructorArgs
+	local function detectConstructorConvention()
+		local classes = type(common) == "table" and type(common.classes) == "table" and common.classes
+		if classes then
+			local sawClass = false
+			for _, class in pairs(classes) do
+				if type(class) == "table" then
+					sawClass = true
+					if rawget(class, "_unconstructedMeta") ~= nil then return false end
+				end
+			end
+			if sawClass then return true end
+		end
+		local info = type(new) == "function" and debug.getinfo(new, "u")
+		if info and type(info.isvararg) == "boolean" then
+			return info.isvararg
+		end
+		return nil
+	end
+	function construct(className, ...)
+		if newTakesConstructorArgs == nil then
+			newTakesConstructorArgs = detectConstructorConvention()
+			if newTakesConstructorArgs == nil then
+				error("Cannot tell how this Path of Building version constructs classes (no loaded classes, and new() has no signature info)")
+			end
+		end
+		if newTakesConstructorArgs then
+			return new(className, ...)
+		end
+		local object = new(className)
+		return object[className](object, ...)
+	end
+end
+
 -- PoB colour escapes (^7, ^xRRGGBB) are noise in an error message.
 local function stripColorCodes(text)
 	return (tostring(text):gsub("%^x%x%x%x%x%x%x", ""):gsub("%^%d", ""))
@@ -888,8 +944,70 @@ local function getItemInSlot(slotName)
 	}
 end
 
+-- Slot checks shared by the item commands and the slot listings (one table,
+-- not separate top-level locals: the main chunk is close to LuaJIT's limit).
+local slotChecks = { }
+
+-- Slots Path of Building shows only on some passive tree versions: its
+-- ItemsTab gives them a `shown` function testing spec.treeVersion (Wickerman
+-- on 3.30, grafts on 3.27). Only these follow PoB's visibility here; weapon
+-- swap, Ring 3 and abyssal sockets are listed and accepted as before.
+-- `counted` says whether PoB's CalcSetup still uses an item left in the slot
+-- while it is hidden: grafts are skipped off 3.27, but its Wickerman check
+-- (`^Wickerman `) matches no slot name, so Viscera items keep counting.
+do
+	local wickerman = {
+		what = "the Wickerman slots (Head, Body, Arm, Leg)", tree = "3.30", counted = true,
+		remedy = "convert_tree_to_latest moves the build to the latest passive tree, where they are shown",
+	}
+	local graft = {
+		what = "the Graft slots", tree = "3.27", counted = false,
+		remedy = "they are usable only on a 3.27 tree; no tree conversion makes them available",
+	}
+	slotChecks.treeGated = {
+		Head = wickerman, Body = wickerman, Arm = wickerman, Leg = wickerman,
+		["Graft 1"] = graft, ["Graft 2"] = graft,
+	}
+end
+
+-- The tree gate of `slot` when PoB currently hides it, else nil. A slot
+-- without a `shown` property counts as shown (older PoB versions).
+function slotChecks.hiddenGate(slot)
+	local gate = slotChecks.treeGated[slot.slotName]
+	if not gate then return nil end
+	local shown = slot.shown
+	if type(shown) == "function" then shown = shown(slot) end
+	if shown == nil and slot.shown == nil then shown = true end
+	if shown then return nil end
+	return gate
+end
+
+-- Why PoB currently hides `slot`, or nil when it is shown.
+function slotChecks.hiddenReason(slot)
+	local gate = slotChecks.hiddenGate(slot)
+	if not gate then return nil end
+	local treeVersion = build.spec and build.spec.treeVersion or "unknown"
+	return string.format("Path of Building shows %s only on %s passive trees (this build uses tree %s)",
+		gate.what, gate.tree, (tostring(treeVersion):gsub("_", ".")))
+end
+
+-- The slot named `slotName`. Unknown slots are refused; with `equipping`,
+-- so is a slot PoB hides (removing an item from one is always allowed).
+function slotChecks.usableSlot(slotName, equipping)
+	local slot = build.itemsTab.slots[slotName]
+	if not slot then
+		userError("Unknown slot: " .. tostring(slotName))
+	end
+	local reason = equipping and slotChecks.hiddenReason(slot)
+	if reason then
+		userError(string.format("Cannot equip an item in %s: %s; %s", slotName, reason,
+			slotChecks.hiddenGate(slot).remedy))
+	end
+	return slot
+end
+
 -- Why ItemsTab:IsItemValidForSlot refused `item` for `slotName`.
-local function slotRefusalReason(tab, item, slotName)
+function slotChecks.refusalReason(tab, item, slotName)
 	local kind = item.type or (item.base and item.base.type) or "unknown"
 	if slotName:match("^Jewel %d+$") then
 		if kind ~= "Jewel" then
@@ -914,7 +1032,7 @@ end
 -- normalising), but never through the items tab's displayItem: a parse
 -- failure can then never leave an earlier display item behind to be equipped.
 local function parseItemText(itemRaw, slotName)
-	local ok, item = pcall(new, "Item", itemRaw)
+	local ok, item = pcall(construct, "Item", itemRaw)
 	if not ok then
 		userError("Could not parse the item text for " .. slotName .. ": " .. stripColorCodes(tostring(item)))
 	end
@@ -930,7 +1048,7 @@ local function assertItemFitsSlot(tab, slot, item)
 	local slotName = slot.slotName
 	if not tab:IsItemValidForSlot(item, slotName) then
 		userError(string.format("%s cannot be equipped in %s: %s", tostring(item.name or "This item"), slotName,
-			slotRefusalReason(tab, item, slotName)))
+			slotChecks.refusalReason(tab, item, slotName)))
 	end
 	local parent = slot.parentSlot
 	if parent then
@@ -958,10 +1076,7 @@ end
 
 local function equipItemInSlot(slotName, itemRaw)
 	local tab = build.itemsTab
-	local slot = tab.slots[slotName]
-	if not slot then
-		userError("Unknown slot: " .. tostring(slotName))
-	end
+	local slot = slotChecks.usableSlot(slotName, true)
 	local newItem = parseItemText(itemRaw, slotName)
 	assertItemFitsSlot(tab, slot, newItem)
 	-- AddItem gives the item the lowest free id (not the highest).
@@ -1240,10 +1355,7 @@ local function restoreItemsState(state)
 end
 
 local function unequipSlot(slotName)
-	local slot = build.itemsTab.slots[slotName]
-	if not slot then
-		userError("Unknown slot: " .. tostring(slotName))
-	end
+	local slot = slotChecks.usableSlot(slotName, false)
 	slot:SetSelItemId(0)
 	build.buildFlag = true
 	build.itemsTab:PopulateSlots()
@@ -1518,7 +1630,7 @@ local function installSpec(version, state)
 	if type(versions) ~= "table" or not versions[version] then
 		error("Tree convert failed: unknown tree version " .. tostring(version))
 	end
-	local newSpec = new("PassiveSpec", build, version)
+	local newSpec = construct("PassiveSpec", build, version)
 	newSpec.title = state.title
 	newSpec.jewels = shallowCopy(state.jewels)
 	local overrides = shallowCopy(state.hashOverrides)
@@ -2393,7 +2505,7 @@ local function getValidSlots()
 		return result
 	end
 	for _, slot in ipairs(build.itemsTab.orderedSlots) do
-		if slot.slotName and not slot.slotName:find("Abyssal Socket") then
+		if slot.slotName and not slot.slotName:find("Abyssal Socket") and not slotChecks.hiddenReason(slot) then
 			local itemId = slot.selItemId or 0
 			local item = (itemId ~= 0) and build.itemsTab.items[itemId] or nil
 			table.insert(result, {
@@ -2430,13 +2542,23 @@ local function listEquippedItems()
 		return result
 	end
 	for _, slot in ipairs(build.itemsTab.orderedSlots) do
-		-- Skip abyssal sockets and inactive flask slots
+		-- Skip abyssal sockets. A slot PoB hides on this tree (Wickerman, grafts)
+		-- is listed only when it holds an item, marked hidden.
 		if slot.slotName and not slot.slotName:find("Abyssal Socket") then
 			local itemId = slot.selItemId or 0
 			if itemId ~= 0 then
 				local item = build.itemsTab.items[itemId]
 				if item then
+					local gate = slotChecks.hiddenGate(slot)
+					local note
+					if gate then
+						note = slotChecks.hiddenReason(slot) .. (gate.counted
+							and "; Path of Building still counts this item in its calculations. unequip_item removes it"
+							or "; Path of Building ignores this item in its calculations on this tree. unequip_item removes it")
+					end
 					table.insert(result, {
+						hidden = gate and true or nil,
+						note = note,
 						slot = slot.slotName,
 						itemId = itemId,
 						rarity = item.rarity,
@@ -3106,9 +3228,14 @@ local function tradeStateOrError()
 		end
 		h:close()
 	end
-	local gen = new("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	local gen = construct("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	-- The generator's own copy (PoB 2.68+ `require`s it; loading it again
+	-- would make a second instance), else the module as PoB loads it.
 	local _, helpers = findUpvalue(gen.StartQuery, "tradeHelpers")
-	helpers = helpers or LoadModule("Classes/TradeHelpers")
+	if not helpers then
+		local okRequire, mod = pcall(require, "Classes.TradeHelpers")
+		helpers = okRequire and type(mod) == "table" and mod or LoadModule("Classes/TradeHelpers")
+	end
 	local texts, pseudo = { }, { }
 	for _, cat in ipairs(helpers.getTradeStats() or { }) do
 		for _, entry in ipairs(cat.entries or { }) do
@@ -3234,9 +3361,14 @@ local function runTradeQuery(cmd)
 	local captured = nil
 	gen.requesterContext = nil
 	gen.requesterCallback = function(_ctx, json, errMsg) captured = { json = json, err = errMsg } end
-	-- Lift PoB's 36-filter cap so every weight comes back; the caller applies
-	-- the cap after its own adjustments.
+	-- PoB <= 2.67 caps the weights with a MAX_FILTERS upvalue: lift it so every
+	-- weight comes back and the caller applies the cap after its own
+	-- adjustments. PoB 2.68+ has no such upvalue: FinishQuery caps the weights
+	-- by the trade site's query complexity budget (a local), which stays.
 	local maxIdx, maxOrig = findUpvalue(gen.FinishQuery, "MAX_FILTERS")
+	-- PoB <= 2.67 adds the influence "and" filters itself (hasInfluenceModIds);
+	-- 2.68+ ignores influence1/influence2, so they are added below.
+	local pobAddsInfluences = findUpvalue(gen.FinishQuery, "hasInfluenceModIds") ~= nil
 	local openOrig, closeOrig = rawget(main, "OpenPopup"), rawget(main, "ClosePopup")
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
@@ -3261,20 +3393,78 @@ local function runTradeQuery(cmd)
 	gen.calcContext = { }
 	gen.requesterCallback = nil
 	if not ok then error(err, 0) end
-	if not captured or type(captured.json) ~= "string" then
+	-- PoB <= 2.67 hands the callback the full request as JSON; 2.68+ hands it
+	-- the bare query table (its callers wrap it). Normalised to the JSON form:
+	-- {query = {filters, status, stats}, sort = {statgroup.0 = desc}, engine}.
+	local raw = captured and captured.json
+	local decoded, queryJson, changed = nil, nil, false
+	if type(raw) == "string" then
+		decoded, queryJson = dkjson.decode(raw), raw
+	elseif type(raw) == "table" then
+		decoded, changed = type(raw.query) == "table" and raw or { query = raw }, true
+	end
+	local stats = type(decoded) == "table" and type(decoded.query) == "table" and decoded.query.stats
+	if type(stats) ~= "table" or type(stats[1]) ~= "table" or stats[1].type ~= "weight" then
 		error("Path of Building produced no trade query", 0)
 	end
-	local decoded = dkjson.decode(captured.json)
-	local weightGroup = decoded and decoded.query and decoded.query.stats and decoded.query.stats[1]
+	-- 2.68+ always sends weight, "and" and "not" groups: keep the weight
+	-- group, drop the empty others.
+	for i = #stats, 2, -1 do
+		if type(stats[i].filters) ~= "table" or #stats[i].filters == 0 then
+			table.remove(stats, i)
+			changed = true
+		end
+	end
+	if not pobAddsInfluences and #influences > 0 then
+		-- Ids already in any group (a PoB that adds them itself under another
+		-- name) are not added again.
+		local andGroup, present = nil, { }
+		for _, group in ipairs(stats) do
+			if group.type == "and" and not andGroup then andGroup = group end
+			for _, f in ipairs(type(group.filters) == "table" and group.filters or { }) do
+				if type(f) == "table" and f.id ~= nil then present[f.id] = true end
+			end
+		end
+		if not andGroup then
+			andGroup = { type = "and", filters = { } }
+			stats[#stats + 1] = andGroup
+		end
+		for _, idx in ipairs({ options.influence1, options.influence2 }) do
+			if idx > 1 then
+				local id = "pseudo.pseudo_has_" .. itemLib.influenceInfo.default[idx - 1].display:lower() .. "_influence"
+				if not st.texts[id] then
+					userError("This Path of Building's trade stat list (Data/TradeSiteStats.lua) has no " .. id
+						.. " filter, which the influence requirement needs; update Path of Building")
+				end
+				if not present[id] then
+					present[id] = true
+					andGroup.filters[#andGroup.filters + 1] = { id = id }
+					changed = true
+				end
+			end
+		end
+		if #andGroup.filters == 0 then
+			for i = #stats, 2, -1 do
+				if stats[i] == andGroup then table.remove(stats, i) end
+			end
+		end
+	end
+	if decoded.sort == nil then decoded.sort, changed = { ["statgroup.0"] = "desc" }, true end
+	if decoded.engine == nil then decoded.engine, changed = "new", true end
+	if changed then queryJson = dkjson.encode(decoded) end
+	local weightGroup = stats[1]
 	for _, f in ipairs(weightGroup and weightGroup.filters or { }) do
 		if type(f.id) == "string" and st.texts[f.id] then idTexts[#idTexts + 1] = { id = f.id, text = st.texts[f.id] } end
 	end
 	local used = { }
 	for _, w in ipairs(statWeights) do used[#used + 1] = { stat = w.stat, label = w.label, weight = w.weightMult } end
 	return {
-		queryJson = captured.json,
+		queryJson = queryJson,
 		pobMessage = captured.err or dkjson.null,
 		capLifted = maxIdx ~= nil,
+		-- "maxFilters": PoB's 36-filter count (lifted here); "complexity":
+		-- PoB 2.68+'s trade-site complexity budget, already applied.
+		capModel = maxIdx ~= nil and "maxFilters" or "complexity",
 		itemCategory = category or dkjson.null,
 		categoryQuery = queryStr or dkjson.null,
 		currentItem = item and (item.title or item.name) or dkjson.null,
@@ -3574,6 +3764,11 @@ local DISPATCH = {
 	unequipItem = {
 		handler = function(cmd) unequipSlot(cmd.slot) return { } end,
 		mutating = true,
+	},
+	checkSlotUsable = {
+		-- The same refusal equipItem gives for an unknown or hidden slot,
+		-- without changing anything (compare_items checks before probing).
+		handler = function(cmd) slotChecks.usableSlot(cmd.slot, true) return { } end,
 	},
 	selectItem = {
 		-- Re-select an item the build already holds; `selected` is false (nothing

@@ -25,7 +25,7 @@ ls "$POB_PATH/src/Modules/Build.lua"
 
 If neither exists, your install is incomplete. Re-run the Path of Building Community installer, or clone <https://github.com/PathOfBuildingCommunity/PathOfBuilding>.
 
-A source clone is run read-only (the server switches PoB's dev-mode autosave off). Prefer a release tag (`git clone --branch v2.67.2 --depth 1 <repo>`): the default branch can use Lua syntax plain LuaJIT cannot parse. To check a clone, run `POB_SOURCE_PATH=<clone> npm run test:source-clone`.
+A source clone is run read-only (the server switches PoB's dev-mode autosave off). Prefer a release tag (`git clone --branch v2.68.1 --depth 1 <repo>`): the server translates the compound assignment (`x += 1`) PoB 2.68+ uses, but the default branch can use other Lua syntax plain LuaJIT cannot parse. To check a clone, run `POB_SOURCE_PATH=<clone> npm run test:source-clone`.
 
 ## "… is Path of Building for Path of Exile 2"
 
@@ -57,6 +57,7 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 **Causes & fixes:**
 - The wrong `luajit` (e.g. a PUC Lua 5.3/5.4 binary). Point `luajitPath` / `LUAJIT_PATH` at a LuaJIT binary.
 - Wrong PoB folder: see the sections above, then `configure_pob_path`.
+- `'=' expected near '+'` (or near another operator) while loading a PoB module such as `Modules/Main.lua`: PoB 2.68+ uses compound assignment (`count += 1`), which only PoB's own LuaJIT parses. Update pob-mcp-server; current versions translate it for stock LuaJIT. If a current server still shows a syntax error in a PoB file, that PoB release uses other syntax the server does not translate yet: report it.
 - Corrupted PoB install. Re-run the PoB Community installer, or if you're using a source clone, run `git clean -xdf` inside it.
 
 ## "Lua engine has crashed N times — refusing to restart"
@@ -98,7 +99,16 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 ## "Item text must start with a `Rarity:` line"
 
-`swap_item` and `compare_items` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`.
+`swap_item` and `compare_items` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`. The one exception is a Viscera (Wickerman) item copied from the game, whose first line is `Item Class: Viscera` and which has no `Rarity:` line; it is accepted as is.
+
+## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
+
+The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
+
+- **Wickerman:** run `convert_tree_to_latest` to move the build to the 3.30 tree, then equip.
+- **Graft:** only a 3.27 tree shows them; no conversion helps (`convert_tree_to_latest` goes to the latest tree, not 3.27).
+
+An item already in a hidden slot is still listed by `list_equipped_items` (with `hidden: true` and a note) and `unequip_item` removes it. PoB still counts a hidden Wickerman item in its calculations; a hidden graft is ignored.
 
 ## State drift / unexpected stat values after multiple operations
 

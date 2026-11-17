@@ -81,7 +81,15 @@ function assertStatsExact(label: string, before: KeyStats, after: KeyStats): voi
 async function checkUserErrorsFromShortScriptPath(paths: ResolvedPaths): Promise<void> {
   const shortScript = path.join(os.tmpdir(), 'b.lua');
   assert(shortScript.length < 50, `temp dir path is too long to test an untruncated script path: ${shortScript}`);
-  copyFileSync(paths.bridgeLua, shortScript);
+  // The bridge loads its compound-assignment module from its own directory.
+  const compoundModule = path.join(path.dirname(shortScript), 'compound-assign.lua');
+  copyFileSync(path.join(path.dirname(paths.bridgeLua), 'compound-assign.lua'), compoundModule);
+  try {
+    copyFileSync(paths.bridgeLua, shortScript);
+  } catch (e) {
+    rmSync(compoundModule, { force: true });
+    throw e;
+  }
   const bridge = new LuaBridge({ ...paths, bridgeLua: shortScript }, 60_000);
   try {
     log(`Test 0: user errors from a bridge started at a short script path (${shortScript})`);
@@ -105,6 +113,7 @@ async function checkUserErrorsFromShortScriptPath(paths: ResolvedPaths): Promise
   } finally {
     await bridge.dispose().catch(() => {});
     rmSync(shortScript, { force: true });
+    rmSync(compoundModule, { force: true });
   }
 }
 
