@@ -28,7 +28,10 @@
 //      recalculation failing too (buildEditRecalcFails) the error says the
 //      stats may be stale, and with the engine gone then
 //      (buildEditRecalcExits) nothing is committed; a failure part-way (applyChangesFailsMidway) rolls
-//      back exactly and pushes nothing.
+//      back exactly and pushes nothing; a rollback whose fingerprint check
+//      differs (buildEditRollbackInexact) is an internal error naming
+//      reset_build with one undo entry and no journal record, and undo
+//      restores the pre-call build.
 //   6. Through the MCP server: the four tools are listed as undoable,
 //      apply_changes echoes the label and reports points, undo reverts.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -535,6 +538,17 @@ async function test5Faults(): Promise<void> {
     assert(session.undoStackDepth() === 0 && bridge.committedCount() === 0, 'nothing committed');
     await expectRestart('after the engine died in the recalculation', session.getStats());
     assertSame('respawned without the uncommitted change', await state(session), base);
+  }
+  {
+    const bridge = newBridge('applyChangesFailsMidway,buildEditRollbackInexact');
+    const session = await primedSession(bridge);
+    const base = await state(session);
+    const e = await rejection(session.applyChanges({ config: { usePowerCharges: true }, gems: [{ op: 'remove', group: MAIN_GROUP, index: 1 }], items: [{ slot: 'Ring 1', itemText: RING }] }));
+    assert(!(e instanceof UserError) && /failed part-way/.test(e.message) && /not exact/.test(e.message) && /reset_build/.test(e.message), `inexact rollback: ${e.message}`);
+    assert(session.undoStackDepth() === 1 && bridge.committedCount() === 0, 'one undo entry, nothing journaled');
+    await session.undoLastChange();
+    assertSame('undo after the inexact rollback', await state(session), base);
+    assert(session.undoStackDepth() === 0 && bridge.committedCount() === 0, 'undo pops the entry');
   }
   log('PASS 5');
 }

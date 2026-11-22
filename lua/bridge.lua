@@ -2549,9 +2549,23 @@ function buildEdit.applied(result, replay)
 	if TEST_FAULTS.buildEditFailsAfterChange then error("test fault: build edit failed after changing the build", 0) end
 end
 
+-- applyChangesFailsMidway raises part-way through the change (the caller
+-- rolls it back); with buildEditRollbackInexact it also arms the next
+-- committed-state fingerprint read to come back with one extra line, so the
+-- caller's check after the rollback sees a difference (the build itself is
+-- left as the rollback put it).
 function buildEdit.testFaultMidway(replay)
-	if TEST_FAULTS.applyChangesFailsMidway and not replay then error("test fault: apply_changes failed part-way", 0) end
+	if TEST_FAULTS.applyChangesFailsMidway and not replay then
+		if TEST_FAULTS.buildEditRollbackInexact then buildEdit.rollbackInexact = true end
+		error("test fault: apply_changes failed part-way", 0)
+	end
 end
+
+-- The commands that start a build edit. Dispatching one disarms the test
+-- faults an earlier edit armed but never reached (failNextStats when the
+-- edit failed before its recalculation, rollbackInexact when no rollback
+-- read the fingerprint), so they only ever hit the edit that armed them.
+buildEdit.COMMANDS = { applyChanges = true, createSocketGroup = true, deleteSocketGroup = true, setMainSkill = true }
 
 -- Returns { added, removed }: the nodes the batch added, in the order they
 -- joined the tree (each one next to the tree as it was then: PoB's path runs
@@ -4571,7 +4585,17 @@ do
 			build.buildFlag = true
 		end,
 	})
-	DISPATCH.probe = { handler = function(cmd) return probe.probe(cmd) end }
+	DISPATCH.probe = {
+		handler = function(cmd)
+			local res = probe.probe(cmd)
+			if cmd.fingerprint and buildEdit.rollbackInexact then
+				-- Test fault (buildEditRollbackInexact): see buildEdit.testFaultMidway.
+				buildEdit.rollbackInexact = nil
+				res.fingerprint[#res.fingerprint + 1] = "testFault|buildEditRollbackInexact"
+			end
+			return res
+		end,
+	}
 	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
 	-- apply_changes: one probe variant applied for real and kept.
 	DISPATCH.applyChanges = { handler = function(cmd) return probe.applyChanges(cmd) end }
@@ -4583,6 +4607,7 @@ local function dispatch(cmd)
 	end
 	if cmd.cmd ~= "treeEditApplied" then nodeBatch.record = nil end
 	if cmd.cmd ~= "buildEditApplied" then buildEdit.record = nil end
+	if buildEdit.COMMANDS[cmd.cmd] then buildEdit.failNextStats, buildEdit.rollbackInexact = nil, nil end
 	if buildEdit.failNextStats and cmd.cmd == "getStats" then
 		-- Test fault (buildEditRecalcFails): PoB's recalculation after an applied edit fails.
 		buildEdit.failNextStats = nil
