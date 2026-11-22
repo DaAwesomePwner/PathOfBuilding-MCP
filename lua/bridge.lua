@@ -1949,7 +1949,85 @@ local function restoreTreeState(encoded)
 	return report
 end
 
-local function getFullConfigInput()
+-- The config tables of the active config set. PoB keeps `input` and
+-- `placeholder` both on the config set and as configTab.input /
+-- configTab.placeholder (the same tables; older PoB has no config sets).
+-- PoB 2.67's ConfigTab:Save writes them with pairs(), so their iteration
+-- order is part of the export: a key added and removed again can resize the
+-- table and reorder it. What-ifs therefore never write to these tables: they
+-- swap in copies and later put the very same objects back. (One table of
+-- functions: the main chunk is at Lua's limit of 200 locals.)
+local ConfigTables = { stash = nil }
+do
+	local function current()
+		local configTab = build.configTab
+		local set = configTab.configSets and configTab.activeConfigSetId and configTab.configSets[configTab.activeConfigSetId]
+		return { input = configTab.input, placeholder = configTab.placeholder, set = set,
+			setInput = set and set.input, setPlaceholder = set and set.placeholder }
+	end
+
+	local function attach(t)
+		local configTab = build.configTab
+		configTab.input, configTab.placeholder = t.input, t.placeholder
+		if t.set then t.set.input, t.set.placeholder = t.setInput, t.setPlaceholder end
+	end
+
+	local function shallowCopy(t)
+		local out = { }
+		for k, v in pairs(t or { }) do out[k] = v end
+		return out
+	end
+
+	ConfigTables.current = current
+
+	-- Installs copies of the `orig` config tables (with `changes` applied to
+	-- the input copy).
+	local function attachCopies(orig, changes)
+		local input, placeholder = shallowCopy(orig.input), shallowCopy(orig.placeholder)
+		for key, value in pairs(changes or { }) do input[key] = value end
+		attach({ input = input, placeholder = placeholder, set = orig.set, setInput = input, setPlaceholder = placeholder })
+	end
+
+	-- Installs copies of the active config tables (with `changes` applied to
+	-- the input copy) and returns the originals, untouched, for restore.
+	function ConfigTables.detach(changes)
+		local orig = current()
+		attachCopies(orig, changes)
+		return orig
+	end
+
+	-- Puts the original config tables back and rebuilds the config mod list
+	-- (and the config controls, which BuildModList also sets) from them.
+	-- BuildModList writes placeholders and the boss damage type into its
+	-- tables, so it runs on copies of them: the originals are never written
+	-- and keep their iteration order.
+	function ConfigTables.restore(orig)
+		attachCopies(orig, nil)
+		local ok, err = pcall(function() build.configTab:BuildModList() end)
+		attach(orig)
+		if not ok then error(err, 0) end
+	end
+
+	-- True when `input` holds exactly the values of `snapshot` (by value).
+	function ConfigTables.sameInput(input, snapshot)
+		local n = 0
+		for key, value in pairs(input) do
+			if snapshot[key] ~= copyValue(value) then return false end
+			n = n + 1
+		end
+		for _ in pairs(snapshot) do n = n - 1 end
+		return n == 0
+	end
+
+	-- probeCommit detached the config tables for a fallback variant: the
+	-- restore that follows puts `orig` back (when the input returns to their
+	-- values and `detached` is still the live input table).
+	function ConfigTables.stashCommitted(orig, detached)
+		ConfigTables.stash = { orig = orig, detached = detached }
+	end
+end
+
+function ConfigTables.fullInput()
 	local result = { }
 	if build.configTab and build.configTab.input then
 		for key, value in pairs(build.configTab.input) do
@@ -1959,18 +2037,33 @@ local function getFullConfigInput()
 	return result
 end
 
-local function restoreConfigInput(input)
+-- set_config undo and the full snapshot restore (restoreConfig).
+function ConfigTables.restoreInput(input)
 	if not (build.configTab and build.configTab.input) then
 		error("Config tab not available")
 	end
-	-- Wipe current input and replace with snapshot
-	for key, _ in pairs(build.configTab.input) do
-		build.configTab.input[key] = nil
+	input = input or { }
+	local stash = ConfigTables.stash
+	ConfigTables.stash = nil
+	local current = ConfigTables.current()
+	if stash and stash.detached == current.input and ConfigTables.sameInput(stash.orig.input, input) then
+		-- After a fallback variant: the committed tables, never written.
+		ConfigTables.restore(stash.orig)
+	elseif ConfigTables.sameInput(current.input, input) then
+		-- Nothing to change (a restore after a non-config change): rebuild the
+		-- mod list without writing to the tables, so their order stays.
+		ConfigTables.restore(current)
+	else
+		-- Change only the keys that differ (set_config undo).
+		local target = current.input
+		for key in pairs(target) do
+			if input[key] == nil then target[key] = nil end
+		end
+		for key, value in pairs(input) do
+			if target[key] ~= value then target[key] = value end
+		end
+		build.configTab:BuildModList()
 	end
-	for key, value in pairs(input or { }) do
-		build.configTab.input[key] = value
-	end
-	build.configTab:BuildModList()
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
@@ -3660,7 +3753,7 @@ local DISPATCH = {
 		handler = function(_cmd) return { metadata = getConfigMetadata() } end,
 	},
 	getFullConfig = {
-		handler = function(_cmd) return { input = getFullConfigInput() } end,
+		handler = function(_cmd) return { input = ConfigTables.fullInput() } end,
 	},
 	setConfig = {
 		-- Inline mutation: options loop + rebuild before stats
@@ -3675,7 +3768,7 @@ local DISPATCH = {
 		end,
 	},
 	restoreConfig = {
-		handler = function(cmd) restoreConfigInput(cmd.input or { }) return { } end,
+		handler = function(cmd) ConfigTables.restoreInput(cmd.input or { }) return { } end,
 		mutating = true,
 	},
 
@@ -4007,6 +4100,9 @@ do
 		findGemByName = findGemByName,
 		getConfigMetadata = getConfigMetadata,
 		equipItemInSlot = equipItemInSlot,
+		detachConfigTables = ConfigTables.detach,
+		restoreConfigTables = ConfigTables.restore,
+		stashCommittedConfigTables = ConfigTables.stashCommitted,
 		allocNodesBatch = allocNodesBatch,
 		deallocNodesBatch = deallocNodesBatch,
 		pumpAndRead = pumpAndRead,
