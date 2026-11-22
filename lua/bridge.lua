@@ -2543,8 +2543,9 @@ function buildEdit.applied(result, replay)
 	buildEdit.record.applied = result
 	if replay then return end
 	-- Test faults: the next getStats fails (PoB's recalculation after an
-	-- applied change failing too), and the command fails after the change.
-	if TEST_FAULTS.buildEditRecalcFails then buildEdit.failNextStats = true end
+	-- applied change failing too) or ends the process (buildEditRecalcExits),
+	-- and the command fails after the change.
+	if TEST_FAULTS.buildEditRecalcFails or TEST_FAULTS.buildEditRecalcExits then buildEdit.failNextStats = true end
 	if TEST_FAULTS.buildEditFailsAfterChange then error("test fault: build edit failed after changing the build", 0) end
 end
 
@@ -3405,11 +3406,23 @@ function buildEdit.groupAt(index)
 	return group, list
 end
 
-function buildEdit.activeGemCount(group)
+-- How many active skills PoB makes from the group when it is the main group
+-- (CalcSetup's "Create active skills" loop): every granted effect of every
+-- enabled gem (a Vaal gem grants two) that is not a support, is supported,
+-- and, for an effect with a global part, has that part enabled. PoB builds a
+-- group's display skill list only for enabled or main groups, so it is
+-- counted here rather than read.
+function buildEdit.activeSkillCount(group)
 	local n = 0
 	for _, gem in ipairs(group.gemList or { }) do
-		local effect = (gem.gemData and gem.gemData.grantedEffect) or gem.grantedEffect
-		if effect and not effect.support and gem.enabled ~= false then n = n + 1 end
+		if gem.enabled and (gem.gemData or gem.grantedEffect) then
+			local effects = gem.gemData and gem.gemData.grantedEffectList or { gem.grantedEffect }
+			for index, effect in ipairs(effects) do
+				if not effect.support and not effect.unsupported and (not effect.hasGlobalEffect or gem["enableGlobal" .. index]) then
+					n = n + 1
+				end
+			end
+		end
 	end
 	return n
 end
@@ -3471,7 +3484,11 @@ function buildEdit.createSocketGroup(cmd)
 	if cmd.label ~= nil and type(cmd.label) ~= "string" then userError("label must be a string") end
 	if cmd.enabled ~= nil and type(cmd.enabled) ~= "boolean" then userError("enabled must be a boolean") end
 	if cmd.setAsMain ~= nil and type(cmd.setAsMain) ~= "boolean" then userError("setAsMain must be a boolean") end
-	local group = { label = cmd.label or "", enabled = cmd.enabled ~= false, slot = cmd.slot, gemList = gems }
+	-- mainActiveSkill / mainActiveSkillCalcs as SkillsTab:LoadSkill defaults them.
+	local group = {
+		label = cmd.label or "", enabled = cmd.enabled ~= false, slot = cmd.slot, gemList = gems,
+		mainActiveSkill = 1, mainActiveSkillCalcs = 1,
+	}
 	buildEdit.started()
 	tab.socketGroupList[#tab.socketGroupList + 1] = group
 	local index = #tab.socketGroupList
@@ -3513,15 +3530,12 @@ end
 function buildEdit.setMainSkill(cmd)
 	pumpAndRead() -- display skill lists as of the last recalculation
 	local group = buildEdit.groupAt(cmd.group)
-	if buildEdit.activeGemCount(group) == 0 then
+	local count = buildEdit.activeSkillCount(group)
+	if count == 0 then
 		userError("Skill group " .. cmd.group .. " has no enabled active skill gem to use as the main skill")
 	end
 	if cmd.activeSkill ~= nil then
 		if not buildEdit.isInt(cmd.activeSkill, 1) then userError("activeSkill must be a 1-based integer") end
-		-- The group's skill list as PoB last built it (only for enabled or
-		-- main groups); otherwise its enabled active gems.
-		local skills = group.displaySkillList
-		local count = (type(skills) == "table" and #skills > 0) and #skills or buildEdit.activeGemCount(group)
 		if cmd.activeSkill > count then
 			userError("activeSkill " .. cmd.activeSkill .. " is out of range: skill group " .. cmd.group .. " has " .. count .. " active skill(s)")
 		end
@@ -4572,6 +4586,7 @@ local function dispatch(cmd)
 	if buildEdit.failNextStats and cmd.cmd == "getStats" then
 		-- Test fault (buildEditRecalcFails): PoB's recalculation after an applied edit fails.
 		buildEdit.failNextStats = nil
+		if TEST_FAULTS.buildEditRecalcExits then os.exit(3) end
 		error("test fault: the recalculation after a build edit failed", 0)
 	end
 	local entry = DISPATCH[cmd.cmd]

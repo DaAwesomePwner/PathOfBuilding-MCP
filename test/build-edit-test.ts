@@ -7,20 +7,27 @@
 //      stats): (a) a gems-only variant, (b) a mixed variant (gem op, node,
 //      config, item). One undo entry and one journal record each; undo
 //      restores exactly (skills export byte-identical, export / node set /
-//      stats as the other restore tests compare).
+//      stats as the other restore tests compare). (c) undoing a change of
+//      the main skill's gem restores the cached main skill (build info,
+//      summary export); (d) variants that take the probe's full-recalculation
+//      fallback (two allocations; deallocate + allocate) match too.
 //   2. Refusals (bad gem name, bad group / gem index, granted group,
 //      unreachable node, unknown config key, empty variant; bad create /
-//      delete / set_main_skill arguments): UserError, export byte-identical,
+//      delete / set_main_skill arguments; an off-hand refused only when
+//      applied, after a two-handed weapon of the same variant, which is
+//      rolled back): UserError, export byte-identical,
 //      undo depth and journal unchanged.
 //   3. create_socket_group / delete_socket_group / set_main_skill change the
-//      groups and the main skill as expected and undo cleanly.
-//   4. Crash replay after apply_changes (with a node path) and after
-//      create_socket_group reproduces the build.
+//      groups and the main skill as expected and undo cleanly; a disabled
+//      Vaal gem group counts two active skills, as PoB does.
+//   4. Crash replay after apply_changes (with a node path; and a fallback
+//      variant) and after the socket group edits reproduces the build.
 //   5. Fault seams: a failure after the change (buildEditFailsAfterChange)
 //      commits it (undo entry + journal record, "WAS applied", a crash
 //      restores it), for apply_changes and create_socket_group; with the
 //      recalculation failing too (buildEditRecalcFails) the error says the
-//      stats may be stale; a failure part-way (applyChangesFailsMidway) rolls
+//      stats may be stale, and with the engine gone then
+//      (buildEditRecalcExits) nothing is committed; a failure part-way (applyChangesFailsMidway) rolls
 //      back exactly and pushes nothing.
 //   6. Through the MCP server: the four tools are listed as undoable,
 //      apply_changes echoes the label and reports points, undo reverts.
@@ -51,6 +58,15 @@ Implicits: 1
 +30 to maximum Life
 +150 to maximum Life
 +30% to all Elemental Resistances`;
+
+const STAFF = `Rarity: RARE
+Build Edit Staff
+Imperial Staff
+Item Level: 80`;
+const SHIELD = `Rarity: RARE
+Build Edit Shield
+Titanium Spirit Shield
+Item Level: 80`;
 
 const log = (msg: string): void => console.log(`[build-edit-test] ${msg}`);
 function assert(cond: unknown, msg: string): asserts cond {
@@ -138,6 +154,35 @@ async function primedSession(bridge: LuaBridge): Promise<BuildSession> {
   return session;
 }
 
+/** `count` distinct 2-point notables whose paths share no node (so allocating them together is one variant). */
+async function twoPointNotables(bridge: LuaBridge, count: number): Promise<Array<{ id: number; name: string }>> {
+  const r = await bridge.send<{ nodes: Array<{ id: number; name: string; type: string; points: number; nodes: number[]; fallback?: string }> }>({
+    cmd: 'probe',
+    candidates: 'allocate',
+    maxPoints: 2,
+  });
+  const out: Array<{ id: number; name: string }> = [];
+  const used = new Set<number>();
+  for (const c of r.nodes) {
+    if (c.type !== 'Notable' || c.points !== 2 || c.fallback || c.nodes.some((id) => used.has(id))) continue;
+    c.nodes.forEach((id) => used.add(id));
+    out.push(c);
+    if (out.length === count) return out;
+  }
+  throw new Error(`only ${out.length} separate 2-point notables`);
+}
+
+/** An allocated notable that nothing depends on (deallocating it removes only itself). */
+async function leafNotable(bridge: LuaBridge): Promise<{ id: number; name: string }> {
+  const r = await bridge.send<{ nodes: Array<{ id: number; name: string; type: string; nodes: number[]; fallback?: string }> }>({
+    cmd: 'probe',
+    candidates: 'deallocate',
+  });
+  const leaf = r.nodes.find((c) => c.type === 'Notable' && c.nodes.length === 1 && !c.fallback);
+  assert(leaf, 'an allocated leaf notable');
+  return leaf;
+}
+
 async function twoPointNotable(bridge: LuaBridge): Promise<{ id: number; name: string }> {
   const r = await bridge.send<{ nodes: Array<{ id: number; name: string; type: string; points: number; fallback?: string }> }>({
     cmd: 'probe',
@@ -222,6 +267,43 @@ async function test1Parity(): Promise<void> {
   await session.undoLastChange();
   assertSame('undo of the mixed variant', await state(session), base);
   log('PASS 1b');
+
+  log('Test 1c: undo of a main-skill gem change restores the cached main skill');
+  const vortex = (await session.listSkillGroups())[MAIN_GROUP - 1].gems.find((g) => g.name === 'Vortex');
+  assert(vortex, 'Vortex in the main group');
+  await session.applyChanges({ gems: [{ op: 'set', group: MAIN_GROUP, index: vortex.index, name: 'Fireball' }] });
+  assert((await session.getBuildInfo()).mainSkill === 'Fireball', 'main skill after the change');
+  assert((await session.exportBuild('summary')).includes('Main Skill: Fireball'), 'summary after the change');
+  await session.undoLastChange();
+  assert((await session.getBuildInfo()).mainSkill === 'Vortex', 'build info after undo');
+  const summary = await session.exportBuild('summary');
+  assert(summary.includes('Main Skill: Vortex') && !summary.includes('Fireball'), `summary after undo: ${summary}`);
+  assertSame('undo of the main-skill change', await state(session), base);
+  log('PASS 1c');
+
+  log('Test 1d: variants that take the full-recalculation fallback');
+  const [n1, n2] = await twoPointNotables(bridge, 2);
+  const leaf = await leafNotable(bridge);
+  for (const [label, variant] of [
+    ['two allocations', { allocate: [n1.id, n2.name], gems: [{ op: 'set', group: MAIN_GROUP, index: 3, level: 18 }] }],
+    ['deallocate + allocate', { deallocate: [leaf.id], allocate: [n1.id], config: { usePowerCharges: true } }],
+  ] as Array<[string, NamedProbeVariant]>) {
+    const probed = await session.probeNamed({ variants: [variant] });
+    assert(probed.results[0].fallback === true, `${label}: the probe takes the fallback`);
+    let applied: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+    await assertParity(label, session, variant, async () => {
+      applied = await session.applyChanges(variant);
+      return applied.after;
+    });
+    assert(applied && applied.summary, `${label}: result`);
+    const ids = specNodes((await state(session)).xml);
+    assert(ids.includes(n1.id), `${label}: ${n1.id} allocated`);
+    if (variant.deallocate) assert(!ids.includes(leaf.id) && applied.removed.some((n) => n.id === leaf.id), `${label}: leaf removed`);
+    else assert(ids.includes(n2.id), `${label}: ${n2.id} allocated`);
+    await session.undoLastChange();
+    assertSame(`${label}: undo`, await state(session), base);
+  }
+  log('PASS 1d');
 }
 
 function toNumber(v: unknown): number {
@@ -245,6 +327,13 @@ async function test2Refusals(): Promise<void> {
     ['unknown config key', () => session.applyChanges({ config: { noSuchConfigKeyAtAll: true }, allocate: [notable.id] }), /Unknown config key/],
     ['bad item', () => session.applyChanges({ items: [{ slot: 'Ring 1', itemText: 'not an item' }] }), /Rarity/],
     ['empty variant', () => session.applyChanges({}), /changes nothing/],
+    // Checked only when applied (its fit depends on the two-handed staff of
+    // the same variant): a refusal after the change started, rolled back.
+    ['off-hand after a two-handed weapon', () => session.applyChanges({
+      config: { usePowerCharges: true },
+      gems: [{ op: 'remove', group: MAIN_GROUP, index: 1 }],
+      items: [{ slot: 'Weapon 1', itemText: STAFF }, { slot: 'Weapon 2', itemText: SHIELD }],
+    }), /cannot be equipped in Weapon 2/],
     ['create: bad gem', () => session.createSocketGroup({ gems: [{ name: 'Fireball' }, { name: 'No Such Gem Whatsoever' }] }), /gem lookup failed/i],
     ['create: bad slot', () => session.createSocketGroup({ gems: [{ name: 'Fireball' }], slot: 'Flask 1' }), /slot must be/],
     ['delete: granted group', () => session.deleteSocketGroup(GRANTED_GROUP), /granted by/],
@@ -314,6 +403,20 @@ async function test3SocketGroups(): Promise<void> {
   await session.undoLastChange();
   assertSame('undo of set_main_skill', await state(session), base);
   assert(session.undoStackDepth() === 0 && bridge.committedCount() === 0, 'undo stack and journal back');
+
+  // A Vaal gem grants two active skills; a disabled group is not built by
+  // PoB until it is main, so the bound comes from the gems.
+  const vaal = await session.createSocketGroup({ gems: [{ name: 'Vaal Cold Snap' }], enabled: false });
+  const vaalIndex = vaal.details.index as number;
+  const vaalXml = skillsXml((await state(session)).xml).split('<Skill ').find((x) => x.includes('Vaal Cold Snap'));
+  assert(vaalXml && /mainActiveSkill="1"/.test(vaalXml) && /mainActiveSkillCalcs="1"/.test(vaalXml), `a new group is saved with mainActiveSkill 1: ${vaalXml}`);
+  const second = await session.setMainSkill(vaalIndex, 2);
+  const firstVaal = await session.setMainSkill(vaalIndex, 1);
+  assert(second.mainSkill && firstVaal.mainSkill && second.mainSkill !== firstVaal.mainSkill, `two active skills: ${firstVaal.mainSkill} / ${second.mainSkill}`);
+  const outOfRange = await rejection(session.setMainSkill(vaalIndex, 3));
+  assert(outOfRange instanceof UserError && /has 2 active skill/.test(outOfRange.message), `vaal bound: ${outOfRange.message}`);
+  for (let i = 0; i < 3; i++) await session.undoLastChange();
+  assertSame('undo of the Vaal group', await state(session), base);
   log('PASS 3');
 }
 
@@ -360,6 +463,19 @@ async function test4CrashReplay(): Promise<void> {
   await crash(bridge);
   await expectRestart('after the socket group edits', session.getStats());
   assertSame('respawned after the socket group edits', await state(session), edited);
+
+  {
+    // A fallback variant (several node changes) is replayed too (a new engine: three crashes trip the breaker).
+    const bridge2 = newBridge();
+    const session2 = await primedSession(bridge2);
+    const [m1, m2, m3] = await twoPointNotables(bridge2, 3);
+    await session2.allocateNodes([m1.id]);
+    await session2.applyChanges({ allocate: [m2.id, m3.id], deallocate: [m1.id] });
+    const fallbackApplied = await state(session2);
+    await crash(bridge2);
+    await expectRestart('after a fallback apply_changes', session2.getStats());
+    assertSame('respawned after a fallback apply_changes', await state(session2), fallbackApplied);
+  }
   log('PASS 4');
 }
 
@@ -407,6 +523,18 @@ async function test5Faults(): Promise<void> {
     assert(!(e instanceof UserError) && /failed part-way/.test(e.message) && !/WAS applied/.test(e.message), `rolled back: ${e.message}`);
     assert(session.undoStackDepth() === 0 && bridge.committedCount() === 0, 'nothing pushed or journaled');
     assertSame('rolled back after a failure part-way', await state(session), base);
+  }
+  {
+    // The engine dies during the recalculation after an applied change: nothing is committed.
+    const bridge = newBridge('buildEditFailsAfterChange,buildEditRecalcExits');
+    const session = await primedSession(bridge);
+    const base = await state(session);
+    const e = await rejection(session.setMainSkill(TWO_ACTIVES_GROUP));
+    assert(/recalculation also failed/.test(e.message) && !/may show values/.test(e.message) && !/WAS applied/.test(e.message), `engine gone: ${e.message}`);
+    assert(!bridge.isRunning(), 'the engine is gone');
+    assert(session.undoStackDepth() === 0 && bridge.committedCount() === 0, 'nothing committed');
+    await expectRestart('after the engine died in the recalculation', session.getStats());
+    assertSame('respawned without the uncommitted change', await state(session), base);
   }
   log('PASS 5');
 }

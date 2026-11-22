@@ -213,13 +213,14 @@ function chunks<T>(list: T[], size: number): T[][] {
   return out;
 }
 
-async function committedFingerprint(deps: ProbeDeps): Promise<string[]> {
+/** The committed state by value (lua/probe.lua's fingerprint); apply_changes compares it around a rollback too. */
+export async function committedFingerprint(deps: Pick<ProbeDeps, 'send'>): Promise<string[]> {
   const res = await deps.send<{ fingerprint: unknown }>({ cmd: 'probe', fingerprint: true });
   return Array.isArray(res.fingerprint) ? (res.fingerprint as string[]) : [];
 }
 
 /** The first line that differs between two fingerprints, or null. */
-function fingerprintDiff(a: string[], b: string[]): string | null {
+export function fingerprintDiff(a: string[], b: string[]): string | null {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     if (a[i] !== b[i]) return `${a[i] ?? '(none)'} -> ${b[i] ?? '(none)'}`;
   }

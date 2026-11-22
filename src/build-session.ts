@@ -4,6 +4,8 @@ import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
 import {
   checkVariant,
+  committedFingerprint,
+  fingerprintDiff,
   runProbe,
   withoutNulls,
   type ProbeGemChange,
@@ -958,6 +960,8 @@ export class BuildSession {
       }
       if (entry.kind === 'full') {
         await this.restoreAllUnlocked(entry.snapshot);
+        // apply_changes can change the main skill (a gem change), so the cached build info may differ.
+        await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'spec') {
         await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
         await this.refreshBuildInfoUnlocked();
@@ -1476,9 +1480,11 @@ export class BuildSession {
    * far it got: not started (a refusal, or a failure before any change) is
    * rethrown; applied in full is returned with the failure, to be committed
    * (commitAfterUnlocked); started but not finished (or unknown) is rolled
-   * back with `rollback` and rethrown. A rollback that fails too pushes the
-   * undo entry (undo can try again; nothing is journaled) and throws an
-   * internal error.
+   * back with `rollback` and rethrown. The rollback must give back the
+   * committed state the command started from, compared by value as probe
+   * fallbacks compare it (`probe` with `fingerprint`). A rollback that fails
+   * or leaves the state different pushes the undo entry (undo can try again;
+   * nothing is journaled) and throws an internal error naming reset_build.
    */
   private async sendBuildEditUnlocked<R extends object>(
     command: object,
@@ -1486,6 +1492,8 @@ export class BuildSession {
     journal: number,
     rollback: () => Promise<void>,
   ): Promise<{ res: R & { ok?: true }; failure?: unknown }> {
+    const deps = { send: <T>(c: object) => this.bridge.send<T>(c) };
+    const before = await committedFingerprint(deps);
     try {
       return { res: await this.bridge.send<R & { ok: true }>(command) };
     } catch (err) {
@@ -1495,6 +1503,10 @@ export class BuildSession {
       if (record && !record.started) throw err;
       try {
         await rollback();
+        const diff = fingerprintDiff(before, await committedFingerprint(deps));
+        if (diff !== null) {
+          throw new Error(`rolling the build back after a failed build edit was not exact (${diff}); call reset_build`);
+        }
       } catch (rollbackError) {
         this.pushUndoEntryUnlocked(entry, journal);
         throw withRestoreFailure(err, rollbackError);
