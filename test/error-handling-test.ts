@@ -17,7 +17,7 @@
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { copyFileSync, readFileSync, rmSync } from 'fs';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -79,9 +79,17 @@ function assertStatsExact(label: string, before: KeyStats, after: KeyStats): voi
  * at a short path and check user errors still arrive as UserError, without a prefix.
  */
 async function checkUserErrorsFromShortScriptPath(paths: ResolvedPaths): Promise<void> {
-  const shortScript = path.join(os.tmpdir(), 'b.lua');
+  // bridge.lua loads its sibling modules (compound-assign.lua, probe.lua) from its
+  // own directory, so the short copy gets a directory of its own with them beside it.
+  const shortDir = path.join(os.tmpdir(), `p${process.pid}`);
+  const shortScript = path.join(shortDir, 'b.lua');
   assert(shortScript.length < 50, `temp dir path is too long to test an untruncated script path: ${shortScript}`);
+  mkdirSync(shortDir, { recursive: true });
   copyFileSync(paths.bridgeLua, shortScript);
+  const luaDir = path.dirname(paths.bridgeLua);
+  for (const name of readdirSync(luaDir)) {
+    if (name.endsWith('.lua') && name !== path.basename(paths.bridgeLua)) copyFileSync(path.join(luaDir, name), path.join(shortDir, name));
+  }
   const bridge = new LuaBridge({ ...paths, bridgeLua: shortScript }, 60_000);
   try {
     log(`Test 0: user errors from a bridge started at a short script path (${shortScript})`);
@@ -104,7 +112,7 @@ async function checkUserErrorsFromShortScriptPath(paths: ResolvedPaths): Promise
     log(`PASS: user error classified without prefix ("${caught.message}")`);
   } finally {
     await bridge.dispose().catch(() => {});
-    rmSync(shortScript, { force: true });
+    rmSync(shortDir, { recursive: true, force: true });
   }
 }
 
