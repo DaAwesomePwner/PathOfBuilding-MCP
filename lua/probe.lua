@@ -4,7 +4,9 @@
 -- gems, config) with `build.calcsTab:GetMiscCalculator()`, the calculator
 -- PoB's UI uses for its tooltip stat deltas, and never runs a full recalc
 -- (BuildOutput) or sets `build.buildFlag`. Per variant:
---   1. data changes are applied in place: config input (+ BuildModList),
+--   1. data changes are applied: config input on copies of the config tables
+--      (+ BuildModList; the committed tables are put back unwritten, as PoB
+--      2.67 exports them in pairs() order),
 --      gem lists (changed gems are copies; the original gem objects are put
 --      back), items (each assigned to its slot under a free item id, or the
 --      slot emptied for an `unequip` entry);
@@ -562,27 +564,25 @@ return function(ctx)
 	end
 
 	-- Set the inputs and rebuild the config mod list, as set_config does
-	-- (without the recalc). Returns the undo function.
+	-- (without the recalc), on copies of the config tables: the committed
+	-- tables are never written, so their pairs() order (which PoB 2.67's
+	-- export follows) stays (ctx.detachConfigTables). Returns the undo
+	-- function, which puts the very same tables back, and the originals.
 	local function applyConfig(options)
-		local configTab = build.configTab
-		local input = configTab.input
-		local saved, flag = { }, build.buildFlag
-		for key, value in pairs(options) do
-			saved[key] = { value = input[key] }
-			input[key] = value
-		end
+		local flag = build.buildFlag
+		local orig = ctx.detachConfigTables(options)
 		local function undo()
-			for key, s in pairs(saved) do input[key] = s.value end
-			configTab:BuildModList()
+			local ok, err = pcall(ctx.restoreConfigTables, orig)
 			build.buildFlag = flag
+			if not ok then error(err, 0) end
 		end
-		local ok, err = pcall(function() configTab:BuildModList() end)
+		local ok, err = pcall(function() build.configTab:BuildModList() end)
 		build.buildFlag = flag
 		if not ok then
 			undo()
 			error(err, 0)
 		end
-		return undo
+		return undo, orig
 	end
 
 	-- ------------------------------------------------------------------
@@ -691,6 +691,20 @@ return function(ctx)
 		for k, v in pairs(build.configTab.input) do keys[#keys + 1] = tostring(k) .. "=" .. type(v) .. ":" .. tostring(v) end
 		table.sort(keys)
 		add("config", table.concat(keys, ","), build.configTab.enemyLevel)
+		-- The config tables in pairs() order, which PoB 2.67's export follows
+		-- (see applyConfig); without byValue, the very same table objects.
+		local configTab = build.configTab
+		local function inOrder(t)
+			local out = { }
+			for k, v in pairs(t or { }) do out[#out + 1] = tostring(k) .. "=" .. tostring(v) end
+			return table.concat(out, ",")
+		end
+		add("configInputOrder", inOrder(configTab.input))
+		add("configPlaceholderOrder", inOrder(configTab.placeholder))
+		if not byValue then
+			local set = configTab.configSets and configTab.activeConfigSetId and configTab.configSets[configTab.activeConfigSetId]
+			add("configTables", configTab.input, configTab.placeholder, set and set.input, set and set.placeholder)
+		end
 		return fp
 	end
 
@@ -1110,7 +1124,11 @@ return function(ctx)
 		local checked = checkVariant(cmd.variant)
 		local beforeIds = { }
 		for id in pairs(build.spec.allocNodes) do beforeIds[id] = true end
-		if checked.config then applyConfig(checked.config) end
+		if checked.config then
+			-- The restore that follows puts the committed tables back.
+			local _, orig = applyConfig(checked.config)
+			ctx.stashCommittedConfigTables(orig, build.configTab.input)
+		end
 		if #checked.gems > 0 then applyGems(checked.gems) end
 		for _, p in ipairs(checked.items) do
 			if p.unequip then

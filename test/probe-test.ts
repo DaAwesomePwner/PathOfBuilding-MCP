@@ -62,6 +62,14 @@
 //      two-hand weapon replacing a main hand beside a skill-granting shield,
 //      unequipping a helmet whose abyss jewel grants a skill) takes the
 //      fallback and equals swap_item / unequip_item; the export is unchanged.
+//  14. Config what-ifs never write the committed config tables: PoB 2.67.2
+//      exports `input` / `placeholder` in pairs() order, so a key added and
+//      removed again could resize and reorder them. Calculator and fallback
+//      variants that set 45 config keys the build does not have, and boss
+//      scenarios (which write placeholders), run 10 times: after each the
+//      export is byte-identical and the by-value fingerprint, which lists both
+//      tables in pairs() order, is unchanged (this also catches the reorder on
+//      PoB 2.68, whose export sorts the keys).
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -880,6 +888,55 @@ async function main(): Promise<void> {
         assert(d.length === 0, `${c.name}: probe differs from the mutate path: ${d.join('; ')}`);
         log(`   ${c.name}: ${r.fallbackReason}`);
       }
+    }
+
+    // ------------------------------------------------------------------
+    log('14. Config what-ifs leave the config tables (and their order) untouched');
+    {
+      await session.loadBuild(fixtureXml);
+      const fingerprintNow = async (): Promise<string[]> =>
+        (await bridge.send<{ fingerprint: string[] }>({ cmd: 'probe', fingerprint: true })).fingerprint;
+      const meta = (await bridge.send<{ metadata: Array<{ var: string; type: string }> }>({ cmd: 'getConfigMetadata' })).metadata;
+      const input = (await bridge.send<{ input: Record<string, unknown> }>({ cmd: 'getFullConfig' })).input;
+      const fresh = meta.filter((m) => m.type === 'check' && !(m.var in input)).slice(0, 45);
+      assert(fresh.length === 45, `only ${fresh.length} unset check config keys`);
+      const many = Object.fromEntries(fresh.map((m) => [m.var, true]));
+      const xml0 = await session.exportXML();
+      const fp0 = await fingerprintNow();
+      assert(fp0.some((l) => l.startsWith('configPlaceholderOrder|') && l.length > 30), 'fingerprint lacks the placeholder order');
+      const depth = undoDepth();
+      const rounds: ProbeVariant[][] = [
+        [{ config: many }],
+        [{ config: { enemyIsBoss: 'Pinnacle' } }, { config: { enemyIsBoss: 'Uber' } }, { config: { enemyIsBoss: 'None' } }],
+        [{ config: { ...many, enemyIsBoss: 'Uber' } }, { allocate: [changing[0].node.id] }],
+        [{ allocate: [changing[0].node.id, changing[1].node.id], config: many }],
+        [{ allocate: [changing[0].node.id, changing[1].node.id], config: { enemyIsBoss: 'None' } }],
+      ];
+      let xmlPrev = xml0;
+      for (let round = 0; round < 10; round++) {
+        for (const [i, variants] of rounds.entries()) {
+          const res = await probe(variants);
+          assert(res.results.every((r) => !r.error), `round ${round}.${i}: ${res.results.find((r) => r.error)?.error}`);
+          if (i >= 3) assert(res.results[0].fallback, `round ${round}.${i}: did not fall back`);
+          const diff = (await fingerprintNow()).find((l, j) => l !== fp0[j]);
+          assert(diff === undefined, `round ${round}.${i}: config tables changed: ${diff?.slice(0, 200)}`);
+          // Byte-identical to the export before the call, except that a
+          // fallback's tree restore may reorder the exported node list on PoB
+          // 2.67.2 (see 3b): there the config section and the rest must match.
+          const xml = await session.exportXML();
+          const [want, got] = i >= 3 ? [normalise(xmlPrev), normalise(xml)] : [xmlPrev, xml];
+          if (got !== want) {
+            const a = want.split(/\r?\n/);
+            const b = got.split(/\r?\n/);
+            const at = a.findIndex((l, k) => l !== b[k]);
+            throw new Error(`round ${round}.${i}: export changed at line ${at + 1}: ${a[at]?.slice(0, 300)} -> ${b[at]?.slice(0, 300)}`);
+          }
+          xmlPrev = xml;
+        }
+      }
+      assert(normalise(xmlPrev) === normalise(xml0), 'export changed after the config probes (beyond node order)');
+      assert(undoDepth() === depth, 'undo depth changed after the config probes');
+      log('   50 config probe calls (calculator and fallback): export unchanged, config tables in the same order');
     }
 
     log('ALL TESTS PASSED');

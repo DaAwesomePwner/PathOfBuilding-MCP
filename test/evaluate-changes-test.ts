@@ -65,7 +65,6 @@ async function main(): Promise<void> {
 
   try {
     await session.loadBuild(readFileSync(fixturePath, 'utf8'));
-    const xml0 = await session.exportXML();
     const undo0 = undoDepth();
     const stats0 = await session.getStats();
 
@@ -85,6 +84,19 @@ async function main(): Promise<void> {
     assert(allocNotables.length >= 2, 'fixture needs allocated notables');
     const [allocNormal] = await fastDealloc(allocated.filter((n) => n.type === 'Normal'));
     assert(allocNormal, 'fixture needs an allocated normal node');
+    // Taken after the setup probes above: a deallocation that takes the
+    // tree-only fallback restores the passive tree, which on PoB 2.67.2 may
+    // list the same nodes in another order in the export.
+    const xml0 = await session.exportXML();
+    /** The export must still be byte-identical to the loaded build's; names the first differing line. */
+    const assertExportUnchanged = async (after: string): Promise<void> => {
+      const xml = await session.exportXML();
+      if (xml === xml0) return;
+      const a = xml0.split(/\r?\n/);
+      const b = xml.split(/\r?\n/);
+      const at = a.findIndex((l, k) => l !== b[k]);
+      throw new Error(`export changed after ${after}, at line ${at + 1}: ${a[at]?.slice(0, 300)} -> ${b[at]?.slice(0, 300)}`);
+    };
 
     // ------------------------------------------------------------------
     log('1. Mixed 30-variant call');
@@ -126,6 +138,7 @@ async function main(): Promise<void> {
       return { result, ms: performance.now() - t0 };
     };
     let { result, ms } = await timed();
+    await assertExportUnchanged('evaluate_changes');
     if (ms >= 1000) {
       log(`   first run took ${ms.toFixed(0)} ms; retrying once`);
       ({ result, ms } = await timed());
@@ -177,6 +190,7 @@ async function main(): Promise<void> {
       assert(row.value === roundStat(num(r.stats.CombinedDPS)), `${row.label}: value ${row.value}`);
       assert((row.pointsAdded ?? 0) === (r.pointsAdded ?? 0) && (row.pointsRemoved ?? 0) === (r.pointsRemoved ?? 0),
         `${row.label}: points ${row.pointsAdded}/${row.pointsRemoved} vs ${r.pointsAdded}/${r.pointsRemoved}`);
+      await assertExportUnchanged(`the single probe of ${row.label}`);
     }
     const rowOf = (label: string) => okRows.find((r) => r.label === label)!;
     const expectDiff = (label: string, before: Stats, after: Stats) => {
@@ -188,20 +202,25 @@ async function main(): Promise<void> {
     const named = notableByName[0];
     const sim = await session.simulatePassiveChange([named.name], []);
     expectDiff(`alloc ${named.name}`, sim.before, sim.after);
+    await assertExportUnchanged('simulate_passive_change');
     assert(rowOf(`alloc ${named.name}`).pointsAdded! >= 1, 'a named allocate reports its points');
     const cmp = await session.compareItems('Ring 1', [RING_A, AMULET]);
     expectDiff('ring', cmp.baseline.stats, cmp.candidates[0].stats!);
+    await assertExportUnchanged('compare_items');
     const gem = await session.swapGemWithDiff(MAIN_GROUP, 1, 'Elemental Focus');
     expectDiff('swap to elemental focus', gem.before, gem.after);
+    await assertExportUnchanged('swap_gem');
     const boss = await session.simulateConfig({ enemyIsBoss: 'Pinnacle' });
     expectDiff('pinnacle', boss.before, boss.after);
+    await assertExportUnchanged('simulate_scenario');
     const onslaught = await session.toggleBuffs({ onslaught: true });
     expectDiff('onslaught', onslaught.before, onslaught.after);
+    await assertExportUnchanged('toggle_buffs');
     log('   PASS');
 
     // ------------------------------------------------------------------
     log('4. Build unchanged');
-    assert((await session.exportXML()) === xml0, 'export changed after evaluate_changes');
+    await assertExportUnchanged('evaluate_changes and the single tools');
     assert(undoDepth() === undo0, `undo depth ${undoDepth()} vs ${undo0}`);
     log('   PASS: export byte-identical, undo depth unchanged');
 
