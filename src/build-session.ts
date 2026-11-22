@@ -1921,6 +1921,15 @@ export class BuildSession {
         passiveTreeSummary: PassiveTreeSummary;
       }>({ cmd: 'diagnoseSnapshot' });
 
+      // The snapshot's stats cover only the bridge's default key list; the crit, hit and
+      // suppression checks need keys outside it, read as the probe's base (no recalc).
+      const extra = (await this.probeUnlocked({ stats: [...DIAGNOSTIC_EXTRA_STATS], variants: [] })).base;
+      const diagStats: Stats = { ...snap.stats };
+      for (const key of DIAGNOSTIC_EXTRA_STATS) {
+        const value = extra[key];
+        if (value !== undefined && value !== null) diagStats[key] = value;
+      }
+
       const tree: PassiveTreeInfo = {
         allocatedNodes: snap.allocatedNodes,
         keystones: snap.allocatedNodes.filter((n) => n.isKeystone),
@@ -1934,8 +1943,8 @@ export class BuildSession {
         return focus === cat;
       };
 
-      if (want('defense')) checks.push(...runDefenseDiagnostics(snap.stats));
-      if (want('offense')) checks.push(...runOffenseDiagnostics(snap.stats, snap.groups, tree));
+      if (want('defense')) checks.push(...runDefenseDiagnostics(diagStats));
+      if (want('offense')) checks.push(...runOffenseDiagnostics(diagStats, snap.groups, tree));
       if (want('qol')) checks.push(...runQoLDiagnostics(snap.groups, snap.items));
 
       const order: Record<DiagnosticCheck['severity'], number> = { critical: 0, warning: 1, info: 2 };
@@ -2011,7 +2020,8 @@ export class BuildSession {
         if ((a.error === undefined) !== (b.error === undefined)) return a.error === undefined ? -1 : 1;
         if (a.empty && !b.empty) return -1;
         if (!a.empty && b.empty) return 1;
-        return (a.dpsContribution + a.ehpContribution) - (b.dpsContribution + b.ehpContribution);
+        // Higher priority = the slot matters less relative to the build (upgrade it first).
+        return b.priority - a.priority;
       });
       return out;
     });
@@ -2645,6 +2655,9 @@ function computeUpgradePriority(dpsLoss: number, ehpLoss: number, baseline: Stat
   const score = (dpsRatio + ehpRatio) * 100;
   return Math.round(Math.max(0, 100 - score));
 }
+
+/** PoB output keys the diagnostics read that the bridge's default stat list does not return. */
+const DIAGNOSTIC_EXTRA_STATS = ['SpellSuppressionChance', 'CritChance', 'HitChance'] as const;
 
 function pct(n: Stats[string]): number {
   return Math.round(toNumber(n));

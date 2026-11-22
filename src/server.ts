@@ -64,6 +64,14 @@ const STAT_CATEGORIES: Record<string, string[]> = {
 
 const ALL_CATEGORIES = Object.keys(STAT_CATEGORIES);
 
+/** The union of the PoB output keys of the given categories (all categories when none are given). */
+function statKeysForCategories(categories?: string[]): string[] {
+  const cats = categories && categories.length > 0 ? categories : ALL_CATEGORIES;
+  const keys = new Set<string>();
+  for (const cat of cats) for (const key of STAT_CATEGORIES[cat] ?? []) keys.add(key);
+  return [...keys];
+}
+
 function categorizeStats(stats: Stats, categories?: string[]): Record<string, Record<string, unknown>> {
   const cats = categories && categories.length > 0 ? categories : ALL_CATEGORIES;
   const result: Record<string, Record<string, unknown>> = {};
@@ -182,8 +190,10 @@ tools.engine<{
       const { base } = await session.probe({ stats: [...new Set(keys)], variants: [] });
       return { stats: base };
     }
-    const stats = await session.getStats();
-    return categorizeStats(stats, categories);
+    // The bridge's default stat list covers only a few keys; read every key of the
+    // requested categories through the probe's base read (no recalc, build untouched).
+    const { base } = await session.probe({ stats: statKeysForCategories(categories), variants: [] });
+    return categorizeStats(base as Stats, categories);
   },
 );
 
@@ -895,7 +905,7 @@ tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   'suggest_upgrades',
   {
     description:
-      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (lowest contribution first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods; list_equipped_items / get_item_in_slot give the items themselves.",
+      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (highest priority first; empty slots come first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods; list_equipped_items / get_item_in_slot give the items themselves.",
     inputSchema: {
       slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
       budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),

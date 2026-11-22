@@ -138,6 +138,10 @@ async function main(): Promise<void> {
       assert(typeof s.priority === 'number', 'priority number');
       assert(Array.isArray(s.suggestedMods), 'suggestedMods array');
     }
+    const sugRanked = sugAll.suggestions.filter((s) => !s.empty);
+    for (let i = 1; i < sugRanked.length; i++) {
+      assert(sugRanked[i - 1].priority >= sugRanked[i].priority, 'suggest_upgrades is not sorted by priority (highest first)');
+    }
     const afterSug = await getKeyStats(client);
     assert(approxEq(afterSug.Life, baseline.Life), 'Life restored after suggest_upgrades');
     assert(approxEq(afterSug.CombinedDPS, baseline.CombinedDPS), `DPS restored after suggest_upgrades (b=${baseline.CombinedDPS}, a=${afterSug.CombinedDPS})`);
