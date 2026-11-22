@@ -6,7 +6,8 @@
 -- (BuildOutput) or sets `build.buildFlag`. Per variant:
 --   1. data changes are applied in place: config input (+ BuildModList),
 --      gem lists (changed gems are copies; the original gem objects are put
---      back), items (each assigned to its slot under a free item id);
+--      back), items (each assigned to its slot under a free item id, or the
+--      slot emptied for an `unequip` entry);
 --   2. calcFunc({ addNodes / removeNodes }, useFullDPS) runs on that data;
 --   3. every data change is undone, in reverse order.
 -- After the whole command the committed state is compared with a fingerprint
@@ -15,9 +16,11 @@
 -- naming reset_build.
 --
 -- Variant kinds the calculator cannot reproduce exactly come back as
--- { fallback = true, reason } and are run by the caller through `probeCommit`
--- (apply for real -> full recalc -> read) between a full snapshot and its
--- exact restore (BuildSession.probe does this). They are:
+-- { fallback = true, reason, treeOnly } and are run by the caller through
+-- `probeCommit` (apply for real -> full recalc -> read) between a full
+-- snapshot and its exact restore (BuildSession.probe does this; `treeOnly`
+-- marks a single node change that touches no skill, for which a passive-tree
+-- snapshot and restore are enough). They are:
 --   * more than one node change (allocate/deallocate together, or several of
 --     either): PoB recomputes paths/dependencies after every single change;
 --   * a node change touching a cluster-jewel socket or expansion node, a
@@ -28,6 +31,9 @@
 --     one that does;
 --   * every variant while the party tab's "export buffs" option is on (see
 --     checkVariant).
+-- A `probe` without variants (and the classify-only pass) reads the base
+-- from the last full recalc without building a calculator; `probe` with
+-- `candidates` lists the nodes the tree searches evaluate (listCandidates).
 -- Gem changes on item- or tree-granted socket groups are refused.
 --
 -- Full DPS: PoB's calculator only rolls up Full DPS when the build already
@@ -148,6 +154,19 @@ return function(ctx)
 		return nil
 	end
 
+	-- Whether changing `set` can add or remove a skill: a node granting one,
+	-- or a jewel socket holding a jewel that grants one.
+	local function touchesSkills(spec, set)
+		for node in pairs(set) do
+			if grantsSkill(node) then return true end
+			if holdsJewel(spec, node) then
+				local jewel = build.itemsTab.items[spec.jewels[node.id]]
+				if jewel == nil or (type(jewel.grantedSkills) == "table" and #jewel.grantedSkills > 0) then return true end
+			end
+		end
+		return false
+	end
+
 	local function nodeById(spec, id, label)
 		if not isInt(id, 0) then userError(label .. " must be a node id (integer)") end
 		local node = spec.nodes[id]
@@ -242,21 +261,24 @@ return function(ctx)
 	-- Parse every item and check what can be checked against the committed
 	-- build (user errors before any change); an item whose fit depends on
 	-- another item of the same variant is checked again when it is applied.
-	-- Returns { { slot, item, itemText } ... } and a fallback reason or nil.
+	-- An entry { slot, unequip = true } empties the slot instead.
+	-- Returns { { slot, item, itemText, unequip } ... } and a fallback reason or nil.
 	function M.checkItems(variant)
 		local list = optArray(variant.items, "items", M.MAX_ITEMS)
 		local tab = build.itemsTab
 		local parsed, bySlot, reason = { }, { }, nil
 		for i, entry in ipairs(list) do
-			if type(entry) ~= "table" or type(entry.slot) ~= "string" or type(entry.itemText) ~= "string" then
-				userError("items[" .. i .. "] must be { slot, itemText }")
+			local unequip = type(entry) == "table" and entry.unequip == true and entry.itemText == nil
+			if type(entry) ~= "table" or type(entry.slot) ~= "string" or not (unequip or type(entry.itemText) == "string") then
+				userError("items[" .. i .. "] must be { slot, itemText } or { slot, unequip = true }")
 			end
 			local slot = tab.slots[entry.slot]
 			if not slot then userError("Unknown slot: " .. entry.slot) end
 			if bySlot[entry.slot] then userError("Slot " .. entry.slot .. " is listed twice") end
-			local item = ctx.parseItemText(entry.itemText, entry.slot)
-			bySlot[entry.slot] = item
-			parsed[i] = { slot = slot, item = item, itemText = entry.itemText }
+			local item = nil
+			if not unequip then item = ctx.parseItemText(entry.itemText, entry.slot) end
+			bySlot[entry.slot] = true
+			parsed[i] = { slot = slot, item = item, itemText = entry.itemText, unequip = unequip }
 			local current = tab.items[slot.selItemId or 0]
 			if slot.nodeId then
 				reason = reason or (entry.slot .. " is a passive tree jewel socket")
@@ -266,7 +288,7 @@ return function(ctx)
 		end
 		for _, p in ipairs(parsed) do
 			local governing = governingSlotName(p.slot)
-			if not (governing and bySlot[governing]) then
+			if not p.unequip and not (governing and bySlot[governing]) then
 				ctx.assertItemFitsSlot(tab, p.slot, p.item)
 			end
 		end
@@ -283,7 +305,8 @@ return function(ctx)
 	-- its side effects on the committed build: each item is checked against
 	-- the slots as they are at that point, added under a free id and selected
 	-- (slot.selItemId and the active item set's entry, as ItemSlot:SetSelItemId
-	-- does for a non-socket slot); then what ItemsTab:PopulateSlots would do is
+	-- does for a non-socket slot; an `unequip` entry selects nothing, as
+	-- unequip_item does); then what ItemsTab:PopulateSlots would do is
 	-- emulated: every slot whose item no longer fits is emptied (an off-hand
 	-- after a new main hand) and abyssal sockets beyond their parent item's
 	-- socket count are emptied. Returns the undo function, which puts every
@@ -327,13 +350,17 @@ return function(ctx)
 		end
 		local ok, err = pcall(function()
 			for _, p in ipairs(parsed) do
-				ctx.assertItemFitsSlot(tab, p.slot, p.item)
-				local id = freeItemId(tab)
-				p.item.id = id
-				tab.items[id] = p.item
-				added[#added + 1] = id
-				p.item:BuildModList() -- as ItemsTab:AddItem does
-				select(p.slot, id)
+				if p.unequip then
+					select(p.slot, 0) -- as unequip_item (ItemSlot:SetSelItemId(0)) does
+				else
+					ctx.assertItemFitsSlot(tab, p.slot, p.item)
+					local id = freeItemId(tab)
+					p.item.id = id
+					tab.items[id] = p.item
+					added[#added + 1] = id
+					p.item:BuildModList() -- as ItemsTab:AddItem does
+					select(p.slot, id)
+				end
 				populate()
 			end
 			build.skillsTab:UpdateSocketGroups()
@@ -619,6 +646,10 @@ return function(ctx)
 		if nodeSet and not reason then
 			reason = nodeFallbackReason(build.spec, nodeSet, adding)
 		end
+		-- A fallback that only changes one node set and no skill: the caller
+		-- may snapshot and restore just the passive tree around it.
+		local treeOnly = reason ~= nil and nodeSet ~= nil and #parsedItems == 0 and config == nil and #gems == 0
+			and not touchesSkills(build.spec, nodeSet)
 		-- With the party tab's "export buffs" option on, CalcPerform computes
 		-- the MAIN pass differently from the CALCULATOR pass (only MAIN collects
 		-- buff exports, and that branch can apply non-unique flasks to a minion
@@ -630,7 +661,7 @@ return function(ctx)
 		end
 		return {
 			addList = addList, removeList = removeList, items = parsedItems, config = config, gems = gems,
-			nodeSet = nodeSet, adding = adding, fallbackReason = reason,
+			nodeSet = nodeSet, adding = adding, fallbackReason = reason, treeOnly = treeOnly,
 		}
 	end
 
@@ -735,8 +766,16 @@ return function(ctx)
 		return res
 	end
 
+	-- The committed build's stats, read from the last full recalc.
+	local function committedStats(keys)
+		local mainOutput = build.calcsTab.mainOutput
+		if type(mainOutput) ~= "table" then error("Path of Building's calculator is not available (no calculation output yet)") end
+		return readStats(mainOutput, keys, false)
+	end
+
 	function M.probe(cmd)
 		flushPendingRecalc()
+		if cmd.candidates ~= nil then return M.listCandidates(cmd) end
 		local keys = statKeyList(cmd.stats)
 		local variants = cmd.variants
 		if variants == nil then variants = { } end
@@ -754,12 +793,18 @@ return function(ctx)
 				if not ok then
 					results[i] = variantErrorResult(res)
 				elseif res.fallbackReason then
-					results[i] = { fallback = true, reason = res.fallbackReason }
+					results[i] = { fallback = true, reason = res.fallbackReason, treeOnly = res.treeOnly or nil }
 				else
 					results[i] = { fallback = false }
 				end
 			end
-			return { results = results }
+			-- The base too, so a call whose variants all need the fallback
+			-- never builds a calculator just to read it.
+			return { base = committedStats(keys), results = results }
+		end
+		if #variants == 0 then
+			-- Base only: no calculator is built.
+			return { base = committedStats(keys), results = { } }
 		end
 		local calcsTab = build.calcsTab
 		local calcFunc, calcBase = calcsTab:GetMiscCalculator()
@@ -783,7 +828,7 @@ return function(ctx)
 				local ok, res = pcall(function()
 					local checked = checkVariant(variant)
 					if checked.fallbackReason then
-						return { fallback = true, reason = checked.fallbackReason }
+						return { fallback = true, reason = checked.fallbackReason, treeOnly = checked.treeOnly or nil }
 					end
 					return runFast(checked, calcFunc, keys, useFullDPS, nullFullDPS, rollUpHere)
 				end)
@@ -808,6 +853,80 @@ return function(ctx)
 		return { base = base, results = results }
 	end
 
+	-- ------------------------------------------------------------------
+	-- Node search candidates
+	-- ------------------------------------------------------------------
+
+	-- `probe` with `candidates`: the nodes a tree search evaluates and what a
+	-- one-node variant of each would change (nothing is computed):
+	--   "allocate": every unallocated node that is not an ascendancy node, a
+	--     class start or a mastery, that a path reaches, whose `allocate`
+	--     variant costs at most `maxPoints` points; `nodes` is that path, from
+	--     the allocated tree out to the node;
+	--   "deallocate": every allocated node except ascendancy nodes, class
+	--     starts, masteries and jewel sockets holding a jewel; `nodes` is the
+	--     node, then the nodes that depend on it (what `deallocate` removes).
+	-- `points` is what the variant's pointsAdded / pointsRemoved will be and
+	-- `fallback` the reason it needs a full recalculation, if it does.
+	-- `names` maps every listed node id to its name.
+	function M.listCandidates(cmd)
+		local spec = build.spec
+		local adding = cmd.candidates == "allocate"
+		if not adding and cmd.candidates ~= "deallocate" then userError("candidates must be \"allocate\" or \"deallocate\"") end
+		local maxPoints = cmd.maxPoints
+		if adding and not isInt(maxPoints, 1) then userError("maxPoints must be a positive integer") end
+		local out, named, names = { }, { }, { }
+		local function name(node)
+			if not named[node.id] then
+				named[node.id] = true
+				names[#names + 1] = { id = node.id, name = node.dn or "" }
+			end
+			return node.id
+		end
+		for _, node in pairs(spec.nodes) do
+			local eligible = not node.ascendancyName and node.type ~= "ClassStart"
+				and node.type ~= "AscendClassStart" and node.type ~= "Mastery"
+			local set = nil
+			if eligible and adding then
+				if not node.alloc and node.path and #node.path > 0 then set = allocSet(node) end
+			elseif eligible and node.alloc and not holdsJewel(spec, node) then
+				set = deallocSet(node)
+			end
+			local points = 0
+			if set then
+				for n in pairs(set) do
+					if countsAsPoint(n) then points = points + 1 end
+				end
+			end
+			if set and (not adding or points <= maxPoints) then
+				local ids = { }
+				if adding and not set[node.path[#node.path]] then
+					ids[1] = name(node) -- allocated through an Intuitive Leap-like jewel: the node alone
+				elseif adding then
+					for i = #node.path, 1, -1 do ids[#ids + 1] = name(node.path[i]) end
+				else
+					ids[1] = name(node)
+					local deps = { }
+					for dep in pairs(set) do
+						if dep ~= node then deps[#deps + 1] = dep end
+					end
+					table.sort(deps, function(a, b) return a.id < b.id end)
+					for _, dep in ipairs(deps) do ids[#ids + 1] = name(dep) end
+				end
+				local sd = { }
+				for _, line in ipairs(node.sd or { }) do
+					if type(line) == "string" then sd[#sd + 1] = line end
+				end
+				out[#out + 1] = {
+					id = node.id, name = node.dn or "", type = node.type, stats = sd, nodes = ids, points = points,
+					fallback = nodeFallbackReason(spec, set, adding),
+				}
+			end
+		end
+		table.sort(out, function(a, b) return a.id < b.id end)
+		return { nodes = out, names = names }
+	end
+
 	-- A fallback variant, applied for real: the caller snapshots the whole
 	-- build before and restores it exactly after (BuildSession.probe).
 	function M.probeCommit(cmd)
@@ -820,7 +939,15 @@ return function(ctx)
 		if checked.config then applyConfig(checked.config) end
 		if #checked.gems > 0 then applyGems(checked.gems) end
 		for _, p in ipairs(checked.items) do
-			ctx.equipItemInSlot(p.slot.slotName, p.itemText)
+			if p.unequip then
+				-- As the bridge's unequipItem command does.
+				p.slot:SetSelItemId(0)
+				build.buildFlag = true
+				build.itemsTab:PopulateSlots()
+				runCallback("OnFrame")
+			else
+				ctx.equipItemInSlot(p.slot.slotName, p.itemText)
+			end
 		end
 		local function ids(list)
 			local out = { }

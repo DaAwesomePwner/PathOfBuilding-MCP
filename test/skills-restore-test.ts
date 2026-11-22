@@ -23,8 +23,9 @@
 //      LuaBridge.send, not reachable from MCP tool arguments) reaches the
 //      client as an internal error naming reset_build that keeps the probe's
 //      message and has the probe error as its cause; the same for
-//      suggest_upgrades' restore. Without the injection the probe error stays
-//      a user error, shown verbatim.
+//      suggest_upgrades' restore (on a passive-tree jewel socket, which the
+//      probe engine measures through its full snapshot/restore fallback).
+//      Without the injection the probe error stays a user error, shown verbatim.
 //   6. The monster-explosion group (from OccVortex's items): a gem level
 //      changed through the engine survives skills probes (the gem is
 //      relinked to its source); a snapshot naming a source that no longer
@@ -342,8 +343,12 @@ async function main(): Promise<void> {
     // The probe's own change was refused before anything moved, so the build is still exact.
     assertSame('after a refused probe with a failing restore', await state(bridge, session), s5);
 
+    // Ring 1 goes through PoB's calculator (no snapshot); a jewel socket takes
+    // the probe's full snapshot/restore fallback, whose restore fails here.
+    const jewelSlot = (await session.listEquippedItems()).find((i) => /^Jewel \d+$/.test(i.slot))?.slot;
+    assert(jewelSlot, 'test build has no socketed tree jewel');
     corruptSkillsSnapshot = true;
-    const upgradesErr = await rejection(session.suggestUpgrades('Ring 1'));
+    const upgradesErr = await rejection(session.suggestUpgrades(jewelSlot));
     corruptSkillsSnapshot = false;
     assert(!(upgradesErr instanceof UserError), `suggest_upgrades restore failure is a user error: ${upgradesErr.message}`);
     assert(/Invalid skills snapshot/.test(upgradesErr.message), `suggest_upgrades: ${upgradesErr.message}`);
@@ -355,6 +360,8 @@ async function main(): Promise<void> {
     assert(s5b.skills === s0.skills, 'reloaded test build has different skills');
     await session.suggestUpgrades('Ring 1');
     assertSame('after suggest_upgrades', await state(bridge, session), s5b);
+    await session.suggestUpgrades(jewelSlot);
+    assertSame('after suggest_upgrades on a jewel socket', await state(bridge, session), s5b);
     log('PASS: restore failures keep the probe error and name reset_build');
 
     // ---------------------------------------------------------------- 6

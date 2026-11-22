@@ -9,6 +9,7 @@ import type { Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
 import { registerTradeTools } from './trade-search.js';
 import { createToolRegistrar } from './tool-registry.js';
+import { DEFAULT_MAX_POINTS, MAX_MAX_POINTS, MAX_SEARCH_FALLBACKS } from './tree-search.js';
 import { UserError, validateBuildSource, validateItemText, validateSlot } from './validation.js';
 
 // ---------------------------------------------------------------------------
@@ -302,7 +303,7 @@ tools.engine<{ slot: string; items: string[] }>(
   'compare_items',
   {
     description:
-      'Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is tested sequentially with full state restoration; the build returns to its original state when finished.',
+      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo.",
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot to compare in.'),
       items: z
@@ -381,7 +382,7 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   'simulate_passive_change',
   {
     description:
-      'Temporarily allocate or deallocate passive nodes and return the stat diff. Always restores the original tree afterward. Validates that the resulting tree is connected. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class\'s ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start.',
+      "Temporarily allocate or deallocate passive nodes and return the stat diff. Allocating a node also allocates its path from the allocated tree; deallocating a node also removes the nodes that depend on it. Validates that the resulting tree is connected. A request that allocates exactly one node (and deallocates none) on a connected tree is evaluated through Path of Building's own calculator without changing the build; every other request is applied, recalculated and the tree restored exactly. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class's ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start.",
     inputSchema: {
       allocate: z
         .array(z.union([z.string(), z.number().int()]))
@@ -404,11 +405,19 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   },
 );
 
-tools.engine<{ count?: number; optimizeFor?: string; includeJewelSockets?: boolean }>(
+const rankBySchema = z.enum(['perPoint', 'total']);
+
+tools.engine<{
+  count?: number;
+  optimizeFor?: string;
+  includeJewelSockets?: boolean;
+  maxPoints?: number;
+  rankBy?: 'perPoint' | 'total';
+}>(
   'find_best_next_nodes',
   {
     description:
-      'Iterate every reachable unallocated node, simulate allocating each, and rank by improvement of the chosen stat. Skips jewel sockets by default. Build is restored after the scan. May take 10-60s on large trees.',
+      "Rank unallocated passive nodes by how much allocating each one (together with its cheapest path from the allocated tree, as clicking it in PoB does) improves the chosen stat. Every node whose path costs at most `maxPoints` points is evaluated through Path of Building's own calculator (a few seconds; the build never changes); ascendancy nodes, masteries and class starts are skipped, jewel sockets unless `includeJewelSockets`. Each ranking gives `pointsCost`, `delta` (total change of the stat), `deltaPerPoint`, the `path` (node ids and names, tree side first, the node last) and `tradeoffs` (losses in the other kind of stat). `rankBy: \"perPoint\"` (default) ranks by delta per point, `\"total\"` by delta. Nodes that need a full recalculation (cluster jewel nodes, jewel sockets holding a jewel, skill-granting nodes) are capped at the " + MAX_SEARCH_FALLBACKS + " cheapest per call and the rest listed in `skipped`.",
     inputSchema: {
       count: z.number().int().positive().max(50).optional().describe('Top-N to return (default 10).'),
       optimizeFor: z
@@ -419,34 +428,62 @@ tools.engine<{ count?: number; optimizeFor?: string; includeJewelSockets?: boole
         .boolean()
         .optional()
         .describe('Include jewel sockets (default false — they have global radius effects).'),
+      maxPoints: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_MAX_POINTS)
+        .optional()
+        .describe(`Largest path cost in passive points to consider (default ${DEFAULT_MAX_POINTS}, max ${MAX_MAX_POINTS}); 1 = only nodes next to the allocated tree.`),
+      rankBy: rankBySchema.optional().describe('"perPoint" (default): gain per point spent; "total": total gain.'),
     },
   },
-  async ({ count, optimizeFor, includeJewelSockets }, session) => {
-    const rankings = await session.findBestNextNodes(
+  async ({ count, optimizeFor, includeJewelSockets, maxPoints, rankBy }, session) => {
+    const target = optimizeFor ?? 'CombinedDPS';
+    const result = await session.findBestNextNodes(
       count ?? 10,
-      optimizeFor ?? 'CombinedDPS',
+      target,
       includeJewelSockets ?? false,
+      maxPoints ?? DEFAULT_MAX_POINTS,
+      rankBy ?? 'perPoint',
     );
-    return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
+    return {
+      optimizeFor: target,
+      maxPoints: maxPoints ?? DEFAULT_MAX_POINTS,
+      rankBy: rankBy ?? 'perPoint',
+      evaluated: result.evaluated,
+      count: result.rankings.length,
+      rankings: result.rankings,
+      ...(result.skipped.length > 0 ? { skipped: result.skipped } : {}),
+    };
   },
 );
 
-tools.engine<{ count?: number; optimizeFor?: string }>(
+tools.engine<{ count?: number; optimizeFor?: string; rankBy?: 'perPoint' | 'total' }>(
   'find_worst_allocated_nodes',
   {
     description:
-      'Find the least valuable currently-allocated nodes by simulating their removal. Skips keystones, ascendancy nodes, jewel sockets, masteries, and any node whose removal disconnects the tree.',
+      "Find the least valuable allocated passive nodes: each allocated node (normal, notable, keystone, or empty jewel socket; not ascendancy nodes, masteries or class starts) is removed together with every node that depends on it (as deallocating it in PoB does) and evaluated through Path of Building's own calculator (a few seconds; the build never changes). Each ranking gives `lossIfRemoved` (drop of the stat), `pointsRefunded`, `lossPerPoint`, and `removedNodes` (ids and names, the node first; at most 25 listed, `removedNodeCount` has the total). `rankBy: \"perPoint\"` (default) lists the lowest loss per refunded point first, `\"total\"` the lowest total loss. Nodes that need a full recalculation (removing a jewel socket that holds a jewel, cluster jewel nodes) are capped at the " + MAX_SEARCH_FALLBACKS + " cheapest per call and the rest listed in `skipped`.",
     inputSchema: {
       count: z.number().int().positive().max(50).optional().describe('Top-N to return (default 10).'),
       optimizeFor: z
         .string()
         .optional()
         .describe('Stat key to evaluate value by (default "CombinedDPS").'),
+      rankBy: rankBySchema.optional().describe('"perPoint" (default): loss per refunded point; "total": total loss.'),
     },
   },
-  async ({ count, optimizeFor }, session) => {
-    const rankings = await session.findWorstAllocatedNodes(count ?? 10, optimizeFor ?? 'CombinedDPS');
-    return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
+  async ({ count, optimizeFor, rankBy }, session) => {
+    const target = optimizeFor ?? 'CombinedDPS';
+    const result = await session.findWorstAllocatedNodes(count ?? 10, target, rankBy ?? 'perPoint');
+    return {
+      optimizeFor: target,
+      rankBy: rankBy ?? 'perPoint',
+      evaluated: result.evaluated,
+      count: result.rankings.length,
+      rankings: result.rankings,
+      ...(result.skipped.length > 0 ? { skipped: result.skipped } : {}),
+    };
   },
 );
 
@@ -454,7 +491,7 @@ tools.engine<{ keystone: string }>(
   'evaluate_keystone',
   {
     description:
-      'Toggle a keystone (add if not allocated, remove if allocated) and return the full stat diff. Tree is restored afterward.',
+      "Toggle a keystone (add it with its path from the allocated tree if not allocated; remove it with the nodes depending on it if allocated) and return the full stat diff, evaluated through Path of Building's own calculator without changing the build. A keystone no path reaches is an error.",
     inputSchema: {
       keystone: z
         .string()
@@ -755,9 +792,13 @@ function formatUpgrades(suggestions: UpgradeSuggestion[]): string {
     const s = suggestions[i];
     lines.push(`${i + 1}. ${s.slot}${s.empty ? ' (EMPTY)' : ''}`);
     if (s.currentItemName) lines.push(`   Current: ${s.currentItemName}`);
-    lines.push(
-      `   Contribution: ${Math.round(s.dpsContribution).toLocaleString()} DPS, ${Math.round(s.ehpContribution).toLocaleString()} EHP (priority ${s.priority}/100)`,
-    );
+    if (s.error !== undefined) {
+      lines.push(`   Not measured: ${s.error}`);
+    } else {
+      lines.push(
+        `   Contribution: ${Math.round(s.dpsContribution).toLocaleString()} DPS, ${Math.round(s.ehpContribution).toLocaleString()} EHP (priority ${s.priority}/100)`,
+      );
+    }
     if (s.suggestedMods.length > 0) lines.push(`   Look for: ${s.suggestedMods.join(', ')}`);
     lines.push('');
   }
@@ -791,7 +832,7 @@ tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   'suggest_upgrades',
   {
     description:
-      'Rank equipment slots by upgrade priority. Each slot is briefly unequipped to measure its current DPS/EHP contribution; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. Build state is fully restored after the scan.',
+      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`.",
     inputSchema: {
       slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
       budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),

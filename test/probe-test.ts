@@ -32,12 +32,31 @@
 //      active skill, a variant adding one (the build's first Full DPS skill)
 //      equals add_gem + full recalc.
 //   8. More than 50 fallback variants is a user error before anything runs.
+//   9. `{ slot, unequip: true }` item entries and abyssal sockets: emptying
+//      a ring, the main hand, an abyss jewel, a helmet holding one, a helmet
+//      without an abyssal socket in place of one, an unequip plus an equip,
+//      and a passive-tree jewel (fallback) equal unequip_item / swap_item;
+//      the export is unchanged.
+//  10. A call whose variants all fall back sends only the classify pass
+//      (no calculator is built for the base), with the same base.
+//  11. The tools on the probe engine, each leaving the export byte-identical
+//      and the undo depth unchanged, with timings printed (limits: default
+//      find_best_next_nodes 5 s, find_worst_allocated_nodes 3 s, compare_items
+//      with 2 items 0.2 s; x3 when CI is set): find_best_next_nodes with
+//      maxPoints 1 ranks exactly the nodes next to the tree (the old search's
+//      set) with allocNode's deltas; with the default maxPoints 3 its top 10
+//      holds a multi-point node whose path, cost and delta match allocNode;
+//      find_worst_allocated_nodes ranks a notable refunding several points
+//      whose removed nodes and loss match deallocNode; compare_items,
+//      suggest_upgrades, evaluate_keystone and a one-node
+//      simulate_passive_change match equipItem / unequipItem / allocNode(s).
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { BuildSession, type TreeNodeInfo } from '../src/build-session.js';
 import { LuaBridge, type Stats } from '../src/lua-bridge.js';
 import type { ProbeResponse, ProbeVariant, ProbeVariantResult } from '../src/probe.js';
+import { MAX_SEARCH_FALLBACKS } from '../src/tree-search.js';
 import { setupTestEnv } from './_skip.js';
 
 process.env.POB_MCP_CONFIG_DIR ??= mkdtempSync(path.join(os.tmpdir(), 'pob-mcp-probe-'));
@@ -114,7 +133,32 @@ function skillGroup(gems: string[], slot?: string, fullDps = true): string {
   return `<Skill ${attrs}>${gemXml}</Skill>`;
 }
 
-const BAD_ITEM = 'Rarity: RARE\nUnknown Base Ring\nNot A Real Base\n+80 to maximum Life';
+const RING_B = `Rarity: RARE
+Probe Ring B
+Coral Ring
+Item Level: 63
+Implicits: 1
++30 to maximum Life
++40% to Fire Resistance
++12% increased Cast Speed`;
+
+const ABYSS_HELMET = `Rarity: RARE
+Probe Abyss Helmet
+Hubris Circlet
+Item Level: 84
+Has 1 Abyssal Socket
++70 to maximum Life`;
+
+const ABYSS_EYE = `Rarity: RARE
+Probe Eye
+Murderous Eye Jewel
+Item Level: 84
++40 to maximum Life`;
+
+/** OccVortex's passive-tree socket holding a jewel. */
+const TREE_JEWEL_SOCKET = 36634;
+
+const BAD_ITEM ='Rarity: RARE\nUnknown Base Ring\nNot A Real Base\n+80 to maximum Life';
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -501,6 +545,195 @@ async function main(): Promise<void> {
     assert(capError instanceof Error && /51 variants need a full recalculation/.test(capError.message) && (capError as { isUserError?: boolean }).isUserError,
       `expected the fallback-cap user error, got ${capError}`);
     assert(undoDepth() === undoCap, 'undo depth changed after the refused call');
+
+    // ------------------------------------------------------------------
+    log('9. Unequip entries and abyssal sockets (parity with unequip_item / swap_item)');
+    await session.loadBuild(fixtureXml);
+    await bridge.send({ cmd: 'equipItem', slot: 'Helmet', itemText: ABYSS_HELMET });
+    await bridge.send({ cmd: 'equipItem', slot: 'Helmet Abyssal Socket 1', itemText: ABYSS_EYE });
+    await session.loadBuild(await session.exportXML());
+    const eyeSlot = 'Helmet Abyssal Socket 1';
+    assert((await session.getItemInSlot(eyeSlot))?.raw?.includes('Probe Eye'), 'setup did not socket the abyss jewel');
+    const slotId = async (b: LuaBridge, slot: string): Promise<number> =>
+      (await b.send<{ item: { itemId?: number } | null }>({ cmd: 'getItemInSlot', slot })).item?.itemId ?? 0;
+    const xmlAbyss = await session.exportXML();
+    const baseAbyss = (await probe([])).base;
+    const abyssCases: Array<{ name: string; variant: ProbeVariant; mutate: (b: LuaBridge) => Promise<unknown>; dropsEye?: boolean; fallback?: boolean }> = [
+      { name: 'unequip Ring 1', variant: { items: [{ slot: 'Ring 1', unequip: true }] },
+        mutate: (b) => b.send({ cmd: 'unequipItem', slot: 'Ring 1' }) },
+      { name: 'unequip Weapon 1', variant: { items: [{ slot: 'Weapon 1', unequip: true }] },
+        mutate: (b) => b.send({ cmd: 'unequipItem', slot: 'Weapon 1' }) },
+      { name: 'unequip the abyss jewel', variant: { items: [{ slot: eyeSlot, unequip: true }] },
+        mutate: (b) => b.send({ cmd: 'unequipItem', slot: eyeSlot }), dropsEye: true },
+      { name: 'unequip Helmet (drops its abyss jewel)', variant: { items: [{ slot: 'Helmet', unequip: true }] },
+        mutate: (b) => b.send({ cmd: 'unequipItem', slot: 'Helmet' }), dropsEye: true },
+      { name: 'helmet without an abyssal socket (drops the abyss jewel)', variant: { items: [{ slot: 'Helmet', itemText: HELMET }] },
+        mutate: (b) => b.send({ cmd: 'equipItem', slot: 'Helmet', itemText: HELMET }), dropsEye: true },
+      { name: 'unequip + equip in one variant', variant: { items: [{ slot: 'Ring 1', unequip: true }, { slot: 'Amulet', itemText: AMULET }] },
+        mutate: async (b) => {
+          await b.send({ cmd: 'unequipItem', slot: 'Ring 1' });
+          await b.send({ cmd: 'equipItem', slot: 'Amulet', itemText: AMULET });
+        } },
+      { name: 'unequip a passive-tree jewel (fallback)', variant: { items: [{ slot: `Jewel ${TREE_JEWEL_SOCKET}`, unequip: true }] }, fallback: true,
+        mutate: (b) => b.send({ cmd: 'unequipItem', slot: `Jewel ${TREE_JEWEL_SOCKET}` }) },
+    ];
+    const abyssRes = await probe(abyssCases.map((c) => c.variant));
+    assert(normalise(await session.exportXML()) === normalise(xmlAbyss), 'export changed after the unequip probes');
+    for (const [i, c] of abyssCases.entries()) {
+      const r = abyssRes.results[i];
+      assert(!r.error, `${c.name}: ${r.error}`);
+      assert(Boolean(r.fallback) === Boolean(c.fallback), `${c.name}: fallback=${r.fallback} (${r.fallbackReason})`);
+      assert(changesStats(r, baseAbyss, keys), `${c.name}: no stat changed`);
+      const m = await session.withTemporaryChange(async (b) => {
+        await c.mutate(b);
+        return { stats: await b.getStats(), eye: await slotId(b, eyeSlot) };
+      });
+      if (c.dropsEye) assert(m.eye === 0, `${c.name}: the mutate path kept the abyss jewel, the case tests nothing`);
+      const d = statDiffs(r.stats, m.stats, keys);
+      assert(d.length === 0, `${c.name}: probe differs from the mutate path: ${d.join('; ')}`);
+    }
+    const unequipErr = (await probe([{ items: [{ slot: 'No Such Slot', unequip: true }] }])).results[0];
+    assert(unequipErr.userError === true && /slot/i.test(unequipErr.error ?? ''), `unknown unequip slot: ${JSON.stringify(unequipErr)}`);
+    log(`   ${abyssCases.length} unequip / abyssal-socket variants equal the mutate path`);
+
+    // ------------------------------------------------------------------
+    log('10. A call whose variants all fall back reads the base without building a calculator');
+    await session.loadBuild(fixtureXml);
+    const sent: Array<Record<string, unknown>> = [];
+    const spy = bridge as unknown as { send: (cmd: object, ...rest: unknown[]) => Promise<unknown> };
+    const originalSend = spy.send;
+    spy.send = (cmd: object, ...rest: unknown[]) => {
+      sent.push(cmd as Record<string, unknown>);
+      return originalSend.call(bridge, cmd, ...rest);
+    };
+    let allFallback: ProbeResponse;
+    try {
+      allFallback = await probe([{ allocate: [nodeA, nodeB] }, { deallocate: [deallocPick[1].node.id, deallocPick[2].node.id] }]);
+    } finally {
+      spy.send = originalSend;
+    }
+    const probeCmds = sent.filter((c) => c.cmd === 'probe');
+    assert(probeCmds.length === 1 && probeCmds[0].classifyOnly === true,
+      `an all-fallback call sent ${JSON.stringify(probeCmds.map((c) => ({ classifyOnly: c.classifyOnly, variants: (c.variants as unknown[]).length })))}`);
+    assert(allFallback.results.every((r) => r.fallback && !r.error), 'the variants did not fall back');
+    assert(statDiffs(allFallback.base, base, keys).length === 0, `all-fallback base differs: ${statDiffs(allFallback.base, base, keys)}`);
+    const emptyBase = (await probe([])).base;
+    assert(statDiffs(emptyBase, base, keys).length === 0 && Object.keys(emptyBase).length === keys.length, 'variant-less base differs');
+
+    // ------------------------------------------------------------------
+    log('11. Tree searches and item tools on the probe engine');
+    await session.loadBuild(fixtureXml);
+    const statsT = await session.getStats();
+    const num = (v: unknown): number => (typeof v === 'number' ? v : 0);
+    const slack = process.env.CI ? 3 : 1; // shared CI runners are slower
+    /** Run a tool; the export must stay byte-identical and the undo depth unchanged. */
+    async function readOnly<T>(label: string, fn: () => Promise<T>, limitMs?: number): Promise<T> {
+      const xml = await session.exportXML();
+      const depth = undoDepth();
+      let t = performance.now();
+      let out = await fn();
+      let ms = performance.now() - t;
+      if (limitMs && ms >= limitMs * slack) {
+        // Once more: other test scripts may be loading the machine (npm run test:all).
+        log(`   ${label}: ${ms.toFixed(0)} ms, over the limit; timing it again`);
+        t = performance.now();
+        out = await fn();
+        ms = performance.now() - t;
+      }
+      log(`   ${label}: ${ms.toFixed(0)} ms${limitMs ? ` (limit ${limitMs * slack} ms)` : ''}`);
+      if (limitMs) assert(ms < limitMs * slack, `${label} took ${ms.toFixed(0)} ms`);
+      assert((await session.exportXML()) === xml, `${label}: export changed`);
+      assert(undoDepth() === depth, `${label}: undo depth changed`);
+      return out;
+    }
+
+    const adjacent = (await session.getReachableNodes()).filter((n) => !n.isJewelSocket).map((n) => n.id).sort((a, b) => a - b);
+    const best1 = await readOnly('find_best_next_nodes maxPoints 1', () => session.findBestNextNodes(10_000, 'CombinedDPS', false, 1, 'total'));
+    const best1Ids = best1.rankings.map((r) => r.nodeId).sort((a, b) => a - b);
+    assert(JSON.stringify(best1Ids) === JSON.stringify(adjacent),
+      `maxPoints 1 differs from the adjacent nodes: only new ${best1Ids.filter((id) => !adjacent.includes(id))}, only old ${adjacent.filter((id) => !best1Ids.includes(id))}`);
+    assert(best1.rankings.every((r) => r.pointsCost === 1 && r.deltaPerPoint === r.delta), 'a maxPoints 1 ranking costs more than one point');
+    for (const r of best1.rankings.slice(0, 5)) {
+      const m = await viaMutate((b) => b.send({ cmd: 'allocNode', nodeId: r.nodeId }));
+      const expected = num(m.stats.CombinedDPS) - num(statsT.CombinedDPS);
+      assert(r.delta === expected, `best node ${r.nodeId} (${r.nodeName}): delta ${r.delta}, allocNode gives ${expected}`);
+    }
+
+    const best3 = await readOnly('find_best_next_nodes (default maxPoints 3)', () => session.findBestNextNodes(), 5000);
+    assert(best3.rankings.length === 10, `expected 10 rankings, got ${best3.rankings.length}`);
+    for (let i = 1; i < best3.rankings.length; i++) {
+      assert((best3.rankings[i - 1].deltaPerPoint ?? 0) >= (best3.rankings[i].deltaPerPoint ?? 0), 'rankings are not sorted by delta per point');
+    }
+    const multi = best3.rankings.find((r) => (r.pointsCost ?? 0) > 1);
+    assert(multi, `no node with pointsCost > 1 in the top 10: ${JSON.stringify(best3.rankings.map((r) => [r.nodeName, r.pointsCost]))}`);
+    {
+      const m = await viaMutate((b) => b.send({ cmd: 'allocNode', nodeId: multi.nodeId }));
+      const added = m.nodes.filter((id) => !allocated0.includes(id)).sort((a, b) => a - b);
+      const path = (multi.path ?? []).map((p) => p.id);
+      assert(path[path.length - 1] === multi.nodeId && JSON.stringify([...path].sort((a, b) => a - b)) === JSON.stringify(added),
+        `path ${path} vs allocNode adding ${added}`);
+      assert(multi.pointsCost === added.length, `pointsCost ${multi.pointsCost} vs ${added.length} nodes added`);
+      assert(multi.delta === num(m.stats.CombinedDPS) - num(statsT.CombinedDPS), `${multi.nodeName}: delta differs from allocNode`);
+      assert(multi.deltaPerPoint === multi.delta / added.length, 'deltaPerPoint');
+      log(`   ${multi.nodeName}: ${multi.pointsCost} points via ${(multi.path ?? []).map((p) => p.name).join(' -> ')}`);
+    }
+
+    await readOnly('find_worst_allocated_nodes (default)', () => session.findWorstAllocatedNodes(), 3000);
+    const worst = await readOnly('find_worst_allocated_nodes (all)', () => session.findWorstAllocatedNodes(10_000, 'CombinedDPS'));
+    for (let i = 1; i < worst.rankings.length; i++) {
+      assert((worst.rankings[i - 1].lossPerPoint ?? 0) <= (worst.rankings[i].lossPerPoint ?? 0), 'worst rankings are not sorted by loss per point');
+    }
+    assert(worst.rankings.every((r) => r.nodeType !== 'Mastery' && r.nodeType !== 'ClassStart'), 'a mastery or class start was ranked');
+    const worstNotable = worst.rankings.find((r) => r.isNotable && (r.pointsRefunded ?? 0) > 1 && (r.removedNodeCount ?? 0) <= 25);
+    assert(worstNotable, 'no notable with pointsRefunded > 1');
+    {
+      const m = await viaMutate((b) => b.send({ cmd: 'deallocNode', nodeId: worstNotable.nodeId }));
+      const removed = allocated0.filter((id) => !m.nodes.includes(id));
+      const listed = (worstNotable.removedNodes ?? []).map((n) => n.id).sort((a, b) => a - b);
+      assert(JSON.stringify(listed) === JSON.stringify(removed), `removedNodes ${listed} vs deallocNode removing ${removed}`);
+      assert(worstNotable.lossIfRemoved === num(statsT.CombinedDPS) - num(m.stats.CombinedDPS), `${worstNotable.nodeName}: loss differs from deallocNode`);
+      log(`   ${worstNotable.nodeName}: refunds ${worstNotable.pointsRefunded} points, loss ${worstNotable.lossIfRemoved}`);
+    }
+    const worstTotal = await session.findWorstAllocatedNodes(10_000, 'Life', 'total');
+    for (let i = 1; i < worstTotal.rankings.length; i++) {
+      assert((worstTotal.rankings[i - 1].lossIfRemoved ?? 0) <= (worstTotal.rankings[i].lossIfRemoved ?? 0), 'rankBy total is not sorted by loss');
+    }
+    if (worst.skipped.length > 0) log(`   ${worst.skipped.length} slow nodes skipped (cap ${MAX_SEARCH_FALLBACKS})`);
+
+    const cmp = await readOnly('compare_items (2 items)', () => session.compareItems('Ring 1', [RING_A, RING_B]), 200);
+    for (const [i, text] of [RING_A, RING_B].entries()) {
+      const m = await viaMutate((b) => b.send({ cmd: 'equipItem', slot: 'Ring 1', itemText: text }));
+      const c = cmp.candidates[i];
+      assert(c.error === null && c.stats, `candidate ${i}: ${c.error}`);
+      assert(statDiffs(c.stats, m.stats, keys).length === 0 && JSON.stringify(Object.keys(c.stats).sort()) === JSON.stringify(Object.keys(m.stats).sort()),
+        `compare_items candidate ${i} differs from equipItem: ${statDiffs(c.stats, m.stats, keys)}`);
+    }
+
+    const upgrades = await readOnly('suggest_upgrades', () => session.suggestUpgrades());
+    {
+      const ring = upgrades.find((u) => u.slot === 'Ring 1');
+      assert(ring && ring.error === undefined, `Ring 1 suggestion: ${JSON.stringify(ring)}`);
+      const m = await viaMutate((b) => b.send({ cmd: 'unequipItem', slot: 'Ring 1' }));
+      assert(ring.ehpContribution === num(statsT.TotalEHP) - num(m.stats.TotalEHP), 'Ring 1 EHP contribution differs from unequipItem');
+      assert(ring.dpsContribution === num(statsT.CombinedDPS) - num(m.stats.CombinedDPS), 'Ring 1 DPS contribution differs from unequipItem');
+    }
+
+    const ci = await readOnly('evaluate_keystone (Chaos Inoculation)', () => session.evaluateKeystone('Chaos Inoculation'));
+    {
+      const m = await viaMutate((b) => b.send({ cmd: 'allocNode', nodeId: ci.nodeId }));
+      assert(statDiffs(ci.after, m.stats, keys).length === 0, `evaluate_keystone differs from allocNode: ${statDiffs(ci.after, m.stats, keys)}`);
+    }
+
+    const sim = await readOnly('simulate_passive_change (one node)', () => session.simulatePassiveChange([multi.nodeId], []));
+    {
+      const m = await viaMutate((b) => b.send({ cmd: 'allocNodes', nodeIds: [multi.nodeId] }));
+      const sameKeys = JSON.stringify(Object.keys(sim.after).sort()) === JSON.stringify(Object.keys(m.stats).sort());
+      assert(sim.valid && sameKeys && statDiffs(sim.after, m.stats, keys).length === 0,
+        `simulate_passive_change differs from allocNodes: ${statDiffs(sim.after, m.stats, keys)}`);
+      // A node the probe refuses (already allocated) takes the mutate path, as before.
+      const again = await session.simulatePassiveChange([deallocPick[1].node.id], []);
+      assert(again.valid && Object.keys(again.statDiff).length === 0, 'an already allocated node changed stats');
+    }
 
     log('ALL TESTS PASSED');
   } finally {

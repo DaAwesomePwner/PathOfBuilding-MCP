@@ -93,8 +93,8 @@ The server exposes 39 MCP tools. See [`GETTING_STARTED.md`](./GETTING_STARTED.md
 - **Engine setup:** `configure_pob_path`, `get_engine_info`, `reload_engine` (these work even when PoB is not configured).
 - **Build I/O:** `load_build`, `export_build` (summary, XML or PoB build code — round-trip lossless), `reset_build`.
 - **Inspection:** `get_stats`, `get_skill_breakdown`, `list_equipped_items`, `list_valid_slots`, `get_item_in_slot`.
-- **Items:** `swap_item`, `unequip_item`, `compare_items`, `suggest_upgrades`.
-- **Passive tree:** `get_passive_tree`, `simulate_passive_change`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `convert_tree_to_latest` (moves an old-league tree to PoB's latest tree, undoable, reports the nodes and masteries lost).
+- **Items:** `swap_item`, `unequip_item`, `compare_items` (2-5 candidates for a slot, read-only, well under a second), `suggest_upgrades` (each slot's DPS/EHP contribution, measured by emptying it, read-only).
+- **Passive tree:** `get_passive_tree`, `simulate_passive_change`, `find_best_next_nodes` (every node whose path costs at most `maxPoints` points, default 3, ranked by gain per point or in total with `rankBy`; reports each node's cost and path; a few seconds), `find_worst_allocated_nodes` (every allocated node, notables and keystones included, removed with the nodes that depend on it; ranked by loss per refunded point or in total), `evaluate_keystone`, `convert_tree_to_latest` (moves an old-league tree to PoB's latest tree, undoable, reports the nodes and masteries lost).
 - **Gems:** `list_skill_groups`, `lookup_gem`, `list_available_supports`, `swap_gem`, `compare_supports`, `evaluate_gem_levels`, `find_optimal_links`.
 - **Config / scenarios:** `get_config`, `set_config`, `list_scenarios`, `simulate_scenario`, `compare_scenarios`, `toggle_buffs`.
 - **State / analysis:** `undo_last_change`, `snapshot_and_compare`, `diagnose_build`.

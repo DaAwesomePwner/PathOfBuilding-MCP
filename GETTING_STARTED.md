@@ -30,7 +30,7 @@ Three layers, three responsibilities:
 - **Never exits for a missing install.** If PoB or LuaJIT can't be found the server still starts; engine tools return an error asking for the PoB folder (`configure_pob_path`), or ask you directly via MCP elicitation when the client supports it.
 - **Version-aware.** If PoB updates itself on disk (new league), tools refuse to run on the stale in-memory engine and point at `reload_engine`.
 - **Serial execution.** A mutex guarantees only one operation runs at a time. PoB is fundamentally a single-threaded singleton with shared global state.
-- **Snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `suggest_upgrades`, etc. all wrap their probes in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
+- **Read-only probes and snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `suggest_upgrades` and a one-node `simulate_passive_change` evaluate each variant through PoB's own calculator (the one its tooltips use, a few ms per variant) without touching the build; the few variants it cannot reproduce exactly, and the other what-if tools, wrap the change in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
@@ -53,14 +53,14 @@ Three layers, three responsibilities:
 - `get_item_in_slot` — full item text and metadata for one slot, or `{empty: true}`.
 - `swap_item` — equip an item from PoB-format text, **mutates** the build, returns before/after diff.
 - `unequip_item` — remove an item from a slot, **mutates**, returns diff.
-- `compare_items` — test 2-5 candidate items in a slot non-destructively. Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`.
+- `compare_items` — test 2-5 candidate items in a slot non-destructively (tens of milliseconds). Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`; a candidate that does not fit or parse gets its own `error`.
 
 ### Passive tree (6)
 - `get_passive_tree` — every allocated node with stats, plus point counts and class info.
-- `simulate_passive_change` — temporarily allocate/deallocate by node ID or name. Validates connectivity. Always restored.
-- `find_best_next_nodes` — scans every reachable unallocated node, ranks by your chosen stat (Life, CombinedDPS, TotalEHP, etc.). ~26s on a typical end-game build.
-- `find_worst_allocated_nodes` — finds your least valuable Normal nodes (skips keystones, ascendancy, sockets, masteries; refuses to disconnect the tree).
-- `evaluate_keystone` — toggle any keystone, return full stat diff.
+- `simulate_passive_change` — temporarily allocate/deallocate by node ID or name (allocating takes the node's path with it, deallocating its dependents). Validates connectivity. Always restored.
+- `find_best_next_nodes` — evaluates every unallocated node whose path from your tree costs at most `maxPoints` points (default 3, up to 10), so a notable two travel nodes away is found too, and ranks by gain per point (`rankBy: "perPoint"`, default) or total gain (`"total"`) of your chosen stat (Life, CombinedDPS, TotalEHP, etc.). Each result lists its `pointsCost` and `path`. ~2s on a typical end-game build (~0.4s with `maxPoints: 1`).
+- `find_worst_allocated_nodes` — finds your least valuable allocated nodes: normal, notable, keystone and empty jewel sockets, each removed together with the nodes that depend on it (so the tree stays connected), ranked by loss per refunded point (default) or total loss. Skips ascendancy nodes and masteries. ~1.5s.
+- `evaluate_keystone` — toggle any keystone (adding it takes its path), return full stat diff.
 - `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
 ### Skill gems and links (7)
@@ -82,7 +82,7 @@ Three layers, three responsibilities:
 
 ### Optimization advisor (5)
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`.
-- `suggest_upgrades` — unequips each slot in turn to measure its DPS+EHP contribution, ranks by upgrade priority, suggests archetype-aware mods.
+- `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only, well under a second), ranks by upgrade priority, suggests archetype-aware mods.
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
 - `undo_last_change` — pops the undo stack (works for swap/unequip/swap_gem/set_config/convert_tree_to_latest/etc.).
 - `reset_build` — discard everything, return to the originally loaded state.
@@ -151,7 +151,7 @@ A user prompt to Claude like *"Here's my build code: `eNrtPGtv28b...` — what's
 1. `load_build({ source: "eNrtPGtv28b..." })` — Claude pastes the code in.
 2. `get_stats({})` — sanity check on baseline stats.
 3. `diagnose_build({})` — see if anything jumps out (uncapped resist, low EHP, bad mana, etc.).
-4. `suggest_upgrades({})` — full unequip-and-measure sweep across every slot, ~26s.
+4. `suggest_upgrades({})` — unequip-and-measure sweep across every slot, well under a second.
 5. `list_equipped_items({})` — pull mod text on the slot it flagged.
 6. Claude reasons about *what mods* would help and replies with a prioritized recommendation.
 
@@ -171,10 +171,10 @@ To shop for an upgrade on the trade site:
 ## Important behavior to know
 
 - **All work is serial.** If you ask Claude to compare 5 items and find optimal links at the same time, the second tool call waits. This is intentional — PoB cannot run concurrent calculations.
-- **Mutations require explicit undo or reset.** `swap_item`, `unequip_item`, `swap_gem`, `set_config`, `simulate_passive_change` (when written as commit) all push to the undo stack. `undo_last_change` reverts one step; `reset_build` reverts everything.
+- **Mutations require explicit undo or reset.** `swap_item`, `unequip_item`, `set_config` and `convert_tree_to_latest` push to the undo stack; `simulate_passive_change` and the other what-if tools never do. `undo_last_change` reverts one step; `reset_build` reverts everything.
 - **Simulation tools never persist.** `simulate_*`, `compare_*`, `evaluate_*`, `find_*` always restore the state in `finally`, even if the operation throws. Verified bit-exact across 70+ tests.
 - **Build code round-trip is lossless.** `export_build({ format: "code" })` produces a string you can paste back into PoB-the-app or back into `load_build`. Same for `format: "xml"`.
-- **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; full-tree scans 16-26s.
+- **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; node searches (`find_best_next_nodes`, `find_worst_allocated_nodes`) a few seconds.
 - **Crash circuit breaker.** After 3 strikes (unexpected exits, command timeouts or failed starts) the server refuses to respawn LuaJIT and tells you to restart the MCP server (or update Path of Building and call `reload_engine`). Prevents respawn loops. Earlier crashes restart the engine with the last committed build; the first call afterwards reports it and clears undo history.
 - **PoB updates.** When PoB updates itself (new league), tools stop with *"Path of Building was updated on disk from X to Y"*. `reload_engine` restarts the engine and reloads your build; undo history is cleared.
 

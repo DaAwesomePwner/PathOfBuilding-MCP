@@ -23,7 +23,8 @@
 //   8. convert_tree_to_latest interrupted by a crash or a timeout with the new
 //      spec active: no rollback on (or respawn into) a fresh engine during the
 //      call; the next call restores the pre-conversion build. Likewise a
-//      what-if probe whose engine dies is not restored onto a fresh engine.
+//      what-if probe whose engine dies (in the `probe` command, or in the
+//      `probeCommit` of a fallback variant) is not restored onto a fresh engine.
 //   9. POB_MCP_TEST_FAULTS in the server's own environment never reaches the
 //      engine; only the LuaBridge option sets it.
 //  10. swap_item / set_config / convert_tree_to_latest whose engine dies right
@@ -407,16 +408,25 @@ async function test8Convert(): Promise<void> {
     assert((await session.getBuildInfo()).treeVersion === '3_13', `${fault}: the pre-conversion tree is back`);
     assertSame(`${fault}: restored build`, await state(session), committed);
   }
-  // Same rule for what-if probes: the restore after a probe whose engine died
-  // must not run on (or start) a fresh engine.
-  const bridge = newBridge(120_000, 'exitOn_equipItem');
-  const { session, base } = await primedSession(bridge);
-  const spawns = bridge.getSpawnCount();
-  const e = await rejection(session.compareItems('Ring 1', [RING_A]));
-  assert(!(e instanceof UserError) && /stopped during this call/.test(e.message), `probe restore on a dead engine: ${e.message}`);
-  assert(bridge.getSpawnCount() === spawns && !bridge.isRunning(), 'no engine may be started during the failed probe');
-  await expectRestart('after the probe crash', session.getStats(), /build was restored/);
-  assertSame('after the probe crash', await state(session), base);
+  // Same rule for what-if probes: a probe whose engine died fails its call
+  // without starting a fresh engine (compare_items runs on the `probe`
+  // command), and the restore after a fallback variant (several node changes:
+  // snapshot, `probeCommit`, restore) whose engine died never runs on one.
+  for (const fault of ['exitOn_probe', 'exitOn_probeCommit']) {
+    const bridge = newBridge(120_000, fault);
+    const { session, base } = await primedSession(bridge);
+    const reachable = (await session.getReachableNodes()).filter((n) => !n.isJewelSocket).slice(0, 2).map((n) => n.id);
+    const spawns = bridge.getSpawnCount();
+    const e = await rejection(fault === 'exitOn_probe'
+      ? session.compareItems('Ring 1', [RING_A])
+      : session.probe({ variants: [{ allocate: reachable }] }));
+    // A `probe` crash has nothing to restore; a fallback's restore is refused on the dead engine.
+    const expected = fault === 'exitOn_probe' ? /exited unexpectedly/ : /stopped during this call/;
+    assert(!(e instanceof UserError) && expected.test(e.message), `${fault}: probe on a dead engine: ${e.message}`);
+    assert(bridge.getSpawnCount() === spawns && !bridge.isRunning(), `${fault}: no engine may be started during the failed probe`);
+    await expectRestart(`${fault}: after the probe crash`, session.getStats(), /build was restored/);
+    assertSame(`${fault}: after the probe crash`, await state(session), base);
+  }
   log('PASS 8');
 }
 
