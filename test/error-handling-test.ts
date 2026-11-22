@@ -85,10 +85,15 @@ async function checkUserErrorsFromShortScriptPath(paths: ResolvedPaths): Promise
   const shortScript = path.join(shortDir, 'b.lua');
   assert(shortScript.length < 50, `temp dir path is too long to test an untruncated script path: ${shortScript}`);
   mkdirSync(shortDir, { recursive: true });
-  copyFileSync(paths.bridgeLua, shortScript);
-  const luaDir = path.dirname(paths.bridgeLua);
-  for (const name of readdirSync(luaDir)) {
-    if (name.endsWith('.lua') && name !== path.basename(paths.bridgeLua)) copyFileSync(path.join(luaDir, name), path.join(shortDir, name));
+  try {
+    copyFileSync(paths.bridgeLua, shortScript);
+    const luaDir = path.dirname(paths.bridgeLua);
+    for (const name of readdirSync(luaDir)) {
+      if (name.endsWith('.lua') && name !== path.basename(paths.bridgeLua)) copyFileSync(path.join(luaDir, name), path.join(shortDir, name));
+    }
+  } catch (e) {
+    rmSync(shortDir, { recursive: true, force: true });
+    throw e;
   }
   const bridge = new LuaBridge({ ...paths, bridgeLua: shortScript }, 60_000);
   try {
