@@ -2018,7 +2018,12 @@ end
 -- table and reorder it. What-ifs therefore never write to these tables: they
 -- swap in copies and later put the very same objects back. (One table of
 -- functions: the main chunk is at Lua's limit of 200 locals.)
-local ConfigTables = { stash = nil }
+-- `replaced` maps the input table of copies a change swapped in (a probe
+-- fallback, apply_changes) to the committed tables it replaced, untouched
+-- since: a restore (rollback, undo) whose target values are theirs puts those
+-- very tables back. Writing to the live tables drops their entry; weak keys,
+-- so the tables of a replaced build go away.
+local ConfigTables = { replaced = setmetatable({ }, { __mode = "k" }) }
 do
 	local function current()
 		local configTab = build.configTab
@@ -2091,11 +2096,11 @@ do
 		return n == 0
 	end
 
-	-- probeCommit detached the config tables for a fallback variant: the
-	-- restore that follows puts `orig` back (while `detached` is still the
-	-- live input table), before comparing or changing any key.
+	-- probeCommit and apply_changes swapped in copies (`detached` is their
+	-- input table) for the committed tables `orig`: a later restoreInput to
+	-- orig's values puts orig back instead of writing to the copies.
 	function ConfigTables.stashCommitted(orig, detached)
-		ConfigTables.stash = { orig = orig, detached = detached }
+		ConfigTables.replaced[detached] = orig
 	end
 end
 
@@ -2115,12 +2120,15 @@ function ConfigTables.restoreInput(input)
 		error("Config tab not available")
 	end
 	input = input or { }
-	local stash = ConfigTables.stash
-	ConfigTables.stash = nil
-	if stash and stash.detached == build.configTab.input then
-		-- After a fallback variant with config: the committed tables, never
-		-- written, go back first; the copies are dropped.
-		ConfigTables.attach(stash.orig)
+	local live = ConfigTables.current()
+	local orig = ConfigTables.replaced[live.input]
+	if orig and orig.set == live.set and ConfigTables.sameInput(orig.input, input) then
+		-- The live tables are copies swapped in for tables that hold exactly
+		-- the target values (the restore after a fallback variant with config,
+		-- a rollback or undo of apply_changes): those tables, never written
+		-- since, go back; the copies are dropped.
+		ConfigTables.replaced[live.input] = nil
+		ConfigTables.attach(orig)
 	end
 	local current = ConfigTables.current()
 	if ConfigTables.sameInput(current.input, input) then
@@ -2132,6 +2140,7 @@ function ConfigTables.restoreInput(input)
 		-- Change only the keys that differ (set_config undo); a value equal
 		-- but for JSON rounding is left as it is.
 		local target = current.input
+		ConfigTables.replaced[target] = nil
 		for key in pairs(target) do
 			if input[key] == nil then target[key] = nil end
 		end
@@ -4196,6 +4205,7 @@ local DISPATCH = {
 	setConfig = {
 		-- Inline mutation: options loop + rebuild before stats
 		handler = function(cmd)
+			ConfigTables.replaced[build.configTab.input] = nil
 			for key, value in pairs(cmd.options or { }) do
 				build.configTab.input[key] = value
 			end
@@ -4581,12 +4591,6 @@ do
 		pumpAndRead = pumpAndRead,
 		nodeBatch = nodeBatch,
 		buildEdit = buildEdit,
-		-- As the setConfig command sets options, without the recalculation.
-		setConfigInput = function(options)
-			for key, value in pairs(options) do build.configTab.input[key] = value end
-			build.configTab:BuildModList()
-			build.buildFlag = true
-		end,
 	})
 	DISPATCH.probe = {
 		handler = function(cmd)

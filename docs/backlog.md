@@ -118,9 +118,9 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
   `src/server.ts:33-65` (use `build.displayStats`); max points `99+23` / `8`
   (`lua/bridge.lua:851-852`); `optimizeFor` accepts unknown stats and returns
   zero deltas.
-- **Gem lookup quirks.** "X Support" names fail; archetype detection uses name
-  regexes (`src/build-session.ts:1985-1993`). Fall back to `data.gemForBaseName`
-  and gem tags.
+- **Gem lookup quirks.** "X Support" names fail. Fall back to
+  `data.gemForBaseName` and gem tags. (The archetype detection by name regexes
+  is gone: `suggest_upgrades` takes its mods from PoB's trade query generator.)
 
 ## MCP layer
 

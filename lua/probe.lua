@@ -1322,12 +1322,12 @@ return function(ctx)
 		edit.started()
 		if config then
 			-- As set_config sets the options, but on copies of the config
-			-- tables (as probeCommit does), the committed ones stashed: a
-			-- rollback (ConfigTables.restoreInput) puts them back unwritten,
-			-- so their pairs() order stays; writing keys into them and
-			-- deleting them again may not keep it (the string hash seed
-			-- differs per process). The stash is cleared once everything is
-			-- applied.
+			-- tables (as probeCommit does), which stay live once the change is
+			-- committed; the committed tables are remembered unwritten
+			-- (stashCommittedConfigTables), so a rollback or an undo of this
+			-- change (ConfigTables.restoreInput) puts them back with their
+			-- pairs() order. Writing keys into them and deleting them again
+			-- may not keep it (the string hash seed differs per process).
 			local orig = ctx.detachConfigTables(config)
 			ctx.stashCommittedConfigTables(orig, build.configTab.input)
 			build.configTab:BuildModList()
@@ -1361,8 +1361,6 @@ return function(ctx)
 		table.sort(extra)
 		for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
 		local result = { added = added, removed = nodeBatch.lostSince(before), allocOrder = allocOrder, gemNames = gemNames }
-		-- Applied in full: no rollback will need the committed config tables.
-		if config then ctx.stashCommittedConfigTables(nil, nil) end
 		edit.applied(result, cmd.replay == true)
 		runCallback("OnFrame")
 		return result

@@ -2358,14 +2358,23 @@ export class BuildSession {
       // Suggested mods: PoB's weighted trade query for the highest-priority slots.
       const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, focusSlots.length));
       const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
+      // A failure is recorded on its slot and the measurements are kept. A
+      // query that ended the engine (a bridge timeout kills it and counts as
+      // a crash strike) stops the queries: the slots after it are marked.
+      let engineGone = false;
       for (const s of out.filter((x) => x.error === undefined).slice(0, modSlots)) {
+        if (engineGone) {
+          s.modsError = "not computed: the engine stopped during an earlier slot's trade query";
+          continue;
+        }
         try {
           const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
           const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
           s.suggestedMods = topTradeMods(raw, modsPerSlot);
         } catch (e) {
-          if (!(e instanceof UserError)) throw e;
-          s.modsError = e.message;
+          const message = e instanceof Error ? e.message : String(e);
+          s.modsError = e instanceof UserError ? message : `Path of Building's trade query generator failed: ${message}`;
+          engineGone = !this.bridge.isRunning();
         }
       }
       return out;
@@ -3006,7 +3015,7 @@ export interface UpgradeSuggestion {
   priority: number;
   /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
   suggestedMods?: SuggestedMod[];
-  /** PoB's trade query generator could not weigh mods for the slot. */
+  /** PoB's trade query generator could not weigh mods for the slot (a refusal, or a failure of the generator). */
   modsError?: string;
   /** The slot could not be measured (refused as input); its contributions are 0. */
   error?: string;

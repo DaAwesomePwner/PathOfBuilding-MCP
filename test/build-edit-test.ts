@@ -122,6 +122,12 @@ interface State {
   stats: Stats;
 }
 
+/** The committed config tables by value and in pairs() order (PoB 2.67 exports them in that order). */
+async function configTables(bridge: LuaBridge): Promise<string> {
+  const res = await bridge.send<{ fingerprint: string[] }>({ cmd: 'probe', fingerprint: true });
+  return JSON.stringify(res.fingerprint.filter((line) => line.startsWith('config')));
+}
+
 async function state(session: BuildSession): Promise<State> {
   // Export first: an export written before PoB recalculated carries stale
   // PlayerStat lines, so this order catches a change left unrecalculated.
@@ -255,6 +261,7 @@ async function test1Parity(): Promise<void> {
     items: [{ slot: 'Ring 1', itemText: RING }],
   };
   let result: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+  const tablesBefore = await configTables(bridge);
   await assertParity('mixed', session, mixed, async () => {
     result = await session.applyChanges(mixed);
     return result.after;
@@ -269,6 +276,13 @@ async function test1Parity(): Promise<void> {
   assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'one undo entry, one journal record');
   await session.undoLastChange();
   assertSame('undo of the mixed variant', await state(session), base);
+  assert((await configTables(bridge)) === tablesBefore, 'undo of the mixed variant: config tables differ in value or pairs() order');
+  // Config keys added and removed again can reorder a table; undo puts the very tables back.
+  for (let i = 0; i < 5; i++) {
+    await session.applyChanges({ config: { useFrenzyCharges: true, buffOnslaught: true, conditionLowLife: true, buffElusive: true } });
+    await session.undoLastChange();
+    assert((await configTables(bridge)) === tablesBefore, `apply_changes config + undo #${i + 1}: config tables differ in value or pairs() order`);
+  }
   log('PASS 1b');
 
   log('Test 1c: undo of a main-skill gem change restores the cached main skill');

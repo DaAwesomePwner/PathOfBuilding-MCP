@@ -208,6 +208,39 @@ async function main(): Promise<void> {
     assert((await state()) === before, 'suggest_upgrades changed the build, config, undo depth or fingerprint');
     log('PASS: suggested mods carry PoB weights; build unchanged');
 
+    log('Test 8: a trade query failure stays on its slot');
+    const realSend = bridge.send.bind(bridge);
+    const realRunning = bridge.isRunning.bind(bridge);
+    const order = measured.map((s) => s.slot);
+    const failSlot = (slot: string, gone: boolean): void => {
+      (bridge as unknown as { send: typeof bridge.send }).send = (<T>(command: object, timeout?: number): Promise<T> => {
+        const c = command as { cmd?: string; slot?: string };
+        if (c.cmd === 'tradeQuery' && c.slot === slot) {
+          if (gone) (bridge as unknown as { isRunning: () => boolean }).isRunning = () => false;
+          return Promise.reject(new Error('simulated trade query failure'));
+        }
+        return realSend<T>(command, timeout);
+      }) as typeof bridge.send;
+    };
+    try {
+      failSlot(order[0], false);
+      const failedOne = await session.suggestUpgrades();
+      assert(failedOne.length === suggestions.length, 'every slot still listed');
+      const first = failedOne.find((s) => s.slot === order[0])!;
+      assert(first.suggestedMods === undefined && /trade query generator failed: simulated/.test(first.modsError ?? ''), `failed slot: ${JSON.stringify(first)}`);
+      assert(first.dpsContribution === measured[0].dpsContribution && first.ehpContribution === measured[0].ehpContribution, 'measurement kept');
+      assert(failedOne.filter((s) => (s.suggestedMods?.length ?? 0) > 0).length === 2, 'the other two slots still get mods');
+      failSlot(order[0], true);
+      const gone = await session.suggestUpgrades();
+      const rest = gone.filter((s) => s.error === undefined).slice(1, 3);
+      assert(rest.every((s) => s.suggestedMods === undefined && /engine stopped/.test(s.modsError ?? '')), `slots after an engine loss: ${JSON.stringify(rest)}`);
+    } finally {
+      (bridge as unknown as { send: typeof bridge.send }).send = realSend;
+      (bridge as unknown as { isRunning: () => boolean }).isRunning = realRunning;
+    }
+    assert((await state()) === before, 'build changed');
+    log('PASS: failures recorded per slot; queries stop once the engine is gone');
+
     console.log('\nALL STAT WEIGHTS TESTS PASSED');
   } finally {
     await bridge.dispose();
