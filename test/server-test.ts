@@ -84,6 +84,13 @@ async function main(): Promise<void> {
     assert(typeof stats.defense.Life === 'number' && (stats.defense.Life as number) > 0, 'Life should be > 0');
     assert(typeof stats.offense.CombinedDPS === 'number' && (stats.offense.CombinedDPS as number) > 0, 'CombinedDPS > 0');
     log(`PASS: Life=${stats.defense.Life}, CombinedDPS=${stats.offense.CombinedDPS}`);
+    // Keys outside the bridge's default stat list come through the category mode too.
+    assert(typeof stats.offense.Speed === 'number' && (stats.offense.Speed as number) > 0, 'offense.Speed missing');
+    assert(typeof stats.offense.CritChance === 'number' && (stats.offense.CritChance as number) > 0, 'offense.CritChance missing');
+    assert(typeof stats.defense.BlockChance === 'number' && (stats.defense.BlockChance as number) > 0, 'defense.BlockChance missing');
+    assert(typeof stats.attributes?.Str === 'number' && typeof stats.attributes?.Int === 'number', 'attributes missing');
+    assert(typeof stats.charges?.PowerChargesMax === 'number', 'charges.PowerChargesMax missing');
+    log('PASS: category stats include keys outside the bridge default list');
 
     log('Test 3: get_stats (filtered to defense)');
     const defResult = await client.callTool({
