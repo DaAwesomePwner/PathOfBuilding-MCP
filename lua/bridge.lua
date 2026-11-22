@@ -2442,8 +2442,55 @@ local function withTreeRollback(fn)
 	error(err, 0)
 end
 
-local function allocNodesBatch(nodeIds)
+-- Helpers of the node batches below, in one table (the main chunk is close
+-- to LuaJIT's limit of 200 locals).
+local nodeBatch = { }
+
+-- `strict` (allocate_nodes / deallocate_nodes) also refuses a repeated id
+-- and, when allocating, a mastery (choosing mastery effects is not supported)
+-- or a node that is already allocated.
+function nodeBatch.strictChecks(nodes, allocating)
+	local seen = { }
+	for _, node in ipairs(nodes) do
+		if seen[node.id] then
+			userError("Node " .. nodeLabel(node) .. " is listed more than once")
+		end
+		seen[node.id] = true
+		if allocating and node.type == "Mastery" then
+			userError("Node " .. nodeLabel(node) .. " is a mastery; allocating masteries (choosing a mastery effect) is not supported yet")
+		end
+		if allocating and node.alloc then
+			userError("Node " .. nodeLabel(node) .. " is already allocated")
+		end
+	end
+end
+
+function nodeBatch.allocatedIdSet()
+	local set = { }
+	for id in pairs(build.spec.allocNodes) do set[id] = true end
+	return set
+end
+
+-- Nodes allocated before (`before`, an id set) and not now, by id.
+function nodeBatch.lostSince(before)
+	local lost = { }
+	for id in pairs(before) do
+		if not build.spec.allocNodes[id] then lost[#lost + 1] = id end
+	end
+	table.sort(lost)
+	for i, id in ipairs(lost) do lost[i] = build.spec.nodes[id] end
+	return lost
+end
+
+-- Returns the nodes the batch added, in the order they joined the tree (each
+-- one next to the tree as it was then: PoB's path runs from the node back to
+-- the tree), and the nodes it removed (another option of a choice node).
+-- Allocating exactly the added ids in that order reproduces the change
+-- whichever of several equally short paths PoB picked (its choice depends on
+-- table order, which differs between processes): what a crash replay needs.
+local function allocNodesBatch(nodeIds, strict)
 	local nodes = batchNodes(nodeIds)
+	if strict then nodeBatch.strictChecks(nodes, true) end
 	local choiceParent = { }
 	for _, node in ipairs(nodes) do
 		-- PassiveSpec:AllocNode silently does nothing for a node no path
@@ -2463,8 +2510,19 @@ local function allocNodesBatch(nodeIds)
 			choiceParent[parent] = node
 		end
 	end
+	local before = nodeBatch.allocatedIdSet()
+	local order, listed = { }, { }
 	withTreeRollback(function()
 		for _, node in ipairs(nodes) do
+			local path = node.path or { }
+			if #(node.intuitiveLeapLikesAffecting or { }) > 0 then path = { node } end
+			for i = #path, 1, -1 do
+				local pathNode = path[i]
+				if not pathNode.alloc and not listed[pathNode.id] then
+					listed[pathNode.id] = true
+					order[#order + 1] = pathNode
+				end
+			end
 			build.spec:AllocNode(node)
 		end
 		for _, node in ipairs(nodes) do
@@ -2473,12 +2531,27 @@ local function allocNodesBatch(nodeIds)
 			end
 		end
 	end)
+	local added = { }
+	for _, node in ipairs(order) do
+		if node.alloc then added[#added + 1] = node end
+	end
+	-- Anything else that became allocated (not expected) follows, by id.
+	local extra = { }
+	for id in pairs(build.spec.allocNodes) do
+		if not before[id] and not listed[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	for _, id in ipairs(extra) do added[#added + 1] = build.spec.nodes[id] end
 	build.buildFlag = true
 	runCallback("OnFrame")
+	return added, nodeBatch.lostSince(before)
 end
 
-local function deallocNodesBatch(nodeIds)
+-- Returns the nodes removed (the requested ones and every node that depended
+-- on them), by id.
+local function deallocNodesBatch(nodeIds, strict)
 	local nodes = batchNodes(nodeIds)
+	if strict then nodeBatch.strictChecks(nodes, false) end
 	for _, node in ipairs(nodes) do
 		if node.type == "ClassStart" or node.type == "AscendClassStart" then
 			userError("Node " .. nodeLabel(node) .. " is a class start and cannot be deallocated")
@@ -2490,6 +2563,7 @@ local function deallocNodesBatch(nodeIds)
 			userError("Node " .. nodeLabel(node) .. " is not allocated")
 		end
 	end
+	local before = nodeBatch.allocatedIdSet()
 	withTreeRollback(function()
 		for _, node in ipairs(nodes) do
 			build.spec:DeallocNode(node)
@@ -2497,6 +2571,15 @@ local function deallocNodesBatch(nodeIds)
 	end)
 	build.buildFlag = true
 	runCallback("OnFrame")
+	return nodeBatch.lostSince(before)
+end
+
+function nodeBatch.describe(nodes)
+	local out = { }
+	for i, node in ipairs(nodes) do
+		out[i] = { id = node.id, name = node.dn, type = node.type, ascendancyName = node.ascendancyName }
+	end
+	return out
 end
 
 local function isTreeConnected()
@@ -3927,11 +4010,16 @@ local DISPATCH = {
 		mutating = true,
 	},
 	allocNodes = {
-		handler = function(cmd) allocNodesBatch(cmd.nodeIds or { }) return { } end,
+		handler = function(cmd)
+			local added, removed = allocNodesBatch(cmd.nodeIds or { }, cmd.strict == true)
+			return { added = nodeBatch.describe(added), removed = nodeBatch.describe(removed) }
+		end,
 		mutating = true,
 	},
 	deallocNodes = {
-		handler = function(cmd) deallocNodesBatch(cmd.nodeIds or { }) return { } end,
+		handler = function(cmd)
+			return { removed = nodeBatch.describe(deallocNodesBatch(cmd.nodeIds or { }, cmd.strict == true)) }
+		end,
 		mutating = true,
 	},
 	restoreTreeFromList = {

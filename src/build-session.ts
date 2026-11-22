@@ -264,6 +264,8 @@ export type UndoEntry = (
   | { kind: 'config'; snapshot: ConfigSnapshot }
   /** Tree-version change: restores the whole spec, version included. */
   | { kind: 'spec'; state: SpecState }
+  /** Committed node allocation / deallocation: restores the tree exactly (items are untouched). */
+  | { kind: 'tree'; snapshot: TreeSnapshot }
 ) & {
   /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
   journal?: number;
@@ -956,6 +958,8 @@ export class BuildSession {
       } else if (entry.kind === 'spec') {
         await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
         await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'tree') {
+        await this.restoreTreeUnlocked(entry.snapshot);
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
@@ -1235,6 +1239,62 @@ export class BuildSession {
     } catch (rollbackError) {
       console.error('[pob-mcp] could not roll back a failed tree conversion:', rollbackError);
     }
+  }
+
+  /**
+   * Commit an allocation (allocate_nodes): each node with its shortest path
+   * from the allocated tree, as PoB's click and simulate_passive_change do.
+   * Names resolve as in simulate_passive_change. The bridge checks the whole
+   * batch first (unknown, unreachable, already allocated, mastery, repeated,
+   * two options of one choice node), so a refusal changes nothing and pushes
+   * nothing. Pushes one tree undo entry and records, for crash replay, the
+   * added node ids in the order they joined the tree (so the replay does not
+   * depend on which of several equally short paths PoB picks).
+   */
+  async allocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'allocate');
+  }
+
+  /**
+   * Commit a deallocation (deallocate_nodes): each node together with every
+   * node that depends on it. Checked first like allocateNodes; one tree undo
+   * entry; the requested ids are recorded for replay (what depends on a node
+   * is a property of the tree, not of table order).
+   */
+  async deallocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'deallocate');
+  }
+
+  private async treeEdit(refs: Array<string | number>, mode: 'allocate' | 'deallocate'): Promise<TreeEditResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    if (refs.length === 0) throw new UserError('Pass at least one node');
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const ids = await resolver.resolveAll(refs, mode);
+      const entry: UndoEntry = { kind: 'tree', snapshot: await this.snapshotTreeUnlocked() };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      let res: { ok: true; added?: unknown; removed?: unknown };
+      try {
+        res = await this.bridge.send({ cmd: mode === 'allocate' ? 'allocNodes' : 'deallocNodes', nodeIds: ids, strict: true });
+      } catch (err) {
+        // A refusal changed nothing (the bridge checks first and rolls a failed
+        // batch back exactly); any other failure may have: undo reverts it.
+        if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+        throw err;
+      }
+      const added = treeEditNodes(res.added);
+      const removed = treeEditNodes(res.removed);
+      const command =
+        mode === 'allocate'
+          ? { cmd: 'allocNodes', nodeIds: added.map((n) => n.id) }
+          : { cmd: 'deallocNodes', nodeIds: ids };
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        const after = await this.bridge.getStats();
+        const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
+        return { added, removed, summary: summary.summary, before, after, diff: computeDiff(before, after) };
+      });
+    });
   }
 
   async getPassiveTree(): Promise<PassiveTreeInfo> {
@@ -2330,6 +2390,33 @@ export interface TreeNodeInfo {
   alloc: boolean;
   stats?: string[];
   linked?: number[];
+}
+
+/** A node allocate_nodes / deallocate_nodes added or removed. */
+export interface TreeEditNode {
+  id: number;
+  name: string;
+  type: string;
+  ascendancyName?: string;
+}
+
+export interface TreeEditResult extends StatDiffResult {
+  /** Allocated by the change, in the order they joined the tree. */
+  added: TreeEditNode[];
+  /** Deallocated by the change (dependents; another option of a choice node), by id. */
+  removed: TreeEditNode[];
+  /** The tree after the change (point counts). */
+  summary: PassiveTreeSummary;
+}
+
+function treeEditNodes(value: unknown): TreeEditNode[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((n: TreeEditNode) => ({
+    id: n.id,
+    name: n.name,
+    type: n.type,
+    ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+  }));
 }
 
 export interface PassiveTreeSummary {

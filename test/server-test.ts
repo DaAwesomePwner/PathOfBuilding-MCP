@@ -172,7 +172,7 @@ async function main(): Promise<void> {
     }
     assert(annotated.get('reset_build')?.idempotentHint === true, 'reset_build is idempotent');
     assert(annotated.get('load_build')?.openWorldHint === true, 'load_build may fetch a URL');
-    for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest']) {
+    for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest', 'allocate_nodes', 'deallocate_nodes']) {
       assert(annotated.get(name)?.readOnlyHint === false && annotated.get(name)?.destructiveHint === false, `${name} is an undoable change`);
     }
     // undo_last_change discards a change that cannot be redone.

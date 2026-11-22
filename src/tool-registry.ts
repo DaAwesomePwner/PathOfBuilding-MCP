@@ -44,6 +44,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   unequip_item: UNDOABLE,
   set_config: UNDOABLE,
   convert_tree_to_latest: UNDOABLE,
+  allocate_nodes: UNDOABLE,
+  deallocate_nodes: UNDOABLE,
   // Session-scoped stat snapshots only; the build is untouched.
   snapshot_and_compare: { ...UNDOABLE, idempotentHint: true },
   // Reads
