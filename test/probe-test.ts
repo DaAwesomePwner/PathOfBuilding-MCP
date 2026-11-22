@@ -22,6 +22,16 @@
 //      variant only; their siblings succeed.
 //   5. Speed: the average per variant over 100 single-node variants is printed
 //      and must be under 25 ms.
+//   6. Off-hand displacement: a new main hand that the current off-hand cannot
+//      go with (bow + quiver -> claw, dual wands -> sword, sword + claw ->
+//      wand) gives the same stats as equip_item, which empties the off-hand.
+//   7. Full DPS: on the fixture with three socket groups and a Raise Zombie
+//      group included in Full DPS (plus a Cast when Damage Taken trigger
+//      group), FullDPS / FullDotDPS of node, item, gem and config variants
+//      equal the mutate path; on a build whose only Full DPS group has no
+//      active skill, a variant adding one (the build's first Full DPS skill)
+//      equals add_gem + full recalc.
+//   8. More than 50 fallback variants is a user error before anything runs.
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -60,6 +70,49 @@ Probe Helmet
 Hubris Circlet
 Item Level: 84
 +80 to maximum Life`;
+
+const BOW = `Rarity: RARE
+Probe Bow
+Short Bow
++40 to maximum Life`;
+
+const QUIVER = `Rarity: RARE
+Probe Quiver
+Serrated Arrow Quiver
++80 to maximum Life`;
+
+const CLAW = `Rarity: RARE
+Probe Claw
+Nailed Fist
++10 to maximum Life`;
+
+const CLAW_OFF = `Rarity: RARE
+Probe Off Claw
+Nailed Fist
++70 to maximum Life`;
+
+const WAND = `Rarity: RARE
+Probe Wand
+Driftwood Wand
++20 to maximum Life`;
+
+const WAND_OFF = `Rarity: RARE
+Probe Off Wand
+Driftwood Wand
++90 to maximum Life`;
+
+const SWORD = `Rarity: RARE
+Probe Sword
+Rusted Sword
++30 to maximum Life`;
+
+/** A socket group for the build XML; gems by name (PoB resolves them when the build loads). */
+function skillGroup(gems: string[], slot?: string, fullDps = true): string {
+  const attrs = `enabled="true" mainActiveSkill="1" mainActiveSkillCalcs="1"${fullDps ? ' includeInFullDPS="true"' : ''}${slot ? ` slot="${slot}"` : ''}`;
+  const gemXml = gems.map((name) =>
+    `<Gem nameSpec="${name}" level="20" quality="0" enabled="true" enableGlobal1="true" enableGlobal2="true" count="1"/>`).join('');
+  return `<Skill ${attrs}>${gemXml}</Skill>`;
+}
 
 const BAD_ITEM = 'Rarity: RARE\nUnknown Base Ring\nNot A Real Base\n+80 to maximum Life';
 
@@ -104,7 +157,8 @@ async function main(): Promise<void> {
 
   try {
     log(`PoB: ${pobLabel}`);
-    await session.loadBuild(readFileSync(fixturePath, 'utf8'));
+    const fixtureXml = readFileSync(fixturePath, 'utf8');
+    await session.loadBuild(fixtureXml);
     const stats0 = await session.getStats();
     const empty = await probe([{}]);
     const base = empty.base;
@@ -324,6 +378,8 @@ async function main(): Promise<void> {
       { name: 'item not fitting', variant: { items: [{ slot: 'Ring 1', itemText: HELMET }] }, match: /cannot be equipped/ },
       { name: 'unknown gem', variant: { gems: [{ op: 'add', group: MAIN_GROUP, name: 'Definitely Not A Gem' }] }, match: /gem lookup failed/i },
       { name: 'unknown config key', variant: { config: { someUnknownConfigKey: 1 } }, match: /Unknown config key/ },
+      { name: 'null config value', variant: { config: { enemyIsBoss: null } }, match: /Invalid value for config key "enemyIsBoss"/ },
+      { name: 'item text without Rarity', variant: { items: [{ slot: 'Ring 1', itemText: 'Coral Ring\n+80 to maximum Life' }] }, match: /Rarity/ },
     ];
     const errRes = await probe([ok1, ...errCases.flatMap((c) => [c.variant, ok1])]);
     const okStats = errRes.results[0].stats;
@@ -344,6 +400,107 @@ async function main(): Promise<void> {
     assert(typeof extra.results[0].stats.Str === 'number', 'Str is not a number');
     assert(extra.results[0].stats.FullDPS === null, 'FullDPS is not null with useFullDPS=false');
     assert(extra.results[0].stats.Life === changing[0].r.stats.Life, 'Life differs with useFullDPS=false');
+
+
+    // ------------------------------------------------------------------
+    log('6. Off-hand displaced by a new main hand');
+    /** Stats (and slot contents) after equipping through the mutate commands, exactly restored. */
+    async function offHandCase(name: string, setup: Array<[string, string]>, mainHand: string): Promise<void> {
+      await session.loadBuild(fixtureXml);
+      for (const [slot, itemText] of setup) await bridge.send({ cmd: 'equipItem', slot, itemText });
+      await session.loadBuild(await session.exportXML());
+      const offBefore = await session.getItemInSlot('Weapon 2');
+      assert(offBefore && offBefore.raw?.includes('Probe'), `${name}: setup did not equip the off-hand`);
+      const r = (await probe([{ items: [{ slot: 'Weapon 1', itemText: mainHand }] }])).results[0];
+      assert(!r.error && !r.fallback, `${name}: ${r.error ?? r.fallbackReason}`);
+      const m = await session.withTemporaryChange(async (b) => {
+        await b.send({ cmd: 'equipItem', slot: 'Weapon 1', itemText: mainHand });
+        const off = await b.send<{ item: { itemId: number } }>({ cmd: 'getItemInSlot', slot: 'Weapon 2' });
+        return { stats: await b.getStats(), offId: off.item.itemId };
+      });
+      assert(m.offId === 0, `${name}: equip_item kept the off-hand, the case tests nothing`);
+      const d = statDiffs(r.stats, m.stats, keys);
+      assert(d.length === 0, `${name}: probe differs from equip_item: ${d.join('; ')}`);
+      log(`   ${name}: Life ${r.stats.Life} (off-hand dropped)`);
+    }
+    await offHandCase('bow + quiver -> claw', [['Weapon 1', BOW], ['Weapon 2', QUIVER]], CLAW);
+    await offHandCase('dual wands -> sword', [['Weapon 1', WAND], ['Weapon 2', WAND_OFF]], SWORD);
+    await offHandCase('sword + claw -> wand', [['Weapon 1', SWORD], ['Weapon 2', CLAW_OFF]], WAND);
+
+    // ------------------------------------------------------------------
+    log('7. Full DPS parity');
+    /** FullDPS / FullDotDPS of the committed (mutated) build, read like get_stats reads the output. */
+    const fullKeys = ['FullDPS', 'FullDotDPS', 'CombinedDPS', 'Life'];
+    async function readFull(b: LuaBridge): Promise<Stats> {
+      return (await b.send<{ base: Stats }>({ cmd: 'probe', variants: [], stats: fullKeys })).base;
+    }
+    async function fullDpsParity(label: string, cases2: Array<{ name: string; variant: ProbeVariant; mutate: (b: LuaBridge) => Promise<unknown> }>): Promise<ProbeResponse> {
+      const res = await probe(cases2.map((c) => c.variant), { stats: fullKeys });
+      for (const [i, c] of cases2.entries()) {
+        const r = res.results[i];
+        assert(!r.error && !r.fallback, `${label} ${c.name}: ${r.error ?? r.fallbackReason}`);
+        const m = await session.withTemporaryChange(async (b) => { await c.mutate(b); return readFull(b); });
+        const d = statDiffs(r.stats, m, fullKeys);
+        assert(d.length === 0, `${label} ${c.name}: probe differs from mutate: ${d.join('; ')}`);
+      }
+      return res;
+    }
+    let fullXml = fixtureXml;
+    for (const slot of ['Weapon 1', 'Gloves', 'Body Armour']) {
+      fullXml = fullXml.replace(new RegExp(`<Skill ([^>]*slot="${slot}")`), '<Skill includeInFullDPS="true" $1');
+    }
+    fullXml = fullXml.replace('</Skills>', `${skillGroup(['Raise Zombie'])}${skillGroup(['Cast when Damage Taken', 'Frostblink'], 'Helmet')}</Skills>`);
+    await session.loadBuild(fullXml);
+    const fullGroups = (await bridge.send<{ groups: Array<{ gems: Array<{ name: string }> }> }>({ cmd: 'getSocketGroups' })).groups;
+    const zombieGroup = fullGroups.findIndex((g) => g.gems[0]?.name === 'Raise Zombie') + 1;
+    assert(zombieGroup > 0, 'Raise Zombie group missing');
+    assert(fullGroups.some((g) => g.gems.map((x) => x.name).join('+') === 'Cast when Damage Taken+Frostblink'), 'trigger group missing');
+    const fullBase = (await probe([], { stats: fullKeys })).base;
+    assert(typeof fullBase.FullDPS === 'number' && fullBase.FullDPS > (fullBase.CombinedDPS as number), `FullDPS ${fullBase.FullDPS} does not add up several skills`);
+    const fullRes = await fullDpsParity('full DPS build', [
+      { name: 'node', variant: { allocate: [nodeA] }, mutate: (b) => b.send({ cmd: 'allocNode', nodeId: nodeA }) },
+      { name: 'deallocate notable', variant: { deallocate: [notable.node.id] }, mutate: (b) => b.send({ cmd: 'deallocNodes', nodeIds: notable.r.nodesRemoved }) },
+      { name: 'item', variant: { items: [{ slot: 'Ring 1', itemText: RING_A }] }, mutate: (b) => b.send({ cmd: 'equipItem', slot: 'Ring 1', itemText: RING_A }) },
+      { name: 'support swap', variant: { gems: [{ op: 'set', group: MAIN_GROUP, index: 3, name: NEW_SUPPORT }] },
+        mutate: (b) => b.send({ cmd: 'setGem', groupIndex: MAIN_GROUP, gemIndex: 3, gemName: NEW_SUPPORT }) },
+      { name: 'minion level', variant: { gems: [{ op: 'set', group: zombieGroup, index: 1, level: 10 }] },
+        mutate: (b) => b.send({ cmd: 'setGemLevel', groupIndex: zombieGroup, gemIndex: 1, level: 10 }) },
+      { name: 'config', variant: { config: { enemyIsBoss: 'None' } }, mutate: (b) => b.send({ cmd: 'setConfig', options: { enemyIsBoss: 'None' } }) },
+    ]);
+    assert(fullRes.results.some((r) => r.stats.FullDPS !== fullBase.FullDPS), 'no variant changed FullDPS');
+
+    log('7b. A variant adding the build\'s first Full DPS skill');
+    const firstXml = fixtureXml.replace('</Skills>', `${skillGroup(['Elemental Focus'], undefined, true)}</Skills>`);
+    await session.loadBuild(firstXml);
+    const firstGroups = (await bridge.send<{ groups: Array<{ gems: Array<{ name: string }> }> }>({ cmd: 'getSocketGroups' })).groups
+      .findIndex((g) => g.gems.length === 1 && g.gems[0].name === 'Elemental Focus') + 1;
+    assert(firstGroups > 0, 'Elemental Focus group missing');
+    const firstBase = (await probe([], { stats: fullKeys })).base;
+    assert(firstBase.FullDPS === 0, `FullDPS should start at 0, got ${firstBase.FullDPS}`);
+    const firstRes = await fullDpsParity('first Full DPS skill', [
+      { name: 'add Frostbolt', variant: { gems: [{ op: 'add', group: firstGroups, name: 'Frostbolt', position: 1 }] },
+        mutate: (b) => b.send({ cmd: 'addGem', groupIndex: firstGroups, gemName: 'Frostbolt', position: 1 }) },
+      { name: 'node', variant: { allocate: [nodeA] }, mutate: (b) => b.send({ cmd: 'allocNode', nodeId: nodeA }) },
+    ]);
+    assert((firstRes.results[0].stats.FullDPS as number) > 0, 'adding Frostbolt did not add Full DPS');
+
+    // ------------------------------------------------------------------
+    log('8. Fallback cap is checked before any work');
+    await session.loadBuild(fixtureXml);
+    const tooMany: ProbeVariant[] = [
+      ...reachable.slice(0, 100).map((n) => ({ allocate: [n.id] })),
+      ...Array.from({ length: 51 }, (_v, i) => ({ allocate: [reachable[i].id, reachable[i + 1].id] })),
+    ];
+    const undoCap = undoDepth();
+    let capError: unknown = null;
+    try {
+      await probe(tooMany);
+    } catch (e) {
+      capError = e;
+    }
+    assert(capError instanceof Error && /51 variants need a full recalculation/.test(capError.message) && (capError as { isUserError?: boolean }).isUserError,
+      `expected the fallback-cap user error, got ${capError}`);
+    assert(undoDepth() === undoCap, 'undo depth changed after the refused call');
 
     log('ALL TESTS PASSED');
   } finally {

@@ -25,9 +25,16 @@
 --     grants a skill (the skill's socket group exists only after a full recalc);
 --   * an item in a passive-tree jewel socket (cluster graphs / conquered
 --     nodes are rebuilt by the spec), an item granting a skill or replacing
---     one that does, a two-handed weapon whose off-hand slot holds an item,
---     and both weapon slots of one set in one variant.
+--     one that does;
+--   * every variant while the party tab's "export buffs" option is on (see
+--     checkVariant).
 -- Gem changes on item- or tree-granted socket groups are refused.
+--
+-- Full DPS: PoB's calculator only rolls up Full DPS when the build already
+-- had a skill counted in it when the calculator was made. When it had none,
+-- the roll-up is run here with the same arguments (so a variant that adds the
+-- build's first Full DPS skill is still exact), or FullDPS / FullDotDPS are 0
+-- when no socket group is included in Full DPS (what a full recalc reports).
 return function(ctx)
 	local userError = ctx.userError
 	local USER_ERROR_PREFIX = ctx.USER_ERROR_PREFIX
@@ -218,26 +225,24 @@ return function(ctx)
 	-- Items
 	-- ------------------------------------------------------------------
 
-	local TWO_HAND_TYPES = { ["Staff"] = true, ["Two Handed Sword"] = true, ["Two Handed Axe"] = true,
-		["Two Handed Mace"] = true, ["Bow"] = true }
-
-	local function isTwoHanded(item)
-		local base = item.base or { }
-		return TWO_HAND_TYPES[base.type] or (base.tags and base.tags.twohand) and true or false
-	end
-
 	local function hasGrantedSkills(item)
 		return item ~= nil and type(item.grantedSkills) == "table" and #item.grantedSkills > 0
 	end
 
-	local function offHandOf(slotName)
-		if slotName == "Weapon 1" then return "Weapon 2" end
-		if slotName == "Weapon 1 Swap" then return "Weapon 2 Swap" end
+	-- The slot whose item decides whether `slot` can hold an item: the main
+	-- hand for an off-hand (ItemsTab:IsItemValidForSlot), the parent item for
+	-- an abyssal socket (assertItemFitsSlot / ItemSlot:Populate).
+	local function governingSlotName(slot)
+		if slot.parentSlot then return slot.parentSlot.slotName end
+		if slot.slotName == "Weapon 2" then return "Weapon 1" end
+		if slot.slotName == "Weapon 2 Swap" then return "Weapon 1 Swap" end
 		return nil
 	end
 
-	-- Parse and check every item (user errors before any change). Returns
-	-- { { slot, item } ... } and a fallback reason or nil.
+	-- Parse every item and check what can be checked against the committed
+	-- build (user errors before any change); an item whose fit depends on
+	-- another item of the same variant is checked again when it is applied.
+	-- Returns { { slot, item, itemText } ... } and a fallback reason or nil.
 	function M.checkItems(variant)
 		local list = optArray(variant.items, "items", M.MAX_ITEMS)
 		local tab = build.itemsTab
@@ -250,7 +255,6 @@ return function(ctx)
 			if not slot then userError("Unknown slot: " .. entry.slot) end
 			if bySlot[entry.slot] then userError("Slot " .. entry.slot .. " is listed twice") end
 			local item = ctx.parseItemText(entry.itemText, entry.slot)
-			ctx.assertItemFitsSlot(tab, slot, item)
 			bySlot[entry.slot] = item
 			parsed[i] = { slot = slot, item = item, itemText = entry.itemText }
 			local current = tab.items[slot.selItemId or 0]
@@ -260,12 +264,10 @@ return function(ctx)
 				reason = reason or ("the item for " .. entry.slot .. " or the item it replaces grants a skill")
 			end
 		end
-		for slotName, item in pairs(bySlot) do
-			local off = offHandOf(slotName)
-			if off and bySlot[off] then
-				reason = reason or ("both " .. slotName .. " and " .. off .. " change")
-			elseif off and isTwoHanded(item) and tab.slots[off] and (tab.slots[off].selItemId or 0) ~= 0 then
-				reason = reason or ("the two-handed item for " .. slotName .. " would displace the item in " .. off)
+		for _, p in ipairs(parsed) do
+			local governing = governingSlotName(p.slot)
+			if not (governing and bySlot[governing]) then
+				ctx.assertItemFitsSlot(tab, p.slot, p.item)
 			end
 		end
 		return parsed, reason
@@ -277,27 +279,62 @@ return function(ctx)
 		return id
 	end
 
-	-- Assign each item to its slot under a free id (no PopulateSlots, no
-	-- SetSelItemId side effects). Returns the undo function.
+	-- Equip the items one after another the way equip_item does, without
+	-- its side effects on the committed build: each item is checked against
+	-- the slots as they are at that point, added under a free id and selected
+	-- (slot.selItemId and the active item set's entry, as ItemSlot:SetSelItemId
+	-- does for a non-socket slot); then what ItemsTab:PopulateSlots would do is
+	-- emulated: every slot whose item no longer fits is emptied (an off-hand
+	-- after a new main hand) and abyssal sockets beyond their parent item's
+	-- socket count are emptied. Returns the undo function, which puts every
+	-- slot, set entry and the item list back.
 	local function applyItems(parsed)
 		local tab = build.itemsTab
-		local done = { }
+		local itemSet = tab.activeItemSet
+		local changes, added = { }, { }
+		local function select(slot, id)
+			local entry = itemSet[slot.slotName]
+			changes[#changes + 1] = { slot = slot, slotId = slot.selItemId, entry = entry, entryId = entry and entry.selItemId }
+			if entry then entry.selItemId = id end
+			slot.selItemId = id
+		end
 		local function undo()
-			for i = #done, 1, -1 do
-				local d = done[i]
-				d.slot.selItemId = d.oldId
-				tab.items[d.id] = nil
+			for i = #changes, 1, -1 do
+				local c = changes[i]
+				c.slot.selItemId = c.slotId
+				if c.entry then c.entry.selItemId = c.entryId end
 			end
+			for i = #added, 1, -1 do tab.items[added[i]] = nil end
 			build.skillsTab:UpdateSocketGroups()
+		end
+		local function populate()
+			for _, slot in ipairs(tab.orderedSlots) do
+				local id = slot.selItemId or 0
+				if not slot.nodeId and id ~= 0 then
+					local item = tab.items[id]
+					if not item or not tab:IsItemValidForSlot(item, slot.slotName) then select(slot, 0) end
+				end
+			end
+			for _, slot in ipairs(tab.orderedSlots) do
+				if not slot.nodeId and slot.abyssalSocketList then
+					local item = tab.items[slot.selItemId or 0]
+					local count = item and item.abyssalSocketCount or 0
+					for i, socket in ipairs(slot.abyssalSocketList) do
+						if i > count and (socket.selItemId or 0) ~= 0 then select(socket, 0) end
+					end
+				end
+			end
 		end
 		local ok, err = pcall(function()
 			for _, p in ipairs(parsed) do
+				ctx.assertItemFitsSlot(tab, p.slot, p.item)
 				local id = freeItemId(tab)
 				p.item.id = id
 				tab.items[id] = p.item
-				done[#done + 1] = { slot = p.slot, oldId = p.slot.selItemId, id = id }
+				added[#added + 1] = id
 				p.item:BuildModList() -- as ItemsTab:AddItem does
-				p.slot.selItemId = id
+				select(p.slot, id)
+				populate()
 			end
 			build.skillsTab:UpdateSocketGroups()
 		end)
@@ -506,7 +543,10 @@ return function(ctx)
 		table.sort(ids)
 		add("nodes", table.concat(ids, ","))
 		local tab = build.itemsTab
-		for _, slot in ipairs(tab.orderedSlots) do add("slot", slot.slotName, slot.selItemId) end
+		for _, slot in ipairs(tab.orderedSlots) do
+			local entry = tab.activeItemSet[slot.slotName]
+			add("slot", slot.slotName, slot.selItemId, entry and entry.selItemId)
+		end
 		local itemIds = { }
 		for id, item in pairs(tab.items) do itemIds[#itemIds + 1] = id .. "=" .. tostring(item) end
 		table.sort(itemIds)
@@ -579,6 +619,15 @@ return function(ctx)
 		if nodeSet and not reason then
 			reason = nodeFallbackReason(build.spec, nodeSet, adding)
 		end
+		-- With the party tab's "export buffs" option on, CalcPerform computes
+		-- the MAIN pass differently from the CALCULATOR pass (only MAIN collects
+		-- buff exports, and that branch can apply non-unique flasks to a minion
+		-- through a link skill), so the calculator is not trusted then. PoB
+		-- neither saves nor loads the option in build XML and the bridge never
+		-- sets it, so this cannot happen through the MCP tools today.
+		if build.partyTab and build.partyTab.enableExportBuffs then
+			reason = reason or "the party tab's export-buffs option is on"
+		end
 		return {
 			addList = addList, removeList = removeList, items = parsedItems, config = config, gems = gems,
 			nodeSet = nodeSet, adding = adding, fallbackReason = reason,
@@ -593,24 +642,60 @@ return function(ctx)
 	-- The main env of the calculator pass that runs next (the first
 	-- calcs.perform call inside calcFunc), captured by wrapping calcs.perform
 	-- for the duration of the probe command.
-	local capturedEnv = nil
+	-- calcs.initEnv is wrapped the same way to keep the cached mod DBs of that
+	-- pass, which a Full DPS roll-up run here needs.
+	local capturedEnv, capturedInit = nil, nil
 	local function withEnvCapture(fn)
 		local calcsMod = build.calcsTab.calcs
 		local perform = calcsMod and calcsMod.perform
-		if type(perform) ~= "function" then return fn() end
+		local initEnv = calcsMod and calcsMod.initEnv
+		if type(perform) ~= "function" or type(initEnv) ~= "function" then
+			error("Path of Building's calcs module changed (no calcs.perform / calcs.initEnv)")
+		end
 		calcsMod.perform = function(env, ...)
 			if capturedEnv == nil then capturedEnv = env end
 			return perform(env, ...)
 		end
+		calcsMod.initEnv = function(...)
+			local results = { initEnv(...) }
+			if capturedInit == nil then capturedInit = results end
+			return unpack(results, 1, table.maxn(results))
+		end
 		local ok, res = pcall(fn)
 		calcsMod.perform = perform
-		capturedEnv = nil
+		calcsMod.initEnv = initEnv
+		capturedEnv, capturedInit = nil, nil
 		if not ok then error(res, 0) end
 		return res
 	end
 
+	local function anyGroupInFullDPS()
+		for _, group in ipairs(build.skillsTab.socketGroupList) do
+			if group.includeInFullDPS then return true end
+		end
+		return false
+	end
+
+	-- Full DPS for a calculator that was made without any Full DPS skill (see
+	-- the header): the roll-up calcFunc would run, with the main pass's DBs.
+	local function addFullDPS(output, override)
+		if anyGroupInFullDPS() and capturedInit then
+			local env, playerDB, enemyDB, minionDB = capturedInit[1], capturedInit[2], capturedInit[3], capturedInit[4]
+			local fullDPS = build.calcsTab.calcs.calcFullDPS(build, "CALCULATOR", override, {
+				cachedPlayerDB = playerDB, cachedEnemyDB = enemyDB, cachedMinionDB = minionDB, env = nil,
+				triggerSourceCache = env and env.triggerSourceCache,
+			})
+			output.SkillDPS = fullDPS.skills
+			output.FullDPS = fullDPS.combinedDPS
+			output.FullDotDPS = fullDPS.TotalDotDPS
+		else
+			output.FullDPS = 0
+			output.FullDotDPS = 0
+		end
+	end
+
 	-- One variant through the calculator: data changes, calcFunc, undo.
-	local function runFast(checked, calcFunc, keys, useFullDPS, nullFullDPS)
+	local function runFast(checked, calcFunc, keys, useFullDPS, nullFullDPS, rollUpHere)
 		local undos = { }
 		local ok, res = pcall(function()
 			if checked.config then undos[#undos + 1] = applyConfig(checked.config) end
@@ -629,11 +714,12 @@ return function(ctx)
 				end
 			end
 			wipeCalculatorCache()
-			capturedEnv = nil
+			capturedEnv, capturedInit = nil, nil
 			local output = calcFunc(override, useFullDPS)
+			if rollUpHere then addFullDPS(output, override) end
 			result.stats = readStats(output, keys, nullFullDPS)
 			addMainOnlyStats(result.stats, keys, capturedEnv)
-			capturedEnv = nil
+			capturedEnv, capturedInit = nil, nil
 			return result
 		end)
 		local restoreErr = nil
@@ -660,15 +746,30 @@ return function(ctx)
 		end
 		if cmd.useFullDPS ~= nil and type(cmd.useFullDPS) ~= "boolean" then userError("useFullDPS must be a boolean") end
 		local useFullDPS = cmd.useFullDPS
+		if cmd.classifyOnly then
+			-- Validate and classify only (nothing is computed or changed).
+			local results = { }
+			for i, variant in ipairs(variants) do
+				local ok, res = pcall(checkVariant, variant)
+				if not ok then
+					results[i] = variantErrorResult(res)
+				elseif res.fallbackReason then
+					results[i] = { fallback = true, reason = res.fallbackReason }
+				else
+					results[i] = { fallback = false }
+				end
+			end
+			return { results = results }
+		end
 		local calcsTab = build.calcsTab
 		local calcFunc, calcBase = calcsTab:GetMiscCalculator()
 		if type(calcFunc) ~= "function" then error("Path of Building's calculator is not available (no calculation output yet)") end
 		local mainOutput = calcsTab.mainOutput
 		local base = readStats(mainOutput, keys, false)
 		local nullFullDPS = useFullDPS == false
-		-- No skill counts towards Full DPS: PoB's calculator leaves FullDPS
-		-- unset, a full recalc reports 0.
-		local noFullDPSSkills = calcBase and calcBase.FullDPS == nil
+		-- No skill counted towards Full DPS when the calculator was made: it
+		-- will not roll Full DPS up, so runFast does (see the header).
+		local rollUpHere = not nullFullDPS and calcBase ~= nil and calcBase.FullDPS == nil
 
 		local before = fingerprint()
 		local cache = GlobalCache.cachedData.CALCULATOR
@@ -684,13 +785,7 @@ return function(ctx)
 					if checked.fallbackReason then
 						return { fallback = true, reason = checked.fallbackReason }
 					end
-					local r = runFast(checked, calcFunc, keys, useFullDPS, nullFullDPS)
-					if noFullDPSSkills and not nullFullDPS then
-						for _, k in ipairs({ "FullDPS", "FullDotDPS" }) do
-							if r.stats[k] == jsonNull then r.stats[k] = 0 end
-						end
-					end
-					return r
+					return runFast(checked, calcFunc, keys, useFullDPS, nullFullDPS, rollUpHere)
 				end)
 				if ok then
 					results[i] = res

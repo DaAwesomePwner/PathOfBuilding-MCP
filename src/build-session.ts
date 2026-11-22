@@ -732,6 +732,7 @@ export class BuildSession {
           validateConfig: (options) => this.validateConfigOptionsUnlocked(options),
           snapshot: () => this.snapshotAllUnlocked(),
           restore: (snapshot) => this.restoreAllUnlocked(snapshot as FullSnapshot),
+          probeThenRestore,
         },
         request,
       ),

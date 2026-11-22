@@ -7,11 +7,12 @@
 // Variant kinds the calculator cannot reproduce exactly come back marked
 // `fallback`; those are run here one at a time through `probeCommit` (apply
 // for real, full recalc, read) between a full build snapshot and its exact
-// restore — the same path the what-if tools used before. Nothing is pushed to
+// restore — the same path the what-if tools used before. Variants go to the
+// engine in chunks (PROBE_CHUNK) so no single bridge command nears its timeout. Nothing is pushed to
 // the undo stack or the crash-recovery journal: the build never changes.
 
 import type { Stats } from './lua-bridge.js';
-import { UserError } from './validation.js';
+import { UserError, validateItemText, validateSlot } from './validation.js';
 
 /** One gem change; group and gem indices are 1-based, as in get_skill_breakdown. */
 export type ProbeGemChange =
@@ -72,6 +73,12 @@ export interface ProbeResponse {
 export const MAX_PROBE_VARIANTS = 500;
 /** Variants that need a full recalculation each take ~0.3-0.5 s. */
 export const MAX_FALLBACK_VARIANTS = 50;
+/**
+ * Variants per bridge command. Calculator variants take ~3-5 ms on a typical
+ * build; 50 keeps one command far below the 30 s bridge timeout even on a
+ * build 50x heavier, so a large request never times out (and strikes) the engine.
+ */
+export const PROBE_CHUNK = 50;
 
 /** What probe needs from BuildSession; every call runs under its lock. */
 export interface ProbeDeps {
@@ -81,6 +88,8 @@ export interface ProbeDeps {
   /** Full build snapshot / exact restore (restore throws when it is not exact). */
   snapshot(): Promise<unknown>;
   restore(snapshot: unknown): Promise<void>;
+  /** BuildSession's probeThenRestore, so errors read like the other what-if tools'. */
+  probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promise<void>): Promise<T>;
 }
 
 interface BridgeProbeResult extends Partial<ProbeVariantResult> {
@@ -112,11 +121,28 @@ export function validateProbeRequest(request: unknown): ProbeRequest {
   return request as unknown as ProbeRequest;
 }
 
-/** Checks done here rather than in the engine (config values use the TS set_config rules). */
+/**
+ * Checks done here rather than in the engine, with the rules the mutating
+ * tools use: swap_item's slot and item-text checks, set_config's config
+ * validation (set_config's schema takes booleans, numbers and strings only,
+ * so a null value is refused here too).
+ */
 async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<void> {
   if (!isPlainObject(variant)) throw new UserError('each variant must be an object');
+  if (Array.isArray(variant.items)) {
+    for (const entry of variant.items) {
+      if (!isPlainObject(entry)) throw new UserError('each item must be { slot, itemText }');
+      validateSlot(entry.slot);
+      validateItemText(entry.itemText);
+    }
+  }
   if (variant.config !== undefined) {
     if (!isPlainObject(variant.config)) throw new UserError('config must be an object of config keys');
+    for (const [key, value] of Object.entries(variant.config)) {
+      if (value === null || !['boolean', 'number', 'string'].includes(typeof value)) {
+        throw new UserError(`Invalid value for config key "${key}": expected a boolean, number or string, got ${JSON.stringify(value)}`);
+      }
+    }
     await deps.validateConfig(variant.config);
   }
 }
@@ -125,7 +151,17 @@ function failed(error: unknown): ProbeVariantResult {
   return { stats: {}, error: errorText(error), userError: error instanceof UserError };
 }
 
-/** Run one fallback variant: snapshot, apply for real, read, exact restore. */
+function chunks<T>(list: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Run one fallback variant between a full snapshot and its exact restore
+ * (probeThenRestore). A variant error with an exact restore is that variant's
+ * error; a restore that fails ends the whole call (the build may differ).
+ */
 async function runFallback(
   deps: ProbeDeps,
   variant: ProbeVariant,
@@ -133,82 +169,99 @@ async function runFallback(
   reason: string | undefined,
 ): Promise<ProbeVariantResult> {
   const snapshot = await deps.snapshot();
-  let result: ProbeVariantResult;
-  let probeError: unknown = null;
+  let restoreFailed = false;
+  const restore = async (): Promise<void> => {
+    try {
+      await deps.restore(snapshot);
+    } catch (error) {
+      restoreFailed = true;
+      throw error;
+    }
+  };
   try {
-    const raw = await deps.send<BridgeProbeResult & { ok: true }>({
-      cmd: 'probeCommit',
-      variant,
-      stats: request.stats,
-      useFullDPS: request.useFullDPS,
-    });
-    const { ok: _ok, ...rest } = raw;
-    result = { ...(rest as ProbeVariantResult), stats: raw.stats ?? {}, fallback: true, fallbackReason: reason };
-  } catch (error) {
-    probeError = error;
-    result = { ...failed(error), fallback: true, fallbackReason: reason };
-  }
-  try {
-    await deps.restore(snapshot);
-  } catch (restoreError) {
-    const prefix = probeError ? `${errorText(probeError)} (` : '';
-    const suffix = probeError ? ')' : '';
-    throw new Error(
-      `${prefix}restoring the build after a probe variant failed: ${errorText(restoreError)}${suffix}; call reset_build`,
-      { cause: probeError ?? restoreError },
+    const raw = await deps.probeThenRestore(
+      () => deps.send<BridgeProbeResult & { ok: true }>({
+        cmd: 'probeCommit',
+        variant,
+        stats: request.stats,
+        useFullDPS: request.useFullDPS,
+      }),
+      restore,
     );
+    const { ok: _ok, reason: _reason, ...rest } = raw;
+    return { ...(rest as ProbeVariantResult), stats: raw.stats ?? {}, fallback: true, fallbackReason: reason };
+  } catch (error) {
+    if (restoreFailed) throw error;
+    return { ...failed(error), fallback: true, fallbackReason: reason };
   }
-  return result;
 }
 
-/** BuildSession.probe's body; the caller holds the session lock. */
+/** BuildSession.probe's body; the caller holds the session lock for all of it. */
 export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeResponse> {
   const request = validateProbeRequest(input);
   const results: Array<ProbeVariantResult | undefined> = new Array(request.variants.length);
-  const sent: ProbeVariant[] = [];
-  const sentIndex: number[] = [];
+  const toEngine: number[] = [];
   for (let i = 0; i < request.variants.length; i++) {
     try {
       await checkVariant(deps, request.variants[i]);
-      sent.push(request.variants[i]);
-      sentIndex.push(i);
+      toEngine.push(i);
     } catch (error) {
       if (!(error instanceof UserError)) throw error;
       results[i] = failed(error);
     }
   }
 
-  const response = await deps.send<{ ok: true; base: Stats; results: BridgeProbeResult[] }>({
-    cmd: 'probe',
-    stats: request.stats,
-    useFullDPS: request.useFullDPS,
-    variants: sent,
-  });
-
-  const fallbacks: number[] = [];
-  sent.forEach((_variant, j) => {
-    const raw = response.results?.[j] ?? {};
-    const i = sentIndex[j];
-    if (raw.fallback) {
-      fallbacks.push(j);
-      return;
-    }
-    if (raw.error !== undefined) {
-      results[i] = { stats: {}, error: raw.error, userError: raw.userError === true };
-      return;
-    }
-    results[i] = { ...(raw as ProbeVariantResult), stats: raw.stats ?? {} };
-  });
-
+  // Classify first (validation only), so the fallback cap fails before any work.
+  const fast: number[] = [];
+  const fallbacks: Array<{ index: number; reason?: string }> = [];
+  for (const chunk of chunks(toEngine, PROBE_CHUNK)) {
+    const res = await deps.send<{ ok: true; results: BridgeProbeResult[] }>({
+      cmd: 'probe',
+      classifyOnly: true,
+      variants: chunk.map((i) => request.variants[i]),
+    });
+    chunk.forEach((i, j) => {
+      const raw = res.results?.[j] ?? {};
+      if (raw.error !== undefined) results[i] = { stats: {}, error: raw.error, userError: raw.userError === true };
+      else if (raw.fallback) fallbacks.push({ index: i, reason: raw.reason });
+      else fast.push(i);
+    });
+  }
   if (fallbacks.length > MAX_FALLBACK_VARIANTS) {
     throw new UserError(
-      `${fallbacks.length} variants need a full recalculation each (multi-node changes, jewel sockets, ` +
-        `skill-granting nodes or items, two-handed weapon swaps); at most ${MAX_FALLBACK_VARIANTS} are allowed per call`,
+      `${fallbacks.length} variants need a full recalculation each (several node changes in one variant, jewel ` +
+        `sockets, skill-granting nodes or items); at most ${MAX_FALLBACK_VARIANTS} are allowed per call`,
     );
   }
-  for (const j of fallbacks) {
-    results[sentIndex[j]] = await runFallback(deps, sent[j], request, response.results[j].reason);
+
+  let base: Stats | undefined;
+  for (const chunk of fast.length > 0 ? chunks(fast, PROBE_CHUNK) : [[]]) {
+    const res = await deps.send<{ ok: true; base: Stats; results: BridgeProbeResult[] }>({
+      cmd: 'probe',
+      stats: request.stats,
+      useFullDPS: request.useFullDPS,
+      variants: chunk.map((i) => request.variants[i]),
+    });
+    base ??= res.base;
+    chunk.forEach((i, j) => {
+      const raw = res.results?.[j] ?? {};
+      if (raw.fallback) {
+        // Classified as calculator-safe a moment ago; the build has not changed.
+        fallbacks.push({ index: i, reason: raw.reason });
+      } else if (raw.error !== undefined) {
+        results[i] = { stats: {}, error: raw.error, userError: raw.userError === true };
+      } else {
+        results[i] = { ...(raw as ProbeVariantResult), stats: raw.stats ?? {} };
+      }
+    });
   }
 
-  return { base: response.base, results: results.map((r) => r ?? { stats: {}, error: 'variant was not run' }) };
+  for (const { index, reason } of fallbacks) {
+    results[index] = await runFallback(deps, request.variants[index], request, reason);
+  }
+
+  return {
+    base: base ?? {},
+    results: results.map((r) => r ?? { stats: {}, error: 'variant was not run' }),
+  };
 }
