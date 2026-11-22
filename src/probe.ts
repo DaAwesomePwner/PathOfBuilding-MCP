@@ -4,12 +4,16 @@
 // The bridge's `probe` command (lua/probe.lua) evaluates each variant through
 // Path of Building's own calculator (CalcsTab:GetMiscCalculator, what PoB's
 // tooltips use) without recalculating or changing the committed build.
+// The base comes from the classify pass (or a variant-less probe), which
+// reads the last full recalc and builds no calculator.
 // Variant kinds the calculator cannot reproduce exactly come back marked
 // `fallback`; those are run here one at a time through `probeCommit` (apply
 // for real, full recalc, read) between a full build snapshot and its exact
-// restore — the same path the what-if tools used before. Variants go to the
-// engine in chunks (PROBE_CHUNK) so no single bridge command nears its timeout. Nothing is pushed to
-// the undo stack or the crash-recovery journal: the build never changes.
+// restore — the same path the what-if tools used before (a passive-tree
+// snapshot and restore for a single node change touching no skill, as the
+// tree what-if tools used). Variants go to the engine in chunks (PROBE_CHUNK)
+// so no single bridge command nears its timeout. Nothing is pushed to the
+// undo stack or the crash-recovery journal: the build never changes.
 
 import type { Stats } from './lua-bridge.js';
 import { UserError, validateItemText, validateSlot } from './validation.js';
@@ -23,6 +27,8 @@ export type ProbeGemChange =
   /** Add a gem to group `group` (at `position`, default the end; level defaults to 20, quality to 0). */
   | { op: 'add'; group: number; name: string; level?: number; quality?: number; enabled?: boolean; position?: number };
 
+export type ProbeItemChange = { slot: string; itemText: string } | { slot: string; unequip: true };
+
 /**
  * One what-if variant of the committed build. Changes combine; they apply in
  * this order: config, gems (in list order; indices refer to the group as it
@@ -33,8 +39,11 @@ export interface ProbeVariant {
   allocate?: number[];
   /** Allocated node ids to remove, each together with every node that depends on it. */
   deallocate?: number[];
-  /** Items to put in slots (PoB "Copy item" text). */
-  items?: Array<{ slot: string; itemText: string }>;
+  /**
+   * Items to put in slots (PoB "Copy item" text), or `{ slot, unequip: true }`
+   * to empty a slot as unequip_item does.
+   */
+  items?: ProbeItemChange[];
   gems?: ProbeGemChange[];
   /** Config options, validated like set_config. */
   config?: Record<string, unknown>;
@@ -88,12 +97,23 @@ export interface ProbeDeps {
   /** Full build snapshot / exact restore (restore throws when it is not exact). */
   snapshot(): Promise<unknown>;
   restore(snapshot: unknown): Promise<void>;
+  /** Passive-tree snapshot / exact restore, for a fallback the engine marks `treeOnly`. */
+  snapshotTree(): Promise<unknown>;
+  restoreTree(snapshot: unknown): Promise<void>;
   /** BuildSession's probeThenRestore, so errors read like the other what-if tools'. */
   probeThenRestore<T>(probe: () => Promise<T>, restore: () => Promise<void>): Promise<T>;
 }
 
 interface BridgeProbeResult extends Partial<ProbeVariantResult> {
   reason?: string;
+  /** A single node change touching no skill: a passive-tree snapshot/restore is enough around it. */
+  treeOnly?: boolean;
+}
+
+interface PendingFallback {
+  index: number;
+  reason?: string;
+  treeOnly: boolean;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -131,8 +151,10 @@ async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<void> {
   if (!isPlainObject(variant)) throw new UserError('each variant must be an object');
   if (Array.isArray(variant.items)) {
     for (const entry of variant.items) {
-      if (!isPlainObject(entry)) throw new UserError('each item must be { slot, itemText }');
+      if (!isPlainObject(entry)) throw new UserError('each item must be { slot, itemText } or { slot, unequip: true }');
       validateSlot(entry.slot);
+      if (entry.unequip === true && entry.itemText === undefined) continue;
+      if (entry.unequip !== undefined) throw new UserError('an item entry takes either itemText or unequip: true');
       validateItemText(entry.itemText);
     }
   }
@@ -147,6 +169,24 @@ async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<void> {
   }
 }
 
+function checkFallbackCap(count: number): void {
+  if (count > MAX_FALLBACK_VARIANTS) {
+    throw new UserError(
+      `${count} variants need a full recalculation each (several node changes in one variant, jewel ` +
+        `sockets, skill-granting nodes or items); at most ${MAX_FALLBACK_VARIANTS} are allowed per call`,
+    );
+  }
+}
+
+/** Probe stats in get_stats' shape: a stat the engine does not report (null) is left out. */
+export function withoutNulls(stats: Stats): Stats {
+  const out: Stats = {};
+  for (const [key, value] of Object.entries(stats)) {
+    if (value !== null && value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
 function failed(error: unknown): ProbeVariantResult {
   return { stats: {}, error: errorText(error), userError: error instanceof UserError };
 }
@@ -158,21 +198,22 @@ function chunks<T>(list: T[], size: number): T[][] {
 }
 
 /**
- * Run one fallback variant between a full snapshot and its exact restore
- * (probeThenRestore). A variant error with an exact restore is that variant's
- * error; a restore that fails ends the whole call (the build may differ).
+ * Run one fallback variant between a snapshot and its exact restore
+ * (probeThenRestore): the passive tree's alone for a `treeOnly` variant, the
+ * whole build's otherwise. A variant error with an exact restore is that
+ * variant's error; a restore that fails ends the whole call (the build may differ).
  */
 async function runFallback(
   deps: ProbeDeps,
   variant: ProbeVariant,
   request: ProbeRequest,
-  reason: string | undefined,
+  { reason, treeOnly }: PendingFallback,
 ): Promise<ProbeVariantResult> {
-  const snapshot = await deps.snapshot();
+  const snapshot = treeOnly ? await deps.snapshotTree() : await deps.snapshot();
   let restoreFailed = false;
   const restore = async (): Promise<void> => {
     try {
-      await deps.restore(snapshot);
+      await (treeOnly ? deps.restoreTree(snapshot) : deps.restore(snapshot));
     } catch (error) {
       restoreFailed = true;
       throw error;
@@ -188,7 +229,7 @@ async function runFallback(
       }),
       restore,
     );
-    const { ok: _ok, reason: _reason, ...rest } = raw;
+    const { ok: _ok, reason: _reason, treeOnly: _treeOnly, ...rest } = raw;
     return { ...(rest as ProbeVariantResult), stats: raw.stats ?? {}, fallback: true, fallbackReason: reason };
   } catch (error) {
     if (restoreFailed) throw error;
@@ -213,41 +254,41 @@ export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeRe
 
   // Classify first (validation only), so the fallback cap fails before any work.
   const fast: number[] = [];
-  const fallbacks: Array<{ index: number; reason?: string }> = [];
+  const fallbacks: PendingFallback[] = [];
+  let base: Stats | undefined;
   for (const chunk of chunks(toEngine, PROBE_CHUNK)) {
-    const res = await deps.send<{ ok: true; results: BridgeProbeResult[] }>({
+    const res = await deps.send<{ ok: true; base: Stats; results: BridgeProbeResult[] }>({
       cmd: 'probe',
       classifyOnly: true,
+      stats: request.stats,
       variants: chunk.map((i) => request.variants[i]),
     });
+    base ??= res.base;
     chunk.forEach((i, j) => {
       const raw = res.results?.[j] ?? {};
       if (raw.error !== undefined) results[i] = { stats: {}, error: raw.error, userError: raw.userError === true };
-      else if (raw.fallback) fallbacks.push({ index: i, reason: raw.reason });
+      else if (raw.fallback) fallbacks.push({ index: i, reason: raw.reason, treeOnly: raw.treeOnly === true });
       else fast.push(i);
     });
   }
-  if (fallbacks.length > MAX_FALLBACK_VARIANTS) {
-    throw new UserError(
-      `${fallbacks.length} variants need a full recalculation each (several node changes in one variant, jewel ` +
-        `sockets, skill-granting nodes or items); at most ${MAX_FALLBACK_VARIANTS} are allowed per call`,
-    );
+  checkFallbackCap(fallbacks.length);
+  if (base === undefined) {
+    // No variant reached the engine: a variant-less probe only reads the base.
+    base = (await deps.send<{ ok: true; base: Stats }>({ cmd: 'probe', stats: request.stats, variants: [] })).base;
   }
 
-  let base: Stats | undefined;
-  for (const chunk of fast.length > 0 ? chunks(fast, PROBE_CHUNK) : [[]]) {
+  for (const chunk of chunks(fast, PROBE_CHUNK)) {
     const res = await deps.send<{ ok: true; base: Stats; results: BridgeProbeResult[] }>({
       cmd: 'probe',
       stats: request.stats,
       useFullDPS: request.useFullDPS,
       variants: chunk.map((i) => request.variants[i]),
     });
-    base ??= res.base;
     chunk.forEach((i, j) => {
       const raw = res.results?.[j] ?? {};
       if (raw.fallback) {
         // Classified as calculator-safe a moment ago; the build has not changed.
-        fallbacks.push({ index: i, reason: raw.reason });
+        fallbacks.push({ index: i, reason: raw.reason, treeOnly: raw.treeOnly === true });
       } else if (raw.error !== undefined) {
         results[i] = { stats: {}, error: raw.error, userError: raw.userError === true };
       } else {
@@ -256,12 +297,14 @@ export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeRe
     });
   }
 
-  for (const { index, reason } of fallbacks) {
-    results[index] = await runFallback(deps, request.variants[index], request, reason);
+  // Defensive: the run pass may report a fallback the classify pass did not.
+  checkFallbackCap(fallbacks.length);
+  for (const fallback of fallbacks) {
+    results[fallback.index] = await runFallback(deps, request.variants[fallback.index], request, fallback);
   }
 
   return {
-    base: base ?? {},
+    base,
     results: results.map((r) => r ?? { stats: {}, error: 'variant was not run' }),
   };
 }

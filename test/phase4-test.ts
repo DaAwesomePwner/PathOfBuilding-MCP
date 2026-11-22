@@ -34,9 +34,39 @@ function isError(result: unknown): boolean {
 }
 
 async function call(client: Client, name: string, args: Record<string, unknown> = {}): Promise<unknown> {
-  // find_best_next_nodes takes about 40 s on a CI runner, close to the client's
-  // default 60 s request timeout; other test scripts run at the same time.
+  // Generous: other test scripts run at the same time on a CI runner.
   return client.callTool({ name, arguments: args }, undefined, { timeout: 180_000 });
+}
+
+async function exportXml(client: Client): Promise<string> {
+  return extractText(await call(client, 'export_build', { format: 'xml' }));
+}
+
+/** Call a read-only tool; the exported build must stay byte-identical. */
+async function readOnlyCall(client: Client, name: string, args: Record<string, unknown>): Promise<unknown> {
+  const before = await exportXml(client);
+  const t = performance.now();
+  const result = await call(client, name, args);
+  log(`  ${name} ${JSON.stringify(args)}: ${(performance.now() - t).toFixed(0)} ms`);
+  assert((await exportXml(client)) === before, `${name}: the exported build changed`);
+  return result;
+}
+
+interface Ranking {
+  nodeId: number;
+  nodeName: string;
+  nodeType: string;
+  isKeystone: boolean;
+  isNotable: boolean;
+  delta: number;
+  pointsCost?: number;
+  deltaPerPoint?: number;
+  path?: Array<{ id: number; name: string }>;
+  lossIfRemoved?: number;
+  pointsRefunded?: number;
+  lossPerPoint?: number;
+  removedNodes?: Array<{ id: number; name: string }>;
+  removedNodeCount?: number;
 }
 
 function approxEq(a: unknown, b: unknown, tol = 1e-3): boolean {
@@ -142,15 +172,54 @@ async function main(): Promise<void> {
     assert(approxEq(afterUnknown.Life, baseline.Life), 'state should be unaffected');
     log('PASS: unknown node rejected with state intact');
 
+    // Test 4b: one node to allocate runs on the probe engine; the export stays byte-identical.
+    log('Test 4b: simulate_passive_change (allocate one node)');
+    const near = JSON.parse(
+      extractText(await call(client, 'find_best_next_nodes', { count: 1, optimizeFor: 'Life', maxPoints: 3, rankBy: 'total' })),
+    ) as { rankings: Ranking[] };
+    const target = near.rankings[0];
+    assert(target, 'no node to allocate');
+    const simOne = JSON.parse(
+      extractText(await readOnlyCall(client, 'simulate_passive_change', { allocate: [target.nodeId] })),
+    ) as { valid: boolean; keyDeltas: Record<string, number> };
+    assert(simOne.valid, 'allocating one node with its path must keep the tree connected');
+    assert(approxEq(simOne.keyDeltas.Life, target.delta, 1e-9), `Life delta ${simOne.keyDeltas.Life} vs find_best_next_nodes ${target.delta}`);
+    log(`PASS: allocate "${target.nodeName}" (${target.pointsCost} points) → Life ${simOne.keyDeltas.Life}`);
+
     // Test 5: find_best_next_nodes (limit results)
     log('Test 5: find_best_next_nodes (count=5, optimizeFor=Life)');
     const best = JSON.parse(
-      extractText(await call(client, 'find_best_next_nodes', { count: 5, optimizeFor: 'Life' })),
-    ) as { count: number; rankings: Array<{ nodeName: string; delta: number; isKeystone: boolean; nodeType: string }> };
+      extractText(await readOnlyCall(client, 'find_best_next_nodes', { count: 5, optimizeFor: 'Life' })),
+    ) as { count: number; maxPoints: number; rankBy: string; evaluated: number; rankings: Ranking[] };
     assert(best.count <= 5, `count should be <=5, got ${best.count}`);
     assert(best.count > 0, 'should find at least one reachable node');
+    assert(best.maxPoints === 3 && best.rankBy === 'perPoint', `defaults: maxPoints ${best.maxPoints}, rankBy ${best.rankBy}`);
     assert(best.rankings.every((r) => r.nodeType !== 'Socket'), 'jewel sockets should be excluded by default');
-    log(`PASS: top ${best.count} (best="${best.rankings[0]?.nodeName}" delta=${best.rankings[0]?.delta})`);
+    for (const r of best.rankings) {
+      assert(r.pointsCost !== undefined && r.pointsCost >= 1 && r.pointsCost <= 3, `${r.nodeName}: pointsCost ${r.pointsCost}`);
+      assert(r.path?.length === r.pointsCost && r.path[r.path.length - 1].id === r.nodeId, `${r.nodeName}: path ${JSON.stringify(r.path)}`);
+      assert(approxEq(r.deltaPerPoint, r.delta / r.pointsCost), `${r.nodeName}: deltaPerPoint`);
+    }
+    for (let i = 1; i < best.rankings.length; i++) {
+      assert((best.rankings[i - 1].deltaPerPoint ?? 0) >= (best.rankings[i].deltaPerPoint ?? 0), 'not ranked by delta per point');
+    }
+    log(`PASS: top ${best.count} of ${best.evaluated} (best="${best.rankings[0]?.nodeName}" delta=${best.rankings[0]?.delta} over ${best.rankings[0]?.pointsCost} points)`);
+
+    log('Test 5b: find_best_next_nodes maxPoints / rankBy');
+    const adjacent = JSON.parse(
+      extractText(await readOnlyCall(client, 'find_best_next_nodes', { count: 50, optimizeFor: 'Life', maxPoints: 1, rankBy: 'total' })),
+    ) as { evaluated: number; rankings: Ranking[] };
+    assert(adjacent.rankings.every((r) => r.pointsCost === 1), 'maxPoints 1 returned a node costing more than one point');
+    for (let i = 1; i < adjacent.rankings.length; i++) {
+      assert(adjacent.rankings[i - 1].delta >= adjacent.rankings[i].delta, 'rankBy total is not ranked by delta');
+    }
+    const wide = JSON.parse(
+      extractText(await readOnlyCall(client, 'find_best_next_nodes', { count: 50, maxPoints: 3, rankBy: 'total' })),
+    ) as { evaluated: number; rankings: Ranking[] };
+    assert(wide.evaluated > adjacent.evaluated, `maxPoints 3 evaluated ${wide.evaluated}, maxPoints 1 ${adjacent.evaluated}`);
+    assert(wide.rankings.some((r) => (r.pointsCost ?? 0) > 1), 'maxPoints 3 found no node costing more than one point');
+    assert(isError(await call(client, 'find_best_next_nodes', { maxPoints: 11 })), 'maxPoints 11 should be refused');
+    log(`PASS: maxPoints 1 evaluated ${adjacent.evaluated} nodes, maxPoints 3 ${wide.evaluated}`);
 
     // Test 6: state restored after find_best_next_nodes
     log('Test 6: state integrity after find_best_next_nodes');
@@ -164,12 +233,25 @@ async function main(): Promise<void> {
     // Test 7: find_worst_allocated_nodes
     log('Test 7: find_worst_allocated_nodes (count=5)');
     const worst = JSON.parse(
-      extractText(await call(client, 'find_worst_allocated_nodes', { count: 5, optimizeFor: 'Life' })),
-    ) as { count: number; rankings: Array<{ nodeName: string; lossIfRemoved: number; nodeType: string; isKeystone: boolean }> };
+      extractText(await readOnlyCall(client, 'find_worst_allocated_nodes', { count: 5, optimizeFor: 'Life' })),
+    ) as { count: number; rankBy: string; rankings: Ranking[] };
     assert(worst.count > 0, 'should find at least one removable node');
-    assert(worst.rankings.every((r) => !r.isKeystone), 'keystones should be excluded');
-    assert(worst.rankings.every((r) => r.nodeType === 'Normal'), 'only Normal nodes should be tested');
-    log(`PASS: worst ${worst.count} (least valuable="${worst.rankings[0]?.nodeName}" loss=${worst.rankings[0]?.lossIfRemoved})`);
+    assert(worst.rankBy === 'perPoint', `default rankBy ${worst.rankBy}`);
+    // Notables and keystones are evaluated too (with their dependents); masteries never.
+    assert(worst.rankings.every((r) => r.nodeType !== 'Mastery' && r.nodeType !== 'ClassStart'), 'masteries and class starts are excluded');
+    for (const r of worst.rankings) {
+      assert((r.pointsRefunded ?? 0) >= 1 && r.removedNodes?.[0]?.id === r.nodeId, `${r.nodeName}: ${JSON.stringify(r)}`);
+      assert(approxEq(r.lossPerPoint, (r.lossIfRemoved ?? 0) / (r.pointsRefunded ?? 1)), `${r.nodeName}: lossPerPoint`);
+    }
+    const worstAll = JSON.parse(
+      extractText(await readOnlyCall(client, 'find_worst_allocated_nodes', { count: 50, optimizeFor: 'Life', rankBy: 'total' })),
+    ) as { rankings: Ranking[] };
+    for (let i = 1; i < worstAll.rankings.length; i++) {
+      assert((worstAll.rankings[i - 1].lossIfRemoved ?? 0) <= (worstAll.rankings[i].lossIfRemoved ?? 0), 'rankBy total is not ranked by loss');
+    }
+    const notable = worstAll.rankings.find((r) => r.isNotable && (r.pointsRefunded ?? 0) > 1);
+    assert(notable, 'no notable with its dependents among the 50 least valuable nodes');
+    log(`PASS: worst ${worst.count} (least valuable="${worst.rankings[0]?.nodeName}" loss=${worst.rankings[0]?.lossIfRemoved} over ${worst.rankings[0]?.pointsRefunded} points); notable "${notable.nodeName}" refunds ${notable.pointsRefunded}`);
 
     // Test 8: state restored after find_worst
     log('Test 8: state integrity after find_worst_allocated_nodes');
@@ -184,7 +266,7 @@ async function main(): Promise<void> {
     if (firstKeystone) {
       log(`Test 9: evaluate_keystone "${firstKeystone.name}"`);
       const ev = JSON.parse(
-        extractText(await call(client, 'evaluate_keystone', { keystone: firstKeystone.name })),
+        extractText(await readOnlyCall(client, 'evaluate_keystone', { keystone: firstKeystone.name })),
       ) as { keystone: string; currentlyAllocated: boolean; action: string; keyDeltas: Record<string, number>; nodeStats: string[] };
       assert(ev.currentlyAllocated === true, 'should be currently allocated');
       assert(ev.action === 'removed', 'action should be "removed"');
@@ -199,7 +281,7 @@ async function main(): Promise<void> {
 
     // Test 10: evaluate_keystone for not-allocated keystone
     log('Test 10: evaluate_keystone "Chaos Inoculation" (likely not allocated)');
-    const ciResp = await call(client, 'evaluate_keystone', { keystone: 'Chaos Inoculation' });
+    const ciResp = await readOnlyCall(client, 'evaluate_keystone', { keystone: 'Chaos Inoculation' });
     if (isError(ciResp)) {
       log('  CI not in tree data: SKIPPED');
     } else {

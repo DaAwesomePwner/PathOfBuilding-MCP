@@ -122,8 +122,11 @@ async function main(): Promise<void> {
 
     // Test 4: suggest_upgrades (all slots)
     log('Test 4: suggest_upgrades (all slots)');
+    const xmlBeforeSug = extractText(await call(client, 'export_build', { format: 'xml' }));
     const sugAll = JSON.parse(extractText(await call(client, 'suggest_upgrades'), 1)) as UpgradeResp;
+    assert(extractText(await call(client, 'export_build', { format: 'xml' })) === xmlBeforeSug, 'export changed after suggest_upgrades');
     assert(sugAll.suggestions.length >= 5, `expected several slot suggestions, got ${sugAll.suggestions.length}`);
+    assert(sugAll.suggestions.some((s) => s.dpsContribution > 0), 'no slot contributes DPS');
     for (const s of sugAll.suggestions) {
       assert(typeof s.slot === 'string', 'slot string');
       assert(typeof s.priority === 'number', 'priority number');
