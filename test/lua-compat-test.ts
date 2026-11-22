@@ -48,6 +48,12 @@ interface Case {
   count: number;
   /** Expected run result: "OK:..." exact string, or a RegExp for "ERR:..." messages. */
   run: string | RegExp;
+  /**
+   * Expected run result when the LuaJIT under test parses compound assignments
+   * itself (upstream LuaJIT has since a2ce8114, 2026-07-20), so `loadfile`
+   * succeeds without the rewrite. Defaults to `run`.
+   */
+  runNative?: string | RegExp;
 }
 
 const cases: Case[] = [
@@ -168,6 +174,7 @@ const cases: Case[] = [
     src: 'local t = { 1 }\nt --[[ a\nb ]] [1] += 4\nreturn t[1]',
     count: 0,
     run: /multi-line-comment-inside-lhs-left-alone\.lua:3: '=' expected near '\+'$/,
+    runNative: 'OK:5',
   },
   {
     name: 'crlf',
@@ -194,6 +201,7 @@ const cases: Case[] = [
     src: 'local x = 1\nx += 1\nreturn )',
     count: 1,
     run: /^ERR:.*case-retry-fails-original-error\.lua:2: '=' expected near '\+'$/,
+    runNative: /^ERR:.*case-retry-fails-original-error\.lua:3: /,
   },
 ];
 
@@ -213,6 +221,11 @@ function main(): void {
     }
     throw e;
   }
+
+  // Newer upstream LuaJIT parses `x += 1` natively; then loadfile never needs
+  // the rewrite and only cases that depend on a parse failure differ.
+  const native = spawnSync(luajit, ['-e', 'assert(loadstring("local x = 1 x += 1"))']).status === 0;
+  console.log(`LuaJIT ${native ? 'parses' : 'rejects'} compound assignments natively`);
 
   const dir = mkdtempSync(path.join(os.tmpdir(), 'pob-mcp-lua-compat-'));
   try {
@@ -240,8 +253,9 @@ function main(): void {
       }
       if (c.count === 0 && out !== c.src) fail(`${c.name}: source without compound assignments was modified`);
       if (out.split('\n').length !== c.src.split('\n').length) fail(`${c.name}: line count changed by the rewrite`);
-      const runOk = typeof c.run === 'string' ? run === c.run : c.run.test(run);
-      if (!runOk) fail(`${c.name}: run result ${JSON.stringify(run)} does not match ${String(c.run)}`);
+      const want = native && c.runNative !== undefined ? c.runNative : c.run;
+      const runOk = typeof want === 'string' ? run === want : want.test(run);
+      if (!runOk) fail(`${c.name}: run result ${JSON.stringify(run)} does not match ${String(want)}`);
       console.log(`PASS: ${c.name}`);
     }
     console.log('ALL LUA-COMPAT TESTS PASSED');
