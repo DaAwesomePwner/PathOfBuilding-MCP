@@ -4,7 +4,7 @@
 
 An MCP server that exposes [Path of Building Community](https://pathofbuilding.community/)'s build-planning and calculation engine to LLM clients (Claude Desktop, Claude Code, and other [MCP](https://modelcontextprotocol.io/) hosts).
 
-The server runs PoB's real Lua calculation engine in headless mode and surfaces 39 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," comparing alternatives, and generating weighted trade searches.
+The server runs PoB's real Lua calculation engine in headless mode and surfaces 40 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," comparing alternatives, and generating weighted trade searches.
 
 ## Prerequisites
 
@@ -88,17 +88,26 @@ PoB updates itself in place. The server reads the PoB version from `manifest.xml
 
 ## Tools
 
-The server exposes 39 MCP tools. See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for a narrative tour with examples.
+The server exposes 40 MCP tools. Every tool replies with compact JSON (no pretty-printing) and carries MCP annotations: `readOnlyHint` on every tool that never changes the build, `destructiveHint` on `load_build`, `reset_build`, `configure_pob_path` and `reload_engine`. See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for a narrative tour with examples.
 
 - **Engine setup:** `configure_pob_path`, `get_engine_info`, `reload_engine` (these work even when PoB is not configured).
 - **Build I/O:** `load_build`, `export_build` (summary, XML or PoB build code — round-trip lossless), `reset_build`.
-- **Inspection:** `get_stats`, `get_skill_breakdown`, `list_equipped_items`, `list_valid_slots`, `get_item_in_slot`.
+- **Inspection:** `get_stats` (by category, or exactly the PoB output keys given in `stats`; unknown keys come back as null), `get_skill_breakdown`, `list_equipped_items` (compact by default: mods as `{ line }` plus true flags, no item text; `includeItemText: true` adds the PoB text, `detail: "full"` gives every field), `list_valid_slots`, `get_item_in_slot` (always includes the item text).
+- **Batch what-ifs:** `evaluate_changes` (up to 500 variants mixing node, item, gem and config changes in one call; a compact table ranked by any stat; read-only, see below).
 - **Items:** `swap_item`, `unequip_item`, `compare_items` (2-5 candidates for a slot, read-only, well under a second), `suggest_upgrades` (each slot's DPS/EHP contribution, measured by emptying it, read-only).
-- **Passive tree:** `get_passive_tree`, `simulate_passive_change`, `find_best_next_nodes` (every node whose path costs at most `maxPoints` points, default 3, ranked by gain per point or in total with `rankBy`; reports each node's cost and path; a few seconds), `find_worst_allocated_nodes` (every allocated node, notables and keystones included, removed with the nodes that depend on it; ranked by loss per refunded point or in total; the few needing a full recalculation are capped at the most promising and the rest listed in `skipped`), `evaluate_keystone`, `convert_tree_to_latest` (moves an old-league tree to PoB's latest tree, undoable, reports the nodes and masteries lost).
-- **Gems:** `list_skill_groups`, `lookup_gem`, `list_available_supports`, `swap_gem`, `compare_supports` (a refused candidate gets its own `error`), `evaluate_gem_levels`, `find_optimal_links` (scores every support PoB's own compatibility check accepts for the skill, each at its natural maximum level up to 20, then searches combinations of the best: exhaustive within a budget, else pairwise swaps; reports the winner's DPS delta and how many combinations were evaluated; about 1-3 s for a 6-link). All read-only, through PoB's own calculator in milliseconds.
+- **Passive tree:** `get_passive_tree` (compact by default: keystones and notables with stats, every allocated node as id/name/type; `detail: "full"` gives every node with its stats), `simulate_passive_change`, `find_best_next_nodes` (every node whose path costs at most `maxPoints` points, default 3, ranked by gain per point or in total with `rankBy`; reports each node's cost and path; a few seconds), `find_worst_allocated_nodes` (every allocated node, notables and keystones included, removed with the nodes that depend on it; ranked by loss per refunded point or in total; the few needing a full recalculation are capped at the most promising and the rest listed in `skipped`), `evaluate_keystone`, `convert_tree_to_latest` (moves an old-league tree to PoB's latest tree, undoable, reports the nodes and masteries lost).
+- **Gems:** `list_skill_groups` (compact gems by default; `detail: "full"` adds gem/skill ids, color and `isSupport`), `lookup_gem`, `list_available_supports`, `swap_gem`, `compare_supports` (a refused candidate gets its own `error`), `evaluate_gem_levels`, `find_optimal_links` (scores every support PoB's own compatibility check accepts for the skill, each at its natural maximum level up to 20, then searches combinations of the best: exhaustive within a budget, else pairwise swaps; reports the winner's DPS delta and how many combinations were evaluated; about 1-3 s for a 6-link). All read-only, through PoB's own calculator in milliseconds.
 - **Config / scenarios:** `get_config`, `set_config`, `list_scenarios`, `simulate_scenario`, `compare_scenarios` (a refused scenario gets its own `error`), `toggle_buffs`. The what-if ones are read-only, through PoB's own calculator in milliseconds.
-- **State / analysis:** `undo_last_change`, `snapshot_and_compare`, `diagnose_build`.
+- **State / analysis:** `undo_last_change`, `snapshot_and_compare`, `diagnose_build` (one JSON reply: `checks`). `suggest_upgrades` also replies with one JSON part (`suggestions`, without the full item; `list_equipped_items` has it).
 - **Trade:** `generate_trade_search` (runs PoB's own weighted trade query generator for a gear or flask slot and returns a pathofexile.com trade search URL sorted by weighted sum, with the weights so they can be adjusted, plus required mods and a minimum; read-only, no network access — the link is only opened by you), `search_trade_mods` (find trade stat ids for a slot by text; all/hybrid resistance and attribute ids come back with `weightable: false` and the pseudo totals to weight instead in `preferredTradeIds` — they still work as required mods).
+
+### Iterating fast
+
+What-if questions run through PoB's own calculator (the one its tooltips use) without changing or recalculating the build: a few milliseconds per variant. Use them to search, then commit only the winner.
+
+- **`evaluate_changes`** tries many candidate changes in one call. Each variant can combine `allocate` / `deallocate` (node names or ids), `items` (`{ slot, itemText }` or `{ slot, unequip: true }`), `gems` (`set` / `remove` / `add` / `clear` ops on a group from `list_skill_groups`) and `config` (set_config keys). The reply is `base` plus one short row per variant sorted by the change of `rankBy` (default `CombinedDPS`; `order: "asc"` for smallest first): `value`, `delta` for each requested `stats` key (default DPS, EHP, Life, ES, Mana, resistances), `pointsAdded` / `pointsRemoved`, `fallback`. A refused variant (unknown node or gem, item that does not fit, bad config key) is listed last with its `error`; the call still succeeds. Nothing is applied: commit items with `swap_item` / `unequip_item` and config with `set_config`; tree and gem changes are made in PoB itself.
+- **`find_best_next_nodes`** with `maxPoints` (largest path cost, default 3) and `rankBy` (`perPoint` or `total`), and **`find_worst_allocated_nodes`**, rank the whole tree in a few seconds.
+- **Fast vs fallback:** single-node changes, item swaps and unequips, gem changes and config changes take the fast path. A variant with several node changes at once, a passive-tree jewel socket, or a node or item that grants a skill is applied, recalculated and restored exactly instead (~0.3-0.5 s each, at most 50 per call; marked `fallback`).
 
 ## Troubleshooting
 
