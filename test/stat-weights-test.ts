@@ -18,6 +18,8 @@
 //   7. suggest_upgrades: the first modSlots slots carry PoB trade-generator
 //      mods with numeric weights, the rest none; priority order kept; the
 //      archetype table is gone; timing logged.
+//   8. A trade query failure is recorded on its slot (measurements kept); one
+//      that ends the engine fails the call and no further slot is queried.
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -231,15 +233,26 @@ async function main(): Promise<void> {
       assert(first.dpsContribution === measured[0].dpsContribution && first.ehpContribution === measured[0].ehpContribution, 'measurement kept');
       assert(failedOne.filter((s) => (s.suggestedMods?.length ?? 0) > 0).length === 2, 'the other two slots still get mods');
       failSlot(order[0], true);
-      const gone = await session.suggestUpgrades();
-      const rest = gone.filter((s) => s.error === undefined).slice(1, 3);
-      assert(rest.every((s) => s.suggestedMods === undefined && /engine stopped/.test(s.modsError ?? '')), `slots after an engine loss: ${JSON.stringify(rest)}`);
+      let queried = 0;
+      const countingSend = bridge.send;
+      (bridge as unknown as { send: typeof bridge.send }).send = (<T>(command: object, timeout?: number): Promise<T> => {
+        if ((command as { cmd?: string }).cmd === 'tradeQuery') queried++;
+        return countingSend<T>(command, timeout);
+      }) as typeof bridge.send;
+      let failedCall: unknown;
+      try {
+        await session.suggestUpgrades();
+      } catch (e) {
+        failedCall = e;
+      }
+      assert(failedCall instanceof Error && /simulated trade query failure/.test(failedCall.message), `the call fails once the engine is gone: ${String(failedCall)}`);
+      assert(queried === 1, `no slot is queried after the engine is gone (${queried} queries)`);
     } finally {
       (bridge as unknown as { send: typeof bridge.send }).send = realSend;
       (bridge as unknown as { isRunning: () => boolean }).isRunning = realRunning;
     }
     assert((await state()) === before, 'build changed');
-    log('PASS: failures recorded per slot; queries stop once the engine is gone');
+    log('PASS: failures recorded per slot; the call fails once the engine is gone');
 
     console.log('\nALL STAT WEIGHTS TESTS PASSED');
   } finally {

@@ -1236,7 +1236,7 @@ return function(ctx)
 		if checked.config then
 			-- The restore that follows puts the committed tables back.
 			local _, orig = applyConfig(checked.config)
-			ctx.stashCommittedConfigTables(orig, build.configTab.input)
+			ctx.stashCommittedConfigTables(cmd.configToken, orig, build.configTab.input)
 		end
 		if #checked.gems > 0 then applyGems(checked.gems) end
 		commitItems(checked.items)
@@ -1321,15 +1321,27 @@ return function(ctx)
 		local before = nodeBatch.captureAllocated()
 		edit.started()
 		if config then
+			-- Options that already hold their value change nothing: no copies.
+			local input, changes = build.configTab.input, false
+			for key, value in pairs(config) do
+				if not ctx.sameConfigValue(input[key], value) then
+					changes = true
+					break
+				end
+			end
+			if not changes then config = nil end
+		end
+		if config then
 			-- As set_config sets the options, but on copies of the config
 			-- tables (as probeCommit does), which stay live once the change is
-			-- committed; the committed tables are remembered unwritten
-			-- (stashCommittedConfigTables), so a rollback or an undo of this
-			-- change (ConfigTables.restoreInput) puts them back with their
-			-- pairs() order. Writing keys into them and deleting them again
-			-- may not keep it (the string hash seed differs per process).
+			-- committed; the committed tables are remembered unwritten under
+			-- the caller's `configToken` (stashCommittedConfigTables), so the
+			-- rollback or the undo of this change, sent with that token
+			-- (ConfigTables.restoreInput), puts them back with their pairs()
+			-- order. Writing keys into them and deleting them again may not
+			-- keep it (the string hash seed differs per process).
 			local orig = ctx.detachConfigTables(config)
-			ctx.stashCommittedConfigTables(orig, build.configTab.input)
+			ctx.stashCommittedConfigTables(cmd.configToken, orig, build.configTab.input)
 			build.configTab:BuildModList()
 			build.buildFlag = true
 		end

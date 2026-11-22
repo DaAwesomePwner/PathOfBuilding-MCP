@@ -2018,12 +2018,14 @@ end
 -- table and reorder it. What-ifs therefore never write to these tables: they
 -- swap in copies and later put the very same objects back. (One table of
 -- functions: the main chunk is at Lua's limit of 200 locals.)
--- `replaced` maps the input table of copies a change swapped in (a probe
--- fallback, apply_changes) to the committed tables it replaced, untouched
--- since: a restore (rollback, undo) whose target values are theirs puts those
--- very tables back. Writing to the live tables drops their entry; weak keys,
--- so the tables of a replaced build go away.
-local ConfigTables = { replaced = setmetatable({ }, { __mode = "k" }) }
+-- `remembered` holds, by a token the caller chose, the committed tables a
+-- change replaced with copies (a probe fallback, apply_changes), untouched
+-- since: only the restore sent with that token (the fallback's restore, the
+-- rollback or undo of that apply_changes) puts those very tables back, and
+-- it forgets them. A plain table holding at most MAX_REMEMBERED entries
+-- (oldest dropped: its restore then writes by value), emptied when a build
+-- is loaded, so nothing outlives the build it belongs to.
+local ConfigTables = { remembered = { }, rememberedOrder = { }, MAX_REMEMBERED = 64 }
 do
 	local function current()
 		local configTab = build.configTab
@@ -2097,10 +2099,32 @@ do
 	end
 
 	-- probeCommit and apply_changes swapped in copies (`detached` is their
-	-- input table) for the committed tables `orig`: a later restoreInput to
-	-- orig's values puts orig back instead of writing to the copies.
-	function ConfigTables.stashCommitted(orig, detached)
-		ConfigTables.replaced[detached] = orig
+	-- input table) for the committed tables `orig`: restoreInput with `token`
+	-- puts orig back instead of writing to the copies. No token: nothing is
+	-- remembered.
+	function ConfigTables.stashCommitted(token, orig, detached)
+		if type(token) ~= "string" then return end
+		local order = ConfigTables.rememberedOrder
+		if ConfigTables.remembered[token] == nil then order[#order + 1] = token end
+		ConfigTables.remembered[token] = { orig = orig, detached = detached }
+		while #order > ConfigTables.MAX_REMEMBERED do
+			ConfigTables.remembered[table.remove(order, 1)] = nil
+		end
+	end
+
+	-- Returns the entry of `token` and forgets it.
+	function ConfigTables.takeRemembered(token)
+		local entry = token and ConfigTables.remembered[token]
+		if not entry then return nil end
+		ConfigTables.remembered[token] = nil
+		for i, t in ipairs(ConfigTables.rememberedOrder) do
+			if t == token then table.remove(ConfigTables.rememberedOrder, i) break end
+		end
+		return entry
+	end
+
+	function ConfigTables.forgetAll()
+		ConfigTables.remembered, ConfigTables.rememberedOrder = { }, { }
 	end
 end
 
@@ -2114,21 +2138,20 @@ function ConfigTables.fullInput()
 	return result
 end
 
--- set_config undo and the full snapshot restore (restoreConfig).
-function ConfigTables.restoreInput(input)
+-- set_config undo and the full snapshot restore (restoreConfig). `token`:
+-- the restore a probe fallback or apply_changes remembered tables for.
+function ConfigTables.restoreInput(input, token)
 	if not (build.configTab and build.configTab.input) then
 		error("Config tab not available")
 	end
 	input = input or { }
+	local entry = ConfigTables.takeRemembered(token)
 	local live = ConfigTables.current()
-	local orig = ConfigTables.replaced[live.input]
-	if orig and orig.set == live.set and ConfigTables.sameInput(orig.input, input) then
-		-- The live tables are copies swapped in for tables that hold exactly
-		-- the target values (the restore after a fallback variant with config,
-		-- a rollback or undo of apply_changes): those tables, never written
-		-- since, go back; the copies are dropped.
-		ConfigTables.replaced[live.input] = nil
-		ConfigTables.attach(orig)
+	if entry and entry.detached == live.input and entry.orig.set == live.set and ConfigTables.sameInput(entry.orig.input, input) then
+		-- The live tables are still the copies swapped in for the remembered
+		-- ones, which hold exactly the target values: those tables, never
+		-- written since, go back; the copies are dropped.
+		ConfigTables.attach(entry.orig)
 	end
 	local current = ConfigTables.current()
 	if ConfigTables.sameInput(current.input, input) then
@@ -2140,7 +2163,6 @@ function ConfigTables.restoreInput(input)
 		-- Change only the keys that differ (set_config undo); a value equal
 		-- but for JSON rounding is left as it is.
 		local target = current.input
-		ConfigTables.replaced[target] = nil
 		for key in pairs(target) do
 			if input[key] == nil then target[key] = nil end
 		end
@@ -4135,6 +4157,9 @@ local DISPATCH = {
 	-- Build loading / info
 	loadXML = {
 		handler = function(cmd)
+			-- Remembered config tables belong to the build being replaced (a
+			-- rejected load puts that build back from XML, as new tables).
+			ConfigTables.forgetAll()
 			local xmlText = cmd.xml or ""
 			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
 				userError("Invalid Path of Building XML")
@@ -4205,7 +4230,6 @@ local DISPATCH = {
 	setConfig = {
 		-- Inline mutation: options loop + rebuild before stats
 		handler = function(cmd)
-			ConfigTables.replaced[build.configTab.input] = nil
 			for key, value in pairs(cmd.options or { }) do
 				build.configTab.input[key] = value
 			end
@@ -4216,7 +4240,7 @@ local DISPATCH = {
 		end,
 	},
 	restoreConfig = {
-		handler = function(cmd) ConfigTables.restoreInput(cmd.input or { }) return { } end,
+		handler = function(cmd) ConfigTables.restoreInput(cmd.input or { }, cmd.token) return { } end,
 		mutating = true,
 	},
 
@@ -4586,6 +4610,7 @@ do
 		detachConfigTables = ConfigTables.detach,
 		restoreConfigTables = ConfigTables.restore,
 		stashCommittedConfigTables = ConfigTables.stashCommitted,
+		sameConfigValue = ConfigTables.sameValue,
 		allocNodesBatch = allocNodesBatch,
 		deallocNodesBatch = deallocNodesBatch,
 		pumpAndRead = pumpAndRead,

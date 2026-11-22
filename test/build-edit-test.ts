@@ -283,6 +283,25 @@ async function test1Parity(): Promise<void> {
     await session.undoLastChange();
     assert((await configTables(bridge)) === tablesBefore, `apply_changes config + undo #${i + 1}: config tables differ in value or pairs() order`);
   }
+  // A config option set to the value it holds changes nothing; later restores
+  // that are not this change's own (a probe fallback, a swap_item undo) leave
+  // the config tables as they are.
+  const live = (await bridge.send<{ input: Record<string, unknown> }>({ cmd: 'getFullConfig' })).input;
+  const noopKey = Object.keys(live).find((k) => live[k] === true);
+  assert(noopKey, 'a config option that is on');
+  const [far1, far2] = await twoPointNotables(bridge, 2);
+  await session.applyChanges({ config: { [noopKey]: true }, allocate: [far1.id] });
+  const afterNoop = await configTables(bridge);
+  assert(afterNoop === tablesBefore, 'a no-op config option changed the config tables');
+  const fb = await session.probe({ variants: [{ deallocate: [far1.id], allocate: [far2.id] }, { deallocate: [far1.id], allocate: [far2.id], config: { usePowerCharges: true } }] });
+  assert(fb.results.every((r) => r.fallback && r.error === undefined), `fallback variants: ${JSON.stringify(fb.results.map((r) => r.error ?? r.fallbackReason))}`);
+  assert((await configTables(bridge)) === tablesBefore, 'a probe fallback after a no-op config apply_changes changed the config tables');
+  await session.swapItemWithDiff('Ring 1', RING);
+  await session.undoLastChange();
+  assert((await configTables(bridge)) === tablesBefore, 'a swap_item undo after a no-op config apply_changes changed the config tables');
+  await session.undoLastChange();
+  assertSame('undo of the no-op config variant', await state(session), base);
+  assert((await configTables(bridge)) === tablesBefore, 'undo of the no-op config variant: config tables differ');
   log('PASS 1b');
 
   log('Test 1c: undo of a main-skill gem change restores the cached main skill');
