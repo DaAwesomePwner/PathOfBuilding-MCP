@@ -1979,6 +1979,7 @@ do
 	end
 
 	ConfigTables.current = current
+	ConfigTables.attach = attach
 
 	-- Installs copies of the `orig` config tables (with `changes` applied to
 	-- the input copy).
@@ -2008,11 +2009,21 @@ do
 		if not ok then error(err, 0) end
 	end
 
-	-- True when `input` holds exactly the values of `snapshot` (by value).
+	-- True when a live config value and a snapshot value (which came back
+	-- through JSON, so a number may be rounded to 14 significant digits) are
+	-- the same.
+	function ConfigTables.sameValue(live, snap)
+		if live == snap then return true end
+		if type(live) ~= "number" or type(snap) ~= "number" then return false end
+		return math.abs(live - snap) <= 1e-12 * math.max(math.abs(live), math.abs(snap))
+	end
+
+	-- True when `input` holds the values of `snapshot` (by value).
 	function ConfigTables.sameInput(input, snapshot)
 		local n = 0
 		for key, value in pairs(input) do
-			if snapshot[key] ~= copyValue(value) then return false end
+			local v = copyValue(value)
+			if v == nil or not ConfigTables.sameValue(v, snapshot[key]) then return false end
 			n = n + 1
 		end
 		for _ in pairs(snapshot) do n = n - 1 end
@@ -2020,8 +2031,8 @@ do
 	end
 
 	-- probeCommit detached the config tables for a fallback variant: the
-	-- restore that follows puts `orig` back (when the input returns to their
-	-- values and `detached` is still the live input table).
+	-- restore that follows puts `orig` back (while `detached` is still the
+	-- live input table), before comparing or changing any key.
 	function ConfigTables.stashCommitted(orig, detached)
 		ConfigTables.stash = { orig = orig, detached = detached }
 	end
@@ -2045,22 +2056,26 @@ function ConfigTables.restoreInput(input)
 	input = input or { }
 	local stash = ConfigTables.stash
 	ConfigTables.stash = nil
+	if stash and stash.detached == build.configTab.input then
+		-- After a fallback variant with config: the committed tables, never
+		-- written, go back first; the copies are dropped.
+		ConfigTables.attach(stash.orig)
+	end
 	local current = ConfigTables.current()
-	if stash and stash.detached == current.input and ConfigTables.sameInput(stash.orig.input, input) then
-		-- After a fallback variant: the committed tables, never written.
-		ConfigTables.restore(stash.orig)
-	elseif ConfigTables.sameInput(current.input, input) then
-		-- Nothing to change (a restore after a non-config change): rebuild the
-		-- mod list without writing to the tables, so their order stays.
+	if ConfigTables.sameInput(current.input, input) then
+		-- Nothing to change (a restore after a fallback variant, or after a
+		-- non-config change): rebuild the mod list without writing to the
+		-- tables, so their values and order stay.
 		ConfigTables.restore(current)
 	else
-		-- Change only the keys that differ (set_config undo).
+		-- Change only the keys that differ (set_config undo); a value equal
+		-- but for JSON rounding is left as it is.
 		local target = current.input
 		for key in pairs(target) do
 			if input[key] == nil then target[key] = nil end
 		end
 		for key, value in pairs(input) do
-			if target[key] ~= value then target[key] = value end
+			if not ConfigTables.sameValue(target[key], value) then target[key] = value end
 		end
 		build.configTab:BuildModList()
 	end
