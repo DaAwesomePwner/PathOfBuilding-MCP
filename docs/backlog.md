@@ -19,12 +19,18 @@ it plausible.
 Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
 for later.
 
-- **PoB `dev` branch does not parse under plain LuaJIT.** `src/Modules/Main.lua:342`
-  (`count += 1`, added in upstream commit `c38c8f6b`, 2026-08-23) uses Lua 5.3
-  syntax, so a clone of the default branch fails to boot with `'=' expected
-  near '+'`. Release tags (checked: `v2.67.2`) work. Needs an upstream fix, or
-  a source transform in `bridge.lua`'s module loader. `POB_SOURCE_PATH` for
-  `npm run test:source-clone` should point at a release tag until then.
+- ~~**PoB `dev` branch does not parse under plain LuaJIT.**~~ **Fixed.** PoB 2.68
+  uses compound assignments (`count += 1` in `Modules/Main.lua`, `url ..= ...` in
+  `Classes/CompareBuySimilar.lua`) that only PoB's patched LuaJIT parses. Every PoB
+  file the bridge loads (`LoadModule`, `PLoadModule`, `require`, `Launch.lua`) now
+  goes through `lua/compound-assign.lua`: the file is loaded as-is first, and only
+  if that fails to parse are its compound assignments rewritten in memory to
+  `x = x + (...)` (line numbers preserved; the original error is raised if the
+  retry fails too; nothing is written to the PoB install). Limitations of the
+  rewrite are listed at the top of that file. `test:lua-compat` covers it without
+  PoB. The same change adapts the bridge to 2.68's split constructors
+  (`new("Item"):Item(raw)`), so 2.68.1 boots and passes `test:bridge`/`test:session`.
+  CI still pins `v2.67.2`; moving the pin to a 2.68 tag is separate work.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the

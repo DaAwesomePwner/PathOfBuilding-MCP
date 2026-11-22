@@ -48,6 +48,19 @@ package.cpath = POB_PATH .. "/?.dll;"
 	.. POB_PATH .. "/runtime/?.so;"
 	.. package.cpath
 
+-- PoB 2.68+ uses compound assignments (`count += 1`) that only PoB's patched
+-- LuaJIT parses. Every PoB file is loaded through this loadfile, which tries the
+-- file as-is first and rewrites compound assignments only when that fails to
+-- parse. Nothing is written to the PoB install; the rewrite happens in memory.
+local pobLoadfile
+do
+	local bridgeDir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]*$") or "."
+	local compoundAssign = dofile(bridgeDir .. "/compound-assign.lua")
+	pobLoadfile = compoundAssign.loadfile
+	-- `require` of PoB modules (e.g. Classes.CompareBuySimilar) goes through the same loader.
+	table.insert(package.loaders, 2, compoundAssign.searcher)
+end
+
 -- ---------------------------------------------------------------------------
 -- Protocol stream protection. stdout carries exactly one JSON object per line
 -- and nothing else. Anything PoB (or a library) prints goes to stderr instead.
@@ -550,7 +563,7 @@ function LoadModule(fileName, ...)
 	if not fileName:match("%.lua") then
 		fileName = fileName .. ".lua"
 	end
-	local func, err = loadfile(fileName)
+	local func, err = pobLoadfile(fileName)
 	if func then
 		return func(...)
 	else
@@ -561,7 +574,7 @@ function PLoadModule(fileName, ...)
 	if not fileName:match("%.lua") then
 		fileName = fileName .. ".lua"
 	end
-	local func, err = loadfile(fileName)
+	local func, err = pobLoadfile(fileName)
 	if func then
 		return PCall(func, ...)
 	else
@@ -696,7 +709,7 @@ local function stripColorCodes(text)
 	return (tostring(text):gsub("%^x%x%x%x%x%x%x", ""):gsub("%^%d", ""))
 end
 
-dofile(SCRIPT_PATH .. "/Launch.lua")
+assert(pobLoadfile(SCRIPT_PATH .. "/Launch.lua"))()
 mainObject.continuousIntegrationMode = os.getenv("CI")
 runCallback("OnInit")
 runCallback("OnFrame")
@@ -910,11 +923,31 @@ local function slotRefusalReason(tab, item, slotName)
 	return "a " .. kind .. " item does not go in that slot"
 end
 
+-- PoB 2.68 split object construction into `new("X"):X(args)` and rejects
+-- `new("X", args)`; older PoB only has the latter. Detected once by asking `new`
+-- about a class that does not exist: only the new `new` complains about the
+-- extra argument.
+local construct
+do
+	local split
+	function construct(className, ...)
+		if split == nil then
+			local ok, err = pcall(new, "pobmcp-no-such-class", true)
+			split = not ok and tostring(err):find("Extra argument", 1, true) ~= nil
+		end
+		if split then
+			local object = new(className)
+			return object[className](object, ...)
+		end
+		return new(className, ...)
+	end
+end
+
 -- Parse item text exactly as ItemsTab:CreateDisplayItemFromRaw does (without
 -- normalising), but never through the items tab's displayItem: a parse
 -- failure can then never leave an earlier display item behind to be equipped.
 local function parseItemText(itemRaw, slotName)
-	local ok, item = pcall(new, "Item", itemRaw)
+	local ok, item = pcall(construct, "Item", itemRaw)
 	if not ok then
 		userError("Could not parse the item text for " .. slotName .. ": " .. stripColorCodes(tostring(item)))
 	end
@@ -1518,7 +1551,7 @@ local function installSpec(version, state)
 	if type(versions) ~= "table" or not versions[version] then
 		error("Tree convert failed: unknown tree version " .. tostring(version))
 	end
-	local newSpec = new("PassiveSpec", build, version)
+	local newSpec = construct("PassiveSpec", build, version)
 	newSpec.title = state.title
 	newSpec.jewels = shallowCopy(state.jewels)
 	local overrides = shallowCopy(state.hashOverrides)
@@ -3106,7 +3139,7 @@ local function tradeStateOrError()
 		end
 		h:close()
 	end
-	local gen = new("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	local gen = construct("TradeQueryGenerator", { itemsTab = build.itemsTab })
 	local _, helpers = findUpvalue(gen.StartQuery, "tradeHelpers")
 	helpers = helpers or LoadModule("Classes/TradeHelpers")
 	local texts, pseudo = { }, { }
