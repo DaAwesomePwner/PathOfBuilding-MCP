@@ -13,12 +13,17 @@
 //   * find_best_next_nodes: the cheapest paths first;
 //   * find_worst_allocated_nodes: the calculator candidates are evaluated
 //     first; a slow candidate's removal also removes every evaluated
-//     candidate among its dependents (with their own dependents), so the
-//     largest of their losses estimates how much it loses at least. The
-//     lowest estimate per refunded point (or in total, for rankBy "total")
-//     goes first, the larger refund on ties: a travel path to a socketed
-//     jewel (little lost, many points back) before a node near the class
-//     start whose removal takes most of the tree.
+//     candidate among its dependents (with their own dependents), and the
+//     largest of their losses is a heuristic estimate of its loss (not a
+//     bound: a stat need not drop more when more is removed, e.g. Life when
+//     Chaos Inoculation goes too). Slow candidates with an estimate go in
+//     order of the lowest estimate per refunded point (or in total, for
+//     rankBy "total"), the larger refund on ties: a travel path to a
+//     socketed jewel (little lost, many points back) before a node near the
+//     class start whose removal takes most of the tree. Those with no
+//     evaluated dependent (cluster jewel nodes and the like) have no
+//     estimate; they go by refund, largest first, and the two queues
+//     alternate, so neither fills every slot.
 // The build never changes; nothing is pushed to the undo stack or the
 // journal. Callers hold the session lock.
 
@@ -66,7 +71,11 @@ export interface SkippedNode {
   nodeName: string;
   /** Points the node's variant would add (find_best_next_nodes) or refund (find_worst_allocated_nodes). */
   points: number;
-  /** find_worst_allocated_nodes: the largest loss among the evaluated nodes its removal also removes (about the least it would lose). */
+  /**
+   * find_worst_allocated_nodes: the largest loss among the evaluated nodes its
+   * removal also removes, the heuristic its evaluation order came from (not a
+   * bound on its own loss); absent when none of the nodes it removes was evaluated.
+   */
   minLossEstimate?: number;
   reason: string;
 }
@@ -118,18 +127,31 @@ async function listCandidates(
 function capFallbacks(
   slow: Candidate[],
   which: string,
-  estimate?: (c: Candidate) => number,
+  estimate?: (c: Candidate) => number | undefined,
 ): { kept: Candidate[]; skipped: SkippedNode[] } {
   return {
     kept: slow.slice(0, MAX_SEARCH_FALLBACKS),
-    skipped: slow.slice(MAX_SEARCH_FALLBACKS).map((c) => ({
-      nodeId: c.id,
-      nodeName: c.name,
-      points: c.points,
-      ...(estimate ? { minLossEstimate: estimate(c) } : {}),
-      reason: `needs a full recalculation (${c.fallback}); at most ${MAX_SEARCH_FALLBACKS} such nodes, ${which}, are evaluated per call`,
-    })),
+    skipped: slow.slice(MAX_SEARCH_FALLBACKS).map((c) => {
+      const est = estimate?.(c);
+      return {
+        nodeId: c.id,
+        nodeName: c.name,
+        points: c.points,
+        ...(est !== undefined ? { minLossEstimate: est } : {}),
+        reason: `needs a full recalculation (${c.fallback}); at most ${MAX_SEARCH_FALLBACKS} such nodes, ${which}, are evaluated per call`,
+      };
+    }),
   };
+}
+
+/** a[0], b[0], a[1], b[1], ...; the rest of the longer list at the end. */
+function interleave<T>(a: T[], b: T[]): T[] {
+  const out: T[] = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (i < a.length) out.push(a[i]);
+    if (i < b.length) out.push(b[i]);
+  }
+  return out;
 }
 
 /**
@@ -244,21 +266,25 @@ export async function findWorstAllocatedNodes(deps: TreeSearchDeps, opts: WorstN
     const r = fastRun.results[i];
     if (r.error === undefined) knownLoss.set(c.id, baseValue - toNumber(r.stats[opts.optimizeFor]));
   });
-  const estimate = (c: Candidate): number => {
-    let est = -Infinity;
+  const estimate = (c: Candidate): number | undefined => {
+    let est: number | undefined;
     for (const id of c.nodes) {
       const loss = knownLoss.get(id);
-      if (loss !== undefined && loss > est) est = loss;
+      if (loss !== undefined && (est === undefined || loss > est)) est = loss;
     }
-    return est === -Infinity ? 0 : est;
+    return est;
   };
   const estimates = new Map(candidates.filter((c) => c.fallback !== undefined).map((c) => [c, estimate(c)]));
   const key = (c: Candidate): number => (opts.rankBy === 'total' ? estimates.get(c)! : perPoint(estimates.get(c)!, c.points));
-  const slow = [...estimates.keys()].sort((a, b) => key(a) - key(b) || b.points - a.points || a.id - b.id);
+  const byPoints = (a: Candidate, b: Candidate): number => b.points - a.points || a.id - b.id;
+  const withEstimate = [...estimates.keys()].filter((c) => estimates.get(c) !== undefined)
+    .sort((a, b) => key(a) - key(b) || byPoints(a, b));
+  const withoutEstimate = [...estimates.keys()].filter((c) => estimates.get(c) === undefined).sort(byPoints);
   const { kept: keptSlow, skipped } = capFallbacks(
-    slow,
-    `those whose evaluated dependents lose the least${opts.rankBy === 'total' ? '' : ' per refunded point'}`,
-    (c) => estimates.get(c)!,
+    interleave(withEstimate, withoutEstimate),
+    'alternately those whose evaluated dependents lose the least' +
+      `${opts.rankBy === 'total' ? '' : ' per refunded point'} (a heuristic) and those with no evaluated dependent, largest refund first`,
+    (c) => estimates.get(c),
   );
   const slowRun = keptSlow.length > 0
     ? await evaluate(deps, keptSlow.map((c) => ({ deallocate: [c.id] })), opts.optimizeFor)

@@ -70,7 +70,7 @@ Three layers, three responsibilities:
 - `swap_gem` — replace a gem in a group and return the diff, without changing the build (milliseconds).
 - `compare_supports` — identifies the weakest support in a group, ranks 1-10 candidate replacements; a candidate PoB refuses gets its own `error`.
 - `evaluate_gem_levels` — DPS scaling from current -1 through +4 (capped at 24), or the levels you pass.
-- `find_optimal_links` — scores every eligible support alone, then searches combinations of the best `topN` (exhaustive when they fit the budget, else the best few exhaustively plus pairwise swaps). Honors locked-in supports as constraints; reports `bestDPS`, `dpsDelta` vs the build as it is, and how many combinations were evaluated. ~1-3s for a 6-link.
+- `find_optimal_links` — scores every support PoB's own compatibility check accepts for the skill (each at its natural maximum level up to 20, quality 20) alone, then searches combinations of the best `topN` (exhaustive when they fit the budget, else the best few exhaustively plus pairwise swaps). Honors locked-in supports as constraints; reports `bestDPS`, `dpsDelta` vs the build as it is, and how many combinations were evaluated. ~1-3s for a 6-link.
 
 ### Configuration & scenarios (6)
 - `get_config` — every config var grouped into 8 sections (Combat, Enemy, Map, Skill Options, etc.) with type metadata.
