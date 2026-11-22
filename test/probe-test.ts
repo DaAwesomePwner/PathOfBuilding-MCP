@@ -70,6 +70,13 @@
 //      export is byte-identical and the by-value fingerprint, which lists both
 //      tables in pairs() order, is unchanged (this also catches the reorder on
 //      PoB 2.68, whose export sorts the keys).
+//  15. A committed float config value with more digits than the JSON snapshot
+//      keeps (set_config 0.1234567890123456789) survives a config fallback
+//      variant: the restore puts the committed tables back before comparing,
+//      so neither the value nor the tables change.
+//  16. On a non-boss build with an explicit enemyDamageType, boss-skill
+//      what-ifs (calculator and fallback; PoB's boss preset writes the damage
+//      type into the config input) leave the committed value.
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -937,6 +944,63 @@ async function main(): Promise<void> {
       assert(normalise(xmlPrev) === normalise(xml0), 'export changed after the config probes (beyond node order)');
       assert(undoDepth() === depth, 'undo depth changed after the config probes');
       log('   50 config probe calls (calculator and fallback): export unchanged, config tables in the same order');
+    }
+
+    // ------------------------------------------------------------------
+    log('15. A config fallback restores a committed float that JSON rounds');
+    {
+      await session.loadBuild(fixtureXml);
+      const fingerprintNow = async (): Promise<string[]> =>
+        (await bridge.send<{ fingerprint: string[] }>({ cmd: 'probe', fingerprint: true })).fingerprint;
+      const meta = (await bridge.send<{ metadata: Array<{ var: string; type: string }> }>({ cmd: 'getConfigMetadata' })).metadata;
+      const floatKey = meta.find((m) => m.type === 'float')?.var;
+      assert(floatKey, 'no float config key');
+      const value = 0.1234567890123456789;
+      await session.setConfig({ [floatKey]: value });
+      // The snapshot a fallback restores from comes back through JSON with
+      // fewer significant digits than the committed value.
+      const snap = (await bridge.send<{ input: Record<string, unknown> }>({ cmd: 'getFullConfig' })).input[floatKey];
+      assert(typeof snap === 'number' && Math.abs(snap - value) < 1e-12, `${floatKey} snapshot ${snap}`);
+      log(`   ${floatKey} = ${value}, snapshot ${snap}`);
+      const xml0 = await session.exportXML();
+      const fp0 = await fingerprintNow();
+      const depth = undoDepth();
+      const res = await probe([
+        { allocate: [changing[0].node.id, changing[1].node.id], config: { enemyIsBoss: 'Uber', buffOnslaught: true } },
+        { allocate: [changing[0].node.id, changing[1].node.id] },
+        { config: { enemyIsBoss: 'Uber' } },
+      ]);
+      assert(res.results.every((r) => !r.error), `a variant failed: ${res.results.find((r) => r.error)?.error}`);
+      assert(res.results[0].fallback && res.results[1].fallback, 'the node variants did not fall back');
+      const diff = (await fingerprintNow()).find((l, j) => l !== fp0[j]);
+      assert(diff === undefined, `config changed: ${diff?.slice(0, 200)}`);
+      assert(normalise(await session.exportXML()) === normalise(xml0), 'export changed (beyond node order)');
+      assert(undoDepth() === depth, 'undo depth changed');
+      log('   committed value, tables and export unchanged');
+    }
+
+    // ------------------------------------------------------------------
+    log('16. A boss what-if leaves an explicit enemyDamageType on a non-boss build');
+    {
+      await session.loadBuild(fixtureXml);
+      await session.setConfig({ enemyIsBoss: 'None', presetBossSkills: 'None', enemyDamageType: 'Melee' });
+      const damageType = async (): Promise<unknown> =>
+        (await bridge.send<{ input: Record<string, unknown> }>({ cmd: 'getFullConfig' })).input.enemyDamageType;
+      assert((await damageType()) === 'Melee', `committed enemyDamageType ${await damageType()}`);
+      const xml0 = await session.exportXML();
+      const stats0b = await session.getStats();
+      const boss = { enemyIsBoss: 'Pinnacle', presetBossSkills: 'Shaper Ball' };
+      const res = await probe([
+        { config: boss },
+        { config: { presetBossSkills: 'Shaper Slam' } },
+        { allocate: [changing[0].node.id, changing[1].node.id], config: boss },
+      ]);
+      assert(res.results.every((r) => !r.error), `a variant failed: ${res.results.find((r) => r.error)?.error}`);
+      assert(res.results[2].fallback, 'the node variant did not fall back');
+      assert((await damageType()) === 'Melee', `enemyDamageType became ${await damageType()}`);
+      assert(normalise(await session.exportXML()) === normalise(xml0), 'export changed (beyond node order)');
+      assert(statDiffs(await session.getStats(), stats0b, keys).length === 0, 'get_stats changed');
+      log('   enemyDamageType stays Melee after boss-skill what-ifs (calculator and fallback)');
     }
 
     log('ALL TESTS PASSED');
