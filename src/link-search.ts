@@ -1,11 +1,16 @@
 // find_optimal_links on the read-only probe engine (src/probe.ts, lua/probe.lua).
 //
 // Every evaluation is one probe variant that rebuilds the main socket group
-// as [active skill, locked supports..., candidate supports...] at gem level
-// 20 / quality 20 (a `clear` op, then `add` ops: what replaceSocketGroup
-// does), evaluated through PoB's own calculator in ~3-5 ms. The search:
-//   1. every eligible support (PoB's support list for the skill's tags, minus
-//      the locked ones; no Awakened gems) is scored on its own, in one call;
+// as [active skill, locked supports..., candidate supports...], each gem at
+// its natural maximum level capped at 20 (20 for most; 3 for Empower and the
+// like) and quality 20 (a `clear` op, then `add` ops: what
+// replaceSocketGroup does), evaluated through PoB's own calculator in ~3-5 ms.
+// The search:
+//   1. every eligible support is scored on its own, in one call. Eligible:
+//      every support PoB's own compatibility check lets support the active
+//      skill once the locked supports have added their skill types (`probe`
+//      with `supportsFor`, lua/probe.lua), minus the locked ones and Awakened
+//      gems;
 //   2. the `topN` best singles form the pool. When every combination of the
 //      free slots from the pool fits EXHAUSTIVE_BUDGET it is searched
 //      exhaustively; otherwise the best K singles are (K as large as the
@@ -26,7 +31,8 @@ export const DEFAULT_LINK_POOL = 25;
 export const EXHAUSTIVE_BUDGET = 330;
 /** At most this many combinations are evaluated in all (exhaustive part plus swap rounds). */
 export const MAX_COMBINATIONS = 550;
-const GEM_LEVEL = 20;
+/** Gems are added at their natural maximum level, at most this. */
+const MAX_GEM_LEVEL = 20;
 const GEM_QUALITY = 20;
 const STAT = 'CombinedDPS';
 
@@ -59,6 +65,8 @@ export interface OptimalLinksResult {
   dpsDelta: number;
   /** The main socket group the combinations replace (1-based) and its gems now. */
   mainGroup: { index: number; gems: string[] };
+  /** The main group as evaluated for bestDPS: the active skill, the locked supports, bestCombination, with levels. */
+  bestGroup: Array<{ name: string; level: number; quality: number }>;
   /** The pool: the best single supports (active skill + locked supports + that one), best first. */
   singleSupportDPS: Array<{ name: string; dps: number }>;
   topAlternatives: Array<{ combo: string[]; dps: number }>;
@@ -69,7 +77,7 @@ export interface OptimalLinksResult {
     poolSize: number;
     exhaustiveOver: number;
     combinationsEvaluated: number;
-    /** Supports the engine refused (each with its error); they are left out of the search. */
+    /** Supports the engine refused, or whose compatibility check failed (each with its error); they are left out of the search. */
     skipped?: Array<{ name: string; error: string }>;
   };
 }
@@ -111,8 +119,18 @@ export async function findOptimalLinks(deps: LinkSearchDeps, opts: LinkSearchOpt
   if (opts.supportSlots < 0) throw new UserError('availableSlots must be >= 1');
   const active = await gemByName(deps, opts.activeSkill, 'Active skill');
   if (active.isSupport) throw new UserError(`"${opts.activeSkill}" is a support gem, not an active skill`);
+  const levelOf = new Map<string, number>([[active.name, Math.min(MAX_GEM_LEVEL, active.naturalMaxLevel ?? MAX_GEM_LEVEL)]]);
   const locked: string[] = [];
-  for (const name of opts.constraints) locked.push((await gemByName(deps, name, 'Locked support')).name);
+  for (const name of opts.constraints) {
+    const gem = await gemByName(deps, name, 'Locked support');
+    if (gem.name === active.name) throw new UserError(`Locked support "${name}" is the active skill itself`);
+    if (!gem.isSupport) throw new UserError(`Locked support "${name}" (${gem.name}) is an active skill gem, not a support`);
+    if (locked.includes(gem.name)) throw new UserError(`Locked support "${name}" (${gem.name}) is listed more than once`);
+    locked.push(gem.name);
+    levelOf.set(gem.name, Math.min(MAX_GEM_LEVEL, gem.naturalMaxLevel ?? MAX_GEM_LEVEL));
+  }
+  const gemSpec = (name: string): { name: string; level: number; quality: number } =>
+    ({ name, level: levelOf.get(name) ?? MAX_GEM_LEVEL, quality: GEM_QUALITY });
 
   const groups = (await deps.send<{ groups: SkillGroupInfo[] }>({ cmd: 'getSocketGroups' })).groups ?? [];
   let mainIndex = groups.findIndex((g) => g.isMainGroup);
@@ -127,9 +145,7 @@ export async function findOptimalLinks(deps: LinkSearchDeps, opts: LinkSearchOpt
   const variant = (supports: string[]): { gems: ProbeGemChange[] } => ({
     gems: [
       { op: 'clear', group },
-      ...[active.name, ...locked, ...supports].map(
-        (name): ProbeGemChange => ({ op: 'add', group, name, level: GEM_LEVEL, quality: GEM_QUALITY }),
-      ),
+      ...[active.name, ...locked, ...supports].map((name): ProbeGemChange => ({ op: 'add', group, ...gemSpec(name) })),
     ],
   });
 
@@ -166,6 +182,7 @@ export async function findOptimalLinks(deps: LinkSearchDeps, opts: LinkSearchOpt
       bestDPS: r.dps,
       baselineDPS,
       dpsDelta: r.dps - baselineDPS,
+      bestGroup: [active.name, ...locked].map(gemSpec),
       singleSupportDPS: [],
       topAlternatives: [{ combo: [], dps: r.dps }],
       search: { method: 'exhaustive', supportsEvaluated: 0, poolSize: 0, exhaustiveOver: 0, combinationsEvaluated: 1 },
@@ -173,15 +190,24 @@ export async function findOptimalLinks(deps: LinkSearchDeps, opts: LinkSearchOpt
   }
 
   // 1. Every eligible support on its own.
-  const supports = (await deps.send<{ supports: GemDataInfo[] }>({
-    cmd: 'getAvailableSupports',
-    activeSkillTags: active.tags,
-    includeAwakened: false,
-  })).supports ?? [];
+  const listed = await deps.send<{ supports: unknown; errors: unknown }>({
+    cmd: 'probe',
+    supportsFor: { active: active.name, locked },
+  });
+  // The engine's JSON encoder writes an empty list as {}.
+  const supports = (Array.isArray(listed.supports) ? listed.supports : []) as Array<{ name: string; naturalMaxLevel?: number; isAwakened: boolean }>;
   const lockedSet = new Set(locked);
-  const eligible = supports.map((s) => s.name).filter((name) => !lockedSet.has(name) && name !== active.name);
+  const eligible: string[] = [];
+  for (const s of supports) {
+    if (s.isAwakened || lockedSet.has(s.name) || s.name === active.name) continue;
+    eligible.push(s.name);
+    levelOf.set(s.name, Math.min(MAX_GEM_LEVEL, s.naturalMaxLevel ?? MAX_GEM_LEVEL));
+  }
   const singleRes = await evaluate(eligible.map((name) => [name]));
   const skipped: Array<{ name: string; error: string }> = [];
+  for (const e of (Array.isArray(listed.errors) ? listed.errors : []) as Array<{ name: string; error: string }>) {
+    skipped.push({ name: e.name, error: `PoB's support check failed: ${e.error}` });
+  }
   const singles: Array<{ name: string; dps: number }> = [];
   eligible.forEach((name, i) => {
     const r = singleRes[i];
@@ -258,6 +284,7 @@ export async function findOptimalLinks(deps: LinkSearchDeps, opts: LinkSearchOpt
     bestDPS: winner.dps,
     baselineDPS,
     dpsDelta: winner.dps - baselineDPS,
+    bestGroup: [active.name, ...locked, ...winner.combo].map(gemSpec),
     singleSupportDPS: singles.slice(0, pool.length),
     topAlternatives,
     search: {

@@ -592,11 +592,15 @@ return function(ctx)
 	local GEM_FIELDS = { "nameSpec", "gemId", "skillId", "level", "quality", "enabled", "count", "gemData", "grantedEffect" }
 	local GROUP_FIELDS = { "label", "slot", "source", "enabled", "includeInFullDPS", "mainActiveSkill", "mainActiveSkillCalcs" }
 
-	-- A short hash of a string (FNV-1a, 32 bit), so item texts can be compared cheaply.
+	-- A short hash of a string (FNV-1a, 32 bit), so item texts can be compared
+	-- cheaply. The FNV prime is 2^24 + 403: h * prime is computed as
+	-- (h << 24) + h * 403, which stays far below 2^53, so every step is exact
+	-- before bit.tobit takes it back to 32 bits.
 	local function hashText(text)
-		local h = 2166136261
+		local h = bit.tobit(2166136261)
 		for i = 1, #text do
-			h = bit.tobit(bit.bxor(h, text:byte(i)) * 16777619)
+			h = bit.bxor(h, text:byte(i))
+			h = bit.tobit(bit.lshift(h, 24) + h * 403)
 		end
 		return bit.tohex(h)
 	end
@@ -608,6 +612,8 @@ return function(ctx)
 	-- socket groups and gems as new tables and a full recalc replaces the
 	-- output): gem and group fields, item ids with a hash of their text, slot
 	-- selections, allocated nodes, socketed tree jewels, config input.
+	-- Both include mastery effect choices and every skill set (the active
+	-- one's groups and gems in full, the others by value).
 	local function fingerprint(byValue)
 		local fp = { }
 		local function add(...)
@@ -627,6 +633,10 @@ return function(ctx)
 		for nodeId in pairs(build.spec.allocNodes) do ids[#ids + 1] = nodeId end
 		table.sort(ids)
 		add("nodes", table.concat(ids, ","))
+		local masteries = { }
+		for nodeId, effectId in pairs(build.spec.masterySelections or { }) do masteries[#masteries + 1] = nodeId .. "=" .. tostring(effectId) end
+		table.sort(masteries)
+		add("masteries", table.concat(masteries, ","))
 		if byValue then
 			local jewels = { }
 			for nodeId, itemId in pairs(build.spec.jewels) do jewels[#jewels + 1] = nodeId .. "=" .. tostring(itemId) end
@@ -657,6 +667,24 @@ return function(ctx)
 				local vals = { }
 				for k, f in ipairs(GEM_FIELDS) do vals[k] = tostring(gem[f]) end
 				add("gem", gi, gj, id(gem), table.concat(vals, ","))
+			end
+		end
+		local skillsTab = build.skillsTab
+		add("skillSets", skillsTab.activeSkillSetId, table.concat(skillsTab.skillSetOrderList or { }, ","))
+		for _, setId in ipairs(skillsTab.skillSetOrderList or { }) do
+			local set = skillsTab.skillSets[setId]
+			add("skillSet", setId, set and set.title, set and #set.socketGroupList)
+			if set and set.socketGroupList ~= skillsTab.socketGroupList then
+				for gi, group in ipairs(set.socketGroupList) do
+					local vals = { }
+					for k, f in ipairs(GROUP_FIELDS) do vals[k] = tostring(group[f]) end
+					add("setGroup", setId, gi, table.concat(vals, ","), #group.gemList)
+					for gj, gem in ipairs(group.gemList) do
+						local gvals = { }
+						for k, f in ipairs(GEM_FIELDS) do gvals[k] = tostring(gem[f]) end
+						add("setGem", setId, gi, gj, table.concat(gvals, ","))
+					end
+				end
 			end
 		end
 		local keys = { }
@@ -852,6 +880,7 @@ return function(ctx)
 		-- `fingerprint`: the committed state by value (see fingerprint), which
 		-- the caller compares before and after a fallback variant's restore.
 		if cmd.fingerprint then return { fingerprint = fingerprint(true) } end
+		if cmd.supportsFor ~= nil then return M.listSupports(cmd.supportsFor) end
 		local keys = statKeyList(cmd.stats)
 		local variants = cmd.variants
 		if variants == nil then variants = { } end
@@ -1001,6 +1030,75 @@ return function(ctx)
 		end
 		table.sort(out, function(a, b) return a.id < b.id end)
 		return { nodes = out, names = names }
+	end
+
+	-- ------------------------------------------------------------------
+	-- Supports for an active skill
+	-- ------------------------------------------------------------------
+
+	-- `probe` with `supportsFor = { active, locked }`: every support gem that
+	-- PoB's own check (calcLib.canGrantedEffectSupportActiveSkill, what its
+	-- gem selector and calcs.createActiveSkill use) lets support the active
+	-- skill once the locked supports have added their skill types (applied
+	-- until none adds more, as calcs.createActiveSkill does), with the
+	-- player actor of the last full recalc. Returns each support's name,
+	-- natural maximum level and whether it is an Awakened gem; a check that
+	-- throws is listed in `errors` instead.
+	function M.listSupports(spec)
+		if type(spec) ~= "table" or type(spec.active) ~= "string" then
+			userError("supportsFor must be { active = <gem name>, locked = [<gem names>] }")
+		end
+		local locked = optArray(spec.locked, "supportsFor.locked", M.MAX_GEM_CHANGES)
+		local activeData = lookupGem(spec.active, "supportsFor.active")
+		local activeEffect = activeData.grantedEffect
+		if not activeEffect or activeEffect.support then userError("'" .. activeData.name .. "' is not an active skill gem") end
+		local env = build.calcsTab.mainEnv
+		local actor = env and env.player
+		if not actor then error("Path of Building's calculator is not available (no calculation output yet)") end
+		local activeSkill = {
+			activeEffect = { grantedEffect = activeEffect, gemData = activeData, level = 20, quality = 20 },
+			actor = actor,
+			skillTypes = copyTable(activeEffect.skillTypes or { }),
+			minionSkillTypes = activeEffect.minionSkillTypes and copyTable(activeEffect.minionSkillTypes) or nil,
+			skillData = { },
+		}
+		local pending = { }
+		for i, name in ipairs(locked) do
+			if type(name) ~= "string" then userError("supportsFor.locked[" .. i .. "] must be a gem name") end
+			pending[#pending + 1] = lookupGem(name, "supportsFor.locked[" .. i .. "]").grantedEffect
+		end
+		repeat
+			local added = false
+			for i = #pending, 1, -1 do
+				local support = pending[i]
+				if support and support.support and calcLib.canGrantedEffectSupportActiveSkill(support, activeSkill) then
+					for _, skillType in pairs(support.addSkillTypes or { }) do activeSkill.skillTypes[skillType] = true end
+					table.remove(pending, i)
+					added = true
+				end
+			end
+		until not added
+		local out, errors, seen = { }, { }, { }
+		for _, gemData in pairs(data.gems) do
+			local support = gemData.grantedEffect
+			if support and support.support and gemData.name and not seen[gemData.name] then
+				local ok, res = pcall(calcLib.canGrantedEffectSupportActiveSkill, support, activeSkill)
+				if not ok then
+					seen[gemData.name] = true
+					errors[#errors + 1] = { name = gemData.name, error = tostring(res) }
+				elseif res then
+					seen[gemData.name] = true
+					out[#out + 1] = {
+						name = gemData.name,
+						naturalMaxLevel = gemData.naturalMaxLevel,
+						isAwakened = gemData.name:find("^Awakened ") ~= nil,
+					}
+				end
+			end
+		end
+		table.sort(out, function(a, b) return a.name < b.name end)
+		table.sort(errors, function(a, b) return a.name < b.name end)
+		return { active = activeData.name, supports = out, errors = errors }
 	end
 
 	-- A fallback variant, applied for real: the caller snapshots the whole

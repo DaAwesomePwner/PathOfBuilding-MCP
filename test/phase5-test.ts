@@ -461,25 +461,42 @@ async function directParity(paths: ResolvedPaths, xml: string): Promise<void> {
       assert(r.length === 1 && r[0].error === null && r[0].dps === base.CombinedDPS, `granted group: ${JSON.stringify(r)}`);
     }
 
-    // find_optimal_links: the winner equals replaceSocketGroup + full recalc.
-    const replaced = (gems: string[]) => (b: LuaBridge) =>
-      b.send({ cmd: 'replaceSocketGroup', groupIndex: G, gems: gems.map((name) => ({ name, level: 20, quality: 20 })) });
+    // find_optimal_links: candidates come from PoB's own support check; the
+    // winner equals replaceSocketGroup + full recalc with the reported levels.
+    type GemSpec = { name: string; level: number; quality: number };
+    const replaced = (gems: GemSpec[]) => (b: LuaBridge) => b.send({ cmd: 'replaceSocketGroup', groupIndex: G, gems });
+    const naturalLevel = async (name: string): Promise<number> => Math.min(20, (await session.getGemByName(name)).naturalMaxLevel ?? 20);
+    const compatible = await bridge.send<{ supports: Array<{ name: string; naturalMaxLevel?: number }> }>(
+      { cmd: 'probe', supportsFor: { active: 'Vortex', locked: [] } });
+    const compatibleNames = new Set(compatible.supports.map((x) => x.name));
+    const coarse = await session.getAvailableSupports((await session.getGemByName('Vortex')).tags, false);
+    assert(compatibleNames.has('Inspiration') && !coarse.some((x) => x.name === 'Inspiration'),
+      "Inspiration should be a candidate through PoB's check (and missing from the old tag match)");
+    assert(!compatibleNames.has('Melee Physical Damage'), "an attack-only support passed PoB's check for a spell");
+    log(`  PoB's check: ${compatibleNames.size} supports can support Vortex (the tag match listed ${coarse.length})`);
     const six = await readOnly('find_optimal_links (6-link)', () => session.findOptimalLinks('Vortex', 5), 3000);
     log(`  6-link: [${six.bestCombination.join(', ')}] ${six.bestDPS.toFixed(0)} (delta ${six.dpsDelta.toFixed(0)}), ` +
       `${six.search.method}, ${six.search.supportsEvaluated} supports, ${six.search.combinationsEvaluated} combinations`);
+    assert(six.search.supportsEvaluated === [...compatibleNames].filter((n) => !n.startsWith('Awakened ')).length,
+      `supportsEvaluated ${six.search.supportsEvaluated} vs PoB's check`);
     assert(six.bestCombination.length === 5 && new Set(six.bestCombination).size === 5, `combination ${six.bestCombination}`);
     assert(six.mainGroup.index === G && six.baselineDPS === base.CombinedDPS && six.dpsDelta === six.bestDPS - six.baselineDPS, 'baseline / delta');
-    assert((await viaMutate(replaced(['Vortex', ...six.bestCombination]))).CombinedDPS === six.bestDPS,
-      'find_optimal_links winner differs from replaceSocketGroup');
+    assert(JSON.stringify(six.bestGroup.map((g) => g.name)) === JSON.stringify(['Vortex', ...six.bestCombination]), 'bestGroup names');
+    for (const g of six.bestGroup) assert(g.level === await naturalLevel(g.name) && g.quality === 20, `bestGroup level of ${g.name}: ${g.level}`);
+    assert((await viaMutate(replaced(six.bestGroup))).CombinedDPS === six.bestDPS, 'find_optimal_links winner differs from replaceSocketGroup');
     const single = six.singleSupportDPS[0];
-    assert((await viaMutate(replaced(['Vortex', single.name]))).CombinedDPS === single.dps, `single ${single.name} differs from replaceSocketGroup`);
+    const singleGroup = await Promise.all(['Vortex', single.name].map(async (name) => ({ name, level: await naturalLevel(name), quality: 20 })));
+    assert((await viaMutate(replaced(singleGroup))).CombinedDPS === single.dps, `single ${single.name} differs from replaceSocketGroup`);
     assert(six.topAlternatives.every((a, i) => i === 0 || a.dps <= six.topAlternatives[i - 1].dps), 'alternatives not sorted');
     const locked = await readOnly('find_optimal_links (4-link, one locked)', () => session.findOptimalLinks('Vortex', 3, ['Concentrated Effect']));
     assert(locked.bestCombination.length === 2 && !locked.bestCombination.includes('Concentrated Effect'), `locked: ${locked.bestCombination}`);
-    assert((await viaMutate(replaced(['Vortex', 'Concentrated Effect', ...locked.bestCombination]))).CombinedDPS === locked.bestDPS,
-      'locked find_optimal_links winner differs from replaceSocketGroup');
+    assert(locked.bestGroup[1].name === 'Concentrated Effect', 'the locked support is not in bestGroup');
+    assert((await viaMutate(replaced(locked.bestGroup))).CombinedDPS === locked.bestDPS, 'locked find_optimal_links winner differs from replaceSocketGroup');
     await userError(session.findOptimalLinks('Vortex', 3, [BAD]), /Definitely Not A Gem/, 'find_optimal_links unknown locked gem');
     await userError(session.findOptimalLinks('Concentrated Effect', 3), /support gem/, 'find_optimal_links with a support as the skill');
+    await userError(session.findOptimalLinks('Vortex', 3, ['Frostbolt']), /active skill gem, not a support/, 'locked active gem');
+    await userError(session.findOptimalLinks('Vortex', 3, ['Concentrated Effect', 'Concentrated Effect']), /more than once/, 'locked duplicate');
+    await userError(session.findOptimalLinks('Vortex', 3, ['Vortex']), /active skill itself/, 'locked active skill');
     log('PASS: gem tools equal the mutate path; export and undo depth unchanged');
   } finally {
     await bridge.dispose();

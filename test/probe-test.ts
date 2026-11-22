@@ -723,9 +723,11 @@ async function main(): Promise<void> {
     }
     log(`   ${worst.skipped.length} slow nodes skipped (cap ${MAX_SEARCH_FALLBACKS})`);
     {
-      // The full-recalculation candidates evaluated are those whose evaluated
-      // dependents lose the least per refunded point (the estimate is
-      // recomputed here from the ranking of the calculator candidates).
+      // The full-recalculation candidates evaluated alternate between two
+      // queues: those with an estimate (the largest loss among their
+      // evaluated dependents, recomputed here from the ranking of the
+      // calculator candidates), lowest per refunded point first, and those
+      // with none, largest refund first.
       const listed = await bridge.send<{ nodes: Array<{ id: number; points: number; nodes: number[]; fallback?: string }> }>({ cmd: 'probe', candidates: 'deallocate' });
       const slow = listed.nodes.filter((c) => c.fallback !== undefined);
       const slowIds = new Set(slow.map((c) => c.id));
@@ -735,19 +737,35 @@ async function main(): Promise<void> {
       const keptSlow = slow.filter((c) => ranked.has(c.id));
       assert(keptSlow.length === MAX_SEARCH_FALLBACKS, `${keptSlow.length} full-recalculation candidates ranked`);
       const fastLoss = new Map(worst.rankings.filter((r) => !slowIds.has(r.nodeId)).map((r) => [r.nodeId, r.lossIfRemoved ?? 0]));
-      const estimate = (c: { nodes: number[] }): number => {
+      const estimate = (c: { nodes: number[] }): number | undefined => {
         const known = c.nodes.filter((id) => fastLoss.has(id)).map((id) => fastLoss.get(id)!);
-        return known.length > 0 ? Math.max(...known) : 0;
+        return known.length > 0 ? Math.max(...known) : undefined;
       };
-      const perPt = (c: { nodes: number[]; points: number }): number => estimate(c) / Math.max(1, c.points);
+      const perPt = (c: { nodes: number[]; points: number }): number => estimate(c)! / Math.max(1, c.points);
       for (const sk of worst.skipped) {
         const c = slow.find((x) => x.id === sk.nodeId)!;
         assert(sk.minLossEstimate === estimate(c) && sk.points === c.points && /full recalculation/.test(sk.reason),
           `skipped ${sk.nodeId}: ${JSON.stringify(sk)} vs estimate ${estimate(c)}`);
       }
-      const worstKept = Math.max(...keptSlow.map(perPt));
-      const bestSkipped = Math.min(...worst.skipped.map((sk) => perPt(slow.find((x) => x.id === sk.nodeId)!)));
-      assert(worstKept <= bestSkipped, `a skipped node looked more promising (${bestSkipped}) than an evaluated one (${worstKept})`);
+      const skippedSlow = worst.skipped.map((sk) => slow.find((x) => x.id === sk.nodeId)!);
+      const keptWith = keptSlow.filter((c) => estimate(c) !== undefined);
+      const keptWithout = keptSlow.filter((c) => estimate(c) === undefined);
+      const skippedWith = skippedSlow.filter((c) => estimate(c) !== undefined);
+      const skippedWithout = skippedSlow.filter((c) => estimate(c) === undefined);
+      const allWithout = keptWithout.length + skippedWithout.length;
+      assert(allWithout > 0 && keptWith.length + skippedWith.length > 0, `the fixture does not exercise both queues (${allWithout} without an estimate)`);
+      // Alternating: each queue gets half the slots (more when the other runs out).
+      const half = Math.floor(MAX_SEARCH_FALLBACKS / 2);
+      assert(keptWithout.length === Math.min(allWithout, Math.max(half, MAX_SEARCH_FALLBACKS - (keptWith.length + skippedWith.length))),
+        `${keptWithout.length} of ${allWithout} no-estimate nodes evaluated`);
+      if (keptWith.length > 0 && skippedWith.length > 0) {
+        assert(Math.max(...keptWith.map(perPt)) <= Math.min(...skippedWith.map(perPt)), 'a skipped node with an estimate came before an evaluated one');
+      }
+      if (keptWithout.length > 0 && skippedWithout.length > 0) {
+        assert(Math.min(...keptWithout.map((c) => c.points)) >= Math.max(...skippedWithout.map((c) => c.points)),
+          'a skipped node without an estimate refunds more than an evaluated one');
+      }
+      log(`   slow nodes: ${keptWith.length} + ${keptWithout.length} evaluated (with / without an estimate), ${skippedWith.length} + ${skippedWithout.length} skipped`);
       // A travel path to a socketed jewel: little lost, several points back; ranked with deallocNode's loss.
       const firstSlow = worst.rankings.find((r) => slowIds.has(r.nodeId));
       assert(firstSlow && (firstSlow.pointsRefunded ?? 0) > 1, `no multi-point full-recalculation node ranked: ${JSON.stringify(firstSlow)}`);
