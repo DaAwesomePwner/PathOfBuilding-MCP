@@ -12,6 +12,8 @@ import {
   SCENARIO_NAMES,
   SkillGemInstance,
   StatDiffResult,
+  TreeEditNode,
+  TreeEditResult,
 } from './build-session.js';
 import { registerEvaluateChanges } from './evaluate-changes.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
@@ -397,7 +399,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, set_config or convert_tree_to_latest). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -496,6 +498,70 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
       statDiff: result.statDiff,
     };
   },
+);
+
+const nodeRefsSchema = z
+  .array(z.union([z.string().min(1), z.number().int()]))
+  .min(1)
+  .max(50);
+
+/** Passive and ascendancy points a set of nodes costs, as PoB's CountAllocNodes counts them (`pointCost`). */
+function pointCounts(nodes: TreeEditNode[]): { points: number; ascendancyPoints: number } {
+  return {
+    points: nodes.filter((n) => n.pointCost === 'passive').length,
+    ascendancyPoints: nodes.filter((n) => n.pointCost === 'ascendancy').length,
+  };
+}
+
+function treeEditResponse(result: TreeEditResult, verb: 'allocated' | 'deallocated'): unknown {
+  const node = (n: TreeEditNode) => ({ id: n.id, name: n.name, type: n.type, ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}) });
+  const s = result.summary;
+  const changed = verb === 'allocated' ? result.added : result.removed;
+  const cost = pointCounts(changed);
+  return {
+    status: verb,
+    ...(verb === 'allocated' ? { added: result.added.map(node) } : {}),
+    ...(result.removed.length > 0 ? { removed: result.removed.map(node) } : {}),
+    ...(verb === 'allocated'
+      ? { pointsUsed: cost.points, ascendancyPointsUsed: cost.ascendancyPoints }
+      : { pointsRefunded: cost.points, ascendancyPointsRefunded: cost.ascendancyPoints }),
+    points: {
+      used: s.totalPoints,
+      max: s.maxNormalPoints,
+      remaining: s.maxNormalPoints - s.totalPoints,
+      ascendancyUsed: s.ascendancyPoints,
+      ascendancyMax: s.maxAscendancyPoints,
+    },
+    ...(summarizeStatDiff(result) as object),
+    undo: 'Call undo_last_change to revert this change.',
+  };
+}
+
+tools.engine<{ nodes: Array<string | number> }>(
+  'allocate_nodes',
+  {
+    description:
+      "Allocate passive nodes in the build, each together with its shortest path from the allocated tree (as clicking it in PoB, simulate_passive_change and find_best_next_nodes do), and return the nodes added, the points used, the tree's point totals and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes the change). " +
+      'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, already allocated, a mastery (choosing mastery effects is not supported yet), listed twice, cannot be allocated because no path from the allocated tree reaches it, or is a second option of the same choice node. ' +
+      'A node name resolves among the unallocated nodes a path reaches; a name several of them share (e.g. "Strength") is refused with the candidate ids, so pass ids for those. `removed` lists any node the change deallocated (another option of a choice node). At most 50 nodes.',
+    inputSchema: {
+      nodes: nodeRefsSchema.describe('Node names (e.g. "Resolute Technique") or numeric node IDs to allocate.'),
+    },
+  },
+  async ({ nodes }, session) => treeEditResponse(await session.allocateNodes(nodes), 'allocated'),
+);
+
+tools.engine<{ nodes: Array<string | number> }>(
+  'deallocate_nodes',
+  {
+    description:
+      "Deallocate passive nodes in the build, each together with every node that depends on it (as in PoB), and return the nodes removed, the points refunded, the tree's point totals and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes the change). " +
+      'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, not allocated, a class start or listed twice. A node name resolves among the allocated nodes; a name several of them share is refused with the candidate ids. At most 50 nodes.',
+    inputSchema: {
+      nodes: nodeRefsSchema.describe('Node names or numeric node IDs to deallocate.'),
+    },
+  },
+  async ({ nodes }, session) => treeEditResponse(await session.deallocateNodes(nodes), 'deallocated'),
 );
 
 const rankBySchema = z.enum(['perPoint', 'total']);

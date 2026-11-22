@@ -1970,7 +1970,12 @@ local function restoreTreeState(encoded)
 		if not ok then
 			error("Tree restore failed in PassiveSpec:RestoreUndoState (PoB API may have changed): " .. tostring(err))
 		end
-		if jewelsChanged then
+		-- ImportFromNodeList only queues cluster subgraph nodes (allocSubgraphNodes);
+		-- a graph rebuild allocates them. Needed when the jewels changed, and when
+		-- wanted subgraph nodes are still missing: a Large socket that was
+		-- deallocated (its subgraph dropped) with its jewel kept, as undoing
+		-- deallocate_nodes on the socket does.
+		if jewelsChanged or #treeStateDifferences(spec, state).pending > 0 then
 			spec:BuildClusterJewelGraphs()
 			if build.itemsTab.PopulateSlots then build.itemsTab:PopulateSlots() end
 		end
@@ -2442,8 +2447,94 @@ local function withTreeRollback(fn)
 	error(err, 0)
 end
 
-local function allocNodesBatch(nodeIds)
+-- Helpers of the node batches below, in one table (the main chunk is close
+-- to LuaJIT's limit of 200 locals).
+local nodeBatch = { }
+
+-- `strict` (allocate_nodes / deallocate_nodes) also refuses a repeated id
+-- and, when allocating, a mastery (choosing mastery effects is not supported)
+-- or a node that is already allocated.
+function nodeBatch.strictChecks(nodes, allocating)
+	local seen = { }
+	for _, node in ipairs(nodes) do
+		if seen[node.id] then
+			userError("Node " .. nodeLabel(node) .. " is listed more than once")
+		end
+		seen[node.id] = true
+		if allocating and node.type == "Mastery" then
+			userError("Node " .. nodeLabel(node) .. " is a mastery; allocating masteries (choosing a mastery effect) is not supported yet")
+		end
+		if allocating and node.alloc then
+			userError("Node " .. nodeLabel(node) .. " is already allocated")
+		end
+	end
+end
+
+-- What a node batch reports about a node, captured while the node object is
+-- current: rebuilding the cluster jewel graphs (allocating or deallocating a
+-- socket holding a cluster jewel) drops subgraph nodes from spec.nodes and
+-- replaces their objects. `pointCost` follows PassiveSpec:CountAllocNodes:
+-- class starts and ascendancy choice options cost nothing.
+function nodeBatch.describe(node)
+	local cost = "passive"
+	if node.type == "ClassStart" or node.type == "AscendClassStart" then
+		cost = "none"
+	elseif node.ascendancyName then
+		cost = node.isMultipleChoiceOption and "none" or "ascendancy"
+	end
+	return { id = node.id, name = node.dn, type = node.type, ascendancyName = node.ascendancyName, pointCost = cost }
+end
+
+-- Descriptions of every allocated node, by id.
+function nodeBatch.captureAllocated()
+	local set = { }
+	for id, node in pairs(build.spec.allocNodes) do set[id] = nodeBatch.describe(node) end
+	return set
+end
+
+-- Nodes allocated before (`before`, from captureAllocated) and not now, by id.
+function nodeBatch.lostSince(before)
+	local ids = { }
+	for id in pairs(before) do
+		if not build.spec.allocNodes[id] then ids[#ids + 1] = id end
+	end
+	table.sort(ids)
+	local lost = { }
+	for i, id in ipairs(ids) do lost[i] = before[id] end
+	return lost
+end
+
+-- A strict batch (allocate_nodes / deallocate_nodes) records what it changed
+-- as soon as the tree has changed, before PoB recalculates: when anything
+-- after that fails (OnFrame, the stats, a PoB error popup), the command fails
+-- but the change is in the build, and the caller reads the record
+-- (treeEditApplied, its next command) to commit it. `record` is { } once a
+-- strict batch has started and gets `applied` once the tree changed. Every
+-- other command clears it when dispatched, so the record only ever describes
+-- the command right before the read: a later batch that fails before its
+-- handler runs is reported as not started, never credited with an earlier
+-- batch's change.
+nodeBatch.record = nil
+
+function nodeBatch.recordApplied(strict, result)
+	if not strict then return end
+	nodeBatch.record.applied = result
+	if TEST_FAULTS.treeEditFailsAfterChange then error("test fault: tree edit failed after changing the tree", 0) end
+end
+
+-- Returns { added, removed }: the nodes the batch added, in the order they
+-- joined the tree (each one next to the tree as it was then: PoB's path runs
+-- from the node back to the tree), and the nodes it removed (another option
+-- of a choice node), as nodeBatch.describe tables. Allocating exactly the
+-- added ids in that order reproduces the change whichever of several equally
+-- short paths PoB picked (its choice depends on table order, which differs
+-- between processes): what a crash replay needs. Nodes are looked up by id
+-- at every step: an earlier node of the batch may have rebuilt the cluster
+-- jewel graphs.
+local function allocNodesBatch(nodeIds, strict)
+	if strict then nodeBatch.record = { } end
 	local nodes = batchNodes(nodeIds)
+	if strict then nodeBatch.strictChecks(nodes, true) end
 	local choiceParent = { }
 	for _, node in ipairs(nodes) do
 		-- PassiveSpec:AllocNode silently does nothing for a node no path
@@ -2463,22 +2554,58 @@ local function allocNodesBatch(nodeIds)
 			choiceParent[parent] = node
 		end
 	end
+	local before = nodeBatch.captureAllocated()
+	local order, listed = { }, { }
 	withTreeRollback(function()
-		for _, node in ipairs(nodes) do
+		for i, id in ipairs(nodeIds) do
+			local node = build.spec.nodes[id]
+			if not node then
+				userError("Node " .. nodeLabel(nodes[i]) .. " no longer exists after an earlier node of the batch rebuilt the cluster jewel graphs")
+			end
+			local path = node.path or { }
+			if #(node.intuitiveLeapLikesAffecting or { }) > 0 then path = { node } end
+			for j = #path, 1, -1 do
+				local pathNode = path[j]
+				if not pathNode.alloc and not listed[pathNode.id] then
+					listed[pathNode.id] = true
+					order[#order + 1] = pathNode.id
+				end
+			end
 			build.spec:AllocNode(node)
 		end
-		for _, node in ipairs(nodes) do
-			if not node.alloc then
-				userError("Node " .. nodeLabel(node) .. " could not be allocated")
+		for i, id in ipairs(nodeIds) do
+			if not build.spec.allocNodes[id] then
+				userError("Node " .. nodeLabel(nodes[i]) .. " could not be allocated")
 			end
 		end
 	end)
+	local added = { }
+	for _, id in ipairs(order) do
+		local node = build.spec.allocNodes[id]
+		if node then added[#added + 1] = nodeBatch.describe(node) end
+	end
+	-- Anything else that became allocated (not expected) follows, by id.
+	local extra = { }
+	for id in pairs(build.spec.allocNodes) do
+		if not before[id] and not listed[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
+	local result = { added = added, removed = nodeBatch.lostSince(before) }
 	build.buildFlag = true
+	nodeBatch.recordApplied(strict, result)
 	runCallback("OnFrame")
+	return result
 end
 
-local function deallocNodesBatch(nodeIds)
+-- Returns { removed }: the nodes removed (the requested ones and every node
+-- that depended on them), by id, as nodeBatch.describe tables. Nodes are
+-- looked up by id at every step (see allocNodesBatch); one an earlier node
+-- of the batch already removed (it depended on it) is skipped.
+local function deallocNodesBatch(nodeIds, strict)
+	if strict then nodeBatch.record = { } end
 	local nodes = batchNodes(nodeIds)
+	if strict then nodeBatch.strictChecks(nodes, false) end
 	for _, node in ipairs(nodes) do
 		if node.type == "ClassStart" or node.type == "AscendClassStart" then
 			userError("Node " .. nodeLabel(node) .. " is a class start and cannot be deallocated")
@@ -2490,13 +2617,20 @@ local function deallocNodesBatch(nodeIds)
 			userError("Node " .. nodeLabel(node) .. " is not allocated")
 		end
 	end
+	local before = nodeBatch.captureAllocated()
 	withTreeRollback(function()
-		for _, node in ipairs(nodes) do
-			build.spec:DeallocNode(node)
+		for _, id in ipairs(nodeIds) do
+			local node = build.spec.nodes[id]
+			if node and build.spec.allocNodes[id] then
+				build.spec:DeallocNode(node)
+			end
 		end
 	end)
+	local result = { removed = nodeBatch.lostSince(before) }
 	build.buildFlag = true
+	nodeBatch.recordApplied(strict, result)
 	runCallback("OnFrame")
+	return result
 end
 
 local function isTreeConnected()
@@ -3927,12 +4061,21 @@ local DISPATCH = {
 		mutating = true,
 	},
 	allocNodes = {
-		handler = function(cmd) allocNodesBatch(cmd.nodeIds or { }) return { } end,
+		handler = function(cmd) return allocNodesBatch(cmd.nodeIds or { }, cmd.strict == true) end,
 		mutating = true,
 	},
 	deallocNodes = {
-		handler = function(cmd) deallocNodesBatch(cmd.nodeIds or { }) return { } end,
+		handler = function(cmd) return deallocNodesBatch(cmd.nodeIds or { }, cmd.strict == true) end,
 		mutating = true,
+	},
+	treeEditApplied = {
+		-- Whether the previous command ran a strict node batch, and what it
+		-- changed if it changed the tree.
+		handler = function(_cmd)
+			local record = nodeBatch.record
+			nodeBatch.record = nil
+			return { started = record ~= nil, applied = record and record.applied or dkjson.null }
+		end,
 	},
 	restoreTreeFromList = {
 		handler = function(cmd)
@@ -4207,6 +4350,7 @@ local function dispatch(cmd)
 	if type(cmd) ~= "table" then
 		error("Command must be a JSON object")
 	end
+	if cmd.cmd ~= "treeEditApplied" then nodeBatch.record = nil end
 	local entry = DISPATCH[cmd.cmd]
 	if not entry then
 		userError("Unknown command: " .. tostring(cmd.cmd))

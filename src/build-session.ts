@@ -264,6 +264,8 @@ export type UndoEntry = (
   | { kind: 'config'; snapshot: ConfigSnapshot }
   /** Tree-version change: restores the whole spec, version included. */
   | { kind: 'spec'; state: SpecState }
+  /** Committed node allocation / deallocation: restores the tree exactly (items are untouched). */
+  | { kind: 'tree'; snapshot: TreeSnapshot }
 ) & {
   /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
   journal?: number;
@@ -956,6 +958,8 @@ export class BuildSession {
       } else if (entry.kind === 'spec') {
         await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
         await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'tree') {
+        await this.restoreTreeUnlocked(entry.snapshot);
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
@@ -1234,6 +1238,109 @@ export class BuildSession {
       await this.refreshBuildInfoUnlocked();
     } catch (rollbackError) {
       console.error('[pob-mcp] could not roll back a failed tree conversion:', rollbackError);
+    }
+  }
+
+  /**
+   * Commit an allocation (allocate_nodes): each node with its shortest path
+   * from the allocated tree, as PoB's click and simulate_passive_change do.
+   * Names resolve as in simulate_passive_change. The bridge checks the whole
+   * batch first (unknown, unreachable, already allocated, mastery, repeated,
+   * two options of one choice node), so a refusal changes nothing and pushes
+   * nothing. Pushes one tree undo entry and records, for crash replay, the
+   * added node ids in the order they joined the tree (so the replay does not
+   * depend on which of several equally short paths PoB picks).
+   */
+  async allocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'allocate');
+  }
+
+  /**
+   * Commit a deallocation (deallocate_nodes): each node together with every
+   * node that depends on it. Checked first like allocateNodes; one tree undo
+   * entry; the requested ids are recorded for replay (what depends on a node
+   * is a property of the tree, not of table order).
+   */
+  async deallocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'deallocate');
+  }
+
+  private async treeEdit(refs: Array<string | number>, mode: 'allocate' | 'deallocate'): Promise<TreeEditResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    if (refs.length === 0) throw new UserError('Pass at least one node');
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const ids = await resolver.resolveAll(refs, mode);
+      const entry: UndoEntry = { kind: 'tree', snapshot: await this.snapshotTreeUnlocked() };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      let res: TreeEditApplied;
+      let failure: unknown;
+      try {
+        res = await this.bridge.send({ cmd: mode === 'allocate' ? 'allocNodes' : 'deallocNodes', nodeIds: ids, strict: true });
+      } catch (err) {
+        // The batch records what it changed once the tree has changed; a failure
+        // after that (PoB's recalculation, the stats, an error popup) leaves the
+        // change applied, so it is committed below and the error says so.
+        if (!this.bridge.isRunning()) throw err;
+        const record = await this.treeEditRecordUnlocked();
+        if (!record?.applied) {
+          // A batch that never started (the command failed before its handler)
+          // or was refused changed nothing (the bridge checks first and rolls a
+          // failed batch back exactly). Any other failure, or one whose record
+          // cannot be read, may have left part of a change (a rollback that
+          // failed): undo can revert it, but it is never replayed, as for set_config.
+          if (!(err instanceof UserError) && record?.started !== false) this.pushUndoEntryUnlocked(entry, journal);
+          throw err;
+        }
+        res = record.applied;
+        failure = err;
+      }
+      const added = treeEditNodes(res.added);
+      const removed = treeEditNodes(res.removed);
+      const command =
+        mode === 'allocate'
+          ? { cmd: 'allocNodes', nodeIds: added.map((n) => n.id) }
+          : { cmd: 'deallocNodes', nodeIds: ids };
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        if (failure !== undefined) throw await this.recalcAfterAppliedFailureUnlocked(failure);
+        const after = await this.bridge.getStats();
+        const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
+        return { added, removed, summary: summary.summary, before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * After a tree edit that was applied but whose command then failed: run
+   * PoB's recalculation (reading the stats does), so the build's outputs, and
+   * the PlayerStat lines export_build writes, match the changed tree. Returns
+   * the error to report; when the recalculation fails too it says so.
+   */
+  private async recalcAfterAppliedFailureUnlocked(failure: unknown): Promise<unknown> {
+    try {
+      await this.bridge.getStats();
+      return failure;
+    } catch (e) {
+      const message =
+        `${(failure as Error).message} (PoB's recalculation also failed: ${(e as Error).message}; ` +
+        'stats and export_build may show values from before the change until a later call recalculates)';
+      return new Error(message, { cause: failure });
+    }
+  }
+
+  /**
+   * Read right after a failed strict node batch: whether the batch started
+   * and, when it changed the tree, what it changed. Null when it cannot be read.
+   */
+  private async treeEditRecordUnlocked(): Promise<{ started: boolean; applied: TreeEditApplied | null } | null> {
+    try {
+      const res = await this.bridge.send<{ ok: true; started: boolean; applied: TreeEditApplied | null }>({ cmd: 'treeEditApplied' });
+      const applied = res.applied && typeof res.applied === 'object' ? res.applied : null;
+      return { started: res.started === true, applied };
+    } catch (e) {
+      console.error('[pob-mcp] could not read what a failed tree edit changed:', (e as Error).message);
+      return null;
     }
   }
 
@@ -2330,6 +2437,42 @@ export interface TreeNodeInfo {
   alloc: boolean;
   stats?: string[];
   linked?: number[];
+}
+
+/** A node allocate_nodes / deallocate_nodes added or removed. */
+export interface TreeEditNode {
+  id: number;
+  name: string;
+  type: string;
+  ascendancyName?: string;
+  /** What the node costs, as PoB counts points (class starts and ascendancy choice options cost none). */
+  pointCost: 'passive' | 'ascendancy' | 'none';
+}
+
+/** The bridge's report of a strict node batch (allocNodes / deallocNodes / treeEditApplied). */
+interface TreeEditApplied {
+  added?: unknown;
+  removed?: unknown;
+}
+
+export interface TreeEditResult extends StatDiffResult {
+  /** Allocated by the change, in the order they joined the tree. */
+  added: TreeEditNode[];
+  /** Deallocated by the change (dependents; another option of a choice node), by id. */
+  removed: TreeEditNode[];
+  /** The tree after the change (point counts). */
+  summary: PassiveTreeSummary;
+}
+
+function treeEditNodes(value: unknown): TreeEditNode[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((n: TreeEditNode) => ({
+    id: n.id,
+    name: n.name,
+    type: n.type,
+    ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+    pointCost: n.pointCost === 'ascendancy' || n.pointCost === 'none' ? n.pointCost : 'passive',
+  }));
 }
 
 export interface PassiveTreeSummary {

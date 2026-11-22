@@ -43,6 +43,7 @@
     "test:all": "node scripts/run-tests.mjs",
     "test:convert-tree": "tsx test/convert-tree-test.ts",
     "test:tree-restore": "tsx test/tree-restore-test.ts",
+    "test:tree-edit": "tsx test/tree-edit-test.ts",
     "test:item-restore": "tsx test/item-restore-test.ts",
     "test:wickerman": "tsx test/wickerman-test.ts",
     "test:skills-restore": "tsx test/skills-restore-test.ts",
