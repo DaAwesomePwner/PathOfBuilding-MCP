@@ -1,5 +1,6 @@
 // evaluate_changes: many mixed what-if variants (passive nodes, items, gems,
-// config) in one probe call, returned as a compact table ranked by one stat.
+// config) in one probe call, returned as a compact table ranked by one stat or
+// by a weighted multi-stat objective, with optional hard constraints.
 // Runs through BuildSession.probeNamed (src/probe.ts): nothing is applied to
 // the build and nothing is pushed to undo.
 
@@ -107,10 +108,18 @@ function statDelta(base: unknown, after: unknown): number | null {
 function requestedStats(input: EvaluateChangesInput, rankBy: string | undefined): string[] {
   const keys = [...new Set(input.stats && input.stats.length > 0 ? input.stats : DEFAULT_EVALUATE_STATS)];
   if (rankBy !== undefined && !keys.includes(rankBy)) keys.unshift(rankBy);
-  const extra = [...Object.keys(input.objective?.weights ?? {}), ...(input.constraints ?? []).map((c) => c.stat)];
-  for (const key of extra) if (!keys.includes(key)) keys.push(key);
-  if ((input.objective || input.constraints) && keys.length > MAX_EVALUATE_STATS) {
-    throw new UserError(`Too many stats: ${keys.length} after adding the objective's and constraints' stats (at most ${MAX_EVALUATE_STATS}).`);
+  // A weighted or constrained stat that is already listed is not added again (nor counted twice).
+  const added: string[] = [];
+  for (const key of [...Object.keys(input.objective?.weights ?? {}), ...(input.constraints ?? []).map((c) => c.stat)]) {
+    if (!keys.includes(key)) {
+      keys.push(key);
+      added.push(key);
+    }
+  }
+  if (added.length > 0 && keys.length > MAX_EVALUATE_STATS) {
+    throw new UserError(
+      `Too many stats: ${keys.length - added.length} requested plus ${added.length} more used by the objective / constraints (${added.slice(0, 5).join(', ')}${added.length > 5 ? ', ...' : ''}); at most ${MAX_EVALUATE_STATS} in all.`,
+    );
   }
   return keys;
 }
@@ -153,30 +162,37 @@ export function validateObjectiveInput(input: EvaluateChangesInput): void {
   }
 }
 
+const NOT_A_NUMBER = 'n/a (not a number)';
+
+/** A broken value for a violation text: rounded like every number, but with enough digits that it never reads equal to the bound it breaks (74.996 vs 75, not "75 < 75"). */
+function showBroken(value: number | null, bound: number): string {
+  if (value === null) return NOT_A_NUMBER;
+  const rounded = roundStat(value);
+  return String(rounded === bound ? Number(value.toPrecision(12)) : rounded);
+}
+
 /** Why the variant breaks each constraint ("FireResist 72 < 75"); a stat that is not a number breaks every bound. */
-function violations(constraints: EvaluateConstraint[], base: Stats, after: Stats): string[] {
+export function violations(constraints: EvaluateConstraint[], base: Stats, after: Stats): string[] {
   const out: string[] = [];
   for (const c of constraints) {
-    const value = after[c.stat];
-    const delta = statDelta(base[c.stat], value);
-    const shown = finite(value) ? String(roundStat(value)) : 'n/a (not a number)';
-    const shownDelta = delta === null ? 'n/a (not a number)' : String(roundStat(delta));
-    if (c.min !== undefined && !(finite(value) && value >= c.min)) out.push(`${c.stat} ${shown} < ${c.min}`);
-    if (c.max !== undefined && !(finite(value) && value <= c.max)) out.push(`${c.stat} ${shown} > ${c.max}`);
-    if (c.minDelta !== undefined && !(delta !== null && delta >= c.minDelta)) out.push(`${c.stat} change ${shownDelta} < ${c.minDelta}`);
-    if (c.maxDelta !== undefined && !(delta !== null && delta <= c.maxDelta)) out.push(`${c.stat} change ${shownDelta} > ${c.maxDelta}`);
+    const value = finite(after[c.stat]) ? (after[c.stat] as number) : null;
+    const delta = statDelta(base[c.stat], after[c.stat]);
+    if (c.min !== undefined && !(value !== null && value >= c.min)) out.push(`${c.stat} ${showBroken(value, c.min)} < ${c.min}`);
+    if (c.max !== undefined && !(value !== null && value <= c.max)) out.push(`${c.stat} ${showBroken(value, c.max)} > ${c.max}`);
+    if (c.minDelta !== undefined && !(delta !== null && delta >= c.minDelta)) out.push(`${c.stat} change ${showBroken(delta, c.minDelta)} < ${c.minDelta}`);
+    if (c.maxDelta !== undefined && !(delta !== null && delta <= c.maxDelta)) out.push(`${c.stat} change ${showBroken(delta, c.maxDelta)} > ${c.maxDelta}`);
   }
   return out;
 }
 
-interface Scorer {
+export interface Scorer {
   /** Weighted stats that add nothing for any row. */
   ignored: string[];
   score(after: Stats): { score: number; unscored: string[] };
 }
 
 /** score = sum of weight * change: delta / |base| (relative; a base that is 0 or not a number counts for nothing) or the raw delta (absolute). */
-function makeScorer(objective: EvaluateObjective, base: Stats): Scorer {
+export function makeScorer(objective: EvaluateObjective, base: Stats): Scorer {
   const mode = objective.mode ?? 'relative';
   const entries = Object.entries(objective.weights);
   const ignored = entries.filter(([stat]) => !finite(base[stat]) || (mode === 'relative' && base[stat] === 0)).map(([stat]) => stat);
@@ -368,7 +384,8 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
         '`pointsAdded` / `pointsRemoved` for node changes, and `fallback`. A refused variant (unknown node or gem, item that does not fit, bad config) is listed after the others with its `error`; the call still succeeds. ' +
         'Numbers are rounded to 2 decimals (4 significant digits below 1). A node name resolves among the nodes the change can apply to (unallocated ones for allocate, allocated ones for deallocate); a name several of them share (e.g. "Strength") refuses that variant with the candidate ids, so pass ids for those. ' +
         `Per variant: at most ${MAX_VARIANT_NODES} nodes in each of allocate / deallocate, ${MAX_VARIANT_ITEMS} items, ${MAX_VARIANT_GEMS} gem changes, ${MAX_VARIANT_CONFIG_KEYS} config keys; at most ${MAX_NODE_NAMES} different node names per call. ` +
-        'Optional `objective` {weights:{stat:weight}, mode:"relative"|"absolute"} ranks by `score` = sum of weight x change (relative: delta/|base|, a stat whose base is 0 or not a number counts for nothing and is listed in `objective.ignored`; absolute: raw delta; negative weights penalise) instead of `rankBy` (give one, not both). ' +
+        'Optional `objective` {weights:{stat:weight}, mode:"relative"|"absolute"} ranks by `score` = sum of weight x change instead of `rankBy` (give one, not both; rows then have `score` and no `value`). ' +
+        'Relative (default): delta/|base|, so a tiny base dominates the score; prefer "absolute" (raw delta) or small weights for those. A stat whose base is 0 or not a number counts for nothing and is listed in `objective.ignored`; a row whose own value is not a number lists it in `unscored`. Negative weights penalise. ' +
         'Optional `constraints` [{stat, min?, max?, minDelta?, maxDelta?}] limit the variant\'s resulting value (or change): rows that break one list `violates` (e.g. "FireResist 72 < 75"; a non-number stat breaks it), come after the passing rows, and are counted in `violating`; `onlyPassing` drops them. Weighted and constrained stats are added to `stats`.',
       inputSchema: {
         variants: z.array(variantSchema).min(1).max(MAX_PROBE_VARIANTS).describe('The variants to evaluate, each on its own against the current build.'),

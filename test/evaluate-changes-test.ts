@@ -19,7 +19,7 @@ import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { BuildSession, type NamedProbeVariant, type TreeNodeInfo } from '../src/build-session.js';
-import { DEFAULT_EVALUATE_STATS, evaluateChanges, roundStat, type EvaluateChangesResult, type EvaluateChangesVariant } from '../src/evaluate-changes.js';
+import { DEFAULT_EVALUATE_STATS, evaluateChanges, makeScorer, roundStat, violations,type EvaluateChangesResult, type EvaluateChangesVariant } from '../src/evaluate-changes.js';
 import { LuaBridge, type Stats } from '../src/lua-bridge.js';
 import { setupTestEnv } from './_skip.js';
 
@@ -297,11 +297,24 @@ async function main(): Promise<void> {
     assert(JSON.stringify(Object.keys(plain)) === '["rankBy","order","base","evaluated","failed","fallbacks","results"]', `plain keys ${Object.keys(plain)}`);
     const OLD_ROW_KEYS = ['index', 'label', 'value', 'delta', 'pointsAdded', 'pointsRemoved', 'fallback', 'error', 'userError'];
     for (const r of plain.results) assert(Object.keys(r).every((k) => OLD_ROW_KEYS.includes(k)), `plain row keys ${Object.keys(r)}`);
-    assert(JSON.stringify(plain.results.map((r) => r.index)) === JSON.stringify(result.results.map((r) => r.index)), 'plain call keeps the same order');
+    // The old behaviour, rebuilt here from raw probe numbers: successes by CombinedDPS change (desc, ties by index), refused variants after them by index.
+    const rawProbe = await session.probeNamed({ stats: ['CombinedDPS'], variants: variants.map(({ label: _l, ...v }) => v as NamedProbeVariant) });
+    const rawDelta = (i: number): number => num(rawProbe.results[i].stats.CombinedDPS) - num(rawProbe.base.CombinedDPS);
+    const okIdx = rawProbe.results.map((r, i) => i).filter((i) => rawProbe.results[i].error === undefined);
+    const errIdx = rawProbe.results.map((r, i) => i).filter((i) => rawProbe.results[i].error !== undefined);
+    const expectedOrder = [...okIdx.sort((a, b) => (rawDelta(a) === rawDelta(b) ? a - b : rawDelta(b) - rawDelta(a))), ...errIdx];
+    assert(JSON.stringify(plain.results.map((r) => r.index)) === JSON.stringify(expectedOrder), `plain order ${plain.results.map((r) => r.index)} vs expected ${expectedOrder}`);
+    assert(plain.results[0].label === 'add elemental focus' && plain.results[1].label === 'swap to elemental focus', `top two: ${plain.results[0].label}, ${plain.results[1].label}`);
+    const KEY_ORDER = ['index', 'label', 'value', 'delta', 'pointsAdded', 'pointsRemoved', 'fallback', 'error', 'userError'];
+    for (const r of plain.results) {
+      const keys = Object.keys(r);
+      assert(JSON.stringify(keys) === JSON.stringify(KEY_ORDER.filter((k) => keys.includes(k))), `plain row key order ${keys}`);
+      assert(r.error === undefined ? keys.includes('value') && keys.includes('delta') : keys.includes('error') && keys.includes('userError'), `plain row keys ${keys}`);
+    }
     // Constraints nobody breaks change nothing but the `violating` counter.
     const loose = await evaluateChanges(session, { variants, constraints: [{ stat: 'Life', min: -1e9 }] });
     assert(loose.violating === 0, `loose violating ${loose.violating}`);
-    assert(JSON.stringify(loose.results.map((r) => r.index)) === JSON.stringify(plain.results.map((r) => r.index)), 'unbroken constraints keep the order');
+    assert(JSON.stringify(loose.results.map((r) => r.index)) === JSON.stringify(expectedOrder), 'unbroken constraints keep the order');
     assert(loose.results.every((r) => r.violates === undefined), 'no violates when nothing is broken');
     log('   PASS');
 
@@ -452,6 +465,54 @@ async function main(): Promise<void> {
       assert(err instanceof Error && err.constructor.name === 'UserError' && pattern.test(err.message), `${name}: ${String(err)}`);
     }
     log(`   PASS: ${cases.length} invalid inputs refused with a UserError`);
+
+    // ------------------------------------------------------------------
+    log('11. base-0 stats, unscored rows, precision, the stat limit');
+    // A stat that is 0 in the build cannot take a relative change: it is ignored in relative mode, scored in absolute mode.
+    const zeroStat = Object.keys(stats0).find((k) => stats0[k] === 0);
+    assert(zeroStat, 'fixture needs a stat that is 0');
+    const rel0 = await evaluateChanges(session, { variants: good, objective: { weights: { Life: 1, [zeroStat]: 3 } } });
+    assert(JSON.stringify(rel0.objective) === JSON.stringify({ mode: 'relative', ignored: [zeroStat] }), `relative ignored ${JSON.stringify(rel0.objective)}`);
+    assert(rel0.results.every((r) => r.unscored === undefined), 'an ignored stat is not reported per row');
+    const abs0 = await evaluateChanges(session, { variants: good, objective: { mode: 'absolute', weights: { Life: 1, [zeroStat]: 3 } } });
+    assert(abs0.objective!.ignored === undefined, `absolute mode keeps a 0-base stat: ${JSON.stringify(abs0.objective)}`);
+    log(`   base-0 stat ${zeroStat}: ignored in relative mode only`);
+
+    // unscored: a weighted stat that is a number in the base but not in the variant (no build gives one, so checked on the scorer).
+    const scorer = makeScorer({ weights: { A: 2, B: 1, C: 1 } }, { A: 10, B: 0, C: 'x' });
+    assert(JSON.stringify(scorer.ignored) === '["B","C"]', `scorer ignored ${scorer.ignored}`);
+    const scored = scorer.score({ A: 15, B: 4, C: 'x' });
+    assert(scored.score === 1 && scored.unscored.length === 0, `score ${JSON.stringify(scored)}`);
+    const unscoredRow = makeScorer({ weights: { A: 2, D: 1 } }, { A: 10, D: 5 }).score({ A: 15, D: 'n/a' });
+    assert(unscoredRow.score === 1 && JSON.stringify(unscoredRow.unscored) === '["D"]', `unscored ${JSON.stringify(unscoredRow)}`);
+
+    // Violation text keeps enough digits to read true.
+    const vio = (c: Parameters<typeof violations>[0][number], after: number, before = 80): string[] => violations([c], { S: before }, { S: after });
+    assert(vio({ stat: 'S', min: 75 }, 74.996)[0] === 'S 74.996 < 75', `precision: ${vio({ stat: 'S', min: 75 }, 74.996)}`);
+    assert(vio({ stat: 'S', max: 75 }, 75.004)[0] === 'S 75.004 > 75', `precision max: ${vio({ stat: 'S', max: 75 }, 75.004)}`);
+    assert(vio({ stat: 'S', min: 75 }, 72)[0] === 'S 72 < 75', 'plain text unchanged');
+    assert(vio({ stat: 'S', min: 75 }, 74.3333333)[0] === 'S 74.33 < 75', 'rounded when it reads true');
+    assert(vio({ stat: 'S', minDelta: 0 }, 79.9996)[0] === 'S change -0.0004 < 0', `delta: ${vio({ stat: 'S', minDelta: 0 }, 79.9996)}`);
+    assert(vio({ stat: 'S', min: 75 }, 75).length === 0, 'at the bound passes');
+
+    // Stats already listed are not counted twice; only added stats can push the call over the limit.
+    const fifty = ['Life', ...Array.from({ length: 49 }, (_v, i) => `FakeStat${i}`)];
+    const dedup = await evaluateChanges(session, {
+      variants: [{ config: { usePowerCharges: true } }],
+      stats: fifty,
+      objective: { weights: { Life: 1, FakeStat3: 1 } },
+      constraints: [{ stat: 'Life', min: 0 }, { stat: 'FakeStat7', max: 1 }],
+    });
+    assert(Object.keys(dedup.base).length === 50, `${Object.keys(dedup.base).length} stats`);
+    let tooMany: unknown;
+    try {
+      await evaluateChanges(session, { variants: [{ config: { usePowerCharges: true } }], stats: fifty, objective: { weights: { Life: 1 } }, constraints: [{ stat: 'Life', min: 0 }, { stat: 'ExtraStat51', min: 0 }] });
+    } catch (e) {
+      tooMany = e;
+    }
+    assert(tooMany instanceof Error && tooMany.constructor.name === 'UserError' && /50 requested plus 1 more/.test(tooMany.message) && /ExtraStat51/.test(tooMany.message) && !/Life/.test(tooMany.message),
+      `too many stats: ${String(tooMany)}`);
+    log('   PASS');
 
     console.log('\nAll evaluate_changes tests passed.');
   } finally {
