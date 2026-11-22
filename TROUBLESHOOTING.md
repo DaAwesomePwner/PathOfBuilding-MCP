@@ -73,7 +73,7 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 **What the server does:** the stuck process is killed and the timeout counts as one of the three strikes (see above); the in-flight tool call returns an error. The next tool call restarts the engine — see the next section.
 
 **Fix:**
-- Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter on `suggest_upgrades`.
+- Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter or a smaller `modSlots` on `suggest_upgrades`.
 - If a specific build always times out, capture stderr (`POB_TIMING=1` helps) and try simplifying the build (remove very large jewel clusters, exotic skill setups) to isolate the offending data.
 
 ## "The Path of Building engine stopped unexpectedly and was restarted"
@@ -133,6 +133,10 @@ A tool call was queued or running when the engine was replaced (`reload_engine`,
 
 **Fix:** This is an internal invariant violation. Capture stderr and the call sequence and file an issue.
 
+## `stat_weights` lists a line under `unparsed`
+
+Path of Building's mod parser could not use the line (the same check its Custom modifiers box applies: a line with any unrecognised text is skipped there), so it was not evaluated; `reason` says whether nothing or only part of it was recognised. Write it the way the game or PoB shows the mod on an item, one modifier per line, with numbers filled in (`+50 to maximum Life`, not `+# to maximum Life`). A line that grants a skill is not supported. Lines are added as global modifiers, so local item mods (a weapon's added damage, an armour piece's own armour) are counted as global ones.
+
 ## Performance reference (OccVortex on a typical desktop)
 
 | Operation | Expected wall time |
@@ -145,7 +149,8 @@ A tool call was queued or running when the engine was replaced (`reload_engine`,
 | `find_worst_allocated_nodes` | 2–3 s |
 | `compare_supports`, `swap_gem`, `evaluate_gem_levels` | milliseconds |
 | `find_optimal_links` (6-link, default topN) | 1–3 s |
-| `suggest_upgrades` (all slots) | <1 s |
+| `suggest_upgrades` (all slots; suggested mods for 3) | ~2 s (`modSlots: 10` ~5 s, `modSlots: 0` <0.1 s) |
+| `stat_weights` (default 37 lines) | ~0.1 s |
 | `simulate_scenario`, `compare_scenarios`, `toggle_buffs` | milliseconds |
 
 Run the server with `POB_TIMING=1` to log every Lua bridge command's wall time to stderr.

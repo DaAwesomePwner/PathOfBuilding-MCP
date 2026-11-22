@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   46 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   47 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -23,7 +23,7 @@ Three layers, three responsibilities:
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
 | **Probe engine** | `lua/probe.lua`, `src/probe.ts` | Evaluates what-if variants through PoB's own calculator (the one its tooltips use) without changing or recalculating the build; `src/tree-search.ts`, `src/link-search.ts` and `src/evaluate-changes.ts` build the node searches, the link search and `evaluate_changes` on it. |
-| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 46 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
+| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 47 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -31,12 +31,12 @@ Three layers, three responsibilities:
 - **Never exits for a missing install.** If PoB or LuaJIT can't be found the server still starts; engine tools return an error asking for the PoB folder (`configure_pob_path`), or ask you directly via MCP elicitation when the client supports it.
 - **Version-aware.** If PoB updates itself on disk (new league), tools refuse to run on the stale in-memory engine and point at `reload_engine`.
 - **Serial execution.** A mutex guarantees only one operation runs at a time. PoB is fundamentally a single-threaded singleton with shared global state.
-- **Read-only probes for "what-if" queries.** `evaluate_changes`, `compare_items`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `suggest_upgrades`, a one-node `simulate_passive_change`, the gem tools (`swap_gem`, `compare_supports`, `evaluate_gem_levels`, `find_optimal_links`) and the scenario tools (`simulate_scenario`, `compare_scenarios`, `toggle_buffs`) evaluate each variant through PoB's own calculator (the one its tooltips use, a few ms per variant) without changing or recalculating the build. The few variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items), and the other `simulate_passive_change` requests, are applied, recalculated and restored *exactly* (verified bit-exact), and each such restore is checked against a fingerprint of the build taken before it.
+- **Read-only probes for "what-if" queries.** `evaluate_changes`, `compare_items`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `suggest_upgrades`, `stat_weights`, a one-node `simulate_passive_change`, the gem tools (`swap_gem`, `compare_supports`, `evaluate_gem_levels`, `find_optimal_links`) and the scenario tools (`simulate_scenario`, `compare_scenarios`, `toggle_buffs`) evaluate each variant through PoB's own calculator (the one its tooltips use, a few ms per variant) without changing or recalculating the build. The few variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items), and the other `simulate_passive_change` requests, are applied, recalculated and restored *exactly* (verified bit-exact), and each such restore is checked against a fingerprint of the build taken before it.
 - **Compact replies.** Every tool answers with compact JSON. The big read tools (`get_passive_tree`, `list_equipped_items`, `list_skill_groups`) return a trimmed default; pass `detail: "full"` (or `includeItemText: true` for item text) for everything.
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 46 tools
+## The 47 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -87,11 +87,12 @@ Three layers, three responsibilities:
 - `compare_scenarios` — DPS/EHP across 2-6 scenarios in one call; a scenario PoB refuses gets its own `error`.
 - `toggle_buffs` — friendly-named on/off for buffs (`onslaught`, `fortify`, etc.).
 
-### Optimization advisor (7)
+### Optimization advisor (8)
 - `evaluate_changes` — try up to 500 what-if variants in one call (each mixing node allocations/deallocations by name or id, item swaps or unequips, gem ops and config) and get one short row per variant ranked by `rankBy` (default CombinedDPS). Read-only; see the example below.
 - `apply_changes` — `{ variant }`: commit one `evaluate_changes` variant exactly as written (nodes by name or id, items, gem ops, config) as a single undoable step; its stats are the ones `evaluate_changes` reported. The whole variant is checked first (unknown or unreachable node, bad gem name or index, item that does not fit, unknown config key → refused, nothing changes). **Mutates** (undoable; kept by `export_build`; replayed after an engine crash). Returns the nodes added / removed, points and the stat diff.
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`. Returns `{ checks }`.
-- `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only, well under a second), ranks by upgrade priority, suggests archetype-aware mods. Returns `{ suggestions }`.
+- `stat_weights` — what each mod line is worth to this build: every line (default: a generic pack of 37 single-roll offence/defence/sustain mods) is added on its own as a custom modifier (PoB's Custom modifiers box; existing custom modifiers kept) and each requested stat's change is measured through PoB's calculator. Returns `weights` ranked by `rankBy` (default CombinedDPS) with `delta` and `pct` per stat, and `unparsed` for lines PoB's mod parser cannot use. Lines act as global modifiers. Read-only, ~5 ms a line.
+- `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only), ranks by upgrade priority; the first `modSlots` slots (default 3, up to 10; or the given `slot`) get `suggestedMods` from PoB's own weighted trade query generator (`{ mod, weight }`, weight = stat-score gain per point, listed by a typical roll's gain), about 0.5-1 s a slot. Returns `{ suggestions, modsNote? }`.
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
 - `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/allocate_nodes/deallocate_nodes/apply_changes/create_socket_group/delete_socket_group/set_main_skill/convert_tree_to_latest; what-if tools push nothing).
 - `reset_build` — discard everything, return to the originally loaded state.
@@ -160,7 +161,8 @@ A user prompt to Claude like *"Here's my build code: `eNrtPGtv28b...` — what's
 1. `load_build({ source: "eNrtPGtv28b..." })` — Claude pastes the code in.
 2. `get_stats({})` — sanity check on baseline stats.
 3. `diagnose_build({})` — see if anything jumps out (uncapped resist, low EHP, bad mana, etc.).
-4. `suggest_upgrades({})` — unequip-and-measure sweep across every slot, well under a second.
+4. `suggest_upgrades({})` — unequip-and-measure sweep across every slot, plus PoB's trade-weighted mods for the 3 highest-priority slots (~2 s).
+   `stat_weights({})` — what a typical roll of each common mod is worth to this build.
 5. `list_equipped_items({})` — pull mod text on the slot it flagged.
 6. Claude reasons about *what mods* would help and replies with a prioritized recommendation.
 

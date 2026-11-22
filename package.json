@@ -53,7 +53,8 @@
     "test:lua-compat": "tsx test/lua-compat-test.ts",
     "test:probe": "tsx test/probe-test.ts",
     "test:evaluate": "tsx test/evaluate-changes-test.ts",
-    "test:stats": "tsx test/stats-diagnostics-test.ts"
+    "test:stats": "tsx test/stats-diagnostics-test.ts",
+    "test:stat-weights": "tsx test/stat-weights-test.ts"
   },
   "repository": {
     "type": "git",

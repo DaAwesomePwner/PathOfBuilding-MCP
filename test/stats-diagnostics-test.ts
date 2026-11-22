@@ -63,7 +63,7 @@ async function main(): Promise<void> {
 
     log('Test 2: suggest_upgrades sorts by priority');
     await session.unequipItem('Belt');
-    const sug = await session.suggestUpgrades();
+    const sug = await session.suggestUpgrades(undefined, { modSlots: 0 });
     assert(sug.length >= 5, `expected several slots, got ${sug.length}`);
     assert(sug[0].empty && sug[0].slot === 'Belt', `empty slot should come first, got ${sug[0].slot}`);
     const measured = sug.filter((s) => !s.empty && s.error === undefined);
