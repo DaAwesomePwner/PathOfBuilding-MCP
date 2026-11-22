@@ -58,6 +58,15 @@ Implicits: 1
 +30 to maximum Life
 +70 to maximum Life`;
 
+// A magic item names its base inside its name line: with a BOM left on the
+// Rarity line PoB would not find the base, so this one shows the BOM is stripped.
+const MAGIC_RING = `Rarity: MAGIC
+Hale Coral Ring
+--------
+Item Level: 63
+--------
++30 to maximum Life`;
+
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
@@ -157,6 +166,12 @@ async function main(): Promise<void> {
     const probed = await session.probe({ variants: [{ items: [{ slot: 'Graft 1', itemText: GRAFT }] }] });
     assert(probed.results[0].userError === true && /Graft 1.*3\.27/.test(probed.results[0].error ?? ''),
       `probe into a hidden slot: ${JSON.stringify(probed.results[0])}`);
+    // Probe item text is normalized as swap_item's: a leading BOM changes nothing.
+    const ringProbe = await session.probe({
+      variants: [{ items: [{ slot: 'Ring 1', itemText: MAGIC_RING }] }, { items: [{ slot: 'Ring 1', itemText: '﻿' + MAGIC_RING }] }],
+    });
+    assert(ringProbe.results.every((r) => r.error === undefined) && sameStats(ringProbe.results[0].stats, ringProbe.results[1].stats),
+      `a BOM-prefixed probe item gives the same stats: ${JSON.stringify(ringProbe.results)}`);
     await expectUserError('nothing to undo', () => session.undoLastChange(), /[Nn]othing to undo|empty/);
     assert((await session.exportBuild('xml')) === xml0, 'refused changes must leave the export unchanged');
     assert(sameStats(await session.getStats(), stats0), 'refused changes must leave stats unchanged');
@@ -202,8 +217,15 @@ async function main(): Promise<void> {
     }
     const xmlConverted = await session.exportBuild('xml');
     const before = await session.getStats();
+    // evaluate_changes / probe variants take Viscera game text too, BOM or not, with swap_item's numbers.
+    const headProbe = await session.probe({
+      variants: [{ items: [{ slot: 'Head', itemText: VISCERA_HEAD }] }, { items: [{ slot: 'Head', itemText: '﻿' + VISCERA_HEAD }] }],
+    });
+    assert(headProbe.results.every((r) => r.error === undefined) && sameStats(headProbe.results[0].stats, headProbe.results[1].stats)
+      && headProbe.results[0].stats.Life !== before.Life, `Viscera probe with and without BOM: ${JSON.stringify(headProbe.results)}`);
     const head = await session.swapItemWithDiff('Head', '\uFEFF' + VISCERA_HEAD);
     assert(head.after.Life !== before.Life && head.diff.Life, `Life should change: ${JSON.stringify(head.diff)}`);
+    assert(sameStats(head.after, headProbe.results[0].stats), 'the probe matches swap_item');
     const headItem = (await session.listEquippedItems()).find((i) => i.slot === 'Head');
     assert(headItem && headItem.baseName === "Thaumaturge's Head" && headItem.rarity === 'NORMAL'
       && headItem.raw === VISCERA_HEAD && !headItem.hidden,

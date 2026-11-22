@@ -370,7 +370,7 @@ tools.engine<{ slot: string; items: string[] }>(
         .array(z.string().min(1))
         .min(2)
         .max(5)
-        .describe('Array of 2-5 item texts to compare (PoB format).'),
+        .describe('Array of 2-5 item texts to compare (PoB format). Viscera items copied from the game (first line "Item Class: Viscera") need no Rarity line.'),
     },
   },
   async ({ slot, items }, session) => {

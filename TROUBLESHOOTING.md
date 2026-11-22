@@ -99,7 +99,7 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 ## "Item text must start with a `Rarity:` line"
 
-`swap_item` and `compare_items` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`. The one exception is a Viscera (Wickerman) item copied from the game, whose first line is `Item Class: Viscera` and which has no `Rarity:` line; it is accepted as is.
+`swap_item`, `compare_items` and item variants in `evaluate_changes` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`. The one exception is a Viscera (Wickerman) item copied from the game, whose first line is `Item Class: Viscera` and which has no `Rarity:` line; it is accepted as is.
 
 ## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
 
