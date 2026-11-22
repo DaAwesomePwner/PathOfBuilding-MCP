@@ -1320,7 +1320,19 @@ return function(ctx)
 
 		local before = nodeBatch.captureAllocated()
 		edit.started()
-		if config then ctx.setConfigInput(config) end
+		if config then
+			-- As set_config sets the options, but on copies of the config
+			-- tables (as probeCommit does), the committed ones stashed: a
+			-- rollback (ConfigTables.restoreInput) puts them back unwritten,
+			-- so their pairs() order stays; writing keys into them and
+			-- deleting them again may not keep it (the string hash seed
+			-- differs per process). The stash is cleared once everything is
+			-- applied.
+			local orig = ctx.detachConfigTables(config)
+			ctx.stashCommittedConfigTables(orig, build.configTab.input)
+			build.configTab:BuildModList()
+			build.buildFlag = true
+		end
 		if #gems > 0 then
 			applyGems(gems)
 			build.buildFlag = true
@@ -1349,6 +1361,8 @@ return function(ctx)
 		table.sort(extra)
 		for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
 		local result = { added = added, removed = nodeBatch.lostSince(before), allocOrder = allocOrder, gemNames = gemNames }
+		-- Applied in full: no rollback will need the committed config tables.
+		if config then ctx.stashCommittedConfigTables(nil, nil) end
 		edit.applied(result, cmd.replay == true)
 		runCallback("OnFrame")
 		return result
