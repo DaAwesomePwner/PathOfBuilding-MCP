@@ -37,6 +37,10 @@ export interface SnapshotItem {
   sockets?: string;
   corrupted?: boolean;
   hidden?: boolean;
+  /** Weapon-swap slot. */
+  swap?: boolean;
+  /** PoB ignores this item: the weapon set not in use, or an abyss jewel in a socket its parent item does not have. */
+  inactive?: boolean;
   /** Active mod lines: {enchant}, {scourge}, {implicit}, then explicits ({crafted} / {fractured} marked). */
   mods: string[];
 }
@@ -92,6 +96,15 @@ const MAX_MOD_LINES = 12;
 const MAX_GROUPS = 20;
 const MAX_CONFIG = 30;
 const MAX_VALUE_CHARS = 120;
+const MAX_LABEL_CHARS = 120;
+const MAX_MOD_CHARS = 160;
+const MAX_NAME_CHARS = 80;
+const MAX_GEMS = 12;
+
+/** `text` cut to `max` characters (with an ellipsis). */
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 
 /** The first `max` entries; `more` counts the rest (absent when nothing was cut). */
 function capped<T>(list: T[], max: number): { list: T[]; more?: number } {
@@ -142,11 +155,11 @@ function treeSide(nodes: SnapshotNode[]): Record<string, unknown> {
   let other = 0;
   for (const n of nodes) {
     if (n.type === 'ClassStart' || n.type === 'AscendClassStart') continue;
-    const entry: NamedNode = { id: n.id, name: n.name };
+    const entry: NamedNode = { id: n.id, ...(n.name !== undefined ? { name: clip(n.name, MAX_NAME_CHARS) } : {}) };
     if (n.ascendancy) named.ascendancy.push(entry);
     else if (n.type === 'Keystone') named.keystones.push(entry);
     else if (n.type === 'Notable') named.notables.push(entry);
-    else if (n.type === 'Mastery') named.masteries.push(n.effect ? { ...entry, effect: n.effect } : entry);
+    else if (n.type === 'Mastery') named.masteries.push(n.effect ? { ...entry, effect: clip(n.effect, MAX_MOD_CHARS) } : entry);
     else if (n.type === 'Socket') jewelSockets++;
     else if (n.type === 'Normal') normal++;
     else other++;
@@ -173,7 +186,16 @@ function diffTree(a: BuildSnapshot, b: BuildSnapshot): Record<string, unknown> {
   const onlyB = b.tree.nodes.filter((n) => !byIdA.has(n.id));
   const masteryChanges = a.tree.nodes
     .filter((n) => n.type === 'Mastery' && byIdB.has(n.id) && (byIdB.get(n.id)!.effect ?? null) !== (n.effect ?? null))
-    .map((n) => ({ id: n.id, name: n.name, a: n.effect ?? null, b: byIdB.get(n.id)!.effect ?? null }));
+    .map((n) => {
+      const effectB = byIdB.get(n.id)!.effect;
+      return {
+        id: n.id,
+        name: n.name !== undefined ? clip(n.name, MAX_NAME_CHARS) : undefined,
+        a: n.effect !== undefined ? clip(n.effect, MAX_MOD_CHARS) : null,
+        b: effectB !== undefined ? clip(effectB, MAX_MOD_CHARS) : null,
+      };
+    });
+  const mc = capped(masteryChanges, MAX_NAMED_NODES);
   const versionA = a.info.treeVersion ?? null;
   const versionB = b.info.treeVersion ?? null;
   return {
@@ -182,7 +204,8 @@ function diffTree(a: BuildSnapshot, b: BuildSnapshot): Record<string, unknown> {
     sameNodes: a.tree.nodes.length - onlyA.length,
     onlyA: treeSide(onlyA),
     onlyB: treeSide(onlyB),
-    ...(masteryChanges.length ? { masteryChanges: capped(masteryChanges, MAX_NAMED_NODES).list } : {}),
+    ...(mc.list.length ? { masteryChanges: mc.list } : {}),
+    ...(mc.more ? { masteryChangesMore: mc.more } : {}),
     ...(versionA !== versionB
       ? { treeVersionNote: `The two sides use different passive tree versions (${versionA} / ${versionB}); nodes are compared by id.` }
       : {}),
@@ -193,7 +216,7 @@ function diffTree(a: BuildSnapshot, b: BuildSnapshot): Record<string, unknown> {
 
 function itemLabel(item: SnapshotItem): string {
   const name = item.name ?? item.base ?? '(unnamed item)';
-  return item.base && item.base !== name ? `${name} (${item.base})` : name;
+  return clip(item.base && item.base !== name ? `${name} (${item.base})` : name, MAX_LABEL_CHARS);
 }
 
 /** Entries of `x` not matched by an entry of `y` (multiset difference). */
@@ -210,10 +233,10 @@ function multisetMinus(x: string[], y: string[]): string[] {
 }
 
 function itemChange(slot: string, a: SnapshotItem, b: SnapshotItem): Record<string, unknown> | null {
-  const removed = multisetMinus(a.mods, b.mods);
-  const added = multisetMinus(b.mods, a.mods);
+  const removed = multisetMinus(a.mods, b.mods).map((m) => clip(m, MAX_MOD_CHARS));
+  const added = multisetMinus(b.mods, a.mods).map((m) => clip(m, MAX_MOD_CHARS));
   const fields: Record<string, unknown> = {};
-  for (const key of ['rarity', 'quality', 'sockets', 'corrupted'] as const) {
+  for (const key of ['rarity', 'quality', 'sockets', 'corrupted', 'inactive'] as const) {
     if ((a[key] ?? null) !== (b[key] ?? null)) fields[key] = { a: a[key] ?? null, b: b[key] ?? null };
   }
   const sameLabel = itemLabel(a) === itemLabel(b);
@@ -223,12 +246,17 @@ function itemChange(slot: string, a: SnapshotItem, b: SnapshotItem): Record<stri
   const more = (r.more ?? 0) + (ad.more ?? 0);
   return {
     slot,
+    ...(b.swap ? { swap: true } : {}),
     ...(sameLabel ? { item: itemLabel(a) } : { a: itemLabel(a), b: itemLabel(b) }),
     ...(r.list.length ? { modsOnlyA: r.list } : {}),
     ...(ad.list.length ? { modsOnlyB: ad.list } : {}),
     ...(more ? { more } : {}),
     ...fields,
   };
+}
+
+function oneSide(slot: string, item: SnapshotItem): Record<string, unknown> {
+  return { slot, item: itemLabel(item), ...(item.swap ? { swap: true } : {}), ...(item.inactive ? { inactive: true } : {}) };
 }
 
 function diffItems(a: SnapshotItem[], b: SnapshotItem[]): Record<string, unknown> {
@@ -246,8 +274,8 @@ function diffItems(a: SnapshotItem[], b: SnapshotItem[]): Record<string, unknown
       const change = itemChange(slot, ia, ib);
       if (change) changed.push(change);
       else same.push(slot);
-    } else if (ia) onlyA.push({ slot, item: itemLabel(ia) });
-    else if (ib) onlyB.push({ slot, item: itemLabel(ib) });
+    } else if (ia) onlyA.push(oneSide(slot, ia));
+    else if (ib) onlyB.push(oneSide(slot, ib));
   }
   const c = capped(changed, MAX_ITEM_SLOTS);
   const oa = capped(onlyA, MAX_ITEM_SLOTS);
@@ -262,17 +290,30 @@ function activeNames(g: SnapshotGroup): string[] {
   return g.gems.filter((x) => !x.support).map((x) => x.name).sort();
 }
 
+/** Matching key of a group: its active skills (full names; shown clipped by groupLabel). */
 function groupKey(g: SnapshotGroup): string {
   const active = activeNames(g);
   if (active.length) return active.join(' + ');
   return `supports in ${g.label ?? g.slot ?? 'a group'}`;
 }
 
+function groupLabel(g: SnapshotGroup): string {
+  return clip(groupKey(g), MAX_LABEL_CHARS);
+}
+
+/** Gem names (clipped), at most MAX_GEMS, under `key`, with `<key>More` counting the rest. */
+function gemList(key: string, names: string[]): Record<string, unknown> {
+  if (!names.length) return {};
+  const c = capped(names.map((n) => clip(n, MAX_NAME_CHARS)), MAX_GEMS);
+  return { [key]: c.list, ...(c.more ? { [`${key}More`]: c.more } : {}) };
+}
+
 function groupSummary(g: SnapshotGroup): Record<string, unknown> {
   return {
-    skills: groupKey(g),
-    ...(g.slot ? { slot: g.slot } : {}),
-    supports: g.gems.filter((x) => x.support).map((x) => x.name),
+    skills: groupLabel(g),
+    ...(g.slot ? { slot: clip(g.slot, MAX_NAME_CHARS) } : {}),
+    supports: [],
+    ...gemList('supports', g.gems.filter((x) => x.support).map((x) => x.name)),
     ...(g.enabled ? {} : { enabled: false }),
   };
 }
@@ -293,17 +334,21 @@ function groupChange(a: SnapshotGroup, b: SnapshotGroup): Record<string, unknown
     const gb = b.gems.find((x) => x.name === ga.name && !used.has(x));
     if (!gb) continue;
     used.add(gb);
-    if (gemText(ga) !== gemText(gb)) gemChanges.push(`${ga.name}: ${gemText(ga)} -> ${gemText(gb)}`);
+    if (gemText(ga) !== gemText(gb)) gemChanges.push(`${clip(ga.name, MAX_NAME_CHARS)}: ${gemText(ga)} -> ${gemText(gb)}`);
   }
   const fields: Record<string, unknown> = {};
-  if ((a.slot ?? null) !== (b.slot ?? null)) fields.slot = { a: a.slot ?? null, b: b.slot ?? null };
+  if ((a.slot ?? null) !== (b.slot ?? null)) {
+    fields.slot = { a: a.slot !== undefined ? clip(a.slot, MAX_NAME_CHARS) : null, b: b.slot !== undefined ? clip(b.slot, MAX_NAME_CHARS) : null };
+  }
   if (a.enabled !== b.enabled) fields.enabled = { a: a.enabled, b: b.enabled };
   if (!supportsRemoved.length && !supportsAdded.length && !gemChanges.length && !Object.keys(fields).length) return null;
+  const changes = capped(gemChanges, MAX_GEMS);
   return {
-    skills: groupKey(a),
-    ...(supportsAdded.length ? { supportsAdded } : {}),
-    ...(supportsRemoved.length ? { supportsRemoved } : {}),
-    ...(gemChanges.length ? { gemChanges } : {}),
+    skills: groupLabel(a),
+    ...gemList('supportsAdded', supportsAdded),
+    ...gemList('supportsRemoved', supportsRemoved),
+    ...(changes.list.length ? { gemChanges: changes.list } : {}),
+    ...(changes.more ? { gemChangesMore: changes.more } : {}),
     ...fields,
   };
 }
@@ -337,7 +382,10 @@ function diffGems(a: BuildSnapshot, b: BuildSnapshot): Record<string, unknown> {
   const ob = capped([...freeB].map(groupSummary), MAX_GROUPS);
   const more = (c.more ?? 0) + (oa.more ?? 0) + (ob.more ?? 0);
   return {
-    mainSkill: { a: a.info.mainSkill ?? null, b: b.info.mainSkill ?? null },
+    mainSkill: {
+      a: a.info.mainSkill != null ? clip(a.info.mainSkill, MAX_NAME_CHARS) : null,
+      b: b.info.mainSkill != null ? clip(b.info.mainSkill, MAX_NAME_CHARS) : null,
+    },
     sameGroups: pairs.length - changed.length,
     changed: c.list,
     onlyA: oa.list,
@@ -371,7 +419,7 @@ function metaSide(s: BuildSnapshot): Record<string, unknown> {
     class: s.info.class ?? null,
     ascendancy: s.info.ascendancy ?? null,
     level: s.info.level ?? null,
-    mainSkill: s.info.mainSkill ?? null,
+    mainSkill: s.info.mainSkill != null ? clip(s.info.mainSkill, MAX_NAME_CHARS) : null,
     treeVersion: s.info.treeVersion ?? null,
   };
 }
@@ -432,13 +480,31 @@ function firstLine(message: string): string {
   return line.length > 300 ? `${line.slice(0, 300)}…` : line;
 }
 
+/**
+ * A temporary engine's error line without the live engine's crash wording
+ * (strike counts, "the next tool call restarts the engine"): the temporary
+ * engine's strikes are its own and it is never restarted.
+ */
+function temporaryDetail(message: string): string {
+  const line = firstLine(message);
+  if (/^The Path of Building engine stopped during this call/.test(line)) return 'its process exited';
+  return line
+    .replace(/\(the engine was stopped; strike \d+ of \d+\)/g, '(its process was killed)')
+    .replace(/\s*\(strike \d+ of \d+\)/g, '')
+    .replace(/[;,]?\s*strike \d+ of \d+/g, '')
+    .replace(/\.?\s*Stderr:\s*$/, '');
+}
+
+const UNAFFECTED =
+  'It was discarded and is not restarted; this is not a crash of the main engine and does not count towards its crash limit; the loaded build and the main engine are unaffected.';
+
 /** What went wrong in the temporary engine, as an error of this call. */
 function temporaryFailure(e: unknown, bridge: LuaBridge, step: string, label: string): Error {
   const message = e instanceof Error ? e.message : String(e);
   if (!bridge.isRunning()) {
     return new TemporaryEngineError(
-      `The temporary Path of Building engine stopped while ${step} the ${label} build (${firstLine(message)}). ` +
-        'It was discarded; the loaded build and the main engine are unaffected. Retry the call, or check that the build opens in Path of Building.',
+      `The temporary Path of Building engine started for this comparison stopped while ${step} the ${label} build (${temporaryDetail(message)}). ` +
+        `${UNAFFECTED} Retry the call, or check that the build opens in Path of Building.`,
     );
   }
   if (step === 'loading') {
@@ -447,7 +513,7 @@ function temporaryFailure(e: unknown, bridge: LuaBridge, step: string, label: st
   }
   if (e instanceof UserError) return new UserError(`The ${label} build: ${message}`);
   return new TemporaryEngineError(
-    `Reading the ${label} build in the temporary Path of Building engine failed: ${firstLine(message)}. ` +
+    `Reading the ${label} build in the temporary Path of Building engine started for this comparison failed: ${temporaryDetail(message)}. ` +
       'The loaded build and the main engine are unaffected.',
   );
 }
@@ -479,8 +545,7 @@ async function readInTemporaryEngine(
   } catch (e) {
     if (e instanceof UserError) throw e;
     throw new TemporaryEngineError(
-      `The temporary Path of Building engine for the comparison could not start: ${firstLine((e as Error).message)}. ` +
-        'The loaded build and the main engine are unaffected.',
+      `The temporary Path of Building engine for this comparison could not start (${temporaryDetail((e as Error).message)}). ${UNAFFECTED}`,
     );
   }
 }

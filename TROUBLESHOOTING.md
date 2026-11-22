@@ -137,6 +137,8 @@ A tool call was queued or running when the engine was replaced (`reload_engine`,
 
 `compare_builds` evaluates the other build in a second, short-lived engine started for that call. It crashed, timed out (60 s per step) or could not start, so the call failed. That engine is always discarded and never restarted, and its failures do not count towards the main engine's three-strike limit: the loaded build, its undo history and the main engine are unaffected. Retry the call; if it keeps failing for the same build, check that the build opens in Path of Building itself ("Path of Building could not load the source build: …" means PoB refused it).
 
+`compare_builds is refused: the Path of Building engine has crashed N times …` means the main engine's crash breaker is open for this install: no second engine is started for it either (see "Lua engine has crashed N times" above). After a Path of Building update on disk, `compare_builds` asks for `reload_engine` first, like every engine tool.
+
 ## `stat_weights` lists a line under `unparsed`
 
 Path of Building's mod parser could not use the line (the same check its Custom modifiers box applies: a line with any unrecognised text is skipped there), so it was not evaluated; `reason` says whether nothing or only part of it was recognised. Write it the way the game or PoB shows the mod on an item, one modifier per line, with numbers filled in (`+50 to maximum Life`, not `+# to maximum Life`). A line that grants a skill is not supported. Lines are added as global modifiers, so local item mods (a weapon's added damage, an armour piece's own armour) are counted as global ones.

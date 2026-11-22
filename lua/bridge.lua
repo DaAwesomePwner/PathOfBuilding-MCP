@@ -4691,7 +4691,7 @@ do
 			end
 			local items = { }
 			local tab = build.itemsTab
-			local function addItem(slotName, itemId, hidden)
+			local function addItem(slotName, itemId, flags)
 				local item = itemId and itemId ~= 0 and tab.items[itemId]
 				if not item then return end
 				items[#items + 1] = {
@@ -4702,20 +4702,43 @@ do
 					quality = item.quality,
 					sockets = socketText(item),
 					corrupted = item.corrupted or nil,
-					hidden = hidden or nil,
+					hidden = flags.hidden,
+					swap = flags.swap,
+					inactive = flags.inactive,
 					mods = modLines(item),
 				}
 			end
+			local useSecond = tab and tab.activeItemSet and tab.activeItemSet.useSecondWeaponSet
 			for _, slot in ipairs(tab and tab.orderedSlots or { }) do
-				if slot.slotName then
-					addItem(slot.slotName, slot.selItemId, slotChecks.hiddenGate(slot) and true or nil)
+				-- Passive-tree socket slots ("Jewel <nodeId>") keep their item
+				-- after the socket is deallocated: they are listed from
+				-- spec.jewels below, allocated sockets only.
+				if slot.slotName and not slot.nodeId then
+					local inactive = nil
+					-- The weapon set not in use, and an abyss jewel in a socket
+					-- its parent item does not have: PoB's CalcSetup skips both.
+					if slot.weaponSet and slot.weaponSet ~= (useSecond and 2 or 1) then inactive = true end
+					if slot.parentSlot then
+						local parentId = slot.parentSlot.selItemId or 0
+						local parent = parentId ~= 0 and tab.items[parentId] or nil
+						if not parent or (parent.abyssalSocketCount or 0) < (slot.slotNum or 0) then inactive = true end
+					end
+					addItem(slot.slotName, slot.selItemId, {
+						hidden = slotChecks.hiddenGate(slot) and true or nil,
+						swap = slot.weaponSet == 2 or nil,
+						inactive = inactive,
+					})
 				end
 			end
-			-- Jewels in passive-tree sockets (part of the tree state).
-			for nodeId, itemId in pairs(spec and spec.jewels or { }) do
-				if spec.allocNodes and spec.allocNodes[nodeId] then
-					addItem("Tree jewel " .. tostring(nodeId), itemId, nil)
-				end
+			-- Jewels in allocated passive-tree sockets (part of the tree
+			-- state), by node id so both sides list them in the same order.
+			local socketIds = { }
+			for nodeId in pairs(spec and spec.jewels or { }) do
+				if spec.allocNodes and spec.allocNodes[nodeId] then socketIds[#socketIds + 1] = nodeId end
+			end
+			table.sort(socketIds)
+			for _, nodeId in ipairs(socketIds) do
+				addItem("Tree jewel " .. tostring(nodeId), spec.jewels[nodeId], { })
 			end
 
 			local groups = { }

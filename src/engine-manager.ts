@@ -338,6 +338,26 @@ export class EngineManager {
       const paths = this.paths;
       if (!paths) throw new EngineNotReadyError(msg.unconfigured(this.resolveError, this.promptMessage));
       if (this.shuttingDown) throw new EngineNotReadyError('The server is shutting down.');
+      // The same install checks engine tools get, right before spawning.
+      if (detectUpdateState(paths.pobPath) === 'applying') throw new EngineNotReadyError(msg.updating(paths.pobPath));
+      if (this.startFingerprint) {
+        const current = fingerprintInstall(paths.pobPath);
+        if (installChanged(this.startFingerprint, current)) {
+          throw new EngineNotReadyError(msg.stale(this.startFingerprint, current, paths.pobPath));
+        }
+      }
+      // An install whose engine keeps crashing must not get a process per call.
+      // The live bridge holds the ledger's count for these paths plus its own.
+      const strikes =
+        this.bridge && this.bridgePaths?.pobPath === paths.pobPath && this.bridgePaths.luajitPath === paths.luajitPath
+          ? this.bridge.getCrashCount()
+          : this.ledger.initialCount(paths.pobPath, paths.luajitPath);
+      if (strikes >= msg.MAX_CRASHES) {
+        throw new UserError(
+          `compare_builds is refused: the Path of Building engine has crashed ${strikes} times with this install ` +
+            '(the crash breaker is open), so no second engine is started for it. ' + msg.circuitOpen(strikes),
+        );
+      }
       bridge = this.temporaryBridgeFactory(paths, {
         timeoutMs: options.timeoutMs ?? TEMPORARY_ENGINE_TIMEOUT_MS,
         testFaults: options.testFaults,

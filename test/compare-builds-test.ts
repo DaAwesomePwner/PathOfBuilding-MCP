@@ -1,6 +1,8 @@
 // compare_builds (src/compare-builds.ts): the loaded build against another
 // build evaluated in a short-lived second engine.
 //
+//   0. Output bounds (no engine): long names and mod lines are clipped, long
+//      gem lists capped with `...More` counts, mastery changes with a count.
 //   1. B = the fixture with a 2-point notable allocated, a ring swapped, a
 //      support gem replaced (apply_changes) and a config option set, exported
 //      as a build code and undone. The comparison reports exactly those
@@ -13,15 +15,23 @@
 //   5. A temporary engine that crashes, hangs (timeout) or fails to start
 //      fails the call with a TemporaryEngineError; the live engine keeps
 //      working with no strike, its crash ledger entry unchanged.
+//   5b. With the live crash breaker open the call is refused before any
+//      process starts; after a PoB update on disk (stale engine) too.
 //   6. Concurrency: engine tools run while a comparison's temporary engine is
 //      up (they are not blocked for its whole duration); two comparisons at
 //      once never have two temporary engines alive.
+//   7. Tree jewels: listed once, from allocated sockets only (a swapped jewel
+//      is one change; a deallocated socket's jewel is only on side a).
+//   8. An item in the weapon set not in use is marked swap + inactive (PoB
+//      ignores it: no stat change). (An abyss jewel in a socket its item does
+//      not have is marked the same way; PoB 2.68 clears such slots itself on
+//      load and on a swap, so no test builds one.)
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { BuildSession } from '../src/build-session.js';
-import { compareBuilds, COMPARE_STAT_KEYS, KEY_STATS, TemporaryEngineError } from '../src/compare-builds.js';
-import { EngineManager } from '../src/engine-manager.js';
+import { type BuildSnapshot, compareBuilds, COMPARE_STAT_KEYS, diffBuilds, KEY_STATS, TemporaryEngineError } from '../src/compare-builds.js';
+import { EngineManager, EngineNotReadyError } from '../src/engine-manager.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
 import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
@@ -37,6 +47,16 @@ function log(msg: string): void {
 }
 
 const MAIN_GROUP = 5; // Vortex
+const TREE_SOCKET = 36634; // holds the fixture's Cataclysm Stone (item 17)
+const JEWEL = `Rarity: RARE
+Compare Jewel
+Cobalt Jewel
++40 to maximum Life
+12% increased Spell Damage`;
+const WAND = `Rarity: RARE
+Compare Wand
+Imbued Wand
++20 to maximum Life`;
 const RING = `Rarity: RARE
 Compare Ring
 Coral Ring
@@ -92,7 +112,37 @@ async function waitDead(pid: number): Promise<boolean> {
   return false;
 }
 
+function testBounds(): void {
+  log('Test 0: output bounds');
+  const long = 'x'.repeat(1000);
+  const gems = (n: number, prefix: string) => Array.from({ length: n }, (_, i) => ({ name: `${prefix} ${i} ${long}`, level: 20, quality: 0, enabled: true, support: true }));
+  const side = (supports: string, effect: string): BuildSnapshot => ({
+    info: { class: 'Witch', mainSkill: long },
+    stats: {},
+    tree: { points: 0, ascendancyPoints: 0, nodes: Array.from({ length: 40 }, (_, i) => ({ id: i + 1, name: long, type: 'Mastery', effect: `${effect}${long}` })) },
+    items: [{ slot: 'Ring 1', name: supports + long, base: 'Coral Ring', mods: Array.from({ length: 30 }, (_, i) => `${supports}${i}${long}`) }],
+    groups: [{ enabled: true, gems: [{ name: `Vortex ${long}`, level: 20, quality: 0, enabled: true, support: false }, ...gems(30, supports)] }],
+    config: {},
+  });
+  const out = diffBuilds(side('a', 'A'), side('b', 'B')) as {
+    tree: { masteryChanges: unknown[]; masteryChangesMore: number };
+    items: { changed: Array<{ a: string; modsOnlyA: string[]; more: number }> };
+    gems: { mainSkill: { a: string }; changed: Array<{ skills: string; supportsAdded: string[]; supportsAddedMore: number; supportsRemovedMore: number }> };
+  };
+  const text = JSON.stringify(out);
+  assert(text.length < 40_000, `bounded output is ${text.length} bytes`);
+  assert(out.tree.masteryChanges.length === 30 && out.tree.masteryChangesMore === 10, `mastery changes: ${out.tree.masteryChanges.length} + ${out.tree.masteryChangesMore}`);
+  const ring = out.items.changed[0];
+  assert(ring.a.length <= 120 && ring.modsOnlyA.length === 12 && ring.more === 36 && ring.modsOnlyA.every((m) => m.length <= 160), 'item label / mod lines clipped and capped');
+  const g = out.gems.changed[0];
+  assert(g.skills.length <= 120 && g.supportsAdded.length === 12 && g.supportsAddedMore === 18 && g.supportsRemovedMore === 18 && g.supportsAdded.every((n) => n.length <= 80),
+    `gem lists: ${JSON.stringify(g).slice(0, 300)}`);
+  assert(out.gems.mainSkill.a.length <= 80, 'main skill clipped');
+  log(`PASS (${text.length} bytes)`);
+}
+
 async function main(): Promise<void> {
+  testBounds();
   const { paths, fixturePath } = setupTestEnv();
   const fixtureXml = readFileSync(fixturePath, 'utf8');
 
@@ -250,18 +300,51 @@ async function main(): Promise<void> {
         (engine as unknown as { ledger: { initialCount(p: string, l: string): number } }).ledger.initialCount(paths.pobPath, paths.luajitPath)]));
     const strikesBefore = await strikes();
     assert(strikesBefore === '[0,0]', `strikes before: ${strikesBefore}`);
-    await expectError(compare({ source: codeB }, { testFaults: 'exitOn_compareSnapshot' }), TemporaryEngineError, /temporary Path of Building engine stopped while reading the source build/, 'crash');
+    // The live engine's crash wording (strikes, "the next tool call restarts") never shows.
+    const temporaryOnly = (e: Error, label: string): void => {
+      assert(!/strike|next tool call|restarts the engine/i.test(e.message), `${label}: live-engine crash wording: ${e.message}`);
+      assert(/not a crash of the main engine/.test(e.message), `${label}: does not say the main engine is unaffected: ${e.message}`);
+    };
+    temporaryOnly(await expectError(compare({ source: codeB }, { testFaults: 'exitOn_compareSnapshot' }), TemporaryEngineError,
+      /temporary Path of Building engine started for this comparison stopped while reading the source build/, 'crash'), 'crash');
     await allTempDead('after crash');
     t0 = Date.now();
-    await expectError(compare({ source: codeB }, { testFaults: 'hangOn_compareSnapshot', timeoutMs: 8_000 }), TemporaryEngineError, /stopped while reading the source build \(Lua bridge timeout/, 'timeout');
+    temporaryOnly(await expectError(compare({ source: codeB }, { testFaults: 'hangOn_compareSnapshot', timeoutMs: 8_000 }), TemporaryEngineError,
+      /stopped while reading the source build \(Lua bridge timeout after 8000ms on cmd "compareSnapshot" \(its process was killed\)\)/, 'timeout'), 'timeout');
     assert(Date.now() - t0 < 30_000, 'timeout took too long');
     await allTempDead('after timeout');
-    await expectError(compare({ source: codeB }, { testFaults: 'failOnStart' }), TemporaryEngineError, /could not start/, 'startup failure');
+    temporaryOnly(await expectError(compare({ source: codeB }, { testFaults: 'failOnStart' }), TemporaryEngineError, /could not start/, 'startup failure'), 'startup failure');
     await allTempDead('after startup failure');
     assert((await strikes()) === strikesBefore, `live strikes changed: ${await strikes()}`);
     assert((await liveState()) === stateBefore, 'temporary engine failures changed the live build');
     assert(JSON.stringify(await liveStats()) === JSON.stringify(statsA), 'live engine stats changed');
     log('PASS: call errors; live engine fine, no strike');
+
+    log('Test 5b: refused with the crash breaker open, and on a stale engine');
+    const created = temp.length;
+    await run(async (s) => {
+      const b = liveBridge(s);
+      const real = b.getCrashCount.bind(b);
+      b.getCrashCount = () => 3;
+      try {
+        await expectError(compareBuilds(engine, s, { source: codeB }), UserError, /crash breaker is open/, 'breaker open');
+        await expectError(compareBuilds(engine, s, { source: codeB, against: codeB }), UserError, /crash breaker is open/, 'breaker open, against');
+      } finally {
+        b.getCrashCount = real;
+      }
+    });
+    const fpHolder = engine as unknown as { startFingerprint: { version: string | null } | null };
+    const realFp = fpHolder.startFingerprint;
+    assert(realFp, 'engine start fingerprint');
+    fpHolder.startFingerprint = { ...realFp, version: '0.0.1-before-update' };
+    try {
+      await expectError(engine.withTemporaryEngine(async () => 1), EngineNotReadyError, /reload_engine/, 'stale install');
+    } finally {
+      fpHolder.startFingerprint = realFp;
+    }
+    assert(temp.length === created, 'a refused call started a temporary engine');
+    assert((await liveState()) === stateBefore, 'refusals changed the live build');
+    log('PASS');
 
     log('Test 6: concurrency');
     const done: string[] = [];
@@ -282,6 +365,51 @@ async function main(): Promise<void> {
     assert(count.max === 1 && count.alive === 0, `${count.max} temporary engines were alive at once (${count.alive} now)`);
     await allTempDead('after concurrency');
     assert((await liveState()) === stateBefore, 'concurrency changed the live build');
+    log('PASS');
+
+    log('Test 7: tree jewels');
+    const snapA = await run((s) => s.compareSnapshot<{ items: Array<{ slot: string; name?: string }> }>(statKeys));
+    const socketItems = snapA.items.filter((i) => i.slot.includes(String(TREE_SOCKET)));
+    assert(socketItems.length === 1 && socketItems[0].slot === `Tree jewel ${TREE_SOCKET}` && socketItems[0].name === 'Cataclysm Stone',
+      `tree jewel listed: ${JSON.stringify(socketItems)}`);
+    assert(!snapA.items.some((i) => /^Jewel \d+$/.test(i.slot)), "PoB's tree socket slots are listed as items");
+    const { codeJewel, codeNoSocket } = await run(async (s) => {
+      await s.swapItemWithDiff(`Jewel ${TREE_SOCKET}`, JEWEL);
+      const jewel = await s.exportBuild('code');
+      await s.undoLastChange();
+      await s.deallocateNodes([TREE_SOCKET]);
+      const noSocket = await s.exportBuild('code');
+      await s.undoLastChange();
+      return { codeJewel: jewel, codeNoSocket: noSocket };
+    });
+    const swapped = await compare({ source: codeJewel });
+    assert(JSON.stringify(swapped.tree.onlyA) === '{}' && JSON.stringify(swapped.tree.onlyB) === '{}', 'jewel swap changed the tree');
+    assert(swapped.items.onlyA.length === 0 && swapped.items.onlyB.length === 0, `jewel swap: items on one side ${JSON.stringify(swapped.items)}`);
+    assert(swapped.items.changed.length === 1 && swapped.items.changed[0].slot === `Tree jewel ${TREE_SOCKET}` &&
+      swapped.items.changed[0].a === 'Cataclysm Stone (Cobalt Jewel)' && swapped.items.changed[0].b === 'Compare Jewel (Cobalt Jewel)',
+      `jewel swap: ${JSON.stringify(swapped.items.changed)}`);
+    const unsocketed = await compare({ source: codeNoSocket });
+    assert(unsocketed.items.changed.length === 0 && unsocketed.items.onlyB.length === 0, `deallocated socket: ${JSON.stringify(unsocketed.items)}`);
+    assert(JSON.stringify(unsocketed.items.onlyA) === JSON.stringify([{ slot: `Tree jewel ${TREE_SOCKET}`, item: 'Cataclysm Stone (Cobalt Jewel)' }]),
+      `deallocated socket: ${JSON.stringify(unsocketed.items.onlyA)}`);
+    assert(((unsocketed.tree.onlyA as { jewelSockets?: number }).jewelSockets ?? 0) >= 1 && JSON.stringify(unsocketed.tree.onlyB) === '{}',
+      `deallocated socket tree: ${JSON.stringify(unsocketed.tree)}`);
+    log('PASS');
+
+    log('Test 8: an item in the weapon set not in use is marked swap + inactive');
+    const codeSwap = await run(async (s) => {
+      await s.swapItemWithDiff('Weapon 1 Swap', WAND);
+      const code = await s.exportBuild('code');
+      await s.undoLastChange();
+      return code;
+    });
+    assert((await liveState()) === stateBefore, 'the weapon swap edit was not undone');
+    const swapSet = await compare({ source: codeSwap });
+    assert(JSON.stringify(swapSet.items.onlyB) === JSON.stringify([{ slot: 'Weapon 1 Swap', item: 'Compare Wand (Imbued Wand)', swap: true, inactive: true }]),
+      `weapon swap item: ${JSON.stringify(swapSet.items)}`);
+    assert(swapSet.items.changed.length === 0 && swapSet.stats.Life.delta === 0 && swapSet.stats.CombinedDPS.delta === 0,
+      `an inactive weapon-swap item changed stats: ${JSON.stringify(swapSet.stats)}`);
+    await allTempDead('after jewel tests');
     log('PASS');
 
     console.log('\nALL COMPARE BUILDS TESTS PASSED');
