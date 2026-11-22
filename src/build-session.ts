@@ -24,6 +24,97 @@ import { UserError } from './validation.js';
  */
 const TRADE_QUERY_TIMEOUT_MS = 90_000;
 
+/** Different passive node names one evaluate_changes call may use (each unknown one is a bridge lookup). */
+export const MAX_NODE_NAMES = 200;
+/** Candidates listed in an ambiguous-name error. */
+const MAX_LISTED_MATCHES = 12;
+
+interface NodeMatch {
+  id: number;
+  name: string;
+  type: string;
+  allocated: boolean;
+  /** Unallocated: passive points of its path from the allocated tree. */
+  points?: number;
+}
+
+/**
+ * Resolves passive node names (case-insensitive, as PoB's node names) to ids
+ * for simulate_passive_change and evaluate_changes. The index holds every
+ * allocated node and every unallocated node a path from the allocated tree
+ * reaches (ascendancy nodes, masteries and class starts excepted), read once
+ * per call and only when a name is given. A name is resolved among the nodes
+ * the change can apply to (unallocated ones to allocate, allocated ones to
+ * deallocate): exactly one is used; several are a UserError listing their
+ * ids. When none of that kind match, a single match of the other kind is used
+ * (so the engine reports e.g. "already allocated") and several are an error;
+ * a name the index lacks is looked up with getNodeInfo (one node).
+ */
+class NodeNameResolver {
+  private index?: Map<string, NodeMatch[]>;
+  private readonly single = new Map<string, number | null>();
+
+  constructor(private readonly send: <T>(command: object) => Promise<T>) {}
+
+  private async loadIndex(): Promise<Map<string, NodeMatch[]>> {
+    if (this.index) return this.index;
+    const index = new Map<string, NodeMatch[]>();
+    const add = (m: NodeMatch): void => {
+      const key = m.name.toLowerCase();
+      if (key === '') return;
+      const list = index.get(key) ?? [];
+      list.push(m);
+      index.set(key, list);
+    };
+    const allocated = await this.send<{ nodes: TreeNodeInfo[] }>({ cmd: 'getAllocatedNodesDetailed' });
+    for (const n of allocated.nodes ?? []) add({ id: n.id, name: n.name, type: n.type, allocated: true });
+    const reachable = await this.send<{ nodes: Array<{ id: number; name: string; type: string; points: number }> }>({
+      cmd: 'probe',
+      candidates: 'allocate',
+      maxPoints: 10_000,
+    });
+    for (const n of reachable.nodes ?? []) add({ id: n.id, name: n.name, type: n.type, allocated: false, points: n.points });
+    this.index = index;
+    return index;
+  }
+
+  async resolve(ref: string | number, mode: 'allocate' | 'deallocate'): Promise<number> {
+    if (typeof ref === 'number') return ref;
+    const matches = (await this.loadIndex()).get(ref.toLowerCase()) ?? [];
+    const relevant = matches.filter((m) => m.allocated === (mode === 'deallocate'));
+    if (relevant.length === 1) return relevant[0].id;
+    if (relevant.length > 1) throw ambiguousName(ref, relevant);
+    if (matches.length === 1) return matches[0].id;
+    if (matches.length > 1) throw ambiguousName(ref, matches);
+    const key = ref.toLowerCase();
+    if (!this.single.has(key)) {
+      const res = await this.send<{ node: TreeNodeInfo | null }>({ cmd: 'getNodeInfo', name: ref });
+      this.single.set(key, res.node ? res.node.id : null);
+    }
+    const id = this.single.get(key);
+    if (id === null || id === undefined) throw new UserError(`Passive node not found: "${ref}"`);
+    return id;
+  }
+
+  async resolveAll(refs: Array<string | number>, mode: 'allocate' | 'deallocate'): Promise<number[]> {
+    const ids: number[] = [];
+    for (const ref of refs) ids.push(await this.resolve(ref, mode));
+    return ids;
+  }
+}
+
+function ambiguousName(ref: string, matches: NodeMatch[]): UserError {
+  const sorted = [...matches].sort((a, b) => (a.points ?? 0) - (b.points ?? 0) || a.id - b.id);
+  const listed = sorted.slice(0, MAX_LISTED_MATCHES).map((m) =>
+    `${m.id} (${m.allocated ? 'allocated' : `unallocated, ${m.points} point${m.points === 1 ? '' : 's'} away`}, ${m.type})`,
+  );
+  const more = sorted.length > listed.length ? ` and ${sorted.length - listed.length} more` : '';
+  return new UserError(
+    `Passive node name "${ref}" matches ${matches.length} nodes: ` +
+      `${listed.join(', ')}${more}. Pass the node id instead.`,
+  );
+}
+
 /**
  * The engine was restarted after a crash or timeout since the last tool call.
  * Thrown once, by the first locked call after the restart, which does nothing else.
@@ -741,46 +832,23 @@ export class BuildSession {
 
   /**
    * probe() whose variants may name passive nodes instead of giving ids, all
-   * under one lock. A deallocate name is matched against the allocated nodes
-   * first (several nodes share names like "Strength"); any other name is
-   * looked up as simulate_passive_change does. A variant naming a node that
-   * does not exist gets a user error and is not run; the others still are.
+   * under one lock. Names resolve as in simulate_passive_change
+   * (NodeNameResolver): a name several nodes share is refused with their ids.
+   * A variant naming a node that does not exist, or an ambiguous name, gets a
+   * user error and is not run; the others still are.
    */
   async probeNamed(request: Omit<ProbeRequest, 'variants'> & { variants: NamedProbeVariant[] }): Promise<ProbeResponse> {
+    const names = new Set<string>();
+    for (const v of request.variants) {
+      for (const ref of [...(v.allocate ?? []), ...(v.deallocate ?? [])]) {
+        if (typeof ref === 'string') names.add(ref.toLowerCase());
+      }
+    }
+    if (names.size > MAX_NODE_NAMES) {
+      throw new UserError(`${names.size} different node names in one call; at most ${MAX_NODE_NAMES} are allowed (pass node ids instead)`);
+    }
     return this.withLock(async () => {
-      const byName = new Map<string, number | null>();
-      let allocatedByName: Map<string, number> | undefined;
-      const lookup = async (ref: string | number, allocatedFirst: boolean): Promise<number | null> => {
-        if (typeof ref === 'number') return ref;
-        const key = ref.toLowerCase();
-        if (allocatedFirst) {
-          if (!allocatedByName) {
-            const res = await this.bridge.send<{ ok: true; nodes: TreeNodeInfo[] }>({ cmd: 'getAllocatedNodesDetailed' });
-            allocatedByName = new Map();
-            for (const n of res.nodes ?? []) {
-              if (n.name && !allocatedByName.has(n.name.toLowerCase())) allocatedByName.set(n.name.toLowerCase(), n.id);
-            }
-          }
-          const id = allocatedByName.get(key);
-          if (id !== undefined) return id;
-        }
-        if (!byName.has(key)) {
-          const res = await this.bridge.send<{ ok: true; node: TreeNodeInfo | null }>({ cmd: 'getNodeInfo', name: ref });
-          byName.set(key, res.node ? res.node.id : null);
-        }
-        return byName.get(key) ?? null;
-      };
-      const resolveAll = async (refs: Array<string | number> | undefined, allocatedFirst: boolean): Promise<number[] | undefined> => {
-        if (refs === undefined) return undefined;
-        const ids: number[] = [];
-        for (const ref of refs) {
-          const id = await lookup(ref, allocatedFirst);
-          if (id === null) throw new UserError(`Passive node not found: "${ref}"`);
-          ids.push(id);
-        }
-        return ids;
-      };
-
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
       const results: Array<ProbeVariantResult | undefined> = new Array(request.variants.length);
       const toRun: number[] = [];
       const resolved: ProbeVariant[] = [];
@@ -788,8 +856,8 @@ export class BuildSession {
         const { allocate, deallocate, ...rest } = request.variants[i];
         try {
           const variant: ProbeVariant = { ...rest };
-          const allocIds = await resolveAll(allocate, false);
-          const deallocIds = await resolveAll(deallocate, true);
+          const allocIds = allocate && (await resolver.resolveAll(allocate, 'allocate'));
+          const deallocIds = deallocate && (await resolver.resolveAll(deallocate, 'deallocate'));
           if (allocIds !== undefined) variant.allocate = allocIds;
           if (deallocIds !== undefined) variant.deallocate = deallocIds;
           resolved.push(variant);
@@ -1214,33 +1282,14 @@ export class BuildSession {
     return result.result;
   }
 
-  private async resolveNodeIds(refs: Array<string | number>): Promise<number[]> {
-    if (refs.length === 0) return [];
-    const ids: number[] = [];
-    for (const ref of refs) {
-      if (typeof ref === 'number') {
-        ids.push(ref);
-        continue;
-      }
-      const lookup = await this.bridge.send<{ ok: true; node: TreeNodeInfo | null }>({
-        cmd: 'getNodeInfo',
-        name: ref,
-      });
-      if (!lookup.node) {
-        throw new UserError(`Passive node not found: "${ref}"`);
-      }
-      ids.push(lookup.node.id);
-    }
-    return ids;
-  }
-
   async simulatePassiveChange(
     allocate: Array<string | number> = [],
     deallocate: Array<string | number> = [],
   ): Promise<{ statDiff: StatDiff; valid: boolean; validationErrors: string[]; before: Stats; after: Stats }> {
     return this.withLock(async () => {
-      const allocIds = await this.resolveNodeIds(allocate);
-      const deallocIds = await this.resolveNodeIds(deallocate);
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const allocIds = await resolver.resolveAll(allocate, 'allocate');
+      const deallocIds = await resolver.resolveAll(deallocate, 'deallocate');
       const before = await this.bridge.getStats();
 
       // Probe path: exactly one node to allocate on a connected tree. The probe

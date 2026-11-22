@@ -190,6 +190,25 @@ async function main(): Promise<void> {
     assert(approxEq(afterUnknown.Life, baseline.Life), 'state should be unaffected');
     log('PASS: unknown node rejected with state intact');
 
+    // Test 4a: a name several allocated nodes share is refused with their ids.
+    log('Test 4a: simulate_passive_change with an ambiguous name');
+    const seen = new Map<string, number[]>();
+    for (const n of tree.allocatedNodes) seen.set(n.name, [...(seen.get(n.name) ?? []), n.id]);
+    const [dupName, dupIds] = [...seen.entries()].find(([, ids]) => ids.length > 1) ?? [];
+    assert(dupName && dupIds, 'fixture needs two allocated nodes with the same name');
+    const ambiguous = (await call(client, 'simulate_passive_change', { deallocate: [dupName] })) as { isError?: boolean; content: ToolTextContent[] };
+    assert(ambiguous.isError === true, `deallocate "${dupName}" should be refused as ambiguous`);
+    const ambiguousText = ambiguous.content[0].text;
+    assert(/matches \d+ nodes/.test(ambiguousText) && ambiguousText.includes('Pass the node id'), `message: ${ambiguousText}`);
+    // Up to 12 candidates are listed (lowest ids first), then "and N more".
+    const listedIds = [...dupIds].sort((x, y) => x - y).slice(0, 12);
+    assert(listedIds.every((id) => ambiguousText.includes(String(id))) && ambiguousText.includes('allocated'), `ids missing: ${ambiguousText}`);
+    assert(ambiguousText.includes(`matches ${dupIds.length} nodes`), `count: ${ambiguousText}`);
+    assert(!ambiguousText.startsWith('Internal error'), 'ambiguity is a user error');
+    const afterAmbiguous = await getKeyStats(client);
+    assert(approxEq(afterAmbiguous.Life, baseline.Life), 'state should be unaffected');
+    log(`PASS: ${ambiguousText.slice(0, 160)}`);
+
     // Test 4b: one node to allocate runs on the probe engine; the export stays byte-identical.
     log('Test 4b: simulate_passive_change (allocate one node)');
     const near = JSON.parse(
@@ -326,6 +345,21 @@ async function main(): Promise<void> {
       `final state should match baseline: ${JSON.stringify({ baseline, final })}`,
     );
     log('PASS: build pristine after all phase 4 operations');
+
+    // Test 13: the compact tree keeps allocated masteries' chosen effects.
+    log('Test 13: get_passive_tree default keeps mastery stats');
+    await call(client, 'load_build', { source: readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8') });
+    type Node = { id: number; type: string; stats?: string[] };
+    const fullM = JSON.parse(extractText(await call(client, 'get_passive_tree', { detail: 'full' }))) as { allocatedNodes: Node[] };
+    const compactM = JSON.parse(extractText(await call(client, 'get_passive_tree'))) as { allocatedNodes: Node[] };
+    const masteries = fullM.allocatedNodes.filter((n) => n.type === 'Mastery');
+    assert(masteries.length > 0, 'fixture has allocated masteries');
+    for (const m of masteries) {
+      const c = compactM.allocatedNodes.find((n) => n.id === m.id);
+      assert(c && (m.stats ?? []).length > 0 && JSON.stringify(c.stats) === JSON.stringify(m.stats), `mastery ${m.id}: ${JSON.stringify(c)} vs ${JSON.stringify(m.stats)}`);
+    }
+    assert(compactM.allocatedNodes.every((n) => n.type === 'Mastery' || n.stats === undefined), 'only masteries carry stats in allocatedNodes');
+    log(`PASS: ${masteries.length} masteries with their effects (e.g. ${JSON.stringify(masteries[0].stats)})`);
   } finally {
     try { await client.close(); } catch { /* ignore */ }
   }

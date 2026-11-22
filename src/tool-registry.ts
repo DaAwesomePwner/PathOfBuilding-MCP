@@ -37,7 +37,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   // Build lifecycle: load_build may fetch a pastebin / pobb.in link.
   load_build: { ...REPLACES, idempotentHint: true, openWorldHint: true },
   reset_build: { ...REPLACES, idempotentHint: true },
-  undo_last_change: UNDOABLE,
+  // Discards the last change; it cannot be redone.
+  undo_last_change: { ...UNDOABLE, destructiveHint: true },
   // Committed changes (undo_last_change reverts them)
   swap_item: UNDOABLE,
   unequip_item: UNDOABLE,

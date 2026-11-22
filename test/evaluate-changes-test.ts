@@ -226,6 +226,51 @@ async function main(): Promise<void> {
     assert((await session.exportXML()) === xml0, 'export changed after the option checks');
     assert(undoDepth() === undo0, 'undo depth changed after the option checks');
 
+    // ------------------------------------------------------------------
+    log('6. Node names several nodes share');
+    const unallocated = (await bridge.send<{ nodes: Array<{ id: number; name: string }> }>({ cmd: 'probe', candidates: 'allocate', maxPoints: 10_000 })).nodes;
+    const group = (nodes: Array<{ id: number; name: string }>): Map<string, number[]> => {
+      const m = new Map<string, number[]>();
+      for (const n of nodes) m.set(n.name.toLowerCase(), [...(m.get(n.name.toLowerCase()) ?? []), n.id]);
+      return m;
+    };
+    const unallocByName = group(unallocated);
+    const allocByName = group(allocated);
+    const [ambAlloc, ambAllocIds] = [...unallocByName.entries()].find(([, ids]) => ids.length > 1)!;
+    const [ambDealloc, ambDeallocIds] = [...allocByName.entries()].find(([, ids]) => ids.length > 1)!;
+    // Allocated once, unallocated elsewhere too: deallocating it by name is not ambiguous.
+    const [onceName, [onceId]] = [...allocByName.entries()].find(([name, ids]) => ids.length === 1 && (unallocByName.get(name)?.length ?? 0) > 0)!;
+    assert(ambAlloc && ambDealloc && onceName, 'fixture needs shared node names');
+    const shared = await evaluateChanges(session, {
+      variants: [
+        { label: 'ambiguous allocate', allocate: [ambAlloc] },
+        { label: 'ambiguous deallocate', deallocate: [ambDealloc] },
+        { label: 'allocated-once by name', deallocate: [onceName] },
+        { label: 'allocated-once by id', deallocate: [onceId] },
+        { label: 'config still runs', config: { usePowerCharges: true } },
+      ],
+    });
+    const row = (label: string) => shared.results.find((r) => r.label === label)!;
+    for (const [label, ids] of [['ambiguous allocate', ambAllocIds], ['ambiguous deallocate', ambDeallocIds]] as const) {
+      const r = row(label);
+      assert(r.userError === true && /matches \d+ nodes/.test(r.error ?? '') && r.error!.includes('Pass the node id'), `${label}: ${JSON.stringify(r)}`);
+      assert(r.error!.includes(`matches ${ids.length} nodes`), `${label}: count: ${r.error}`);
+      log(`   ${label}: ${r.error!.slice(0, 140)}`);
+    }
+    assert(row('ambiguous allocate').error!.includes('unallocated'), 'allocate candidates say unallocated');
+    assert(row('allocated-once by name').error === undefined && row('config still runs').error === undefined, 'the other variants ran');
+    assert(JSON.stringify(row('allocated-once by name').delta) === JSON.stringify(row('allocated-once by id').delta), 'name resolves to the allocated node');
+    let simError: unknown;
+    try {
+      await session.simulatePassiveChange([ambAlloc], []);
+    } catch (e) {
+      simError = e;
+    }
+    assert(simError instanceof Error && simError.constructor.name === 'UserError' && /matches \d+ nodes/.test(simError.message),
+      `simulate_passive_change with an ambiguous name: ${String(simError)}`);
+    assert((await session.exportXML()) === xml0, 'export changed after the name checks');
+    log('   PASS');
+
     console.log('\nAll evaluate_changes tests passed.');
   } finally {
     await bridge.dispose();

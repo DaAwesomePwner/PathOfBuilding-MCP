@@ -399,7 +399,7 @@ tools.engine<Record<string, never>>(
 // Phase 4 tools: passive tree analysis
 // ---------------------------------------------------------------------------
 
-/** get_passive_tree's default: node stats only for keystones and notables. */
+/** get_passive_tree's default: node stats only for keystones, notables and masteries (their chosen effect). */
 function compactTree(tree: PassiveTreeInfo): unknown {
   const named = (n: { id: number; name: string; stats?: string[] }) => ({ id: n.id, name: n.name, stats: n.stats ?? [] });
   return {
@@ -411,6 +411,7 @@ function compactTree(tree: PassiveTreeInfo): unknown {
       name: n.name,
       type: n.type,
       ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+      ...(n.isMastery || n.type === 'Mastery' ? { stats: n.stats ?? [] } : {}),
     })),
   };
 }
@@ -419,7 +420,7 @@ tools.engine<{ detail?: 'summary' | 'full' }>(
   'get_passive_tree',
   {
     description:
-      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type). ' +
+      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type; allocated masteries also carry `stats`, their chosen effect). ' +
       '`detail: "full"` returns every allocated node with all its fields and stats.',
     inputSchema: {
       detail: detailSchema.optional().describe('"summary" (default) or "full" (every allocated node with its stats and flags).'),
@@ -461,14 +462,16 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   'simulate_passive_change',
   {
     description:
-      "Temporarily allocate or deallocate passive nodes and return the stat diff. Allocating a node also allocates its path from the allocated tree; deallocating a node also removes the nodes that depend on it. Validates that the resulting tree is connected. A request that allocates exactly one node (and deallocates none) on a connected tree is evaluated through Path of Building's own calculator without changing the build; every other request is applied, recalculated and the tree restored exactly. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class's ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start.",
+      "Temporarily allocate or deallocate passive nodes and return the stat diff. Allocating a node also allocates its path from the allocated tree; deallocating a node also removes the nodes that depend on it. Validates that the resulting tree is connected. A request that allocates exactly one node (and deallocates none) on a connected tree is evaluated through Path of Building's own calculator without changing the build; every other request is applied, recalculated and the tree restored exactly. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class's ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start. A node name resolves among the nodes the change can apply to (unallocated ones to allocate, allocated ones to deallocate); a name several of them share (e.g. \"Strength\") is refused with the candidate ids, so pass ids for those. At most 50 nodes in each list.",
     inputSchema: {
       allocate: z
-        .array(z.union([z.string(), z.number().int()]))
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .max(50)
         .optional()
         .describe('Node names (e.g. "Resolute Technique") or numeric node IDs to allocate.'),
       deallocate: z
-        .array(z.union([z.string(), z.number().int()]))
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .max(50)
         .optional()
         .describe('Node names or numeric node IDs to deallocate.'),
     },

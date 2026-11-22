@@ -168,6 +168,9 @@ async function main(): Promise<void> {
     for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest']) {
       assert(annotated.get(name)?.readOnlyHint === false && annotated.get(name)?.destructiveHint === false, `${name} is an undoable change`);
     }
+    // undo_last_change discards a change that cannot be redone.
+    assert(annotated.get('undo_last_change')?.readOnlyHint === false && annotated.get('undo_last_change')?.destructiveHint === true,
+      'undo_last_change should be destructive');
     log(`PASS: ${names.length} tools annotated`);
 
     log('Test 9: compact JSON output');
@@ -224,6 +227,28 @@ async function main(): Promise<void> {
     assert(evaluated.results[0].delta!.CombinedDPS >= evaluated.results[1].delta!.CombinedDPS, 'ranked by CombinedDPS');
     assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'evaluate_changes changed the build');
     log(`PASS: ${evaluated.results.map((r) => `${r.label}=${r.delta?.CombinedDPS ?? r.error}`).join(', ')}`);
+
+    log('Test 13: input bounds');
+    const refused = async (name: string, args: Record<string, unknown>, what: string): Promise<void> => {
+      const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content?: ToolTextContent[] };
+      assert(r.isError === true, `${what} should be refused`);
+    };
+    const ids51 = Array.from({ length: 51 }, (_, i) => i + 1);
+    const ring = 'Rarity: RARE\nBound Ring\nCoral Ring\n+30 to maximum Life';
+    await refused('evaluate_changes', { variants: [{ allocate: ids51 }] }, 'evaluate_changes with 51 nodes to allocate');
+    await refused('evaluate_changes', { variants: [{ deallocate: ids51 }] }, 'evaluate_changes with 51 nodes to deallocate');
+    await refused('evaluate_changes', { variants: [{ items: Array.from({ length: 11 }, () => ({ slot: 'Ring 1', itemText: ring })) }] }, '11 items');
+    await refused('evaluate_changes', { variants: [{ items: [{ slot: 'Ring 1', itemText: ring + '\n' + 'x'.repeat(10_000) }] }] }, 'item text over 10 KB');
+    await refused('evaluate_changes', { variants: [{ gems: Array.from({ length: 21 }, () => ({ op: 'remove', group: 1, index: 1 })) }] }, '21 gem changes');
+    await refused('evaluate_changes', { variants: [{ label: 'x'.repeat(101) }] }, 'a 101-character label');
+    await refused('evaluate_changes', { variants: [{ config: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`k${i}`, true])) }] }, '51 config keys');
+    await refused('simulate_passive_change', { allocate: ids51 }, 'simulate_passive_change with 51 nodes');
+    const atBounds = JSON.parse(await text('evaluate_changes', {
+      variants: [{ label: 'x'.repeat(100), items: [{ slot: 'Ring 1', itemText: ring }], gems: [], config: { usePowerCharges: true } }],
+    })) as { results: Array<{ error?: string }> };
+    assert(atBounds.results[0].error === undefined, `a variant within the bounds failed: ${atBounds.results[0].error}`);
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'bounds checks changed the build');
+    log('PASS: oversized inputs refused');
   } finally {
     try {
       await client.close();
