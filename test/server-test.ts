@@ -277,6 +277,51 @@ async function main(): Promise<void> {
     const badText = badCompare.content?.[0]?.text ?? '';
     assert(badCompare.isError === true && /^source: /.test(badText), `bad source: ${badText}`);
     log('PASS: compare_builds');
+
+    log('Test 15: masteries and mainSkill through MCP (ConvertTreeMasteries.xml)');
+    await text('load_build', { source: readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8') });
+    const mBefore = await text('export_build', { format: 'xml' });
+    const tree = JSON.parse(await text('get_passive_tree', { masteries: [2841] })) as {
+      allocatedNodes: Array<{ id: number; type: string; effect?: number; stats?: string[] }>;
+      masteryOptions: Array<{ id: number; allocated: boolean; effect?: number; options: Array<{ effect: number; stats: string; takenBy?: number }> }>;
+    };
+    const lifeNode = tree.allocatedNodes.find((n) => n.id === 2841);
+    assert(lifeNode && lifeNode.effect === 64381 && (lifeNode.stats ?? []).length > 0, `allocated mastery carries its effect: ${JSON.stringify(lifeNode)}`);
+    const opt = tree.masteryOptions[0];
+    assert(opt.id === 2841 && opt.allocated && opt.effect === 64381 && opt.options.length >= 4, `masteryOptions: ${JSON.stringify(tree.masteryOptions)}`);
+    const freeEffect = opt.options.find((o) => o.takenBy === undefined && o.effect !== opt.effect)!;
+    const mEval = JSON.parse(await text('evaluate_changes', {
+      variants: [
+        { label: 'mastery', masteries: [{ node: 2841, effect: freeEffect.effect }] },
+        { label: 'skill', mainSkill: { group: 2, activeSkill: 2 } },
+        { label: 'taken', masteries: [{ node: 2841, effect: opt.options.find((o) => o.takenBy !== undefined)!.effect }] },
+      ],
+    })) as { results: Array<{ label: string; error?: string; userError?: boolean; fallback?: boolean }> };
+    const byLabel = new Map(mEval.results.map((r) => [r.label, r]));
+    assert(!byLabel.get('mastery')!.error && !byLabel.get('skill')!.error && !byLabel.get('mastery')!.fallback, `evaluate: ${JSON.stringify(mEval.results)}`);
+    assert(byLabel.get('taken')!.userError === true && /already chosen/.test(byLabel.get('taken')!.error ?? ''), 'a taken effect is refused per variant');
+    assert((await text('export_build', { format: 'xml' })) === mBefore, 'evaluate_changes changed the build');
+    const allocated = JSON.parse(await text('allocate_nodes', { masteries: [{ node: 2841, effect: freeEffect.stats }] })) as {
+      status: string; masteries: Array<{ id: number; effect: number; previousEffect?: number }>;
+    };
+    assert(allocated.status === 'allocated' && allocated.masteries[0].effect === freeEffect.effect && allocated.masteries[0].previousEffect === 64381, `allocate_nodes: ${JSON.stringify(allocated)}`);
+    assert((await text('export_build', { format: 'xml' })).includes(`{2841,${freeEffect.effect}}`), 'the export holds the effect');
+    await text('undo_last_change');
+    const applied = JSON.parse(await text('apply_changes', { variant: { label: 'both', masteries: [{ node: 2841, effect: freeEffect.effect }], mainSkill: { group: 2, activeSkill: 2 } } })) as {
+      status: string; masteries: Array<{ id: number }>; mainSkill: string;
+    };
+    assert(applied.status === 'applied' && applied.masteries[0].id === 2841 && applied.mainSkill === 'Cold Snap', `apply_changes: ${JSON.stringify(applied)}`);
+    await text('undo_last_change');
+    assert((await text('export_build', { format: 'xml' })) === mBefore, 'undo_last_change reverts the mastery edits');
+    const badEffect = (await client.callTool({ name: 'allocate_nodes', arguments: { masteries: [{ node: 2841, effect: 41322 }] } })) as {
+      isError?: boolean; content?: ToolTextContent[];
+    };
+    assert(badEffect.isError === true && /does not offer/.test(badEffect.content?.[0]?.text ?? '') && !/Internal error/.test(badEffect.content?.[0]?.text ?? ''), 'an effect the mastery lacks is a user error');
+    await refused('allocate_nodes', { masteries: Array.from({ length: 21 }, () => ({ node: 2841, effect: 1 })) }, '21 masteries');
+    await refused('evaluate_changes', { variants: [{ mainSkill: { group: 0 } }] }, 'mainSkill group 0');
+    await refused('get_passive_tree', { masteries: Array.from({ length: 21 }, () => 2841) }, 'get_passive_tree with 21 masteries');
+    assert((await text('export_build', { format: 'xml' })) === mBefore, 'refusals changed the build');
+    log('PASS: masteries and mainSkill');
   } finally {
     try {
       await client.close();

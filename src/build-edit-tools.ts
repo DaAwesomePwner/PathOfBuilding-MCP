@@ -35,6 +35,8 @@ function applyResponse(result: ApplyChangesResult, label: string | undefined, su
     ...(label !== undefined ? { label } : {}),
     ...(result.added.length > 0 ? { added: result.added.map(node) } : {}),
     ...(result.removed.length > 0 ? { removed: result.removed.map(node) } : {}),
+    ...(result.masteries && result.masteries.length > 0 ? { masteries: result.masteries } : {}),
+    ...(result.mainSkill !== undefined ? { mainSkill: result.mainSkill } : {}),
     ...(s
       ? {
           pointsUsed: points(result.added, 'passive'),
@@ -64,10 +66,10 @@ export function registerBuildEditTools(tools: ToolRegistrar, summarize: Summariz
     'apply_changes',
     {
       description:
-        'Apply one what-if variant to the build and keep it: exactly the variant format evaluate_changes takes (passive nodes to allocate / deallocate by name or id, items to equip or unequip, gem changes, config options; `label` is optional and echoed back), ' +
-        'applied in the same order (config, gems, items, nodes) and as ONE undo step, so a winning evaluate_changes variant can be committed as-is with the stats evaluate_changes reported for it. PERMANENTLY mutates the build (undo_last_change reverts the whole variant; export_build includes it). ' +
-        'The whole variant is checked first and refused with an error (nothing changes) if any node is unknown, ambiguous, already allocated, unreachable or a mastery, an item does not fit its slot or cannot be parsed, a gem name or group / gem index is wrong (indices refer to the group as it is when that change applies), a gem change targets a group granted by an item or the passive tree, or a config key is unknown. ' +
-        'Returns the nodes `added` (each allocation with its path, tree side first) and `removed`, the points used / refunded and the tree\'s point totals when nodes changed, and the before/after stat diff (as swap_item).',
+        'Apply one what-if variant to the build and keep it: exactly the variant format evaluate_changes takes (passive nodes to allocate / deallocate by name or id, `masteries` [{node, effect}], items to equip or unequip, gem changes, config options, `mainSkill` {group, activeSkill?}; `label` is optional and echoed back), ' +
+        'applied in the same order (config, gems, items, nodes and masteries, main skill) and as ONE undo step, so a winning evaluate_changes variant can be committed as-is with the stats evaluate_changes reported for it. PERMANENTLY mutates the build (undo_last_change reverts the whole variant; export_build includes it). ' +
+        'The whole variant is checked first and refused with an error (nothing changes) if any node is unknown, ambiguous, already allocated, unreachable or a mastery listed in `allocate` (masteries go in `masteries`), a mastery effect is not offered by that mastery or already chosen on another one, an item does not fit its slot or cannot be parsed, a gem name or group / gem index is wrong (indices refer to the group as it is when that change applies), a gem change targets a group granted by an item or the passive tree, a config key is unknown, or the main skill group has no such active skill. ' +
+        "Returns the nodes `added` (each allocation with its path, tree side first) and `removed`, the `masteries` given an effect, the `mainSkill` when set, the points used / refunded and the tree's point totals when nodes changed, and the before/after stat diff (as swap_item).",
       inputSchema: {
         variant: variantSchema.describe('One variant, as in evaluate_changes `variants`.'),
       },

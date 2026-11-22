@@ -58,12 +58,12 @@ Three layers, three responsibilities:
 - `compare_items` — test 2-5 candidate items in a slot non-destructively (tens of milliseconds). Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`; a candidate that does not fit or parse gets its own `error`.
 
 ### Passive tree (8)
-- `get_passive_tree` — point counts and class info, keystones and notables with their stats, and every allocated node (id, name, type; masteries with their chosen effect); `detail: "full"` adds every node's stats and flags.
+- `get_passive_tree` — point counts and class info, keystones and notables with their stats, and every allocated node (id, name, type; masteries with their chosen effect id and text); `detail: "full"` adds every node's stats and flags. `masteries: [ids or names]` lists those masteries' effect options (`effect` id, `stats`, `takenBy` when another mastery has it).
 - `simulate_passive_change` — temporarily allocate/deallocate by node ID or name (allocating takes the node's path with it, deallocating its dependents). Validates connectivity. Always restored. A name several candidate nodes share (e.g. "Strength") is refused with their ids; pass the id.
 - `find_best_next_nodes` — evaluates every unallocated node whose path from your tree costs at most `maxPoints` points (default 3, up to 10), so a notable two travel nodes away is found too, and ranks by gain per point (`rankBy: "perPoint"`, default) or total gain (`"total"`) of your chosen stat (Life, CombinedDPS, TotalEHP, etc.). Each result lists its `pointsCost` and `path`. ~2s on a typical end-game build (~0.4s with `maxPoints: 1`).
 - `find_worst_allocated_nodes` — finds your least valuable allocated nodes: normal, notable, keystone and empty jewel sockets, each removed together with the nodes that depend on it (so the tree stays connected), ranked by loss per refunded point (default) or total loss. Skips ascendancy nodes and masteries. Nodes whose removal needs a full recalculation (cluster jewel nodes, skill-granting nodes, nodes whose dependents include a socketed jewel) are capped at the most promising few per call; the rest are listed in `skipped`. ~2-3s.
 - `evaluate_keystone` — toggle any keystone (adding it takes its path), return full stat diff.
-- `allocate_nodes` — `{ nodes: [ids or names] }`: allocate each node with its shortest path from your tree (as clicking it in PoB does). **Mutates** (undoable with `undo_last_change`; kept by `export_build`). Returns the nodes added (tree side first), points used, the tree's `points` (`used` / `max` / `remaining`, negative when over budget) and the stat diff. Unknown, ambiguous, already-allocated, unreachable and mastery nodes are refused without changing anything. Typical loop: `find_best_next_nodes` → `allocate_nodes` with the winner's id → repeat.
+- `allocate_nodes` — `{ nodes: [ids or names] }`: allocate each node with its shortest path from your tree (as clicking it in PoB does). **Mutates** (undoable with `undo_last_change`; kept by `export_build`). Returns the nodes added (tree side first), points used, the tree's `points` (`used` / `max` / `remaining`, negative when over budget) and the stat diff. `masteries: [{ node, effect }]` allocates a mastery (with its path) with the chosen effect, or switches an allocated mastery's effect (effect by id or text; deallocate a mastery to clear it). Unknown, ambiguous, already-allocated and unreachable nodes, a mastery in `nodes`, and an effect the mastery does not offer or that another mastery already has are refused without changing anything. Typical loop: `find_best_next_nodes` → `allocate_nodes` with the winner's id → repeat.
 - `deallocate_nodes` — `{ nodes: [ids or names] }`: remove each node together with every node that depends on it. **Mutates** (undoable). Returns the nodes removed, points refunded and the stat diff.
 - `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
@@ -88,8 +88,8 @@ Three layers, three responsibilities:
 - `toggle_buffs` — friendly-named on/off for buffs (`onslaught`, `fortify`, etc.).
 
 ### Optimization advisor (8)
-- `evaluate_changes` — try up to 500 what-if variants in one call (each mixing node allocations/deallocations by name or id, item swaps or unequips, gem ops and config) and get one short row per variant ranked by `rankBy` (default CombinedDPS). Read-only; see the example below.
-- `apply_changes` — `{ variant }`: commit one `evaluate_changes` variant exactly as written (nodes by name or id, items, gem ops, config) as a single undoable step; its stats are the ones `evaluate_changes` reported. The whole variant is checked first (unknown or unreachable node, bad gem name or index, item that does not fit, unknown config key → refused, nothing changes). **Mutates** (undoable; kept by `export_build`; replayed after an engine crash). Returns the nodes added / removed, points and the stat diff.
+- `evaluate_changes` — try up to 500 what-if variants in one call (each mixing node allocations/deallocations by name or id, mastery effects, item swaps or unequips, gem ops, config and the main skill) and get one short row per variant ranked by `rankBy` (default CombinedDPS). Read-only; see the example below.
+- `apply_changes` — `{ variant }`: commit one `evaluate_changes` variant exactly as written (nodes by name or id, masteries, items, gem ops, config, main skill) as a single undoable step; its stats are the ones `evaluate_changes` reported. The whole variant is checked first (unknown or unreachable node, bad gem name or index, item that does not fit, unknown config key → refused, nothing changes). **Mutates** (undoable; kept by `export_build`; replayed after an engine crash). Returns the nodes added / removed, points and the stat diff.
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`. Returns `{ checks }`.
 - `stat_weights` — what each mod line is worth to this build: every line (default: a generic pack of 37 single-roll offence/defence/sustain mods) is added on its own as a custom modifier (PoB's Custom modifiers box; existing custom modifiers kept) and each requested stat's change is measured through PoB's calculator. Returns `weights` ranked by `rankBy` (default CombinedDPS) with `delta` and `pct` per stat, and `unparsed` for lines PoB's mod parser cannot use. Lines act as global modifiers. Read-only, ~5 ms a line.
 - `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only), ranks by upgrade priority; the first `modSlots` slots (default 3, up to 10; or the given `slot`) get `suggestedMods` from PoB's own weighted trade query generator (`{ mod, weight }`, weight = stat-score gain per point, listed by a typical roll's gain), about 0.5-1 s a slot. Returns `{ suggestions, modsNote? }`.
@@ -215,6 +215,26 @@ evaluate_changes({
 ```
 
 Each row gets a `score`; variants that break a constraint carry `violates` (e.g. `"Life 6383 < 6728"`), come after every variant that passes (ranked by score among themselves), and are counted in `violating`. `onlyPassing: true` drops them from `results`. Use `mode: "absolute"` to weight raw deltas instead of relative change, and a negative weight to penalise a stat.
+
+Masteries and the main skill work the same way. *"Which Life Mastery effect is best for me, and what would my tree do for Cold Snap instead of Vortex?"*:
+
+```
+get_passive_tree({ masteries: ["Life Mastery"] })
+// masteryOptions: [{"id":2841,"name":"Life Mastery","allocated":true,"effect":64381,"options":[
+//   {"effect":64381,"stats":"10% more Maximum Life if you have at least 6 Life Masteries allocated"},
+//   {"effect":47642,"stats":"+50 to maximum Life","takenBy":12382},
+//   {"effect":31822,"stats":"You count as on Low Life while at 55% of maximum Life or below"}, ...]}, ...]
+evaluate_changes({
+  variants: [
+    { label: "low life", masteries: [{ node: 2841, effect: 31822 }] },
+    { label: "full life", masteries: [{ node: 2841, effect: "Full Life while at 90%" }] },
+    { label: "cold snap", mainSkill: { group: 2, activeSkill: 2 } }
+  ],
+  rankBy: "Life"
+})
+```
+
+An effect is given by id or by text (a whole effect, one of its lines, or a part only one effect has); each effect can be chosen on one mastery only, so one another mastery has (`takenBy`) is refused. Keep a choice with `apply_changes` or `allocate_nodes({ masteries: [{ node: 2841, effect: 31822 }] })`; `mainSkill` in `apply_changes` sets the main skill as `set_main_skill` does.
 
 To shop for an upgrade on the trade site:
 

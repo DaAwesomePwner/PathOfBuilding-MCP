@@ -34,6 +34,16 @@
 //      restores the pre-call build.
 //   6. Through the MCP server: the four tools are listed as undoable,
 //      apply_changes echoes the label and reports points, undo reverts.
+//   7. Masteries and the main skill (ConvertTreeMasteries.xml, a 3.24 tree):
+//      (a) a `mainSkill` variant (group 2, its second active skill) equals
+//      the probe, evaluate_changes and set_main_skill + get_stats; (b) a
+//      variant switching an allocated mastery's effect, allocating another
+//      mastery with its path (a fallback: two mastery changes) and setting
+//      the main skill equals the probe, the export holds both effects and
+//      the result lists them; undo restores exactly; (c) a crash replays it;
+//      (d) refusals (an effect the mastery does not offer, a mastery in
+//      `allocate`, an out-of-range main skill group / active skill) change
+//      nothing.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
@@ -156,9 +166,9 @@ function assertSame(label: string, actual: State, expected: State): void {
 }
 
 /** A session on a build already in PoB's re-read form (loading a fresh XML is not byte-idempotent once). */
-async function primedSession(bridge: LuaBridge): Promise<BuildSession> {
+async function primedSession(bridge: LuaBridge, xml = occXml): Promise<BuildSession> {
   const session = new BuildSession(bridge);
-  await session.loadBuild(occXml);
+  await session.loadBuild(xml);
   await session.loadBuild(await session.exportXML());
   return session;
 }
@@ -658,6 +668,100 @@ async function test6Mcp(): Promise<void> {
   log('PASS 6');
 }
 
+const MASTERY_FIXTURE = path.resolve(testDir, 'fixtures', 'ConvertTreeMasteries.xml');
+const LIFE_MASTERY = 2841; // allocated, effect 64381; 34242 and 47642 are chosen on 12125 / 12382
+
+function specMasteries(xml: string): string[] {
+  const m = /<Spec\b[^>]*\bmasteryEffects="([^"]*)"/.exec(xml);
+  assert(m, 'export has no masteryEffects attribute');
+  return (m[1].match(/\{\d+,\d+\}/g) ?? []).sort();
+}
+
+async function test7MasteriesAndMainSkill(): Promise<void> {
+  const masteryXml = readFileSync(MASTERY_FIXTURE, 'utf8');
+  const bridge = newBridge();
+  const session = await primedSession(bridge, masteryXml);
+  const base = await state(session);
+
+  log('Test 7a: a mainSkill variant equals set_main_skill + get_stats');
+  const mainOnly: NamedProbeVariant = { mainSkill: { group: TWO_ACTIVES_GROUP, activeSkill: 2 } };
+  let applied: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+  await assertParity('mainSkill', session, mainOnly, async () => {
+    applied = await session.applyChanges(mainOnly);
+    return applied.after;
+  });
+  assert(applied, 'applied');
+  assert(applied.mainSkill === 'Cold Snap', `main skill after: ${applied.mainSkill}`);
+  assert(toNumber(applied.after.CombinedDPS) !== toNumber(base.stats.CombinedDPS), 'another main skill changes DPS');
+  assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'one undo entry, one journal record');
+  await session.undoLastChange();
+  assertSame('undo of the mainSkill variant', await state(session), base);
+  const viaTool = await session.setMainSkill(TWO_ACTIVES_GROUP, 2);
+  assertSameStats('apply_changes mainSkill = set_main_skill', viaTool.after, applied.after);
+  await session.undoLastChange();
+  assertSame('undo of set_main_skill', await state(session), base);
+  log('PASS 7a');
+
+  log('Test 7b: masteries + mainSkill in one variant (fallback), undo exact');
+  const life = (await session.getPassiveTree([LIFE_MASTERY])).masteryOptions![0];
+  const free = (life.options ?? []).filter((o) => o.takenBy === undefined && o.effect !== life.effect);
+  const other = ((await session.getPassiveTree(['Life Mastery'])).masteryOptions ?? [])
+    .filter((m) => !m.allocated && m.points !== undefined)
+    .sort((a, b) => a.points! - b.points!)[0];
+  assert(free.length >= 2 && other, 'two free Life Mastery effects and a reachable unallocated Life Mastery');
+  const mixed: NamedProbeVariant = {
+    masteries: [{ node: LIFE_MASTERY, effect: free[0].effect }, { node: other.id!, effect: free[1].stats }],
+    mainSkill: { group: TWO_ACTIVES_GROUP },
+  };
+  const probed = await session.probeNamed({ variants: [mixed] });
+  assert(probed.results[0].fallback === true, `two mastery changes take the fallback: ${JSON.stringify(probed.results[0])}`);
+  let result: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+  await assertParity('masteries + mainSkill', session, mixed, async () => {
+    result = await session.applyChanges(mixed);
+    return result.after;
+  });
+  assert(result, 'applied');
+  const masteries = result.masteries ?? [];
+  assert(masteries.length === 2 && masteries[0].id === LIFE_MASTERY && masteries[0].effect === free[0].effect && masteries[0].previousEffect === 64381
+    && masteries[1].id === other.id && masteries[1].effect === free[1].effect, `masteries: ${JSON.stringify(masteries)}`);
+  assert(result.added.length === other.points && result.added[result.added.length - 1].id === other.id, `added: ${JSON.stringify(result.added)}`);
+  const mixedState = await state(session);
+  const effects = specMasteries(mixedState.xml);
+  assert(effects.includes(`{${LIFE_MASTERY},${free[0].effect}}`) && effects.includes(`{${other.id},${free[1].effect}}`), `export effects: ${effects}`);
+  assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'one undo entry, one journal record');
+  await session.undoLastChange();
+  assertSame('undo of masteries + mainSkill', await state(session), base);
+  log('PASS 7b');
+
+  log('Test 7c: a crash replays it');
+  await session.applyChanges(mixed);
+  const again = await state(session);
+  assertSame('the same variant applied again', again, mixedState);
+  await crash(bridge);
+  await expectRestart('after apply_changes with masteries', session.getStats());
+  assertSame('respawned after apply_changes with masteries', await state(session), again);
+  log('PASS 7c');
+
+  log('Test 7d: refusals change nothing');
+  const now = await state(session);
+  const depth = session.undoStackDepth();
+  const journal = bridge.committedCount();
+  const refusals: Array<[string, NamedProbeVariant, RegExp]> = [
+    ['effect not offered', { masteries: [{ node: 12125, effect: 41322 }] }, /does not offer effect 41322/],
+    ['mastery in allocate', { allocate: [other.id!] }, /is a mastery; pass it in `masteries`/],
+    ['main skill group out of range', { mainSkill: { group: 99 } }, /Skill group not found at index 99/],
+    ['active skill out of range', { mainSkill: { group: TWO_ACTIVES_GROUP, activeSkill: 3 } }, /out of range/],
+    ['mixed with a bad effect', { config: { usePowerCharges: true }, masteries: [{ node: 12125, effect: 'no such effect text' }] }, /no effect of mastery/],
+  ];
+  for (const [label, variant, pattern] of refusals) {
+    const e = await rejection(session.applyChanges(variant));
+    assert(e instanceof UserError && pattern.test(e.message), `${label}: ${e.constructor.name}: ${e.message}`);
+    assertSame(`${label}: unchanged`, await state(session), now);
+    assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, `${label}: undo/journal changed`);
+  }
+  log('PASS 7d');
+}
+
 async function main(): Promise<void> {
   try {
     await test1Parity();
@@ -666,6 +770,7 @@ async function main(): Promise<void> {
     await test4CrashReplay();
     await test5Faults();
     await test6Mcp();
+    await test7MasteriesAndMainSkill();
     log('ALL PASS');
   } finally {
     for (const b of bridges) await b.shutdown().catch(() => undefined);
