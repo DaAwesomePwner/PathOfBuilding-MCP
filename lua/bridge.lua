@@ -3901,6 +3901,31 @@ local DISPATCH = {
 	},
 }
 
+-- Read-only what-if probes through PoB's calculator (lua/probe.lua). `probe`
+-- never changes the committed build; `probeCommit` applies one variant for
+-- real and is only sent between a full snapshot and its restore.
+do
+	local source = debug.getinfo(1, "S").source
+	local bridgeDir = (source:sub(1, 1) == "@" and source:sub(2) or (arg and arg[0] or "")):match("^(.*)[/\\][^/\\]*$") or "."
+	local probe = dofile(bridgeDir .. "/probe.lua")({
+		userError = userError,
+		USER_ERROR_PREFIX = USER_ERROR_PREFIX,
+		jsonNull = dkjson.null,
+		statKeys = statKeys,
+		copyValue = copyValue,
+		parseItemText = parseItemText,
+		assertItemFitsSlot = assertItemFitsSlot,
+		findGemByName = findGemByName,
+		getConfigMetadata = getConfigMetadata,
+		equipItemInSlot = equipItemInSlot,
+		allocNodesBatch = allocNodesBatch,
+		deallocNodesBatch = deallocNodesBatch,
+		pumpAndRead = pumpAndRead,
+	})
+	DISPATCH.probe = { handler = function(cmd) return probe.probe(cmd) end }
+	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
+end
+
 local function dispatch(cmd)
 	if type(cmd) ~= "table" then
 		error("Command must be a JSON object")
