@@ -2,13 +2,26 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { BuildSession, ComparisonResult, computeDiff, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
+import {
+  BuildSession,
+  ComparisonResult,
+  computeDiff,
+  EquippedItem,
+  ItemModLine,
+  PassiveTreeInfo,
+  SCENARIO_NAMES,
+  SkillGemInstance,
+  StatDiffResult,
+} from './build-session.js';
+import { registerEvaluateChanges } from './evaluate-changes.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
 import type { Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
 import { registerTradeTools } from './trade-search.js';
 import { createToolRegistrar } from './tool-registry.js';
+import { DEFAULT_LINK_POOL, EXHAUSTIVE_BUDGET, MAX_COMBINATIONS } from './link-search.js';
+import { DEFAULT_MAX_POINTS, MAX_MAX_POINTS, MAX_SEARCH_FALLBACKS } from './tree-search.js';
 import { UserError, validateBuildSource, validateItemText, validateSlot } from './validation.js';
 
 // ---------------------------------------------------------------------------
@@ -107,6 +120,7 @@ const tools = createToolRegistrar(server, engine);
 
 registerEngineTools(tools, engine);
 registerTradeTools(tools);
+registerEvaluateChanges(tools);
 
 tools.engine<{ source: string }>(
   'load_build',
@@ -141,19 +155,33 @@ tools.engine<{ source: string }>(
   },
 );
 
-tools.engine<{ categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'> }>(
+tools.engine<{
+  categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'>;
+  stats?: string[];
+}>(
   'get_stats',
   {
     description:
-      'Get calculated stats for the currently loaded build, organized by category. Categories: offense, defense, sustain, charges, attributes, movement. Returns only non-zero stats.',
+      'Get calculated stats for the currently loaded build, organized by category. Categories: offense, defense, sustain, charges, attributes, movement. Returns only non-zero stats. ' +
+      'Pass `stats` instead to read exactly those Path of Building output keys (any key PoB calculates, e.g. ["CombinedDPS","Life","CritChance"]): the result is then `{ stats: { key: value } }` with null for a key PoB does not have, and `categories` is ignored.',
     inputSchema: {
       categories: z
         .array(z.enum(['offense', 'defense', 'sustain', 'charges', 'attributes', 'movement']))
         .optional()
         .describe('Optional category filter. Omit for all categories.'),
+      stats: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Exact PoB output stat keys to return (unknown keys come back as null).'),
     },
   },
-  async ({ categories }, session) => {
+  async ({ categories, stats: keys }, session) => {
+    if (keys) {
+      const { base } = await session.probe({ stats: [...new Set(keys)], variants: [] });
+      return { stats: base };
+    }
     const stats = await session.getStats();
     return categorizeStats(stats, categories);
   },
@@ -178,16 +206,49 @@ tools.engine<{ skillIndex?: number }>(
   },
 );
 
-tools.engine<Record<string, never>>(
+/** A mod line with only its true flags (`{ line, crafted: true }`), so `line` and flag checks keep working. */
+function compactMod(mod: ItemModLine): Partial<ItemModLine> & { line: string } {
+  const out: Partial<ItemModLine> & { line: string } = { line: mod.line };
+  for (const flag of ['crafted', 'fractured', 'enchant', 'implicit'] as const) {
+    if (mod[flag]) out[flag] = true;
+  }
+  return out;
+}
+
+/** An equipped item without its item text and false flags (detail: 'full' gives everything). */
+function compactItem(item: EquippedItem, includeItemText: boolean): Record<string, unknown> {
+  const { raw, implicits, explicits, enchants, corrupted, shaper, elder, ...rest } = item;
+  return {
+    ...rest,
+    ...(corrupted ? { corrupted } : {}),
+    ...(shaper ? { shaper } : {}),
+    ...(elder ? { elder } : {}),
+    implicits: implicits.map(compactMod),
+    explicits: explicits.map(compactMod),
+    enchants: enchants.map(compactMod),
+    ...(includeItemText && raw !== undefined ? { raw } : {}),
+  };
+}
+
+const detailSchema = z.enum(['summary', 'full']);
+
+tools.engine<{ detail?: 'summary' | 'full'; includeItemText?: boolean }>(
   'list_equipped_items',
   {
     description:
-      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. An item in a slot Path of Building hides on this passive tree (Wickerman Head/Body/Arm/Leg off 3.30, Graft 1/2 off 3.27) is listed with hidden: true and a note: PoB still counts a hidden Wickerman item in its calculations but ignores a hidden graft; unequip_item removes either.',
-    inputSchema: {},
+      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. ' +
+      'An item in a slot Path of Building hides on this passive tree (Wickerman Head/Body/Arm/Leg off 3.30, Graft 1/2 off 3.27) is listed with hidden: true and a note: PoB still counts a hidden Wickerman item in its calculations but ignores a hidden graft; unequip_item removes either. ' +
+      'By default each mod is `{ line }` plus only its true flags (e.g. `crafted: true`), false item flags are left out and the item text is not included; ' +
+      '`includeItemText: true` adds each item\'s PoB text as `raw`; `detail: "full"` returns every field (all flags and `raw`).',
+    inputSchema: {
+      detail: detailSchema.optional().describe('"summary" (default) or "full" (every field, including the item text).'),
+      includeItemText: z.boolean().optional().describe('Add each item\'s PoB "Copy item" text as `raw` (default false).'),
+    },
   },
-  async (_args, session) => {
+  async ({ detail, includeItemText }, session) => {
     const items = await session.listEquippedItems();
-    return { count: items.length, items };
+    if (detail === 'full') return { count: items.length, items };
+    return { count: items.length, items: items.map((item) => compactItem(item, includeItemText === true)) };
   },
 );
 
@@ -302,7 +363,7 @@ tools.engine<{ slot: string; items: string[] }>(
   'compare_items',
   {
     description:
-      'Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is tested sequentially with full state restoration; the build returns to its original state when finished. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused.',
+      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused.",
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot to compare in.'),
       items: z
@@ -339,15 +400,36 @@ tools.engine<Record<string, never>>(
 // Phase 4 tools: passive tree analysis
 // ---------------------------------------------------------------------------
 
-tools.engine<Record<string, never>>(
+/** get_passive_tree's default: node stats only for keystones, notables and masteries (their chosen effect). */
+function compactTree(tree: PassiveTreeInfo): unknown {
+  const named = (n: { id: number; name: string; stats?: string[] }) => ({ id: n.id, name: n.name, stats: n.stats ?? [] });
+  return {
+    summary: tree.summary,
+    keystones: tree.keystones.map(named),
+    notables: tree.notables.map(named),
+    allocatedNodes: tree.allocatedNodes.map((n) => ({
+      id: n.id,
+      name: n.name,
+      type: n.type,
+      ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+      ...(n.isMastery || n.type === 'Mastery' ? { stats: n.stats ?? [] } : {}),
+    })),
+  };
+}
+
+tools.engine<{ detail?: 'summary' | 'full' }>(
   'get_passive_tree',
   {
     description:
-      'Return the full passive tree state: all allocated nodes with stats, active keystones, allocated notables, point counts, and class info.',
-    inputSchema: {},
+      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type; allocated masteries also carry `stats`, their chosen effect). ' +
+      '`detail: "full"` returns every allocated node with all its fields and stats.',
+    inputSchema: {
+      detail: detailSchema.optional().describe('"summary" (default) or "full" (every allocated node with its stats and flags).'),
+    },
   },
-  async (_args, session) => {
-    return session.getPassiveTree();
+  async ({ detail }, session) => {
+    const tree = await session.getPassiveTree();
+    return detail === 'full' ? tree : compactTree(tree);
   },
 );
 
@@ -381,14 +463,16 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   'simulate_passive_change',
   {
     description:
-      'Temporarily allocate or deallocate passive nodes and return the stat diff. Always restores the original tree afterward. Validates that the resulting tree is connected. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class\'s ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start.',
+      "Temporarily allocate or deallocate passive nodes and return the stat diff. Allocating a node also allocates its path from the allocated tree; deallocating a node also removes the nodes that depend on it. Validates that the resulting tree is connected. A request that allocates exactly one node (and deallocates none) on a connected tree is evaluated through Path of Building's own calculator without changing the build; every other request is applied, recalculated and the tree restored exactly. The whole request is checked first and refused with an error (nothing changes) if any node is unknown, cannot be allocated because no path from the allocated tree reaches it (e.g. another class's ascendancy), is a second option of the same choice node, or, for deallocation, is not allocated or is a class start. A node name resolves among the nodes the change can apply to (unallocated ones to allocate, allocated ones to deallocate); a name several of them share (e.g. \"Strength\") is refused with the candidate ids, so pass ids for those. At most 50 nodes in each list.",
     inputSchema: {
       allocate: z
-        .array(z.union([z.string(), z.number().int()]))
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .max(50)
         .optional()
         .describe('Node names (e.g. "Resolute Technique") or numeric node IDs to allocate.'),
       deallocate: z
-        .array(z.union([z.string(), z.number().int()]))
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .max(50)
         .optional()
         .describe('Node names or numeric node IDs to deallocate.'),
     },
@@ -404,11 +488,19 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
   },
 );
 
-tools.engine<{ count?: number; optimizeFor?: string; includeJewelSockets?: boolean }>(
+const rankBySchema = z.enum(['perPoint', 'total']);
+
+tools.engine<{
+  count?: number;
+  optimizeFor?: string;
+  includeJewelSockets?: boolean;
+  maxPoints?: number;
+  rankBy?: 'perPoint' | 'total';
+}>(
   'find_best_next_nodes',
   {
     description:
-      'Iterate every reachable unallocated node, simulate allocating each, and rank by improvement of the chosen stat. Skips jewel sockets by default. Build is restored after the scan. May take 10-60s on large trees.',
+      "Rank unallocated passive nodes by how much allocating each one (together with its cheapest path from the allocated tree, as clicking it in PoB does) improves the chosen stat. Every node whose path costs at most `maxPoints` points is evaluated through Path of Building's own calculator (a few seconds; the build never changes); ascendancy nodes, masteries and class starts are skipped, jewel sockets unless `includeJewelSockets`. Each ranking gives `pointsCost`, `delta` (total change of the stat), `deltaPerPoint`, the `path` (node ids and names, tree side first, the node last) and `tradeoffs` (losses in the other kind of stat). `rankBy: \"perPoint\"` (default) ranks by delta per point, `\"total\"` by delta. Nodes that need a full recalculation (cluster jewel nodes, jewel sockets holding a jewel, skill-granting nodes) are capped at the " + MAX_SEARCH_FALLBACKS + " with the fewest points per call; any others are not ranked and are listed in `skipped` (with their points and the reason).",
     inputSchema: {
       count: z.number().int().positive().max(50).optional().describe('Top-N to return (default 10).'),
       optimizeFor: z
@@ -419,34 +511,62 @@ tools.engine<{ count?: number; optimizeFor?: string; includeJewelSockets?: boole
         .boolean()
         .optional()
         .describe('Include jewel sockets (default false — they have global radius effects).'),
+      maxPoints: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_MAX_POINTS)
+        .optional()
+        .describe(`Largest path cost in passive points to consider (default ${DEFAULT_MAX_POINTS}, max ${MAX_MAX_POINTS}); 1 = only nodes next to the allocated tree.`),
+      rankBy: rankBySchema.optional().describe('"perPoint" (default): gain per point spent; "total": total gain.'),
     },
   },
-  async ({ count, optimizeFor, includeJewelSockets }, session) => {
-    const rankings = await session.findBestNextNodes(
+  async ({ count, optimizeFor, includeJewelSockets, maxPoints, rankBy }, session) => {
+    const target = optimizeFor ?? 'CombinedDPS';
+    const result = await session.findBestNextNodes(
       count ?? 10,
-      optimizeFor ?? 'CombinedDPS',
+      target,
       includeJewelSockets ?? false,
+      maxPoints ?? DEFAULT_MAX_POINTS,
+      rankBy ?? 'perPoint',
     );
-    return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
+    return {
+      optimizeFor: target,
+      maxPoints: maxPoints ?? DEFAULT_MAX_POINTS,
+      rankBy: rankBy ?? 'perPoint',
+      evaluated: result.evaluated,
+      count: result.rankings.length,
+      rankings: result.rankings,
+      ...(result.skipped.length > 0 ? { skipped: result.skipped } : {}),
+    };
   },
 );
 
-tools.engine<{ count?: number; optimizeFor?: string }>(
+tools.engine<{ count?: number; optimizeFor?: string; rankBy?: 'perPoint' | 'total' }>(
   'find_worst_allocated_nodes',
   {
     description:
-      'Find the least valuable currently-allocated nodes by simulating their removal. Skips keystones, ascendancy nodes, jewel sockets, masteries, and any node whose removal disconnects the tree.',
+      "Find the least valuable allocated passive nodes: each allocated node (normal, notable, keystone, or empty jewel socket; not ascendancy nodes, masteries or class starts) is removed together with every node that depends on it (as deallocating it in PoB does) and evaluated through Path of Building's own calculator (a few seconds; the build never changes). Each ranking gives `lossIfRemoved` (drop of the stat), `pointsRefunded`, `lossPerPoint`, and `removedNodes` (ids and names, the node first; at most 25 listed, `removedNodeCount` has the total). `rankBy: \"perPoint\"` (default) lists the lowest loss per refunded point first, `\"total\"` the lowest total loss. Jewel sockets holding a jewel are never candidates themselves. Nodes whose removal needs a full recalculation (cluster jewel nodes, skill-granting nodes, and nodes whose dependents include a jewel socket holding a jewel) are evaluated after the others and capped at " + MAX_SEARCH_FALLBACKS + " per call, picked by a heuristic: alternately the lowest `minLossEstimate` per refunded point (in total for `rankBy: \"total\"`; the largest loss among the evaluated nodes their removal also removes, an estimate, not a bound) and, for nodes with no evaluated dependent (no estimate), the largest refund. Any others are not ranked and are listed in `skipped` with their points, estimate (when there is one) and reason, so a skipped node can still be among the least valuable.",
     inputSchema: {
       count: z.number().int().positive().max(50).optional().describe('Top-N to return (default 10).'),
       optimizeFor: z
         .string()
         .optional()
         .describe('Stat key to evaluate value by (default "CombinedDPS").'),
+      rankBy: rankBySchema.optional().describe('"perPoint" (default): loss per refunded point; "total": total loss.'),
     },
   },
-  async ({ count, optimizeFor }, session) => {
-    const rankings = await session.findWorstAllocatedNodes(count ?? 10, optimizeFor ?? 'CombinedDPS');
-    return { optimizeFor: optimizeFor ?? 'CombinedDPS', count: rankings.length, rankings };
+  async ({ count, optimizeFor, rankBy }, session) => {
+    const target = optimizeFor ?? 'CombinedDPS';
+    const result = await session.findWorstAllocatedNodes(count ?? 10, target, rankBy ?? 'perPoint');
+    return {
+      optimizeFor: target,
+      rankBy: rankBy ?? 'perPoint',
+      evaluated: result.evaluated,
+      count: result.rankings.length,
+      rankings: result.rankings,
+      ...(result.skipped.length > 0 ? { skipped: result.skipped } : {}),
+    };
   },
 );
 
@@ -454,7 +574,7 @@ tools.engine<{ keystone: string }>(
   'evaluate_keystone',
   {
     description:
-      'Toggle a keystone (add if not allocated, remove if allocated) and return the full stat diff. Tree is restored afterward.',
+      "Toggle a keystone (add it with its path from the allocated tree if not allocated; remove it with the nodes depending on it if allocated) and return the full stat diff, evaluated through Path of Building's own calculator without changing the build. A keystone no path reaches is an error.",
     inputSchema: {
       keystone: z
         .string()
@@ -479,23 +599,41 @@ tools.engine<{ keystone: string }>(
 // Phase 5 tools: skill gems
 // ---------------------------------------------------------------------------
 
-tools.engine<Record<string, never>>(
+/** A gem with its index, name, level and quality, plus disabled / count / error only when they apply. */
+function compactGem(gem: SkillGemInstance): Record<string, unknown> {
+  return {
+    index: gem.index,
+    name: gem.name,
+    level: gem.level,
+    quality: gem.quality,
+    ...(gem.enabled ? {} : { enabled: false }),
+    ...(gem.count !== undefined && gem.count !== 1 ? { count: gem.count } : {}),
+    ...(gem.errMsg ? { errMsg: gem.errMsg } : {}),
+  };
+}
+
+tools.engine<{ detail?: 'summary' | 'full' }>(
   'list_skill_groups',
   {
     description:
-      'List every socket group (skill setup) with active gems, support gems, slot, label, and which group is the main skill.',
-    inputSchema: {},
+      'List every socket group (skill setup) with active gems, support gems, slot, label, and which group is the main skill. ' +
+      'Each gem has its `index` in the group (the 1-based index swap_gem and evaluate_changes take), name, level and quality, plus `enabled: false` / `count` / `errMsg` only when they apply; ' +
+      '`detail: "full"` returns every gem field (gem and skill ids, color, isSupport).',
+    inputSchema: {
+      detail: detailSchema.optional().describe('"summary" (default) or "full" (every gem field).'),
+    },
   },
-  async (_args, session) => {
+  async ({ detail }, session) => {
     const groups = await session.listSkillGroups();
+    const gems = (list: SkillGemInstance[]) => (detail === 'full' ? list : list.map(compactGem));
     const formatted = groups.map((g) => ({
       index: g.index,
       label: g.label,
       slot: g.slotName,
       enabled: g.enabled,
       isMainSkill: g.isMainGroup,
-      activeGems: g.gems.filter((gem) => !gem.isSupport),
-      supportGems: g.gems.filter((gem) => gem.isSupport),
+      activeGems: gems(g.gems.filter((gem) => !gem.isSupport)),
+      supportGems: gems(g.gems.filter((gem) => gem.isSupport)),
     }));
     return { count: formatted.length, groups: formatted };
   },
@@ -538,7 +676,7 @@ tools.engine<{ skillGroupIndex: number; gemIndex: number; newGemName: string; le
   'swap_gem',
   {
     description:
-      'Temporarily swap a single gem in a skill group and return the stat diff. The original gem is restored after the call. Does NOT push undo (no permanent mutation).',
+      "Swap a single gem in a skill group (as PoB does: the new gem keeps the old one's level and quality unless given) and return the stat diff, evaluated through Path of Building's own calculator in milliseconds; the build never changes and nothing is pushed to undo. An unknown gem or bad index is an error.",
     inputSchema: {
       skillGroupIndex: z.number().int().positive().describe('1-based index from list_skill_groups.'),
       gemIndex: z.number().int().positive().describe('1-based index of the gem within the group.'),
@@ -557,7 +695,7 @@ tools.engine<{ skillGroupIndex: number; candidates: string[] }>(
   'compare_supports',
   {
     description:
-      'Identify the weakest enabled support in a skill group (by simulating its removal) and rank candidate replacements by resulting DPS. Build is restored after.',
+      "Identify the weakest enabled support in a skill group (the smallest CombinedDPS loss when removed) and rank candidate replacements (each at level 20 / quality 20 in its place) by resulting DPS, evaluated through Path of Building's own calculator in milliseconds; the build never changes. A candidate PoB refuses (e.g. an unknown gem name) is listed with its `error` and null `dps` / `dpsDelta`, after the others.",
     inputSchema: {
       skillGroupIndex: z.number().int().positive().describe('1-based index of the skill group.'),
       candidates: z
@@ -576,7 +714,7 @@ tools.engine<{ skillGroupIndex: number; gemIndex: number; levels?: number[] }>(
   'evaluate_gem_levels',
   {
     description:
-      'Show how DPS scales with gem level for a specific gem. Default tests the current level ±1 through +4 (capped at 24); pass `levels` to override.',
+      "Show how DPS scales with gem level for a specific gem, evaluated through Path of Building's own calculator in milliseconds (the build never changes). Default tests the current level -1 through +4 (capped at 24); pass `levels` to override. A level PoB refuses has its `error` and null `dps` / `dpsDelta`.",
     inputSchema: {
       skillGroupIndex: z.number().int().positive().describe('1-based skill group index.'),
       gemIndex: z.number().int().positive().describe('1-based gem index within the group.'),
@@ -596,7 +734,7 @@ tools.engine<{ activeSkill: string; availableSlots: number; constraints?: string
   'find_optimal_links',
   {
     description:
-      'Find an optimal support gem combination for an active skill. Heuristic: rank supports individually, take top N, then try swap-with-next to detect synergies. The MAIN skill group is mutated and restored. May take 30-90 seconds.',
+      "Find the best support gem combination for an active skill in the main skill group (its gems are replaced by the active skill, the locked `constraints` and the candidates, each at its natural maximum level capped at 20, e.g. 3 for Empower, and quality 20), evaluated through Path of Building's own calculator; the build never changes. Every support PoB's own compatibility check lets support the skill (after the locked supports add their skill types; Awakened gems left out) is scored alone, then combinations of the best `topN` are searched: exhaustively when they fit the budget (" + EXHAUSTIVE_BUDGET + " combinations), otherwise exhaustively over the best singles the budget allows and then improved by pairwise swaps with the rest of the pool (at most " + MAX_COMBINATIONS + " combinations in all). About 1-3 seconds for a 6-link. Returns `bestCombination`, `bestDPS`, `baselineDPS` (the build as it is) and `dpsDelta`, `bestGroup` (the evaluated group with levels), the `mainGroup` replaced, `singleSupportDPS` (the pool), `topAlternatives`, and `search` (method, supports and combinations evaluated, skipped supports).",
     inputSchema: {
       activeSkill: z.string().min(1).describe('Active skill gem name (e.g. "Vortex").'),
       availableSlots: z
@@ -608,8 +746,8 @@ tools.engine<{ activeSkill: string; availableSlots: number; constraints?: string
       constraints: z
         .array(z.string().min(1))
         .optional()
-        .describe('Support gems that MUST be included.'),
-      topN: z.number().int().min(5).max(40).optional().describe('Pool size for single-support phase (default 25).'),
+        .describe('Support gems that MUST be included (each a support gem, listed once, not the active skill).'),
+      topN: z.number().int().min(5).max(40).optional().describe(`Number of best single supports the combination search draws from (default ${DEFAULT_LINK_POOL}).`),
     },
   },
   async ({ activeSkill, availableSlots, constraints, topN }, session) => {
@@ -672,7 +810,7 @@ tools.engine<{ scenario: string }>(
   'simulate_scenario',
   {
     description:
-      "Temporarily apply a named combat scenario preset (e.g. 'mapping', 'pinnacle_boss') and return the stat diff vs the current config. Build state is fully restored after.",
+      "Apply a named combat scenario preset (e.g. 'mapping', 'pinnacle_boss') as set_config would and return the stat diff vs the current config, evaluated through Path of Building's own calculator in milliseconds; the build never changes.",
     inputSchema: {
       scenario: z
         .enum(SCENARIO_NAMES)
@@ -695,7 +833,7 @@ tools.engine<{ scenarios: string[] }>(
   'compare_scenarios',
   {
     description:
-      'Compare 2-6 named scenarios side-by-side. Each scenario is simulated independently with config restore between them. Returns baseline stats plus one entry per scenario with its diff.',
+      "Compare 2-6 named scenarios side-by-side, each applied on its own to the current config and evaluated through Path of Building's own calculator in one call (milliseconds; the build never changes). Returns baseline stats plus one entry per scenario with its key deltas and stats; a scenario PoB refuses has an `error` instead.",
     inputSchema: {
       scenarios: z
         .array(z.enum(SCENARIO_NAMES))
@@ -706,12 +844,11 @@ tools.engine<{ scenarios: string[] }>(
   },
   async ({ scenarios }, session) => {
     const result = await session.compareScenarios(scenarios);
-    const rows = result.scenarios.map((s) => ({
-      scenario: s.scenario,
-      description: s.description,
-      keyDeltas: keyDeltas(s.diff),
-      keyStats: keyStats(s.after),
-    }));
+    const rows = result.scenarios.map((s) =>
+      s.after && s.diff
+        ? { scenario: s.scenario, description: s.description, keyDeltas: keyDeltas(s.diff), keyStats: keyStats(s.after) }
+        : { scenario: s.scenario, description: s.description, error: s.error ?? 'refused' },
+    );
     return { baseline: keyStats(result.baseline), scenarios: rows };
   },
 );
@@ -720,7 +857,7 @@ tools.engine<{ buffs: Record<string, boolean | number | string> }>(
   'toggle_buffs',
   {
     description:
-      'Temporarily toggle individual buffs / charges and return the stat impact. Build state is restored after. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks, unholyMight; raw PoB config keys also accepted.',
+      "Toggle individual buffs / charges (as config options) and return the stat impact, evaluated through Path of Building's own calculator in milliseconds; the build never changes. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks, unholyMight; raw PoB config keys also accepted.",
     inputSchema: {
       buffs: z
         .record(z.string(), z.union([z.boolean(), z.number(), z.string()]))
@@ -737,38 +874,11 @@ tools.engine<{ buffs: Record<string, boolean | number | string> }>(
 // Phase 7: Optimization advisor
 // ---------------------------------------------------------------------------
 
-function formatDiagnostics(checks: DiagnosticCheck[]): string {
-  if (checks.length === 0) return 'No issues found — build looks solid!';
-  const lines: string[] = ['## Build Diagnosis', ''];
-  for (const c of checks) {
-    const tag = c.severity === 'critical' ? '[CRITICAL]' : c.severity === 'warning' ? '[WARNING]' : '[INFO]';
-    lines.push(`${tag} (${c.category}) ${c.message}`);
-    lines.push(`  -> ${c.suggestion}`);
-    lines.push('');
-  }
-  return lines.join('\n').trimEnd();
-}
-
-function formatUpgrades(suggestions: UpgradeSuggestion[]): string {
-  const lines: string[] = ['## Upgrade Suggestions (lowest contribution first)', ''];
-  for (let i = 0; i < suggestions.length; i++) {
-    const s = suggestions[i];
-    lines.push(`${i + 1}. ${s.slot}${s.empty ? ' (EMPTY)' : ''}`);
-    if (s.currentItemName) lines.push(`   Current: ${s.currentItemName}`);
-    lines.push(
-      `   Contribution: ${Math.round(s.dpsContribution).toLocaleString()} DPS, ${Math.round(s.ehpContribution).toLocaleString()} EHP (priority ${s.priority}/100)`,
-    );
-    if (s.suggestedMods.length > 0) lines.push(`   Look for: ${s.suggestedMods.join(', ')}`);
-    lines.push('');
-  }
-  return lines.join('\n').trimEnd();
-}
-
 tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   'diagnose_build',
   {
     description:
-      'Run a comprehensive read-only analysis of the current build. Identifies uncapped resistances, low EHP, crit/hit-chance issues, sub-level-20 main gems, missing movement/guard skills, etc. Pass `focus` to narrow to defense, offense, qol, or balance.',
+      'Run a comprehensive read-only analysis of the current build. Identifies uncapped resistances, low EHP, crit/hit-chance issues, sub-level-20 main gems, missing movement/guard skills, etc. Pass `focus` to narrow to defense, offense, qol, or balance. Returns `checks` (severity, category, message, suggestion), most severe first; an empty list means no issues were found.',
     inputSchema: {
       focus: z
         .enum(['defense', 'offense', 'qol', 'balance'])
@@ -778,12 +888,7 @@ tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   },
   async ({ focus }, session) => {
     const checks = await session.diagnoseBuild(focus);
-    return {
-      content: [
-        { type: 'text', text: formatDiagnostics(checks) },
-        { type: 'text', text: JSON.stringify({ checks }, null, 2) },
-      ],
-    };
+    return { checks };
   },
 );
 
@@ -791,7 +896,7 @@ tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   'suggest_upgrades',
   {
     description:
-      'Rank equipment slots by upgrade priority. Each slot is briefly unequipped to measure its current DPS/EHP contribution; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. Build state is fully restored after the scan.',
+      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (lowest contribution first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods; list_equipped_items / get_item_in_slot give the items themselves.",
     inputSchema: {
       slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
       budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),
@@ -799,12 +904,7 @@ tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   },
   async ({ slot, budget }, session) => {
     const suggestions = await session.suggestUpgrades(slot, budget);
-    return {
-      content: [
-        { type: 'text', text: formatUpgrades(suggestions) },
-        { type: 'text', text: JSON.stringify({ suggestions }, null, 2) },
-      ],
-    };
+    return { suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest) };
   },
 );
 

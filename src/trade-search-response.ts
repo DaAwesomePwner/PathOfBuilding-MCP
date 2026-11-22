@@ -38,7 +38,6 @@ export function buildTradeSearch(args: TradeSearchArgs, raw: TradeQueryRaw): Rec
     currentItemWeightedValue: round(pobDefaultMin * 2, 6),
     filterBudget: budget,
     capLifted: raw.capLifted,
-    capModel: raw.capModel,
     ...(raw.capLifted ? {} : {
       capWarning: 'This Path of Building version returned an already capped weight list (it applies its own filter limit), ' +
         'so droppedByCap only lists filters dropped after that and filters PoB dropped cannot come back.',

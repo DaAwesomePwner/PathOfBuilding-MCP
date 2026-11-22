@@ -19,6 +19,18 @@ it plausible.
 Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
 for later.
 
+- **Trade search on PoB 2.68: known gaps.** `generate_trade_search` works on 2.67
+  and 2.68 (the bridge lifts 2.68's complexity budget through a scoped line hook,
+  turns its query table into the 2.67 JSON shape and drops its empty `and`/`not`
+  groups). Left open: (1) PoB 2.68 caps a query by the trade site's complexity
+  limit (200; 54 for the weight group, 4 per filter) instead of 36 filters; our
+  TS cap is still `MAX_FILTERS = 36`, which can exceed that limit when many
+  required mods or options are set. (2) 2.68 dropped influences from the
+  generator: the bridge still adds the `pseudo.pseudo_has_*_influence`
+  requirements, but the weights are no longer computed on an influenced copy of
+  the item. (3) 2.68 offers the eldritch option on Amulet; we still refuse
+  `includeEldritch: "keep..."` there. (4) 2.68's blocked mods (`not` group) are
+  not exposed.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the
@@ -81,9 +93,11 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
 - **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
   pastebin links (`parseBuildURL` in `src/validation.ts`); poe.ninja links are
   refused with a UserError.
-- **Swallowed errors give wrong answers (confirmed).** Empty `catch {}` in
-  `compareSupports`, `suggestUpgrades`, `compareScenarios`
-  (`src/build-session.ts:998,1364,1490`) turn failures into zero deltas.
+- ~~**Swallowed errors give wrong answers (confirmed).**~~ **Fixed.** Empty
+  `catch {}` in `compareSupports`, `suggestUpgrades`, `compareScenarios` turned
+  failures into zero deltas. They now run on the probe engine: a variant PoB
+  refuses as input carries its own `error` (null numbers, listed last) and any
+  other failure fails the call.
 - **Undo edge cases (confirmed).** `undoLastChange` pops the entry before
   restoring, so a failed restore loses it. `set_config` pushes an undo entry
   even when the bridge refuses the change with a user error (`swap_item` does
@@ -112,15 +126,39 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
 
 - **Internal errors leak stderr, local paths and Lua tracebacks** to the client
   (`src/server.ts:114-136`). Log in full, return a sanitised message.
-- **No tool annotations** (`readOnlyHint`, `destructiveHint`), `outputSchema` or
-  `structuredContent`.
+- ~~**No tool annotations**~~ **Fixed** for annotations: every tool has
+  `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`
+  (`TOOL_ANNOTATIONS` in `src/tool-registry.ts`, checked by `test:server`).
+  Still open: no `outputSchema` or `structuredContent`.
 - **Unbounded inputs.** No `.max()` on `itemText`, `source`, config records; no
   upper bound on gem/skill indices.
 - **Shutdown.** No `unhandledRejection` handler, no kill timeout on
   `bridge.shutdown()`, `server.close()` not called.
-- **Duplicate payloads.** `diagnose_build` and `suggest_upgrades` return the data
-  twice; JSON is pretty-printed everywhere.
+- ~~**Duplicate payloads.**~~ **Fixed.** `diagnose_build` and `suggest_upgrades`
+  return one compact JSON part (`suggest_upgrades` without the full item), and no
+  tool pretty-prints JSON. `get_passive_tree`, `list_equipped_items` and
+  `list_skill_groups` return a trimmed default (`detail: "full"` for the old
+  shape).
+- **`get_config` is still ~80 KB** on the OccVortex fixture (every option with
+  its label and valid values). A `sections` / `keys` filter would cut it.
 - **Unbounded growth** of `stderrLines` and labelled snapshots.
+
+## Probe engine follow-ups
+
+- **Trade cap-lift.** If PoB moves the `WeightedRatioOutputs` call after the
+  complexity budget loop, `capLifted` would read true for a capped query; guard
+  by counting the lift only while `complexityBudget` still holds its start
+  value.
+- **`find_optimal_links`.** Locked-support skill types are applied until nothing
+  changes; PoB checks supports once in group order, so a rare locked-support
+  order can differ. Legacy Item Quantity support is not filtered (adds no DPS).
+- ~~**Node names shared by several nodes**~~ **Fixed.** `simulate_passive_change`
+  and `evaluate_changes` resolve a name among the nodes the change can apply to
+  (unallocated ones to allocate, allocated ones to deallocate) and refuse a name
+  several of them share with their ids. Left: the name index covers allocated
+  nodes and unallocated nodes a path reaches; a name only found outside it
+  (an unallocated ascendancy node, say) still goes to `getNodeInfo`, which
+  returns one node.
 
 ## Tests and CI
 

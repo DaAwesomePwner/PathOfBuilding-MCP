@@ -48,7 +48,9 @@
     "test:skills-restore": "tsx test/skills-restore-test.ts",
     "test:crash-recovery": "tsx test/crash-recovery-test.ts",
     "test:trade": "tsx test/trade-search-test.ts",
-    "test:compound-assign": "tsx test/compound-assign-test.ts"
+    "test:lua-compat": "tsx test/lua-compat-test.ts",
+    "test:probe": "tsx test/probe-test.ts",
+    "test:evaluate": "tsx test/evaluate-changes-test.ts"
   },
   "repository": {
     "type": "git",

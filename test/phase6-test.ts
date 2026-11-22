@@ -3,6 +3,10 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { BuildSession } from '../src/build-session.js';
+import { LuaBridge, type Stats } from '../src/lua-bridge.js';
+import type { ResolvedPaths } from '../src/paths.js';
+import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -235,6 +239,110 @@ async function main(): Promise<void> {
   } finally {
     try { await client.close(); } catch { /* ignore */ }
   }
+  await directParity(paths, xml);
+}
+
+/**
+ * Test 12: the config tools on the probe engine give exactly what set_config
+ * + full recalc (inside an exact restore) gives, every stat; each leaves the
+ * export byte-identical and the undo depth unchanged. A scenario the engine
+ * refuses (injected by a test-only wrapper around this process's
+ * LuaBridge.send) is reported on its own entry; an internal failure fails the
+ * call. Timings are printed (targets asserted only when ASSERT_TIMINGS=1).
+ */
+async function directParity(paths: ResolvedPaths, xml: string): Promise<void> {
+  log('Test 12: config tools vs the mutate path (direct session)');
+  const bridge = new LuaBridge(paths, 120_000);
+  const session = new BuildSession(bridge);
+  const viaSetConfig = (options: Record<string, unknown>): Promise<Stats> =>
+    session.withTemporaryChange(async (b) => {
+      await b.send({ cmd: 'setConfig', options });
+      return b.getStats();
+    });
+  const sameStats = (a: Stats | null, b: Stats, label: string): void => {
+    assert(a, `${label}: no stats`);
+    const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
+    const diff = keys.filter((k) => a[k] !== b[k]).map((k) => `${k}: ${a[k]} vs ${b[k]}`);
+    assert(diff.length === 0, `${label}: differs from set_config: ${diff.join('; ')}`);
+  };
+  const assertTimings = process.env.ASSERT_TIMINGS === '1';
+  async function readOnly<T>(label: string, fn: () => Promise<T>, targetMs?: number): Promise<T> {
+    const before = await session.exportXML();
+    const depth = session.undoStackDepth();
+    const t = performance.now();
+    const out = await fn();
+    const ms = performance.now() - t;
+    const over = targetMs !== undefined && ms >= targetMs;
+    log(`  ${label}: ${ms.toFixed(0)} ms${targetMs ? ` (target ${targetMs} ms${over ? ', OVER' : ''})` : ''}`);
+    if (assertTimings) assert(!over, `${label} took ${ms.toFixed(0)} ms`);
+    assert((await session.exportXML()) === before, `${label}: export changed`);
+    assert(session.undoStackDepth() === depth, `${label}: undo depth changed`);
+    return out;
+  }
+
+  try {
+    await session.loadBuild(xml);
+    const base = await session.getStats();
+    const presets = new Map(BuildSession.listScenarios().map((s) => [s.name, s.options]));
+
+    const sim = await readOnly('simulate_scenario (pinnacle_boss)', () => session.simulateScenario('pinnacle_boss'));
+    sameStats(sim.after, await viaSetConfig(presets.get('pinnacle_boss')!), 'simulate_scenario');
+    sameStats(sim.before, base, 'simulate_scenario before');
+
+    const names = ['mapping', 'pinnacle_boss', 'uber_boss'];
+    const cmp = await readOnly('compare_scenarios (3)', () => session.compareScenarios(names), 200);
+    for (const [i, name] of names.entries()) {
+      assert(cmp.scenarios[i].error === undefined, `${name}: ${cmp.scenarios[i].error}`);
+      sameStats(cmp.scenarios[i].after, await viaSetConfig(presets.get(name)!), `compare_scenarios ${name}`);
+    }
+
+    const buffs = await readOnly('toggle_buffs', () => session.toggleBuffs({ onslaught: true, powerCharges: true }));
+    sameStats(buffs.after, await viaSetConfig({ buffOnslaught: true, usePowerCharges: true }), 'toggle_buffs');
+    const config = await readOnly('simulate config (customMods)', () => session.simulateConfig({ customMods: '+100 to maximum Life' }));
+    sameStats(config.after, await viaSetConfig({ customMods: '+100 to maximum Life' }), 'simulate config');
+    assert(config.after.Life !== base.Life, 'customMods changed nothing');
+
+    // A scenario the engine refuses: its own entry carries the error; an internal failure fails the call.
+    const spy = bridge as unknown as { send: (cmd: object, ...rest: unknown[]) => Promise<unknown> };
+    const realSend = spy.send;
+    let inject: { userError: boolean } | null = null;
+    spy.send = async (cmd: object, ...rest: unknown[]) => {
+      const out = (await realSend.call(bridge, cmd, ...rest)) as { results?: Array<Record<string, unknown>> };
+      const c = cmd as { cmd?: string; classifyOnly?: boolean; variants?: unknown[] };
+      if (inject && c.cmd === 'probe' && !c.classifyOnly && c.variants?.length === names.length && out.results) {
+        out.results[1] = { error: 'test refusal', userError: inject.userError };
+      }
+      return out;
+    };
+    try {
+      inject = { userError: true };
+      const refused = await session.compareScenarios(names);
+      const entry = refused.scenarios[1];
+      assert(entry.error === 'test refusal' && entry.after === null && entry.diff === null, `refused scenario: ${JSON.stringify(entry)}`);
+      assert(refused.scenarios[0].after && refused.scenarios[2].after && !refused.scenarios[0].error, 'the other scenarios were not evaluated');
+      inject = { userError: false };
+      let failure: unknown;
+      try {
+        await session.compareScenarios(names);
+      } catch (e) {
+        failure = e;
+      }
+      assert(failure instanceof Error && !(failure instanceof UserError) && /test refusal/.test(failure.message),
+        `an internal scenario failure did not fail the call: ${String(failure)}`);
+    } finally {
+      inject = null;
+      spy.send = realSend;
+    }
+    assert(statsEqual(await session.getStats(), base), 'stats changed after the injected failures');
+    log('PASS: config tools equal set_config; refused scenarios are reported, internal failures fail the call');
+  } finally {
+    await bridge.dispose();
+  }
+}
+
+function statsEqual(a: Stats, b: Stats): boolean {
+  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
+  return keys.every((k) => a[k] === b[k]);
 }
 
 main()

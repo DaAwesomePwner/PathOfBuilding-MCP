@@ -92,7 +92,9 @@ async function main(): Promise<void> {
 
     // Test 1: diagnose_build (default = all)
     log('Test 1: diagnose_build (no focus)');
-    const diagAll = JSON.parse(extractText(await call(client, 'diagnose_build'), 1)) as DiagnoseResp;
+    const diagReply = (await call(client, 'diagnose_build')) as { content: ToolTextContent[] };
+    assert(diagReply.content.length === 1, `diagnose_build returns one content part, got ${diagReply.content.length}`);
+    const diagAll = JSON.parse(extractText(diagReply)) as DiagnoseResp;
     assert(Array.isArray(diagAll.checks), 'checks should be an array');
     log(`  ${diagAll.checks.length} diagnostics returned`);
     for (const c of diagAll.checks) {
@@ -104,7 +106,7 @@ async function main(): Promise<void> {
 
     // Test 2: diagnose_build focused on defense
     log('Test 2: diagnose_build (focus=defense)');
-    const diagDef = JSON.parse(extractText(await call(client, 'diagnose_build', { focus: 'defense' }), 1)) as DiagnoseResp;
+    const diagDef = JSON.parse(extractText(await call(client, 'diagnose_build', { focus: 'defense' }))) as DiagnoseResp;
     for (const c of diagDef.checks) {
       assert(c.category === 'defense', `expected defense-only, got category=${c.category}`);
     }
@@ -122,8 +124,15 @@ async function main(): Promise<void> {
 
     // Test 4: suggest_upgrades (all slots)
     log('Test 4: suggest_upgrades (all slots)');
-    const sugAll = JSON.parse(extractText(await call(client, 'suggest_upgrades'), 1)) as UpgradeResp;
+    const xmlBeforeSug = extractText(await call(client, 'export_build', { format: 'xml' }));
+    const sugReply = (await call(client, 'suggest_upgrades')) as { content: ToolTextContent[] };
+    assert(sugReply.content.length === 1, `suggest_upgrades returns one content part, got ${sugReply.content.length}`);
+    const sugAll = JSON.parse(extractText(sugReply)) as UpgradeResp;
+    assert(sugAll.suggestions.every((s) => !('currentItem' in s)), 'suggest_upgrades leaves out the full item');
+    log(`  suggest_upgrades reply: ${sugReply.content[0].text.length} bytes`);
+    assert(extractText(await call(client, 'export_build', { format: 'xml' })) === xmlBeforeSug, 'export changed after suggest_upgrades');
     assert(sugAll.suggestions.length >= 5, `expected several slot suggestions, got ${sugAll.suggestions.length}`);
+    assert(sugAll.suggestions.some((s) => s.dpsContribution > 0), 'no slot contributes DPS');
     for (const s of sugAll.suggestions) {
       assert(typeof s.slot === 'string', 'slot string');
       assert(typeof s.priority === 'number', 'priority number');
@@ -136,7 +145,7 @@ async function main(): Promise<void> {
 
     // Test 5: suggest_upgrades (single slot)
     log('Test 5: suggest_upgrades (single slot Body Armour)');
-    const sugSingle = JSON.parse(extractText(await call(client, 'suggest_upgrades', { slot: 'Body Armour' }), 1)) as UpgradeResp;
+    const sugSingle = JSON.parse(extractText(await call(client, 'suggest_upgrades', { slot: 'Body Armour' }))) as UpgradeResp;
     assert(sugSingle.suggestions.length === 1, `expected 1, got ${sugSingle.suggestions.length}`);
     assert(sugSingle.suggestions[0].slot === 'Body Armour', 'slot match');
     log(`  Body Armour DPS contribution: ${sugSingle.suggestions[0].dpsContribution}`);

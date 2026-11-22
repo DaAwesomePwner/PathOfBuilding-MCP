@@ -1,6 +1,6 @@
-/** generate_trade_search: weight adjustments, the filter cap (adjusted filters pinned), min override, required mods. */
+/** generate_trade_search: weight adjustments, the 36-filter cap (adjusted filters pinned), min override, required mods. */
 import { UserError } from './validation.js';
-import { MAX_FILTERS, TRADE_COMPLEXITY, type TradeQueryRaw, type TradeSearchArgs } from './trade-search-schema.js';
+import { MAX_FILTERS, type TradeQueryRaw, type TradeSearchArgs } from './trade-search-schema.js';
 
 export const round = (n: number, digits = 4) => Number(n.toPrecision(digits));
 
@@ -39,24 +39,15 @@ function adjustmentTargets(args: TradeSearchArgs, raw: TradeQueryRaw): Map<strin
 export const influenceTradeId = (influence: string) => `pseudo.pseudo_has_${influence}_influence`;
 
 /**
- * How many weight filters fit next to the other filters, counted the way the PoB version counts:
- * PoB <= 2.67: 36 filters in all (2 base filters, each option filter, each influence / required mod);
- * PoB 2.68+: the trade site's complexity limit, with FinishQuery's costs (influences and required mods are "and" filters).
+ * How many weight filters fit next to the other filters: 36 filters in all (2 base filters, each option filter,
+ * each distinct influence / required mod id).
  */
-function weightFilterBudget(args: TradeSearchArgs, raw: TradeQueryRaw): { budget: number; limit: string } {
+function weightFilterBudget(args: TradeSearchArgs): number {
   const optionFilters = (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
     + (args.sockets ? 1 : 0) + (args.links ? 1 : 0);
   // Distinct "and" ids: a required pseudo_has_<influence>_influence also named in influences is emitted once.
   const andFilters = new Set([...(args.influences ?? []).map(influenceTradeId), ...(args.requiredMods ?? []).map((m) => m.tradeId)]).size;
-  if (raw.capModel === 'complexity') {
-    const c = TRADE_COMPLEXITY;
-    const left = c.limit - c.weightGroup - c.typeFilters - c.andGroup - c.optionFilter * optionFilters - c.statFilter * andFilters;
-    return {
-      budget: left < c.reserve ? 0 : Math.floor((left - c.reserve) / c.statFilter) + 1,
-      limit: `the trade site's query complexity limit of ${c.limit}`,
-    };
-  }
-  return { budget: MAX_FILTERS - 2 - optionFilters - andFilters, limit: `${MAX_FILTERS} filters` };
+  return MAX_FILTERS - 2 - optionFilters - andFilters;
 }
 
 /** Applies weight adjustments, the filter cap (pinning adjusted filters), the min override and required mods. */
@@ -82,9 +73,9 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   }
 
   const requiredMods = args.requiredMods ?? [];
-  const { budget, limit } = weightFilterBudget(args, raw);
+  const budget = weightFilterBudget(args);
   if (pinned.length > budget) {
-    throw new UserError(`Too many weightAdjustments: ${pinned.length} filters are pinned but only ${budget} fit with the other filters (limit: ${limit}).`);
+    throw new UserError(`Too many weightAdjustments: ${pinned.length} filters are pinned but only ${budget} fit with the other filters (limit ${MAX_FILTERS}).`);
   }
   const kept = [...pinned, ...unpinned.slice(0, budget - pinned.length)].sort((a, b) => b.weight - a.weight);
   const dropped = unpinned.slice(budget - pinned.length);

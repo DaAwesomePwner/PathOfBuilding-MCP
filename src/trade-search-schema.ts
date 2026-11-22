@@ -1,17 +1,12 @@
 /** generate_trade_search / search_trade_mods: argument and bridge result types, option lists, Zod schema. */
 import { z } from 'zod';
 
-/** What the bridge's `tradeQuery` command returns (PoB's TradeQueryGenerator; on PoB <= 2.67 its 36-filter cap lifted). */
+/** What the bridge's `tradeQuery` command returns (PoB's TradeQueryGenerator, its filter cap lifted: 2.67's MAX_FILTERS, 2.68's complexity budget). */
 export interface TradeQueryRaw {
   /** The full request JSON: {query: {filters, status, stats}, sort, engine}; stats[0] is the weight group, no empty groups. */
   queryJson: string;
   pobMessage: string | null;
   capLifted: boolean;
-  /**
-   * How PoB caps the weight list: "maxFilters" = PoB <= 2.67's MAX_FILTERS count (lifted by the bridge, so the list
-   * is complete); "complexity" = PoB 2.68+'s trade-site query complexity budget (already applied by PoB).
-   */
-  capModel: 'maxFilters' | 'complexity';
   itemCategory: string | null;
   currentItem: string | null;
   statWeights: { stat: string; label: string; weight: number }[];
@@ -35,13 +30,7 @@ export interface TradeModsResult {
   }[];
 }
 
-export const MAX_FILTERS = 36; // PoB <= 2.67's MAX_FILTERS (TradeQueryGenerator.lua)
-/**
- * PoB 2.68+'s FinishQuery (TradeQueryGenerator.lua): the trade site's complexity limit per query and the costs PoB
- * charges against it (weight group, category + rarity filter, "and" group, each stat filter, each misc/price/level/
- * socket/link filter); a weight filter is only added while at least `reserve` is left.
- */
-export const TRADE_COMPLEXITY = { limit: 200, weightGroup: 54, typeFilters: 4, andGroup: 4, statFilter: 4, optionFilter: 3, reserve: 8 } as const;
+export const MAX_FILTERS = 36; // PoB 2.67's MAX_FILTERS (TradeQueryGenerator.lua); the server's cap on every PoB version
 export const DEFAULT_STAT_WEIGHTS = [{ stat: 'FullDPS', weight: 1 }, { stat: 'TotalEHP', weight: 0.5 }];
 export const TRADE_TYPES = ['securable', 'available', 'onlineleague', 'online', 'any'] as const;
 export const ELDRITCH = ['copyCurrent', 'keepRegular', 'keepRegularPresence', 'remove'] as const;
@@ -86,7 +75,7 @@ export const tradeSearchSchema = {
   includeScourge: z.boolean().optional().describe('Weigh scourge mods (default: true only in Standard/Hardcore).'),
   includeTalisman: z.boolean().optional().describe('Amulet: weigh talisman implicits (default false). Other slots accept only false.'),
   includeMirrored: z.boolean().optional().describe('Allow mirrored items (default true).'),
-  influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences.'),
+  influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences (PoB 2.68+ no longer weighs mods on an influenced copy of the item; the influence is still required).'),
   maxPrice: z.object({ amount: z.number().int().positive().max(1_000_000), currency: z.enum(CURRENCIES).optional() }).optional()
     .describe('Maximum price (currency default "chaos-equivalent").'),
   maxLevel: z.number().int().min(1).max(100).optional().describe('Maximum required level.'),
@@ -95,6 +84,6 @@ export const tradeSearchSchema = {
   requiredMods: z.array(z.object({ tradeId, min: z.number().optional() })).max(10).optional()
     .describe('Hard requirements: every listed mod must be present (with at least `min` when given).'),
   weightAdjustments: z.array(z.object({ tradeId, weight: z.number().min(-1000).max(1000) })).max(MAX_FILTERS).optional()
-    .describe('Applied after PoB computes its weights: replaces a filter\'s weight, adds a missing filter, or removes it (weight 0). Adjusted/added filters are never dropped by the filter cap. Use it e.g. to add resistance weight when PoB scores capped resists as 0 but the replaced item provided them. Single resistance/attribute ids apply to their pseudo total (e.g. pseudo.pseudo_total_fire_resistance), the filter PoB weighs them through. All/hybrid resistance and attribute ids are refused unless their weight is 0, which changes nothing (PoB leaves them out because the pseudo totals count them; adjust those totals instead).'),
+    .describe('Applied after PoB computes its weights: replaces a filter\'s weight, adds a missing filter, or removes it (weight 0). Adjusted/added filters are never dropped by the 36-filter cap. Use it e.g. to add resistance weight when PoB scores capped resists as 0 but the replaced item provided them. Single resistance/attribute ids apply to their pseudo total (e.g. pseudo.pseudo_total_fire_resistance), the filter PoB weighs them through. All/hybrid resistance and attribute ids are refused unless their weight is 0, which changes nothing (PoB leaves them out because the pseudo totals count them; adjust those totals instead).'),
   minWeightedSum: z.number().optional().describe('Override the minimum weighted sum (default: PoB\'s, half the current item\'s estimated weighted value).'),
 };

@@ -153,6 +153,10 @@ async function main(): Promise<void> {
     await expectUserError('compare_items in Graft 2', () => session.compareItems('Graft 2', [GRAFT, GRAFT]), /Graft 2.*3\.27/);
     await expectUserError('compare_items in Leg', () => session.compareItems('Leg', [VISCERA_HEAD, VISCERA_ARM]), hidden('Leg'));
     await expectUserError('compare_items in an unknown slot', () => session.compareItems('Tail', [RING, RING]), /Unknown slot/);
+    // Probe what-ifs (evaluate_changes, suggest_upgrades, ...) refuse a hidden slot per variant, as swap_item does.
+    const probed = await session.probe({ variants: [{ items: [{ slot: 'Graft 1', itemText: GRAFT }] }] });
+    assert(probed.results[0].userError === true && /Graft 1.*3\.27/.test(probed.results[0].error ?? ''),
+      `probe into a hidden slot: ${JSON.stringify(probed.results[0])}`);
     await expectUserError('nothing to undo', () => session.undoLastChange(), /[Nn]othing to undo|empty/);
     assert((await session.exportBuild('xml')) === xml0, 'refused changes must leave the export unchanged');
     assert(sameStats(await session.getStats(), stats0), 'refused changes must leave stats unchanged');

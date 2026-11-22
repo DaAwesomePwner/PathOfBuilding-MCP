@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import type { z } from 'zod';
 import type { BuildSession } from './build-session.js';
 import type { EngineManager } from './engine-manager.js';
@@ -12,9 +13,72 @@ export interface ToolSchema {
   inputSchema: Record<string, z.ZodTypeAny>;
 }
 
+/** Compact (not pretty-printed) JSON: every byte is a token for the client's model. */
 export function textResponse(payload: unknown): ToolResponse {
-  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
 }
+
+/** Never changes the build, the engine or the session: what-if, read and lookup tools. */
+const READ_ONLY: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+/** Changes the build in a way undo_last_change reverts. */
+const UNDOABLE: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+/** Replaces the build or the engine and clears undo history. */
+const REPLACES: ToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
+
+/**
+ * MCP tool annotations for every tool, by name. A tool registered without an
+ * entry gets none (server-test checks that every tool has one).
+ */
+export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
+  // Engine lifecycle
+  configure_pob_path: REPLACES,
+  reload_engine: REPLACES,
+  get_engine_info: READ_ONLY,
+  // Build lifecycle: load_build may fetch a pastebin / pobb.in link.
+  load_build: { ...REPLACES, idempotentHint: true, openWorldHint: true },
+  reset_build: { ...REPLACES, idempotentHint: true },
+  // Discards the last change; it cannot be redone.
+  undo_last_change: { ...UNDOABLE, destructiveHint: true },
+  // Committed changes (undo_last_change reverts them)
+  swap_item: UNDOABLE,
+  unequip_item: UNDOABLE,
+  set_config: UNDOABLE,
+  convert_tree_to_latest: UNDOABLE,
+  // Session-scoped stat snapshots only; the build is untouched.
+  snapshot_and_compare: { ...UNDOABLE, idempotentHint: true },
+  // Reads
+  get_stats: READ_ONLY,
+  get_skill_breakdown: READ_ONLY,
+  list_equipped_items: READ_ONLY,
+  list_valid_slots: READ_ONLY,
+  get_item_in_slot: READ_ONLY,
+  get_passive_tree: READ_ONLY,
+  list_skill_groups: READ_ONLY,
+  lookup_gem: READ_ONLY,
+  list_available_supports: READ_ONLY,
+  get_config: READ_ONLY,
+  list_scenarios: READ_ONLY,
+  export_build: READ_ONLY,
+  diagnose_build: READ_ONLY,
+  // What-if probes (the build never changes)
+  evaluate_changes: READ_ONLY,
+  compare_items: READ_ONLY,
+  simulate_passive_change: READ_ONLY,
+  find_best_next_nodes: READ_ONLY,
+  find_worst_allocated_nodes: READ_ONLY,
+  evaluate_keystone: READ_ONLY,
+  swap_gem: READ_ONLY,
+  compare_supports: READ_ONLY,
+  evaluate_gem_levels: READ_ONLY,
+  find_optimal_links: READ_ONLY,
+  simulate_scenario: READ_ONLY,
+  compare_scenarios: READ_ONLY,
+  toggle_buffs: READ_ONLY,
+  suggest_upgrades: READ_ONLY,
+  // Trade (offline: builds a search link, never contacts the trade site)
+  generate_trade_search: READ_ONLY,
+  search_trade_mods: READ_ONLY,
+};
 
 export function errorResponse(error: unknown): ToolResponse & { isError: true } {
   if (error instanceof UserError) {
@@ -61,7 +125,8 @@ export interface ToolRegistrar {
  */
 export function createToolRegistrar(server: McpServer, engine: EngineManager): ToolRegistrar {
   const register = (name: string, schema: ToolSchema, run: (args: unknown) => Promise<unknown>) => {
-    server.registerTool(name, schema, async (args: unknown) => {
+    const annotations = TOOL_ANNOTATIONS[name];
+    server.registerTool(name, annotations ? { ...schema, annotations } : schema, async (args: unknown) => {
       try {
         return toResponse(await run(args));
       } catch (error) {
