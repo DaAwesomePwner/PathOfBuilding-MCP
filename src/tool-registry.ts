@@ -82,6 +82,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   toggle_buffs: READ_ONLY,
   suggest_upgrades: READ_ONLY,
   stat_weights: READ_ONLY,
+  // Reads another build (may fetch a pastebin / pobb.in link) in a short-lived second engine.
+  compare_builds: { ...READ_ONLY, openWorldHint: true },
   // Trade (offline: builds a search link, never contacts the trade site)
   generate_trade_search: READ_ONLY,
   search_trade_mods: READ_ONLY,

@@ -1,6 +1,6 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
-import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
+import { BuildInfo, EngineCommandError, LuaBridge, Stats } from './lua-bridge.js';
 import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
 import {
   checkVariant,
@@ -293,7 +293,7 @@ export interface StatDelta {
 
 export type StatDiff = Record<string, StatDelta>;
 
-class AsyncMutex {
+export class AsyncMutex {
   private queue: Array<() => void> = [];
   private locked = false;
 
@@ -531,6 +531,16 @@ export class BuildSession {
 
   async getStats(): Promise<Stats> {
     return this.withLock(() => this.bridge.getStats());
+  }
+
+  /**
+   * compare_builds' read of the loaded build (the bridge's read-only
+   * `compareSnapshot`): build info, the given stat keys, allocated nodes,
+   * items by slot, socket groups and the config input.
+   */
+  async compareSnapshot<T>(stats: string[]): Promise<T> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first, or pass `against` to compare two other builds');
+    return this.withLock(() => this.bridge.send<T>({ cmd: 'compareSnapshot', stats }));
   }
 
   // ------------------------------------------------------------------
@@ -2389,10 +2399,14 @@ export class BuildSession {
       // Suggested mods: PoB's weighted trade query for the highest-priority slots.
       const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, focusSlots.length));
       const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
-      // A failure is recorded on its slot and the measurements are kept. A
-      // query that ended the engine (a bridge timeout kills it and counts as
-      // a crash strike) fails the call, as a crash part-way through any
-      // operation does: no further slot is queried.
+      // A failure the engine reported for its query (a UserError or an
+      // EngineCommandError: the engine answered in step) is recorded on its
+      // slot and the measurements are kept. Anything else fails the call and
+      // no further slot is queried: a query that ended the engine (a bridge
+      // timeout kills it and counts as a crash strike), as a crash part-way
+      // through any operation does, and a transport or protocol failure (a
+      // stdin write error, a reply that is not JSON), after which the next
+      // reply may not belong to the next query.
       for (const s of out.filter((x) => x.error === undefined).slice(0, modSlots)) {
         try {
           const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
@@ -2400,8 +2414,9 @@ export class BuildSession {
           s.suggestedMods = topTradeMods(raw, modsPerSlot);
         } catch (e) {
           if (!this.bridge.isRunning()) throw e;
-          const message = e instanceof Error ? e.message : String(e);
-          s.modsError = e instanceof UserError ? message : `Path of Building's trade query generator failed: ${message}`;
+          if (e instanceof UserError) s.modsError = e.message;
+          else if (e instanceof EngineCommandError) s.modsError = `Path of Building's trade query generator failed: ${e.message}`;
+          else throw e;
         }
       }
       return out;

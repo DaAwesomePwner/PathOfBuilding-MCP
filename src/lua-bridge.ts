@@ -51,6 +51,19 @@ export interface LuaBridgeOptions {
 
 const TEST_FAULTS_ENV = 'POB_MCP_TEST_FAULTS';
 
+/**
+ * An error the engine reported for one command (its JSON reply carried
+ * `error` without `userError`). The process answered in step, so the
+ * protocol is intact; transport and protocol failures (a stdin write error,
+ * a reply that is not JSON, a timeout, an exit) are plain Errors.
+ */
+export class EngineCommandError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EngineCommandError';
+  }
+}
+
 export interface Stats {
   [key: string]: number | string | boolean | null | undefined;
 }
@@ -634,7 +647,7 @@ export class LuaBridge {
         // The Lua side already strips its own source-path prefixes; this is a
         // defensive fallback for any path that slips through (nested errors).
         const cleaned = String(result.error).replace(/^[^:]*\.lua:\d+:\s*/, '');
-        pending.reject(result.userError ? new UserError(cleaned) : new Error(cleaned));
+        pending.reject(result.userError ? new UserError(cleaned) : new EngineCommandError(cleaned));
       } else {
         pending.resolve(result);
       }

@@ -283,6 +283,18 @@ async function test1Parity(): Promise<void> {
     await session.undoLastChange();
     assert((await configTables(bridge)) === tablesBefore, `apply_changes config + undo #${i + 1}: config tables differ in value or pairs() order`);
   }
+  // XML refused before it reaches PoB (truncated) keeps the build, its undo
+  // entries and the config tables they remembered: undo still puts the very
+  // tables back.
+  const truncated = occXml.slice(0, occXml.indexOf('</PathOfBuilding>'));
+  for (let i = 0; i < 5; i++) {
+    await session.applyChanges({ config: { useFrenzyCharges: true, buffOnslaught: true, conditionLowLife: true, buffElusive: true } });
+    const refused = await rejection(session.loadBuild(truncated));
+    assert(refused instanceof UserError && /Invalid Path of Building XML/.test(refused.message), `truncated XML: ${String(refused)}`);
+    assert(session.undoStackDepth() === 1, 'a refused load kept the undo entry');
+    await session.undoLastChange();
+    assert((await configTables(bridge)) === tablesBefore, `refused load between apply_changes and undo #${i + 1}: config tables differ in value or pairs() order`);
+  }
   // A config option set to the value it holds changes nothing; later restores
   // that are not this change's own (a probe fallback, a swap_item undo) leave
   // the config tables as they are.

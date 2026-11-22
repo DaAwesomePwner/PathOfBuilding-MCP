@@ -17,6 +17,7 @@ import {
   TreeEditResult,
 } from './build-session.js';
 import { registerBuildEditTools } from './build-edit-tools.js';
+import { registerCompareBuilds } from './compare-builds.js';
 import { registerEvaluateChanges } from './evaluate-changes.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
@@ -135,6 +136,7 @@ registerEngineTools(tools, engine);
 registerTradeTools(tools);
 registerStatWeights(tools);
 registerEvaluateChanges(tools);
+registerCompareBuilds(tools, engine);
 
 tools.engine<{ source: string }>(
   'load_build',

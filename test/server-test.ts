@@ -62,6 +62,7 @@ async function main(): Promise<void> {
     assert(names.includes('get_stats'), 'get_stats missing');
     assert(names.includes('get_skill_breakdown'), 'get_skill_breakdown missing');
     assert(names.includes('list_equipped_items'), 'list_equipped_items missing');
+    assert(names.includes('compare_builds'), 'compare_builds missing');
 
     log('Test 1: load_build (raw XML)');
     const loadResult = await client.callTool({
@@ -172,6 +173,8 @@ async function main(): Promise<void> {
     }
     assert(annotated.get('reset_build')?.idempotentHint === true, 'reset_build is idempotent');
     assert(annotated.get('load_build')?.openWorldHint === true, 'load_build may fetch a URL');
+    assert(annotated.get('compare_builds')?.readOnlyHint === true && annotated.get('compare_builds')?.openWorldHint === true,
+      'compare_builds is read-only and may fetch a URL');
     for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest', 'allocate_nodes', 'deallocate_nodes', 'apply_changes', 'create_socket_group', 'delete_socket_group', 'set_main_skill']) {
       assert(annotated.get(name)?.readOnlyHint === false && annotated.get(name)?.destructiveHint === false, `${name} is an undoable change`);
     }
@@ -256,6 +259,24 @@ async function main(): Promise<void> {
     assert(atBounds.results[0].error === undefined, `a variant within the bounds failed: ${atBounds.results[0].error}`);
     assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'bounds checks changed the build');
     log('PASS: oversized inputs refused');
+
+    log('Test 14: compare_builds through MCP (the loaded build against its own export)');
+    const ownCode = await text('export_build', { format: 'code' });
+    const compared = JSON.parse(await text('compare_builds', { source: ownCode })) as {
+      a: string; meta: { differs: string[] }; stats: Record<string, { a: number; b: number; delta: number }>;
+      tree: { onlyA: object; onlyB: object }; items: { changed: unknown[]; onlyA: unknown[]; onlyB: unknown[] };
+    };
+    assert(compared.a === 'loaded build' && compared.meta.differs.length === 0, `meta: ${JSON.stringify(compared.meta)}`);
+    assert(compared.stats.CombinedDPS.delta === 0 && compared.stats.Life.delta === 0, `stats: ${JSON.stringify(compared.stats)}`);
+    assert(JSON.stringify(compared.tree.onlyA) === '{}' && JSON.stringify(compared.tree.onlyB) === '{}', 'tree differs');
+    assert(compared.items.changed.length === 0 && compared.items.onlyA.length === 0 && compared.items.onlyB.length === 0, 'items differ');
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'compare_builds changed the build');
+    const badCompare = (await client.callTool({ name: 'compare_builds', arguments: { source: 'not a build' } })) as {
+      isError?: boolean; content?: ToolTextContent[];
+    };
+    const badText = badCompare.content?.[0]?.text ?? '';
+    assert(badCompare.isError === true && /^source: /.test(badText), `bad source: ${badText}`);
+    log('PASS: compare_builds');
   } finally {
     try {
       await client.close();

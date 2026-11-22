@@ -18,15 +18,18 @@
 //   7. suggest_upgrades: the first modSlots slots carry PoB trade-generator
 //      mods with numeric weights, the rest none; priority order kept; the
 //      archetype table is gone; timing logged.
-//   8. A trade query failure is recorded on its slot (measurements kept); one
-//      that ends the engine fails the call and no further slot is queried.
+//   8. A trade query failure the engine reports (EngineCommandError) is
+//      recorded on its slot (measurements kept); one that ends the engine, and
+//      a transport / protocol failure with the engine alive (a stdin write
+//      error, a reply that is not JSON), fail the call and no further slot is
+//      queried.
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { BuildSession } from '../src/build-session.js';
 import { evaluateChanges, roundStat } from '../src/evaluate-changes.js';
-import { LuaBridge } from '../src/lua-bridge.js';
+import { EngineCommandError, LuaBridge } from '../src/lua-bridge.js';
 import { compactStatWeights, computeStatWeights, DEFAULT_STAT_WEIGHT_MODS } from '../src/stat-weights.js';
 import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
@@ -214,12 +217,12 @@ async function main(): Promise<void> {
     const realSend = bridge.send.bind(bridge);
     const realRunning = bridge.isRunning.bind(bridge);
     const order = measured.map((s) => s.slot);
-    const failSlot = (slot: string, gone: boolean): void => {
+    const failSlot = (slot: string, gone: boolean, error: Error = new EngineCommandError('simulated trade query failure')): void => {
       (bridge as unknown as { send: typeof bridge.send }).send = (<T>(command: object, timeout?: number): Promise<T> => {
         const c = command as { cmd?: string; slot?: string };
         if (c.cmd === 'tradeQuery' && c.slot === slot) {
           if (gone) (bridge as unknown as { isRunning: () => boolean }).isRunning = () => false;
-          return Promise.reject(new Error('simulated trade query failure'));
+          return Promise.reject(error);
         }
         return realSend<T>(command, timeout);
       }) as typeof bridge.send;
@@ -232,27 +235,38 @@ async function main(): Promise<void> {
       assert(first.suggestedMods === undefined && /trade query generator failed: simulated/.test(first.modsError ?? ''), `failed slot: ${JSON.stringify(first)}`);
       assert(first.dpsContribution === measured[0].dpsContribution && first.ehpContribution === measured[0].ehpContribution, 'measurement kept');
       assert(failedOne.filter((s) => (s.suggestedMods?.length ?? 0) > 0).length === 2, 'the other two slots still get mods');
-      failSlot(order[0], true);
-      let queried = 0;
-      const countingSend = bridge.send;
-      (bridge as unknown as { send: typeof bridge.send }).send = (<T>(command: object, timeout?: number): Promise<T> => {
-        if ((command as { cmd?: string }).cmd === 'tradeQuery') queried++;
-        return countingSend<T>(command, timeout);
-      }) as typeof bridge.send;
-      let failedCall: unknown;
-      try {
-        await session.suggestUpgrades();
-      } catch (e) {
-        failedCall = e;
+      // The call fails, after one query, when the engine is gone and when the
+      // protocol failed with the engine alive (the next reply may not be the
+      // next query's).
+      const protocolFailures: Array<[string, boolean, Error]> = [
+        ['the engine is gone', true, new EngineCommandError('simulated trade query failure')],
+        ['a reply that is not JSON', false, new Error('Invalid JSON from Lua: {"ok":tru; simulated')],
+        ['a stdin write error', false, Object.assign(new Error('write EPIPE (simulated)'), { code: 'EPIPE' })],
+      ];
+      for (const [what, gone, error] of protocolFailures) {
+        failSlot(order[0], gone, error);
+        let queried = 0;
+        const countingSend = bridge.send;
+        (bridge as unknown as { send: typeof bridge.send }).send = (<T>(command: object, timeout?: number): Promise<T> => {
+          if ((command as { cmd?: string }).cmd === 'tradeQuery') queried++;
+          return countingSend<T>(command, timeout);
+        }) as typeof bridge.send;
+        let failedCall: unknown;
+        try {
+          await session.suggestUpgrades();
+        } catch (e) {
+          failedCall = e;
+        }
+        assert(failedCall === error, `${what}: the call fails with that error: ${String(failedCall)}`);
+        assert(queried === 1, `${what}: no slot is queried after it (${queried} queries)`);
+        (bridge as unknown as { isRunning: () => boolean }).isRunning = realRunning;
       }
-      assert(failedCall instanceof Error && /simulated trade query failure/.test(failedCall.message), `the call fails once the engine is gone: ${String(failedCall)}`);
-      assert(queried === 1, `no slot is queried after the engine is gone (${queried} queries)`);
     } finally {
       (bridge as unknown as { send: typeof bridge.send }).send = realSend;
       (bridge as unknown as { isRunning: () => boolean }).isRunning = realRunning;
     }
     assert((await state()) === before, 'build changed');
-    log('PASS: failures recorded per slot; the call fails once the engine is gone');
+    log('PASS: engine-reported failures recorded per slot; the call fails once the engine is gone or the protocol failed');
 
     console.log('\nALL STAT WEIGHTS TESTS PASSED');
   } finally {
