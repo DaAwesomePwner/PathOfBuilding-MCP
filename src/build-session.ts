@@ -1,6 +1,7 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
+import { runProbe, type ProbeRequest, type ProbeResponse } from './probe.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
 import { UserError } from './validation.js';
 
@@ -716,6 +717,25 @@ export class BuildSession {
         () => this.restoreAllUnlocked(snapshot),
       );
     });
+  }
+
+  /**
+   * Evaluate what-if variants (nodes, items, gems, config) through PoB's own
+   * calculator without changing the build (see src/probe.ts). Records nothing
+   * in the undo stack or the crash-recovery journal.
+   */
+  async probe(request: ProbeRequest): Promise<ProbeResponse> {
+    return this.withLock(() =>
+      runProbe(
+        {
+          send: (command) => this.bridge.send(command),
+          validateConfig: (options) => this.validateConfigOptionsUnlocked(options),
+          snapshot: () => this.snapshotAllUnlocked(),
+          restore: (snapshot) => this.restoreAllUnlocked(snapshot as FullSnapshot),
+        },
+        request,
+      ),
+    );
   }
 
   // ------------------------------------------------------------------
