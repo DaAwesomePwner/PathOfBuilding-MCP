@@ -4157,13 +4157,15 @@ local DISPATCH = {
 	-- Build loading / info
 	loadXML = {
 		handler = function(cmd)
-			-- Remembered config tables belong to the build being replaced (a
-			-- rejected load puts that build back from XML, as new tables).
-			ConfigTables.forgetAll()
 			local xmlText = cmd.xml or ""
 			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
 				userError("Invalid Path of Building XML")
 			end
+			-- Remembered config tables belong to the build being replaced (a
+			-- load PoB rejects puts that build back from XML, as new tables).
+			-- XML refused above never reaches PoB: the build, its tables and
+			-- the session's undo entries stay as they are, so they are kept.
+			ConfigTables.forgetAll()
 			-- Capture the current build (including unsaved mutations) so a failed
 			-- load can put the engine back exactly where the caller left it.
 			local previous = nil
@@ -4636,6 +4638,119 @@ do
 	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
 	-- apply_changes: one probe variant applied for real and kept.
 	DISPATCH.applyChanges = { handler = function(cmd) return probe.applyChanges(cmd) end }
+
+	-- compare_builds: everything the comparison of two builds reads, in one
+	-- read-only call: build info, the `stats` keys (as `probe` reads the
+	-- committed build), allocated passive nodes, items by slot, socket groups
+	-- and the config input. Changes nothing. (Helpers are locals of the
+	-- handler: the main chunk is at Lua's limit of 200 locals.)
+	DISPATCH.compareSnapshot = {
+		handler = function(cmd)
+			local stats = probe.probe({ stats = cmd.stats or statKeys }).base
+			local spec = build.spec
+			local points, ascPoints = 0, 0
+			if spec and spec.CountAllocNodes then points, ascPoints = spec:CountAllocNodes() end
+			local nodes = { }
+			for id, node in pairs(spec and spec.allocNodes or { }) do
+				local effectId = node.type == "Mastery" and spec.masterySelections and spec.masterySelections[id] or nil
+				nodes[#nodes + 1] = {
+					id = id,
+					name = node.dn,
+					type = node.type,
+					ascendancy = node.ascendancyName,
+					effect = effectId and masteryEffectText(spec, effectId) or nil,
+				}
+			end
+			table.sort(nodes, function(a, b) return a.id < b.id end)
+
+			local function modLines(item)
+				local out = { }
+				local function add(lines, tag)
+					for _, ml in ipairs(lines or { }) do
+						local active = not item.CheckModLineVariant or item:CheckModLineVariant(ml)
+						if ml.line and active then
+							local prefix = tag or (ml.crafted and "{crafted}" or (ml.fractured and "{fractured}" or ""))
+							out[#out + 1] = prefix .. stripColorCodes(ml.line)
+						end
+					end
+				end
+				add(item.enchantModLines, "{enchant}")
+				add(item.scourgeModLines, "{scourge}")
+				add(item.implicitModLines, "{implicit}")
+				add(item.explicitModLines, nil)
+				return out
+			end
+			local function socketText(item)
+				local parts = { }
+				for i, socket in ipairs(item.sockets or { }) do
+					parts[#parts + 1] = tostring(socket.color or "?")
+					local nextSocket = item.sockets[i + 1]
+					if nextSocket then parts[#parts + 1] = socket.group == nextSocket.group and "-" or " " end
+				end
+				return #parts > 0 and table.concat(parts) or nil
+			end
+			local items = { }
+			local tab = build.itemsTab
+			local function addItem(slotName, itemId, hidden)
+				local item = itemId and itemId ~= 0 and tab.items[itemId]
+				if not item then return end
+				items[#items + 1] = {
+					slot = slotName,
+					name = item.title or item.name,
+					base = item.baseName,
+					rarity = item.rarity,
+					quality = item.quality,
+					sockets = socketText(item),
+					corrupted = item.corrupted or nil,
+					hidden = hidden or nil,
+					mods = modLines(item),
+				}
+			end
+			for _, slot in ipairs(tab and tab.orderedSlots or { }) do
+				if slot.slotName then
+					addItem(slot.slotName, slot.selItemId, slotChecks.hiddenGate(slot) and true or nil)
+				end
+			end
+			-- Jewels in passive-tree sockets (part of the tree state).
+			for nodeId, itemId in pairs(spec and spec.jewels or { }) do
+				if spec.allocNodes and spec.allocNodes[nodeId] then
+					addItem("Tree jewel " .. tostring(nodeId), itemId, nil)
+				end
+			end
+
+			local groups = { }
+			for i, group in ipairs(build.skillsTab and build.skillsTab.socketGroupList or { }) do
+				local gems = { }
+				for j, gem in ipairs(group.gemList or { }) do
+					local gd = gem.gemData
+					local ge = (gd and gd.grantedEffect) or gem.grantedEffect
+					gems[j] = {
+						name = (gd and gd.name) or (ge and ge.name) or gem.nameSpec or "",
+						level = gem.level,
+						quality = gem.quality,
+						enabled = gem.enabled ~= false,
+						support = (ge and ge.support) and true or false,
+					}
+				end
+				groups[i] = {
+					label = group.label ~= "" and group.label or nil,
+					slot = group.slot ~= "" and group.slot or nil,
+					enabled = group.enabled ~= false,
+					source = group.source,
+					main = build.mainSocketGroup == i or nil,
+					gems = gems,
+				}
+			end
+			return {
+				info = getBuildInfo(),
+				stats = stats,
+				tree = { points = points, ascendancyPoints = ascPoints, nodes = nodes },
+				items = items,
+				groups = groups,
+				config = ConfigTables.fullInput(),
+			}
+		end,
+	}
 end
 
 local function dispatch(cmd)
