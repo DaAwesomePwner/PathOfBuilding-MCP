@@ -93,9 +93,11 @@ interface State {
 }
 
 async function state(session: BuildSession): Promise<State> {
-  // Stats first: reading them runs PoB's recalculation, whose output the export's PlayerStat lines carry.
-  const stats = await session.getStats();
-  return { xml: await session.exportXML(), stats };
+  // Export first: an export written before PoB recalculated carries stale
+  // PlayerStat lines (reading the stats runs the recalculation), so this
+  // order catches a change left unrecalculated.
+  const xml = await session.exportXML();
+  return { xml, stats: await session.getStats() };
 }
 
 function assertSameStats(label: string, actual: Stats, expected: Stats): void {
@@ -454,6 +456,31 @@ async function test8Faults(): Promise<void> {
     const d = await rejection(session.deallocateNodes([target.id]));
     assert(/WAS applied/.test(d.message) && !specNodes((await state(session)).xml).includes(target.id), `dealloc applied-but-failed: ${d.message}`);
     assert(session.undoStackDepth() === 1 && bridge.committedCount() === 2, 'dealloc committed too');
+  }
+  // A strict batch that fails before its handler runs (failOn_<cmd>) right
+  // after a successful one changes nothing and is not credited with the
+  // earlier change: no undo entry, no journal record, build unchanged.
+  for (const [fault, label] of [['failOn_deallocNodes', 'deallocate after allocate'], ['failOn_allocNodes', 'allocate after deallocate']] as const) {
+    const bridge = newBridge(fault);
+    const session = await primedSession(bridge);
+    const target = await twoPointNotable(bridge);
+    let failing: () => Promise<unknown>;
+    if (fault === 'failOn_deallocNodes') {
+      await session.allocateNodes([target.id]);
+      failing = () => session.deallocateNodes([target.id]);
+    } else {
+      const notable = (await session.getPassiveTree()).notables[0];
+      assert(notable, 'an allocated notable to deallocate');
+      await session.deallocateNodes([notable.id]);
+      failing = () => session.allocateNodes([target.id]);
+    }
+    const committed = await state(session);
+    const depth = session.undoStackDepth();
+    const journal = bridge.committedCount();
+    const e = await rejection(failing());
+    assert(/test fault: (de)?allocNodes failed/.test(e.message) && !/WAS applied/.test(e.message), `${label}: ${e.message}`);
+    assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, `${label}: undo/journal changed`);
+    assertSame(`${label}: build unchanged`, await state(session), committed);
   }
   {
     const bridge = newBridge('batchFailsAfterChange');

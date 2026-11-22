@@ -2508,12 +2508,17 @@ end
 -- as soon as the tree has changed, before PoB recalculates: when anything
 -- after that fails (OnFrame, the stats, a PoB error popup), the command fails
 -- but the change is in the build, and the caller reads the record
--- (treeEditApplied) to commit it. Cleared when a strict batch starts.
-nodeBatch.applied = nil
+-- (treeEditApplied, its next command) to commit it. `record` is { } once a
+-- strict batch has started and gets `applied` once the tree changed. Every
+-- other command clears it when dispatched, so the record only ever describes
+-- the command right before the read: a later batch that fails before its
+-- handler runs is reported as not started, never credited with an earlier
+-- batch's change.
+nodeBatch.record = nil
 
 function nodeBatch.recordApplied(strict, result)
 	if not strict then return end
-	nodeBatch.applied = result
+	nodeBatch.record.applied = result
 	if TEST_FAULTS.treeEditFailsAfterChange then error("test fault: tree edit failed after changing the tree", 0) end
 end
 
@@ -2527,7 +2532,7 @@ end
 -- at every step: an earlier node of the batch may have rebuilt the cluster
 -- jewel graphs.
 local function allocNodesBatch(nodeIds, strict)
-	if strict then nodeBatch.applied = nil end
+	if strict then nodeBatch.record = { } end
 	local nodes = batchNodes(nodeIds)
 	if strict then nodeBatch.strictChecks(nodes, true) end
 	local choiceParent = { }
@@ -2598,7 +2603,7 @@ end
 -- looked up by id at every step (see allocNodesBatch); one an earlier node
 -- of the batch already removed (it depended on it) is skipped.
 local function deallocNodesBatch(nodeIds, strict)
-	if strict then nodeBatch.applied = nil end
+	if strict then nodeBatch.record = { } end
 	local nodes = batchNodes(nodeIds)
 	if strict then nodeBatch.strictChecks(nodes, false) end
 	for _, node in ipairs(nodes) do
@@ -4064,11 +4069,12 @@ local DISPATCH = {
 		mutating = true,
 	},
 	treeEditApplied = {
-		-- What the last strict node batch changed, if it changed the tree; read once.
+		-- Whether the previous command ran a strict node batch, and what it
+		-- changed if it changed the tree.
 		handler = function(_cmd)
-			local applied = nodeBatch.applied
-			nodeBatch.applied = nil
-			return { applied = applied or dkjson.null }
+			local record = nodeBatch.record
+			nodeBatch.record = nil
+			return { started = record ~= nil, applied = record and record.applied or dkjson.null }
 		end,
 	},
 	restoreTreeFromList = {
@@ -4344,6 +4350,7 @@ local function dispatch(cmd)
 	if type(cmd) ~= "table" then
 		error("Command must be a JSON object")
 	end
+	if cmd.cmd ~= "treeEditApplied" then nodeBatch.record = nil end
 	local entry = DISPATCH[cmd.cmd]
 	if not entry then
 		userError("Unknown command: " .. tostring(cmd.cmd))
