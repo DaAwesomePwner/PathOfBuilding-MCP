@@ -990,12 +990,19 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   },
   async ({ slot, modSlots }, session) => {
     const suggestions = await session.suggestUpgrades(slot, { modSlots });
-    const withMods = suggestions.filter((s) => s.suggestedMods !== undefined || s.modsError !== undefined).length;
+    const tried = suggestions.filter((s) => s.suggestedMods !== undefined || s.modsError !== undefined).length;
+    const measured = suggestions.filter((s) => s.error === undefined).length;
+    let modsNote: string | undefined;
+    if (measured < suggestions.length) {
+      modsNote = 'slots that could not be measured (error) get no suggestedMods';
+    }
+    if (tried < measured) {
+      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for the first ${tried} measured slot(s) only; ` +
+        'pass slot, or a larger modSlots, for the others';
+    }
     return {
       suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest),
-      ...(withMods < suggestions.length
-        ? { modsNote: `suggestedMods computed for the first ${withMods} slot(s) only; pass slot, or a larger modSlots, for the others.` }
-        : {}),
+      ...(modsNote ? { modsNote } : {}),
     };
   },
 );

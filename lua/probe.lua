@@ -1236,7 +1236,7 @@ return function(ctx)
 		if checked.config then
 			-- The restore that follows puts the committed tables back.
 			local _, orig = applyConfig(checked.config)
-			ctx.stashCommittedConfigTables(orig, build.configTab.input)
+			ctx.stashCommittedConfigTables(cmd.configToken, orig, build.configTab.input)
 		end
 		if #checked.gems > 0 then applyGems(checked.gems) end
 		commitItems(checked.items)
@@ -1321,15 +1321,27 @@ return function(ctx)
 		local before = nodeBatch.captureAllocated()
 		edit.started()
 		if config then
+			-- Options that already hold their value change nothing: no copies.
+			local input, changes = build.configTab.input, false
+			for key, value in pairs(config) do
+				if not ctx.sameConfigValue(input[key], value) then
+					changes = true
+					break
+				end
+			end
+			if not changes then config = nil end
+		end
+		if config then
 			-- As set_config sets the options, but on copies of the config
-			-- tables (as probeCommit does), the committed ones stashed: a
-			-- rollback (ConfigTables.restoreInput) puts them back unwritten,
-			-- so their pairs() order stays; writing keys into them and
-			-- deleting them again may not keep it (the string hash seed
-			-- differs per process). The stash is cleared once everything is
-			-- applied.
+			-- tables (as probeCommit does), which stay live once the change is
+			-- committed; the committed tables are remembered unwritten under
+			-- the caller's `configToken` (stashCommittedConfigTables), so the
+			-- rollback or the undo of this change, sent with that token
+			-- (ConfigTables.restoreInput), puts them back with their pairs()
+			-- order. Writing keys into them and deleting them again may not
+			-- keep it (the string hash seed differs per process).
 			local orig = ctx.detachConfigTables(config)
-			ctx.stashCommittedConfigTables(orig, build.configTab.input)
+			ctx.stashCommittedConfigTables(cmd.configToken, orig, build.configTab.input)
 			build.configTab:BuildModList()
 			build.buildFlag = true
 		end
@@ -1361,8 +1373,6 @@ return function(ctx)
 		table.sort(extra)
 		for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
 		local result = { added = added, removed = nodeBatch.lostSince(before), allocOrder = allocOrder, gemNames = gemNames }
-		-- Applied in full: no rollback will need the committed config tables.
-		if config then ctx.stashCommittedConfigTables(nil, nil) end
 		edit.applied(result, cmd.replay == true)
 		runCallback("OnFrame")
 		return result

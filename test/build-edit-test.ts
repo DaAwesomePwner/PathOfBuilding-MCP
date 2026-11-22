@@ -122,6 +122,12 @@ interface State {
   stats: Stats;
 }
 
+/** The committed config tables by value and in pairs() order (PoB 2.67 exports them in that order). */
+async function configTables(bridge: LuaBridge): Promise<string> {
+  const res = await bridge.send<{ fingerprint: string[] }>({ cmd: 'probe', fingerprint: true });
+  return JSON.stringify(res.fingerprint.filter((line) => line.startsWith('config')));
+}
+
 async function state(session: BuildSession): Promise<State> {
   // Export first: an export written before PoB recalculated carries stale
   // PlayerStat lines, so this order catches a change left unrecalculated.
@@ -255,6 +261,7 @@ async function test1Parity(): Promise<void> {
     items: [{ slot: 'Ring 1', itemText: RING }],
   };
   let result: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+  const tablesBefore = await configTables(bridge);
   await assertParity('mixed', session, mixed, async () => {
     result = await session.applyChanges(mixed);
     return result.after;
@@ -269,6 +276,32 @@ async function test1Parity(): Promise<void> {
   assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'one undo entry, one journal record');
   await session.undoLastChange();
   assertSame('undo of the mixed variant', await state(session), base);
+  assert((await configTables(bridge)) === tablesBefore, 'undo of the mixed variant: config tables differ in value or pairs() order');
+  // Config keys added and removed again can reorder a table; undo puts the very tables back.
+  for (let i = 0; i < 5; i++) {
+    await session.applyChanges({ config: { useFrenzyCharges: true, buffOnslaught: true, conditionLowLife: true, buffElusive: true } });
+    await session.undoLastChange();
+    assert((await configTables(bridge)) === tablesBefore, `apply_changes config + undo #${i + 1}: config tables differ in value or pairs() order`);
+  }
+  // A config option set to the value it holds changes nothing; later restores
+  // that are not this change's own (a probe fallback, a swap_item undo) leave
+  // the config tables as they are.
+  const live = (await bridge.send<{ input: Record<string, unknown> }>({ cmd: 'getFullConfig' })).input;
+  const noopKey = Object.keys(live).find((k) => live[k] === true);
+  assert(noopKey, 'a config option that is on');
+  const [far1, far2] = await twoPointNotables(bridge, 2);
+  await session.applyChanges({ config: { [noopKey]: true }, allocate: [far1.id] });
+  const afterNoop = await configTables(bridge);
+  assert(afterNoop === tablesBefore, 'a no-op config option changed the config tables');
+  const fb = await session.probe({ variants: [{ deallocate: [far1.id], allocate: [far2.id] }, { deallocate: [far1.id], allocate: [far2.id], config: { usePowerCharges: true } }] });
+  assert(fb.results.every((r) => r.fallback && r.error === undefined), `fallback variants: ${JSON.stringify(fb.results.map((r) => r.error ?? r.fallbackReason))}`);
+  assert((await configTables(bridge)) === tablesBefore, 'a probe fallback after a no-op config apply_changes changed the config tables');
+  await session.swapItemWithDiff('Ring 1', RING);
+  await session.undoLastChange();
+  assert((await configTables(bridge)) === tablesBefore, 'a swap_item undo after a no-op config apply_changes changed the config tables');
+  await session.undoLastChange();
+  assertSame('undo of the no-op config variant', await state(session), base);
+  assert((await configTables(bridge)) === tablesBefore, 'undo of the no-op config variant: config tables differ');
   log('PASS 1b');
 
   log('Test 1c: undo of a main-skill gem change restores the cached main skill');

@@ -247,6 +247,13 @@ function describeTreeMismatch(report: TreeRestoreReport): string {
 
 export interface ConfigSnapshot {
   input: Record<string, unknown>;
+  /**
+   * Set on the snapshot taken around a probe fallback or an apply_changes: the
+   * engine remembered the committed config tables under this token, and only
+   * this snapshot's restore (the fallback's restore, the rollback or undo of
+   * that apply_changes) puts those very tables back.
+   */
+  token?: string;
 }
 
 export interface FullSnapshot {
@@ -749,6 +756,7 @@ export class BuildSession {
     await this.bridge.send({
       cmd: 'restoreConfig',
       input: snapshot.input,
+      ...(snapshot.token !== undefined ? { token: snapshot.token } : {}),
     });
   }
 
@@ -843,13 +851,27 @@ export class BuildSession {
   }
 
   private probeUnlocked(request: ProbeRequest): Promise<ProbeResponse> {
+    // A full-snapshot fallback runs snapshot -> probeCommit -> restore: the
+    // probeCommit carries the snapshot's config token (see ConfigSnapshot).
+    let fallbackToken: string | undefined;
     return runProbe(
       {
-        send: (command) => this.bridge.send(command),
+        send: (command) => {
+          const isCommit = (command as { cmd?: string }).cmd === 'probeCommit';
+          return this.bridge.send(isCommit && fallbackToken !== undefined ? { ...command, configToken: fallbackToken } : command);
+        },
         validateConfig: (options) => this.validateConfigOptionsUnlocked(options),
-        snapshot: () => this.snapshotAllUnlocked(),
+        snapshot: async () => {
+          const snapshot = await this.snapshotAllUnlocked();
+          fallbackToken = this.nextConfigToken();
+          snapshot.config.token = fallbackToken;
+          return snapshot;
+        },
         restore: (snapshot) => this.restoreAllUnlocked(snapshot as FullSnapshot),
-        snapshotTree: () => this.snapshotTreeUnlocked(),
+        snapshotTree: () => {
+          fallbackToken = undefined;
+          return this.snapshotTreeUnlocked();
+        },
         restoreTree: (snapshot) => this.restoreTreeUnlocked(snapshot as TreeSnapshot),
         probeThenRestore,
       },
@@ -997,6 +1019,14 @@ export class BuildSession {
       if (entry.journal !== undefined) this.bridge.truncateCommitted(entry.journal);
       return this.bridge.getStats();
     });
+  }
+
+  private configTokenSeq = 0;
+
+  /** A new token for ConfigSnapshot.token. */
+  private nextConfigToken(): string {
+    this.configTokenSeq += 1;
+    return `config-${this.configTokenSeq}`;
   }
 
   undoStackDepth(): number {
@@ -1409,11 +1439,12 @@ export class BuildSession {
       if (deallocate?.length) resolved.deallocate = await resolver.resolveAll(deallocate, 'deallocate');
       const toEngine = await checkVariant({ validateConfig: (options) => this.validateConfigOptionsUnlocked(options) }, resolved);
       const undoSnap = await this.snapshotAllUnlocked();
+      undoSnap.config.token = this.nextConfigToken();
       const entry: UndoEntry = { kind: 'full', snapshot: undoSnap };
       const before = undoSnap.stats;
       const journal = this.bridge.committedCount();
       const { res, failure } = await this.sendBuildEditUnlocked<RawApplyChanges>(
-        { cmd: 'applyChanges', variant: toEngine },
+        { cmd: 'applyChanges', variant: toEngine, configToken: undoSnap.config.token },
         entry,
         journal,
         () => this.restoreAllUnlocked(undoSnap),
@@ -2358,14 +2389,19 @@ export class BuildSession {
       // Suggested mods: PoB's weighted trade query for the highest-priority slots.
       const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, focusSlots.length));
       const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
+      // A failure is recorded on its slot and the measurements are kept. A
+      // query that ended the engine (a bridge timeout kills it and counts as
+      // a crash strike) fails the call, as a crash part-way through any
+      // operation does: no further slot is queried.
       for (const s of out.filter((x) => x.error === undefined).slice(0, modSlots)) {
         try {
           const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
           const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
           s.suggestedMods = topTradeMods(raw, modsPerSlot);
         } catch (e) {
-          if (!(e instanceof UserError)) throw e;
-          s.modsError = e.message;
+          if (!this.bridge.isRunning()) throw e;
+          const message = e instanceof Error ? e.message : String(e);
+          s.modsError = e instanceof UserError ? message : `Path of Building's trade query generator failed: ${message}`;
         }
       }
       return out;
@@ -3006,7 +3042,7 @@ export interface UpgradeSuggestion {
   priority: number;
   /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
   suggestedMods?: SuggestedMod[];
-  /** PoB's trade query generator could not weigh mods for the slot. */
+  /** PoB's trade query generator could not weigh mods for the slot (a refusal, or a failure of the generator). */
   modsError?: string;
   /** The slot could not be measured (refused as input); its contributions are 0. */
   error?: string;
