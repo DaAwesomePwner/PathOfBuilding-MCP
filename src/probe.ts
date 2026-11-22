@@ -153,8 +153,9 @@ export function validateProbeRequest(request: unknown): ProbeRequest {
  * validation (set_config's schema takes booleans, numbers and strings only,
  * so a null value is refused here too). Returns the variant to send to the
  * engine: item text normalized as swap_item sends it (a leading BOM removed).
+ * apply_changes checks its variant with it too.
  */
-async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<ProbeVariant> {
+export async function checkVariant(deps: Pick<ProbeDeps, 'validateConfig'>, variant: unknown): Promise<ProbeVariant> {
   if (!isPlainObject(variant)) throw new UserError('each variant must be an object');
   let toEngine = variant;
   if (Array.isArray(variant.items)) {

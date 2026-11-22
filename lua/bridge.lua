@@ -2522,6 +2522,36 @@ function nodeBatch.recordApplied(strict, result)
 	if TEST_FAULTS.treeEditFailsAfterChange then error("test fault: tree edit failed after changing the tree", 0) end
 end
 
+-- Committed build edits other than node batches (applyChanges in
+-- lua/probe.lua, createSocketGroup / deleteSocketGroup / setMainSkill below),
+-- in one table like nodeBatch. Each checks everything it can first, then
+-- records (`record`, read with buildEditApplied right after a failure) that
+-- it started changing the build and, once the whole change is in, what it
+-- changed (before PoB recalculates): the caller rolls a started-but-unfinished
+-- change back and commits an applied one even when the command then fails.
+-- Every other command clears the record when dispatched, as for nodeBatch.
+local buildEdit = { record = nil }
+
+function buildEdit.started()
+	buildEdit.record = buildEdit.record or { }
+end
+
+-- `replay`: the command is a crash replay of a committed edit (the test
+-- faults below never fire for one).
+function buildEdit.applied(result, replay)
+	buildEdit.started()
+	buildEdit.record.applied = result
+	if replay then return end
+	-- Test faults: the next getStats fails (PoB's recalculation after an
+	-- applied change failing too), and the command fails after the change.
+	if TEST_FAULTS.buildEditRecalcFails then buildEdit.failNextStats = true end
+	if TEST_FAULTS.buildEditFailsAfterChange then error("test fault: build edit failed after changing the build", 0) end
+end
+
+function buildEdit.testFaultMidway(replay)
+	if TEST_FAULTS.applyChangesFailsMidway and not replay then error("test fault: apply_changes failed part-way", 0) end
+end
+
 -- Returns { added, removed }: the nodes the batch added, in the order they
 -- joined the tree (each one next to the tree as it was then: PoB's path runs
 -- from the node back to the tree), and the nodes it removed (another option
@@ -3082,7 +3112,7 @@ local function getAvailableSupports(activeSkillTags, includeAwakened)
 	return result
 end
 
-local function setMainSocketGroupImpl(groupIndex)
+function buildEdit.setMainSocketGroup(groupIndex)
 	if not (build and build.skillsTab and build.skillsTab.socketGroupList) then
 		error("Skills tab not available")
 	end
@@ -3345,6 +3375,164 @@ local function restoreSkills(snap)
 		error("Skills restore was not exact (monster-explosion gem settings lost because their explosion source is gone: "
 			.. table.concat(unlinked, ", ") .. "); call reset_build to return to the loaded build", 0)
 	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Committed socket group edits (create_socket_group / delete_socket_group /
+-- set_main_skill): everything is checked before the skills change; see
+-- buildEdit above for the record.
+-- ---------------------------------------------------------------------------
+
+-- The slots PoB's socket group "Socketed in" list offers (SkillsTab's groupSlotDropList).
+buildEdit.GROUP_SLOTS = {
+	["Weapon 1"] = true, ["Weapon 2"] = true, ["Weapon 1 Swap"] = true, ["Weapon 2 Swap"] = true,
+	["Helmet"] = true, ["Body Armour"] = true, ["Gloves"] = true, ["Boots"] = true, ["Amulet"] = true,
+	["Ring 1"] = true, ["Ring 2"] = true, ["Ring 3"] = true, ["Belt"] = true,
+}
+buildEdit.MAX_GROUP_GEMS = 20
+
+function buildEdit.isInt(v, min)
+	return type(v) == "number" and v == v and v % 1 == 0 and v >= min and v < 2 ^ 31
+end
+
+function buildEdit.groupAt(index)
+	local list = skillsTabOrError().socketGroupList
+	if not buildEdit.isInt(index, 1) then userError("group must be a 1-based integer") end
+	local group = list[index]
+	if not group then
+		userError("Skill group not found at index " .. tostring(index) .. " (the build has " .. #list .. " socket groups)")
+	end
+	return group, list
+end
+
+function buildEdit.activeGemCount(group)
+	local n = 0
+	for _, gem in ipairs(group.gemList or { }) do
+		local effect = (gem.gemData and gem.gemData.grantedEffect) or gem.grantedEffect
+		if effect and not effect.support and gem.enabled ~= false then n = n + 1 end
+	end
+	return n
+end
+
+function buildEdit.describeGroup(index, group)
+	local gems = { }
+	for i, gem in ipairs(group.gemList or { }) do
+		gems[i] = { name = (gem.gemData and gem.gemData.name) or gem.nameSpec or "", level = gem.level, quality = gem.quality, enabled = gem.enabled ~= false }
+	end
+	return { index = index, label = group.displayLabel or group.label or "", slot = group.slot, enabled = group.enabled ~= false, gems = gems }
+end
+
+-- Keep the main socket group (and the Calcs tab's copy) on a valid group
+-- after group `removed` was deleted, as PoB's own delete does for indices
+-- past it; the main group itself moves to the group that took its place
+-- (the last group when it was last).
+function buildEdit.shiftMainAfterDelete(removed)
+	local count = #build.skillsTab.socketGroupList
+	local function shifted(index)
+		index = tonumber(index) or 1
+		if index > removed then index = index - 1 end
+		return math.max(1, math.min(index, count))
+	end
+	build.mainSocketGroup = shifted(build.mainSocketGroup)
+	if build.calcsTab and build.calcsTab.input and build.calcsTab.input.skill_number then
+		build.calcsTab.input.skill_number = shifted(build.calcsTab.input.skill_number)
+	end
+end
+
+-- cmd: { gems = [{ name, level?, quality?, enabled? }], slot?, label?,
+-- enabled?, setAsMain? }. The new group goes last, as PoB's "New" button
+-- puts it. Returns its index and its gems (names as PoB knows them).
+function buildEdit.createSocketGroup(cmd)
+	local tab = skillsTabOrError()
+	local specs = cmd.gems
+	if type(specs) ~= "table" or #specs == 0 then userError("gems must list at least one gem") end
+	if #specs > buildEdit.MAX_GROUP_GEMS then
+		userError("gems has " .. #specs .. " entries; at most " .. buildEdit.MAX_GROUP_GEMS .. " are allowed")
+	end
+	local gems = { }
+	for i, spec in ipairs(specs) do
+		local label = "gems[" .. i .. "]"
+		if type(spec) ~= "table" or type(spec.name) ~= "string" then userError(label .. " must be { name, level?, quality?, enabled? }") end
+		local gemData, errMsg = findGemByName(spec.name)
+		if not gemData then userError(label .. ": gem lookup failed for '" .. spec.name .. "': " .. tostring(errMsg)) end
+		if spec.level ~= nil and not buildEdit.isInt(spec.level, 1) then userError(label .. ": level must be a positive integer") end
+		if spec.quality ~= nil and not buildEdit.isInt(spec.quality, 0) then userError(label .. ": quality must be a non-negative integer") end
+		if spec.enabled ~= nil and type(spec.enabled) ~= "boolean" then userError(label .. ": enabled must be a boolean") end
+		-- As addGem / replaceSocketGroup create gems.
+		gems[i] = {
+			nameSpec = gemData.name, gemId = gemData.id, skillId = gemData.grantedEffectId,
+			level = spec.level or 20, quality = spec.quality or 0, enabled = spec.enabled ~= false,
+			enableGlobal1 = true, enableGlobal2 = true, count = 1,
+		}
+	end
+	if cmd.slot ~= nil and not buildEdit.GROUP_SLOTS[cmd.slot] then
+		userError("slot must be one of the slots a socket group can be socketed in (Weapon 1, Weapon 2, Helmet, Body Armour, Gloves, Boots, Amulet, Ring 1-3, Belt, or a weapon swap slot), got " .. tostring(cmd.slot))
+	end
+	if cmd.label ~= nil and type(cmd.label) ~= "string" then userError("label must be a string") end
+	if cmd.enabled ~= nil and type(cmd.enabled) ~= "boolean" then userError("enabled must be a boolean") end
+	if cmd.setAsMain ~= nil and type(cmd.setAsMain) ~= "boolean" then userError("setAsMain must be a boolean") end
+	local group = { label = cmd.label or "", enabled = cmd.enabled ~= false, slot = cmd.slot, gemList = gems }
+	buildEdit.started()
+	tab.socketGroupList[#tab.socketGroupList + 1] = group
+	local index = #tab.socketGroupList
+	tab:ProcessSocketGroup(group)
+	tab:UpdateSocketGroups()
+	if cmd.setAsMain then build.mainSocketGroup = index end
+	build.buildFlag = true
+	local result = { index = index, group = buildEdit.describeGroup(index, group) }
+	buildEdit.applied(result, cmd.replay == true)
+	runCallback("OnFrame")
+	result.group = buildEdit.describeGroup(index, group)
+	return result
+end
+
+-- cmd: { group }. A group granted by an item or the passive tree is refused.
+-- Later groups move up by one.
+function buildEdit.deleteSocketGroup(cmd)
+	local tab = skillsTabOrError()
+	local group = buildEdit.groupAt(cmd.group)
+	if group.source then
+		userError("Skill group " .. cmd.group .. " is granted by " .. tostring(group.source)
+			.. " and cannot be deleted; remove the item or passive node that grants it instead")
+	end
+	local deleted = buildEdit.describeGroup(cmd.group, group)
+	buildEdit.started()
+	table.remove(tab.socketGroupList, cmd.group)
+	if type(tab.RebuildImbuedSupportBySlot) == "function" then tab:RebuildImbuedSupportBySlot() end
+	if tab.displayGroup == group then tab.displayGroup = tab.socketGroupList[1] end
+	buildEdit.shiftMainAfterDelete(cmd.group)
+	build.buildFlag = true
+	local result = { deleted = deleted, mainSocketGroup = build.mainSocketGroup }
+	buildEdit.applied(result, cmd.replay == true)
+	runCallback("OnFrame")
+	return result
+end
+
+-- cmd: { group, activeSkill? }: make the group the main skill group and,
+-- with activeSkill, pick which of its active skills is the main skill.
+function buildEdit.setMainSkill(cmd)
+	pumpAndRead() -- display skill lists as of the last recalculation
+	local group = buildEdit.groupAt(cmd.group)
+	if buildEdit.activeGemCount(group) == 0 then
+		userError("Skill group " .. cmd.group .. " has no enabled active skill gem to use as the main skill")
+	end
+	if cmd.activeSkill ~= nil then
+		if not buildEdit.isInt(cmd.activeSkill, 1) then userError("activeSkill must be a 1-based integer") end
+		-- The group's skill list as PoB last built it (only for enabled or
+		-- main groups); otherwise its enabled active gems.
+		local skills = group.displaySkillList
+		local count = (type(skills) == "table" and #skills > 0) and #skills or buildEdit.activeGemCount(group)
+		if cmd.activeSkill > count then
+			userError("activeSkill " .. cmd.activeSkill .. " is out of range: skill group " .. cmd.group .. " has " .. count .. " active skill(s)")
+		end
+	end
+	buildEdit.started()
+	build.mainSocketGroup = cmd.group
+	if cmd.activeSkill ~= nil then group.mainActiveSkill = cmd.activeSkill end
+	build.buildFlag = true
+	buildEdit.applied({ mainSocketGroup = cmd.group }, cmd.replay == true)
+	runCallback("OnFrame")
+	return { mainSocketGroup = build.mainSocketGroup, activeSkill = group.mainActiveSkill or 1 }
 end
 
 -- ---------------------------------------------------------------------------
@@ -4077,6 +4265,16 @@ local DISPATCH = {
 			return { started = record ~= nil, applied = record and record.applied or dkjson.null }
 		end,
 	},
+	buildEditApplied = {
+		-- Whether the previous command (applyChanges, createSocketGroup,
+		-- deleteSocketGroup, setMainSkill) started changing the build, and
+		-- what it changed if the whole change went in.
+		handler = function(_cmd)
+			local record = buildEdit.record
+			buildEdit.record = nil
+			return { started = record ~= nil, applied = record and record.applied or dkjson.null }
+		end,
+	},
 	restoreTreeFromList = {
 		handler = function(cmd)
 			local missing = restoreTreeFromIds(cmd.nodeIds or { })
@@ -4150,8 +4348,17 @@ local DISPATCH = {
 		end,
 	},
 	setMainSocketGroup = {
-		handler = function(cmd) setMainSocketGroupImpl(cmd.groupIndex) return { } end,
+		handler = function(cmd) buildEdit.setMainSocketGroup(cmd.groupIndex) return { } end,
 		mutating = true,
+	},
+	createSocketGroup = {
+		handler = function(cmd) return buildEdit.createSocketGroup(cmd) end,
+	},
+	deleteSocketGroup = {
+		handler = function(cmd) return buildEdit.deleteSocketGroup(cmd) end,
+	},
+	setMainSkill = {
+		handler = function(cmd) return buildEdit.setMainSkill(cmd) end,
 	},
 	snapshotSkills = {
 		handler = function(_cmd) return { snapshot = snapshotSkills() } end,
@@ -4341,9 +4548,19 @@ do
 		allocNodesBatch = allocNodesBatch,
 		deallocNodesBatch = deallocNodesBatch,
 		pumpAndRead = pumpAndRead,
+		nodeBatch = nodeBatch,
+		buildEdit = buildEdit,
+		-- As the setConfig command sets options, without the recalculation.
+		setConfigInput = function(options)
+			for key, value in pairs(options) do build.configTab.input[key] = value end
+			build.configTab:BuildModList()
+			build.buildFlag = true
+		end,
 	})
 	DISPATCH.probe = { handler = function(cmd) return probe.probe(cmd) end }
 	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
+	-- apply_changes: one probe variant applied for real and kept.
+	DISPATCH.applyChanges = { handler = function(cmd) return probe.applyChanges(cmd) end }
 end
 
 local function dispatch(cmd)
@@ -4351,6 +4568,12 @@ local function dispatch(cmd)
 		error("Command must be a JSON object")
 	end
 	if cmd.cmd ~= "treeEditApplied" then nodeBatch.record = nil end
+	if cmd.cmd ~= "buildEditApplied" then buildEdit.record = nil end
+	if buildEdit.failNextStats and cmd.cmd == "getStats" then
+		-- Test fault (buildEditRecalcFails): PoB's recalculation after an applied edit fails.
+		buildEdit.failNextStats = nil
+		error("test fault: the recalculation after a build edit failed", 0)
+	end
 	local entry = DISPATCH[cmd.cmd]
 	if not entry then
 		userError("Unknown command: " .. tostring(cmd.cmd))
