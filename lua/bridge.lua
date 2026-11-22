@@ -3215,9 +3215,13 @@ local function influenceIndex(name)
 end
 
 -- PoB 2.67 and older cap the weight group with an upvalue (MAX_FILTERS);
--- 2.68 counts a trade-site complexity budget in a FinishQuery local instead.
--- Both are lifted for the call so every weight comes back; returns a
--- function that undoes the lift and reports whether it took effect.
+-- 2.68 counts a trade-site complexity budget in a FinishQuery local instead,
+-- reachable only from a debug hook. Both are lifted for the call so every
+-- weight comes back; returns a function that undoes the lift and reports
+-- whether it took effect. The line hook (which turns the JIT off while it is
+-- set) is installed only once FinishQuery has run its item calculation (at
+-- its WeightedRatioOutputs call; from the start when that is missing) and
+-- removed as soon as the local is set.
 local tradeCompat = { }
 function tradeCompat.liftFilterCap(finishQuery)
 	local maxIdx, maxOrig = findUpvalue(finishQuery, "MAX_FILTERS")
@@ -3226,8 +3230,13 @@ function tradeCompat.liftFilterCap(finishQuery)
 		return function() debug.setupvalue(finishQuery, maxIdx, maxOrig) return true end
 	end
 	local hook, mask, count = debug.gethook()
-	local lifted = false
-	debug.sethook(function()
+	local lifted, hooked = false, false
+	local function unhook()
+		if not hooked then return end
+		hooked = false
+		if hook then debug.sethook(hook, mask, count) else debug.sethook() end
+	end
+	local function onLine()
 		local info = debug.getinfo(2, "f")
 		if not (info and info.func == finishQuery) then return end
 		for i = 1, 250 do
@@ -3236,14 +3245,30 @@ function tradeCompat.liftFilterCap(finishQuery)
 			if name == "complexityBudget" then
 				debug.setlocal(2, i, 1e9)
 				lifted = true
+				unhook()
 				return
 			end
 		end
-	end, "l")
-	return function()
-		if hook then debug.sethook(hook, mask, count) else debug.sethook() end
+	end
+	local function hookNow()
+		if hooked or lifted then return end
+		hooked = true
+		debug.sethook(onLine, "l")
+	end
+	local _, class = findUpvalue(finishQuery, "TradeQueryGeneratorClass")
+	local ratio = type(class) == "table" and rawget(class, "WeightedRatioOutputs")
+	if type(ratio) ~= "function" then ratio = nil end
+	local undo = function()
+		if ratio then class.WeightedRatioOutputs = ratio end
+		unhook()
 		return lifted
 	end
+	if ratio then
+		class.WeightedRatioOutputs = function(...) hookNow() return ratio(...) end
+	else
+		hookNow()
+	end
+	return undo
 end
 
 -- PoB 2.68 hands the callback the query table (no sort/engine wrapper, empty
