@@ -28,13 +28,19 @@
 --     grants a skill (the skill's socket group exists only after a full recalc);
 --   * an item in a passive-tree jewel socket (cluster graphs / conquered
 --     nodes are rebuilt by the spec), an item granting a skill or replacing
---     one that does;
+--     one that does, or a change that may empty an off-hand or abyssal
+--     socket whose item grants one;
 --   * every variant while the party tab's "export buffs" option is on (see
 --     checkVariant).
 -- A `probe` without variants (and the classify-only pass) reads the base
 -- from the last full recalc without building a calculator; `probe` with
--- `candidates` lists the nodes the tree searches evaluate (listCandidates).
--- Gem changes on item- or tree-granted socket groups are refused.
+-- `candidates` lists the nodes the tree searches evaluate (listCandidates);
+-- `probe` with `fingerprint` returns the committed state by value, which the
+-- caller compares before and after every fallback variant, so an inexact
+-- restore of anything (not only the part a tree-only restore checks) fails.
+-- Gem changes on item- or tree-granted socket groups are refused. Gem ops:
+-- set, remove, add, and clear (every gem out of a group; followed by adds it
+-- rebuilds a group as replaceSocketGroup does).
 --
 -- Full DPS: PoB's calculator only rolls up Full DPS when the build already
 -- had a skill counted in it when the calculator was made. When it had none,
@@ -258,6 +264,22 @@ return function(ctx)
 		return nil
 	end
 
+	-- The slots a change of `slot` can empty as a side effect (applyItems'
+	-- populate step, ItemsTab:PopulateSlots): its abyssal sockets, and for a
+	-- main hand the off-hand and the off-hand's abyssal sockets.
+	local function dependentSlots(tab, slot)
+		local out = { }
+		local function addWithSockets(s)
+			if not s then return end
+			if s ~= slot then out[#out + 1] = s end
+			for _, socket in ipairs(s.abyssalSocketList or { }) do out[#out + 1] = socket end
+		end
+		addWithSockets(slot)
+		if slot.slotName == "Weapon 1" then addWithSockets(tab.slots["Weapon 2"]) end
+		if slot.slotName == "Weapon 1 Swap" then addWithSockets(tab.slots["Weapon 2 Swap"]) end
+		return out
+	end
+
 	-- Parse every item and check what can be checked against the committed
 	-- build (user errors before any change); an item whose fit depends on
 	-- another item of the same variant is checked again when it is applied.
@@ -284,6 +306,15 @@ return function(ctx)
 				reason = reason or (entry.slot .. " is a passive tree jewel socket")
 			elseif hasGrantedSkills(item) or hasGrantedSkills(current) then
 				reason = reason or ("the item for " .. entry.slot .. " or the item it replaces grants a skill")
+			else
+				-- The change may empty an off-hand or abyssal socket whose item
+				-- grants a skill (its socket group exists only after a full recalc).
+				for _, dep in ipairs(dependentSlots(tab, slot)) do
+					if hasGrantedSkills(tab.items[dep.selItemId or 0]) then
+						reason = reason or ("the change to " .. entry.slot .. " may empty " .. dep.slotName .. ", whose item grants a skill")
+						break
+					end
+				end
 			end
 		end
 		for _, p in ipairs(parsed) do
@@ -376,15 +407,15 @@ return function(ctx)
 	-- Gems
 	-- ------------------------------------------------------------------
 
-	local GEM_OPS = { set = true, remove = true, add = true }
+	local GEM_OPS = { set = true, remove = true, add = true, clear = true }
 
 	local function checkGemChange(ch, i)
 		local label = "gems[" .. i .. "]"
 		if type(ch) ~= "table" or not GEM_OPS[ch.op] then
-			userError(label .. ": op must be one of set, remove, add")
+			userError(label .. ": op must be one of set, remove, add, clear")
 		end
 		if not isInt(ch.group, 1) then userError(label .. ": group must be a 1-based integer") end
-		if ch.op ~= "add" and not isInt(ch.index, 1) then userError(label .. ": index must be a 1-based integer") end
+		if ch.op ~= "add" and ch.op ~= "clear" and not isInt(ch.index, 1) then userError(label .. ": index must be a 1-based integer") end
 		if ch.op == "add" and type(ch.name) ~= "string" then userError(label .. ": add needs a gem name") end
 		if ch.name ~= nil and type(ch.name) ~= "string" then userError(label .. ": name must be a string") end
 		for _, key in ipairs({ "level", "quality" }) do
@@ -437,7 +468,10 @@ return function(ctx)
 					order[#order + 1] = group
 				end
 				local list = group.gemList
-				if ch.op == "add" then
+				if ch.op == "clear" then
+					-- Every gem out of the group (then `add` builds a new list, as replaceSocketGroup does).
+					for j = #list, 1, -1 do list[j] = nil end
+				elseif ch.op == "add" then
 					local gemData = lookupGem(ch.name, label)
 					local newGem = {
 						nameSpec = gemData.name, gemId = gemData.id, skillId = gemData.grantedEffectId,
@@ -556,34 +590,73 @@ return function(ctx)
 	-- ------------------------------------------------------------------
 
 	local GEM_FIELDS = { "nameSpec", "gemId", "skillId", "level", "quality", "enabled", "count", "gemData", "grantedEffect" }
+	local GROUP_FIELDS = { "label", "slot", "source", "enabled", "includeInFullDPS", "mainActiveSkill", "mainActiveSkillCalcs" }
 
-	local function fingerprint()
+	-- A short hash of a string (FNV-1a, 32 bit), so item texts can be compared cheaply.
+	local function hashText(text)
+		local h = 2166136261
+		for i = 1, #text do
+			h = bit.tobit(bit.bxor(h, text:byte(i)) * 16777619)
+		end
+		return bit.tohex(h)
+	end
+
+	-- The committed state as a list of lines. By default table identities are
+	-- part of it (the probe's own data changes must put back the very same
+	-- gem, group and item objects and leave the last recalc's output alone).
+	-- With `byValue` only values count (a full snapshot/restore rebuilds
+	-- socket groups and gems as new tables and a full recalc replaces the
+	-- output): gem and group fields, item ids with a hash of their text, slot
+	-- selections, allocated nodes, socketed tree jewels, config input.
+	local function fingerprint(byValue)
 		local fp = { }
 		local function add(...)
 			local parts = { ... }
 			for i = 1, select("#", ...) do parts[i] = tostring(parts[i]) end
 			fp[#fp + 1] = table.concat(parts, "|")
 		end
-		add("mainOutput", build.calcsTab.mainOutput, "buildFlag", build.buildFlag, "mainSocketGroup", build.mainSocketGroup)
+		local function id(object)
+			return byValue and "" or object
+		end
+		if byValue then
+			add("mainSocketGroup", build.mainSocketGroup)
+		else
+			add("mainOutput", build.calcsTab.mainOutput, "buildFlag", build.buildFlag, "mainSocketGroup", build.mainSocketGroup)
+		end
 		local ids = { }
-		for id in pairs(build.spec.allocNodes) do ids[#ids + 1] = id end
+		for nodeId in pairs(build.spec.allocNodes) do ids[#ids + 1] = nodeId end
 		table.sort(ids)
 		add("nodes", table.concat(ids, ","))
+		if byValue then
+			local jewels = { }
+			for nodeId, itemId in pairs(build.spec.jewels) do jewels[#jewels + 1] = nodeId .. "=" .. tostring(itemId) end
+			table.sort(jewels)
+			add("jewels", table.concat(jewels, ","))
+		end
 		local tab = build.itemsTab
 		for _, slot in ipairs(tab.orderedSlots) do
 			local entry = tab.activeItemSet[slot.slotName]
 			add("slot", slot.slotName, slot.selItemId, entry and entry.selItemId)
 		end
 		local itemIds = { }
-		for id, item in pairs(tab.items) do itemIds[#itemIds + 1] = id .. "=" .. tostring(item) end
+		for itemId, item in pairs(tab.items) do
+			local text = byValue and hashText(tostring(item.raw)) or tostring(item)
+			itemIds[#itemIds + 1] = itemId .. "=" .. text
+		end
 		table.sort(itemIds)
 		add("items", table.concat(itemIds, ","), table.concat(tab.itemOrderList, ","))
 		for gi, group in ipairs(build.skillsTab.socketGroupList) do
-			add("group", gi, group, group.enabled, group.mainActiveSkill, #group.gemList)
+			if byValue then
+				local vals = { }
+				for k, f in ipairs(GROUP_FIELDS) do vals[k] = tostring(group[f]) end
+				add("group", gi, table.concat(vals, ","), #group.gemList)
+			else
+				add("group", gi, group, group.enabled, group.mainActiveSkill, #group.gemList)
+			end
 			for gj, gem in ipairs(group.gemList) do
 				local vals = { }
 				for k, f in ipairs(GEM_FIELDS) do vals[k] = tostring(gem[f]) end
-				add("gem", gi, gj, gem, table.concat(vals, ","))
+				add("gem", gi, gj, id(gem), table.concat(vals, ","))
 			end
 		end
 		local keys = { }
@@ -776,6 +849,9 @@ return function(ctx)
 	function M.probe(cmd)
 		flushPendingRecalc()
 		if cmd.candidates ~= nil then return M.listCandidates(cmd) end
+		-- `fingerprint`: the committed state by value (see fingerprint), which
+		-- the caller compares before and after a fallback variant's restore.
+		if cmd.fingerprint then return { fingerprint = fingerprint(true) } end
 		local keys = statKeyList(cmd.stats)
 		local variants = cmd.variants
 		if variants == nil then variants = { } end

@@ -6,10 +6,21 @@
 // path from the allocated tree) or `deallocate: [id]` (the node together with
 // every node that depends on it). Variants go through PoB's own calculator;
 // the few that need a full recalculation (cluster jewel nodes, jewel sockets
-// holding a jewel, skill-granting nodes) are capped at MAX_SEARCH_FALLBACKS
-// per search, cheapest first, and the rest are reported as skipped. The
-// build never changes; nothing is pushed to the undo stack or the journal.
-// Callers hold the session lock.
+// holding a jewel, skill-granting nodes, and in find_worst_allocated_nodes
+// nodes whose dependents include such a socket) are capped at
+// MAX_SEARCH_FALLBACKS per search, in the order most likely to matter for the
+// ranking, and the rest are reported as skipped:
+//   * find_best_next_nodes: the cheapest paths first;
+//   * find_worst_allocated_nodes: the calculator candidates are evaluated
+//     first; a slow candidate's removal also removes every evaluated
+//     candidate among its dependents (with their own dependents), so the
+//     largest of their losses estimates how much it loses at least. The
+//     lowest estimate per refunded point (or in total, for rankBy "total")
+//     goes first, the larger refund on ties: a travel path to a socketed
+//     jewel (little lost, many points back) before a node near the class
+//     start whose removal takes most of the tree.
+// The build never changes; nothing is pushed to the undo stack or the
+// journal. Callers hold the session lock.
 
 import type { Stats } from './lua-bridge.js';
 import { MAX_PROBE_VARIANTS, type ProbeRequest, type ProbeResponse, type ProbeVariant, type ProbeVariantResult } from './probe.js';
@@ -18,8 +29,8 @@ import { toNumber } from './stat-values.js';
 export type RankBy = 'perPoint' | 'total';
 export const DEFAULT_MAX_POINTS = 3;
 export const MAX_MAX_POINTS = 10;
-/** Candidates needing a full recalculation (~0.2-0.5 s each) evaluated per search, so a search stays within a few seconds. */
-export const MAX_SEARCH_FALLBACKS = 6;
+/** Candidates needing a full recalculation (~0.1-0.3 s each) evaluated per search, so a search stays within a few seconds. */
+export const MAX_SEARCH_FALLBACKS = 8;
 /** Removed nodes listed per find_worst_allocated_nodes ranking (removedNodeCount has them all). */
 const MAX_LISTED_NODES = 25;
 
@@ -53,6 +64,10 @@ export interface NodeRanking {
 export interface SkippedNode {
   nodeId: number;
   nodeName: string;
+  /** Points the node's variant would add (find_best_next_nodes) or refund (find_worst_allocated_nodes). */
+  points: number;
+  /** find_worst_allocated_nodes: the largest loss among the evaluated nodes its removal also removes (about the least it would lose). */
+  minLossEstimate?: number;
   reason: string;
 }
 
@@ -96,16 +111,23 @@ async function listCandidates(
   return { candidates, refs: (ids) => ids.map((id) => ({ id, name: names.get(id) ?? '' })) };
 }
 
-/** Keep every calculator candidate and the MAX_SEARCH_FALLBACKS cheapest fallback ones. */
-function capFallbacks(candidates: Candidate[]): { kept: Candidate[]; skipped: SkippedNode[] } {
-  const slow = candidates.filter((c) => c.fallback !== undefined).sort((a, b) => a.points - b.points || a.id - b.id);
-  const dropped = new Set(slow.slice(MAX_SEARCH_FALLBACKS));
+/**
+ * Split the fallback candidates, already in priority order, into the first
+ * MAX_SEARCH_FALLBACKS (evaluated) and the rest (reported as skipped).
+ */
+function capFallbacks(
+  slow: Candidate[],
+  which: string,
+  estimate?: (c: Candidate) => number,
+): { kept: Candidate[]; skipped: SkippedNode[] } {
   return {
-    kept: candidates.filter((c) => !dropped.has(c)),
-    skipped: [...dropped].map((c) => ({
+    kept: slow.slice(0, MAX_SEARCH_FALLBACKS),
+    skipped: slow.slice(MAX_SEARCH_FALLBACKS).map((c) => ({
       nodeId: c.id,
       nodeName: c.name,
-      reason: `needs a full recalculation (${c.fallback}); at most ${MAX_SEARCH_FALLBACKS} such nodes, the cheapest, are evaluated per call`,
+      points: c.points,
+      ...(estimate ? { minLossEstimate: estimate(c) } : {}),
+      reason: `needs a full recalculation (${c.fallback}); at most ${MAX_SEARCH_FALLBACKS} such nodes, ${which}, are evaluated per call`,
     })),
   };
 }
@@ -167,8 +189,13 @@ export interface BestNodesOptions {
 
 /** Unallocated nodes whose path costs at most maxPoints, ranked by gain per point (or total gain). */
 export async function findBestNextNodes(deps: TreeSearchDeps, opts: BestNodesOptions): Promise<TreeSearchResult> {
-  const { candidates, refs } = await listCandidates(deps, 'allocate', opts.maxPoints);
-  const { kept, skipped } = capFallbacks(candidates.filter((c) => opts.includeJewelSockets || c.type !== 'Socket'));
+  const { candidates: all, refs } = await listCandidates(deps, 'allocate', opts.maxPoints);
+  const candidates = all.filter((c) => opts.includeJewelSockets || c.type !== 'Socket');
+  const slow = candidates.filter((c) => c.fallback !== undefined).sort((a, b) => a.points - b.points || a.id - b.id);
+  const capped = capFallbacks(slow, 'those with the fewest points');
+  const keptSlow = new Set(capped.kept);
+  const kept = candidates.filter((c) => c.fallback === undefined || keptSlow.has(c));
+  const skipped = capped.skipped;
   const { base, results } = await evaluate(deps, kept.map((c) => ({ allocate: [c.id] })), opts.optimizeFor);
   const baseValue = toNumber(base[opts.optimizeFor]);
   const rankings: NodeRanking[] = [];
@@ -207,9 +234,38 @@ export interface WorstNodesOptions {
 /** Allocated nodes ranked by the loss of removing each with its dependents, per refunded point (or in total). */
 export async function findWorstAllocatedNodes(deps: TreeSearchDeps, opts: WorstNodesOptions): Promise<TreeSearchResult> {
   const { candidates, refs } = await listCandidates(deps, 'deallocate');
-  const { kept, skipped } = capFallbacks(candidates);
-  const { base, results } = await evaluate(deps, kept.map((c) => ({ deallocate: [c.id] })), opts.optimizeFor);
-  const baseValue = toNumber(base[opts.optimizeFor]);
+  const fast = candidates.filter((c) => c.fallback === undefined);
+  const fastRun = await evaluate(deps, fast.map((c) => ({ deallocate: [c.id] })), opts.optimizeFor);
+  const baseValue = toNumber(fastRun.base[opts.optimizeFor]);
+
+  // Slow candidates, most promising first (see the header).
+  const knownLoss = new Map<number, number>();
+  fast.forEach((c, i) => {
+    const r = fastRun.results[i];
+    if (r.error === undefined) knownLoss.set(c.id, baseValue - toNumber(r.stats[opts.optimizeFor]));
+  });
+  const estimate = (c: Candidate): number => {
+    let est = -Infinity;
+    for (const id of c.nodes) {
+      const loss = knownLoss.get(id);
+      if (loss !== undefined && loss > est) est = loss;
+    }
+    return est === -Infinity ? 0 : est;
+  };
+  const estimates = new Map(candidates.filter((c) => c.fallback !== undefined).map((c) => [c, estimate(c)]));
+  const key = (c: Candidate): number => (opts.rankBy === 'total' ? estimates.get(c)! : perPoint(estimates.get(c)!, c.points));
+  const slow = [...estimates.keys()].sort((a, b) => key(a) - key(b) || b.points - a.points || a.id - b.id);
+  const { kept: keptSlow, skipped } = capFallbacks(
+    slow,
+    `those whose evaluated dependents lose the least${opts.rankBy === 'total' ? '' : ' per refunded point'}`,
+    (c) => estimates.get(c)!,
+  );
+  const slowRun = keptSlow.length > 0
+    ? await evaluate(deps, keptSlow.map((c) => ({ deallocate: [c.id] })), opts.optimizeFor)
+    : { base: fastRun.base, results: [] };
+  const kept = [...fast, ...keptSlow];
+  const results = [...fastRun.results, ...slowRun.results];
+
   const rankings: NodeRanking[] = [];
   kept.forEach((c, i) => {
     const r = results[i];

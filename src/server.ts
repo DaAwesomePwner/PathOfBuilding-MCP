@@ -9,6 +9,7 @@ import type { Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
 import { registerTradeTools } from './trade-search.js';
 import { createToolRegistrar } from './tool-registry.js';
+import { DEFAULT_LINK_POOL, EXHAUSTIVE_BUDGET, MAX_COMBINATIONS } from './link-search.js';
 import { DEFAULT_MAX_POINTS, MAX_MAX_POINTS, MAX_SEARCH_FALLBACKS } from './tree-search.js';
 import { UserError, validateBuildSource, validateItemText, validateSlot } from './validation.js';
 
@@ -417,7 +418,7 @@ tools.engine<{
   'find_best_next_nodes',
   {
     description:
-      "Rank unallocated passive nodes by how much allocating each one (together with its cheapest path from the allocated tree, as clicking it in PoB does) improves the chosen stat. Every node whose path costs at most `maxPoints` points is evaluated through Path of Building's own calculator (a few seconds; the build never changes); ascendancy nodes, masteries and class starts are skipped, jewel sockets unless `includeJewelSockets`. Each ranking gives `pointsCost`, `delta` (total change of the stat), `deltaPerPoint`, the `path` (node ids and names, tree side first, the node last) and `tradeoffs` (losses in the other kind of stat). `rankBy: \"perPoint\"` (default) ranks by delta per point, `\"total\"` by delta. Nodes that need a full recalculation (cluster jewel nodes, jewel sockets holding a jewel, skill-granting nodes) are capped at the " + MAX_SEARCH_FALLBACKS + " cheapest per call and the rest listed in `skipped`.",
+      "Rank unallocated passive nodes by how much allocating each one (together with its cheapest path from the allocated tree, as clicking it in PoB does) improves the chosen stat. Every node whose path costs at most `maxPoints` points is evaluated through Path of Building's own calculator (a few seconds; the build never changes); ascendancy nodes, masteries and class starts are skipped, jewel sockets unless `includeJewelSockets`. Each ranking gives `pointsCost`, `delta` (total change of the stat), `deltaPerPoint`, the `path` (node ids and names, tree side first, the node last) and `tradeoffs` (losses in the other kind of stat). `rankBy: \"perPoint\"` (default) ranks by delta per point, `\"total\"` by delta. Nodes that need a full recalculation (cluster jewel nodes, jewel sockets holding a jewel, skill-granting nodes) are capped at the " + MAX_SEARCH_FALLBACKS + " with the fewest points per call; any others are not ranked and are listed in `skipped` (with their points and the reason).",
     inputSchema: {
       count: z.number().int().positive().max(50).optional().describe('Top-N to return (default 10).'),
       optimizeFor: z
@@ -463,7 +464,7 @@ tools.engine<{ count?: number; optimizeFor?: string; rankBy?: 'perPoint' | 'tota
   'find_worst_allocated_nodes',
   {
     description:
-      "Find the least valuable allocated passive nodes: each allocated node (normal, notable, keystone, or empty jewel socket; not ascendancy nodes, masteries or class starts) is removed together with every node that depends on it (as deallocating it in PoB does) and evaluated through Path of Building's own calculator (a few seconds; the build never changes). Each ranking gives `lossIfRemoved` (drop of the stat), `pointsRefunded`, `lossPerPoint`, and `removedNodes` (ids and names, the node first; at most 25 listed, `removedNodeCount` has the total). `rankBy: \"perPoint\"` (default) lists the lowest loss per refunded point first, `\"total\"` the lowest total loss. Nodes that need a full recalculation (removing a jewel socket that holds a jewel, cluster jewel nodes) are capped at the " + MAX_SEARCH_FALLBACKS + " cheapest per call and the rest listed in `skipped`.",
+      "Find the least valuable allocated passive nodes: each allocated node (normal, notable, keystone, or empty jewel socket; not ascendancy nodes, masteries or class starts) is removed together with every node that depends on it (as deallocating it in PoB does) and evaluated through Path of Building's own calculator (a few seconds; the build never changes). Each ranking gives `lossIfRemoved` (drop of the stat), `pointsRefunded`, `lossPerPoint`, and `removedNodes` (ids and names, the node first; at most 25 listed, `removedNodeCount` has the total). `rankBy: \"perPoint\"` (default) lists the lowest loss per refunded point first, `\"total\"` the lowest total loss. Jewel sockets holding a jewel are never candidates themselves. Nodes whose removal needs a full recalculation (cluster jewel nodes, skill-granting nodes, and nodes whose dependents include a jewel socket holding a jewel) are evaluated after the others and capped at the " + MAX_SEARCH_FALLBACKS + " most promising per call: lowest `minLossEstimate` (the largest loss among the evaluated nodes their removal also removes) per refunded point (in total for `rankBy: \"total\"`). Any others are not ranked and are listed in `skipped` with their points, estimate and reason.",
     inputSchema: {
       count: z.number().int().positive().max(50).optional().describe('Top-N to return (default 10).'),
       optimizeFor: z
@@ -575,7 +576,7 @@ tools.engine<{ skillGroupIndex: number; gemIndex: number; newGemName: string; le
   'swap_gem',
   {
     description:
-      'Temporarily swap a single gem in a skill group and return the stat diff. The original gem is restored after the call. Does NOT push undo (no permanent mutation).',
+      "Swap a single gem in a skill group (as PoB does: the new gem keeps the old one's level and quality unless given) and return the stat diff, evaluated through Path of Building's own calculator in milliseconds; the build never changes and nothing is pushed to undo. An unknown gem or bad index is an error.",
     inputSchema: {
       skillGroupIndex: z.number().int().positive().describe('1-based index from list_skill_groups.'),
       gemIndex: z.number().int().positive().describe('1-based index of the gem within the group.'),
@@ -594,7 +595,7 @@ tools.engine<{ skillGroupIndex: number; candidates: string[] }>(
   'compare_supports',
   {
     description:
-      'Identify the weakest enabled support in a skill group (by simulating its removal) and rank candidate replacements by resulting DPS. Build is restored after.',
+      "Identify the weakest enabled support in a skill group (the smallest CombinedDPS loss when removed) and rank candidate replacements (each at level 20 / quality 20 in its place) by resulting DPS, evaluated through Path of Building's own calculator in milliseconds; the build never changes. A candidate PoB refuses (e.g. an unknown gem name) is listed with its `error` and null `dps` / `dpsDelta`, after the others.",
     inputSchema: {
       skillGroupIndex: z.number().int().positive().describe('1-based index of the skill group.'),
       candidates: z
@@ -613,7 +614,7 @@ tools.engine<{ skillGroupIndex: number; gemIndex: number; levels?: number[] }>(
   'evaluate_gem_levels',
   {
     description:
-      'Show how DPS scales with gem level for a specific gem. Default tests the current level ±1 through +4 (capped at 24); pass `levels` to override.',
+      "Show how DPS scales with gem level for a specific gem, evaluated through Path of Building's own calculator in milliseconds (the build never changes). Default tests the current level -1 through +4 (capped at 24); pass `levels` to override. A level PoB refuses has its `error` and null `dps` / `dpsDelta`.",
     inputSchema: {
       skillGroupIndex: z.number().int().positive().describe('1-based skill group index.'),
       gemIndex: z.number().int().positive().describe('1-based gem index within the group.'),
@@ -633,7 +634,7 @@ tools.engine<{ activeSkill: string; availableSlots: number; constraints?: string
   'find_optimal_links',
   {
     description:
-      'Find an optimal support gem combination for an active skill. Heuristic: rank supports individually, take top N, then try swap-with-next to detect synergies. The MAIN skill group is mutated and restored. May take 30-90 seconds.',
+      "Find the best support gem combination for an active skill in the main skill group (its gems are replaced by the active skill, the locked `constraints` and the candidates, all at level 20 / quality 20), evaluated through Path of Building's own calculator; the build never changes. Every eligible support (PoB's supports for the skill's tags, no Awakened gems) is scored alone, then combinations of the best `topN` are searched: exhaustively when they fit the budget (" + EXHAUSTIVE_BUDGET + " combinations), otherwise exhaustively over the best singles the budget allows and then improved by pairwise swaps with the rest of the pool (at most " + MAX_COMBINATIONS + " combinations in all). About 1-3 seconds for a 6-link. Returns `bestCombination`, `bestDPS`, `baselineDPS` (the build as it is) and `dpsDelta`, the `mainGroup` replaced, `singleSupportDPS` (the pool), `topAlternatives`, and `search` (method, supports and combinations evaluated, skipped supports).",
     inputSchema: {
       activeSkill: z.string().min(1).describe('Active skill gem name (e.g. "Vortex").'),
       availableSlots: z
@@ -646,7 +647,7 @@ tools.engine<{ activeSkill: string; availableSlots: number; constraints?: string
         .array(z.string().min(1))
         .optional()
         .describe('Support gems that MUST be included.'),
-      topN: z.number().int().min(5).max(40).optional().describe('Pool size for single-support phase (default 25).'),
+      topN: z.number().int().min(5).max(40).optional().describe(`Number of best single supports the combination search draws from (default ${DEFAULT_LINK_POOL}).`),
     },
   },
   async ({ activeSkill, availableSlots, constraints, topN }, session) => {
@@ -709,7 +710,7 @@ tools.engine<{ scenario: string }>(
   'simulate_scenario',
   {
     description:
-      "Temporarily apply a named combat scenario preset (e.g. 'mapping', 'pinnacle_boss') and return the stat diff vs the current config. Build state is fully restored after.",
+      "Apply a named combat scenario preset (e.g. 'mapping', 'pinnacle_boss') as set_config would and return the stat diff vs the current config, evaluated through Path of Building's own calculator in milliseconds; the build never changes.",
     inputSchema: {
       scenario: z
         .enum(SCENARIO_NAMES)
@@ -732,7 +733,7 @@ tools.engine<{ scenarios: string[] }>(
   'compare_scenarios',
   {
     description:
-      'Compare 2-6 named scenarios side-by-side. Each scenario is simulated independently with config restore between them. Returns baseline stats plus one entry per scenario with its diff.',
+      "Compare 2-6 named scenarios side-by-side, each applied on its own to the current config and evaluated through Path of Building's own calculator in one call (milliseconds; the build never changes). Returns baseline stats plus one entry per scenario with its key deltas and stats; a scenario PoB refuses has an `error` instead.",
     inputSchema: {
       scenarios: z
         .array(z.enum(SCENARIO_NAMES))
@@ -743,12 +744,11 @@ tools.engine<{ scenarios: string[] }>(
   },
   async ({ scenarios }, session) => {
     const result = await session.compareScenarios(scenarios);
-    const rows = result.scenarios.map((s) => ({
-      scenario: s.scenario,
-      description: s.description,
-      keyDeltas: keyDeltas(s.diff),
-      keyStats: keyStats(s.after),
-    }));
+    const rows = result.scenarios.map((s) =>
+      s.after && s.diff
+        ? { scenario: s.scenario, description: s.description, keyDeltas: keyDeltas(s.diff), keyStats: keyStats(s.after) }
+        : { scenario: s.scenario, description: s.description, error: s.error ?? 'refused' },
+    );
     return { baseline: keyStats(result.baseline), scenarios: rows };
   },
 );
@@ -757,7 +757,7 @@ tools.engine<{ buffs: Record<string, boolean | number | string> }>(
   'toggle_buffs',
   {
     description:
-      'Temporarily toggle individual buffs / charges and return the stat impact. Build state is restored after. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks, unholyMight; raw PoB config keys also accepted.',
+      "Toggle individual buffs / charges (as config options) and return the stat impact, evaluated through Path of Building's own calculator in milliseconds; the build never changes. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks, unholyMight; raw PoB config keys also accepted.",
     inputSchema: {
       buffs: z
         .record(z.string(), z.union([z.boolean(), z.number(), z.string()]))
