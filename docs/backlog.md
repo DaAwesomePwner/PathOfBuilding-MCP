@@ -164,9 +164,13 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
 - **`find_optimal_links`.** Locked-support skill types are applied until nothing
   changes; PoB checks supports once in group order, so a rare locked-support
   order can differ. Legacy Item Quantity support is not filtered (adds no DPS).
-- **Node names shared by several nodes** (`"Strength"`, ...) resolve to one of
-  them in `simulate_passive_change` and `evaluate_changes` (`evaluate_changes`
-  prefers an allocated node for `deallocate`); ids are exact.
+- ~~**Node names shared by several nodes**~~ **Fixed.** `simulate_passive_change`
+  and `evaluate_changes` resolve a name among the nodes the change can apply to
+  (unallocated ones to allocate, allocated ones to deallocate) and refuse a name
+  several of them share with their ids. Left: the name index covers allocated
+  nodes and unallocated nodes a path reaches; a name only found outside it
+  (an unallocated ascendancy node, say) still goes to `getNodeInfo`, which
+  returns one node.
 
 ## Tests and CI
 

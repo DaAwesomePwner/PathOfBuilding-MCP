@@ -4,7 +4,7 @@
 // the build and nothing is pushed to undo.
 
 import { z } from 'zod';
-import type { BuildSession, NamedProbeVariant } from './build-session.js';
+import { MAX_NODE_NAMES, type BuildSession, type NamedProbeVariant } from './build-session.js';
 import type { Stats } from './lua-bridge.js';
 import { MAX_FALLBACK_VARIANTS, MAX_PROBE_VARIANTS, type ProbeVariantResult } from './probe.js';
 import type { ToolRegistrar } from './tool-registry.js';
@@ -14,6 +14,13 @@ export const DEFAULT_EVALUATE_STATS = [
   'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist',
 ];
 export const MAX_EVALUATE_STATS = 50;
+/** Per-variant input bounds. */
+export const MAX_VARIANT_NODES = 50;
+export const MAX_VARIANT_ITEMS = 10;
+export const MAX_VARIANT_GEMS = 20;
+export const MAX_VARIANT_CONFIG_KEYS = 50;
+export const MAX_ITEM_TEXT = 10_000;
+export const MAX_LABEL = 100;
 
 export interface EvaluateChangesVariant extends NamedProbeVariant {
   label?: string;
@@ -160,21 +167,23 @@ const gemChange = z.discriminatedUnion('op', [
 ]);
 
 const variantSchema = z.object({
-  label: z.string().max(200).optional().describe('Your name for the variant, echoed back.'),
-  allocate: z.array(nodeRef).optional().describe('Passive nodes to allocate (names or ids), each with its path from the allocated tree.'),
-  deallocate: z.array(nodeRef).optional().describe('Allocated passive nodes to remove (names or ids), each with the nodes depending on it.'),
+  label: z.string().max(MAX_LABEL).optional().describe('Your name for the variant, echoed back.'),
+  allocate: z.array(nodeRef).max(MAX_VARIANT_NODES).optional().describe('Passive nodes to allocate (names or ids), each with its path from the allocated tree.'),
+  deallocate: z.array(nodeRef).max(MAX_VARIANT_NODES).optional().describe('Allocated passive nodes to remove (names or ids), each with the nodes depending on it.'),
   items: z
     .array(
       z.object({
         slot: z.string().min(1),
-        itemText: z.string().min(1).optional(),
+        itemText: z.string().min(1).max(MAX_ITEM_TEXT).optional(),
         unequip: z.literal(true).optional(),
       }),
     )
+    .max(MAX_VARIANT_ITEMS)
     .optional()
     .describe('{ slot, itemText } (PoB "Copy item" text) equips as swap_item would; { slot, unequip: true } empties the slot.'),
   gems: z
     .array(gemChange)
+    .max(MAX_VARIANT_GEMS)
     .optional()
     .describe(
       'Gem changes in order (group/index are 1-based, as in list_skill_groups / get_skill_breakdown; an index refers to the group as it is when that change applies): ' +
@@ -182,6 +191,9 @@ const variantSchema = z.object({
     ),
   config: z
     .record(z.string(), z.union([z.boolean(), z.number(), z.string()]))
+    .refine((options) => Object.keys(options).length <= MAX_VARIANT_CONFIG_KEYS, {
+      message: `at most ${MAX_VARIANT_CONFIG_KEYS} config keys per variant`,
+    })
     .optional()
     .describe('Config options as set_config takes them (e.g. {"enemyIsBoss":"Pinnacle"}).'),
 });
@@ -200,7 +212,8 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
         'Returns `base` (the requested stats now), then `results` sorted by the change of `rankBy` (default CombinedDPS, `order` desc): ' +
         'each row has `index` (position in `variants`), `label`, `value` (the variant\'s rankBy stat), `delta` (change of every requested stat, null when not a number), ' +
         '`pointsAdded` / `pointsRemoved` for node changes, and `fallback`. A refused variant (unknown node or gem, item that does not fit, bad config) is listed after the others with its `error`; the call still succeeds. ' +
-        'Numbers are rounded to 2 decimals (4 significant digits below 1). A node name several nodes share resolves to one of them (deallocate prefers an allocated one); pass ids to be exact.',
+        'Numbers are rounded to 2 decimals (4 significant digits below 1). A node name resolves among the nodes the change can apply to (unallocated ones for allocate, allocated ones for deallocate); a name several of them share (e.g. "Strength") refuses that variant with the candidate ids, so pass ids for those. ' +
+        `Per variant: at most ${MAX_VARIANT_NODES} nodes in each of allocate / deallocate, ${MAX_VARIANT_ITEMS} items, ${MAX_VARIANT_GEMS} gem changes, ${MAX_VARIANT_CONFIG_KEYS} config keys; at most ${MAX_NODE_NAMES} different node names per call.`,
       inputSchema: {
         variants: z.array(variantSchema).min(1).max(MAX_PROBE_VARIANTS).describe('The variants to evaluate, each on its own against the current build.'),
         stats: z

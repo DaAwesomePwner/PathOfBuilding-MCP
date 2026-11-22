@@ -58,8 +58,8 @@ Three layers, three responsibilities:
 - `compare_items` — test 2-5 candidate items in a slot non-destructively (tens of milliseconds). Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`; a candidate that does not fit or parse gets its own `error`.
 
 ### Passive tree (6)
-- `get_passive_tree` — point counts and class info, keystones and notables with their stats, and every allocated node (id, name, type); `detail: "full"` adds every node's stats and flags.
-- `simulate_passive_change` — temporarily allocate/deallocate by node ID or name (allocating takes the node's path with it, deallocating its dependents). Validates connectivity. Always restored.
+- `get_passive_tree` — point counts and class info, keystones and notables with their stats, and every allocated node (id, name, type; masteries with their chosen effect); `detail: "full"` adds every node's stats and flags.
+- `simulate_passive_change` — temporarily allocate/deallocate by node ID or name (allocating takes the node's path with it, deallocating its dependents). Validates connectivity. Always restored. A name several candidate nodes share (e.g. "Strength") is refused with their ids; pass the id.
 - `find_best_next_nodes` — evaluates every unallocated node whose path from your tree costs at most `maxPoints` points (default 3, up to 10), so a notable two travel nodes away is found too, and ranks by gain per point (`rankBy: "perPoint"`, default) or total gain (`"total"`) of your chosen stat (Life, CombinedDPS, TotalEHP, etc.). Each result lists its `pointsCost` and `path`. ~2s on a typical end-game build (~0.4s with `maxPoints: 1`).
 - `find_worst_allocated_nodes` — finds your least valuable allocated nodes: normal, notable, keystone and empty jewel sockets, each removed together with the nodes that depend on it (so the tree stays connected), ranked by loss per refunded point (default) or total loss. Skips ascendancy nodes and masteries. Nodes whose removal needs a full recalculation (cluster jewel nodes, skill-granting nodes, nodes whose dependents include a socketed jewel) are capped at the most promising few per call; the rest are listed in `skipped`. ~2-3s.
 - `evaluate_keystone` — toggle any keystone (adding it takes its path), return full stat diff.
@@ -192,7 +192,7 @@ The reply is one compact table, sorted by the CombinedDPS change (on the OccVort
  {"index":4,"label":"power charges","value":975099.75,"delta":{"CombinedDPS":0,"TotalEHP":0,"Life":0}}]}
 ```
 
-Nothing was changed. To keep a winner, commit items with `swap_item` / `unequip_item` and config with `set_config` (each undoable); passive-tree and gem changes are made in Path of Building itself. Rank by something else with `rankBy: "TotalEHP"` (`order: "asc"` puts the smallest first). A variant PoB refuses (unknown node or gem, an item that does not fit the slot, a bad config key) comes back last with its `error` instead of failing the call.
+Nothing was changed. To keep a winner, commit items with `swap_item` / `unequip_item` and config with `set_config` (each undoable); passive-tree and gem changes are made in Path of Building itself. Rank by something else with `rankBy: "TotalEHP"` (`order: "asc"` puts the smallest first). A variant PoB refuses (unknown node or gem, a node name several nodes share, an item that does not fit the slot, a bad config key) comes back last with its `error` instead of failing the call.
 
 To shop for an upgrade on the trade site:
 
