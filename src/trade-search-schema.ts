@@ -74,7 +74,7 @@ export const tradeSearchSchema = {
   includeScourge: z.boolean().optional().describe('Weigh scourge mods (default: true only in Standard/Hardcore).'),
   includeTalisman: z.boolean().optional().describe('Amulet: weigh talisman implicits (default false). Other slots accept only false.'),
   includeMirrored: z.boolean().optional().describe('Allow mirrored items (default true).'),
-  influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences.'),
+  influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences (PoB 2.68+ no longer weighs mods on an influenced copy of the item; the influence is still required).'),
   maxPrice: z.object({ amount: z.number().int().positive().max(1_000_000), currency: z.enum(CURRENCIES).optional() }).optional()
     .describe('Maximum price (currency default "chaos-equivalent").'),
   maxLevel: z.number().int().min(1).max(100).optional().describe('Maximum required level.'),

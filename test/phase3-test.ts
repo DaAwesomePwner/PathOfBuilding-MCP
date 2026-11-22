@@ -166,6 +166,8 @@ async function main(): Promise<void> {
     log('PASS: unequip_item + undo');
 
     log('Test 6: compare_items (3 candidates)');
+    const xmlBeforeCompare = extractText(await call(client, 'export_build', { format: 'xml' }));
+    const compareStart = performance.now();
     const compareResp = JSON.parse(
       extractText(
         await call(client, 'compare_items', {
@@ -177,6 +179,8 @@ async function main(): Promise<void> {
       candidates: Array<{ index: number; error: string | null; keyDeltas: { Life: number; CombinedDPS: number } | null }>;
       bestForLife: number | null;
     };
+    log(`  compare_items (3 candidates): ${(performance.now() - compareStart).toFixed(0)} ms`);
+    assert(extractText(await call(client, 'export_build', { format: 'xml' })) === xmlBeforeCompare, 'export changed after compare_items');
     assert(compareResp.candidates.length === 3, 'should have 3 candidates');
     assert(compareResp.candidates.every((c) => c.error === null), 'no candidate should error');
     const lives = compareResp.candidates.map((c) => c.keyDeltas!.Life);

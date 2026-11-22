@@ -3,6 +3,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { TOOL_ANNOTATIONS } from '../src/tool-registry.js';
 import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -145,6 +146,109 @@ async function main(): Promise<void> {
     const codeParsed = JSON.parse(extractText(codeResult)) as { class?: string };
     assert(codeParsed.class === 'Witch', 'build code load failed');
     log('PASS: build code load');
+
+    log('Test 8: tool annotations');
+    const annotated = new Map(tools.tools.map((t) => [t.name, t.annotations]));
+    assert(
+      JSON.stringify(names) === JSON.stringify(Object.keys(TOOL_ANNOTATIONS).sort()),
+      `registered tools and TOOL_ANNOTATIONS differ: ${names.filter((n) => !(n in TOOL_ANNOTATIONS))} / ${Object.keys(TOOL_ANNOTATIONS).filter((n) => !names.includes(n))}`,
+    );
+    for (const name of names) {
+      const a = annotated.get(name);
+      assert(a && typeof a.readOnlyHint === 'boolean' && typeof a.destructiveHint === 'boolean', `${name}: missing annotations`);
+    }
+    for (const name of ['get_stats', 'evaluate_changes', 'simulate_passive_change', 'find_best_next_nodes', 'swap_gem', 'compare_items', 'get_passive_tree']) {
+      assert(annotated.get(name)?.readOnlyHint === true && annotated.get(name)?.destructiveHint === false, `${name} should be read-only`);
+    }
+    for (const name of ['load_build', 'reset_build', 'configure_pob_path', 'reload_engine']) {
+      assert(annotated.get(name)?.readOnlyHint === false && annotated.get(name)?.destructiveHint === true, `${name} should be destructive`);
+    }
+    assert(annotated.get('reset_build')?.idempotentHint === true, 'reset_build is idempotent');
+    assert(annotated.get('load_build')?.openWorldHint === true, 'load_build may fetch a URL');
+    for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest']) {
+      assert(annotated.get(name)?.readOnlyHint === false && annotated.get(name)?.destructiveHint === false, `${name} is an undoable change`);
+    }
+    // undo_last_change discards a change that cannot be redone.
+    assert(annotated.get('undo_last_change')?.readOnlyHint === false && annotated.get('undo_last_change')?.destructiveHint === true,
+      'undo_last_change should be destructive');
+    log(`PASS: ${names.length} tools annotated`);
+
+    log('Test 9: compact JSON output');
+    const statsText = extractText(await client.callTool({ name: 'get_stats', arguments: {} }));
+    assert(!statsText.includes('\n') && statsText === JSON.stringify(JSON.parse(statsText)), 'get_stats output is not compact JSON');
+    log('PASS: no pretty-printing');
+
+    log('Test 10: payload sizes (before = the full shape pretty-printed, as the server returned it before)');
+    const text = async (name: string, args: Record<string, unknown> = {}): Promise<string> =>
+      extractText(await client.callTool({ name, arguments: args }));
+    const pretty = (t: string): number => JSON.stringify(JSON.parse(t), null, 2).length;
+    const sizes: Array<{ tool: string; before: number; after: number; min: number }> = [
+      { tool: 'get_passive_tree', before: pretty(await text('get_passive_tree', { detail: 'full' })), after: (await text('get_passive_tree')).length, min: 3 },
+      { tool: 'list_equipped_items', before: pretty(await text('list_equipped_items', { detail: 'full' })), after: (await text('list_equipped_items')).length, min: 3 },
+      { tool: 'list_skill_groups', before: pretty(await text('list_skill_groups', { detail: 'full' })), after: (await text('list_skill_groups')).length, min: 2 },
+    ];
+    for (const s of sizes) {
+      log(`   ${s.tool}: ${s.before} -> ${s.after} bytes (${(s.before / s.after).toFixed(1)}x smaller)`);
+      assert(s.before >= s.min * s.after, `${s.tool}: default is only ${(s.before / s.after).toFixed(1)}x smaller (want ${s.min}x)`);
+    }
+    const fullItems = JSON.parse(await text('list_equipped_items', { detail: 'full' })) as { items: Array<{ slot: string; raw?: string; explicits: Array<{ line: string; crafted: boolean }> }> };
+    const compactItems = JSON.parse(await text('list_equipped_items')) as { items: Array<{ slot: string; raw?: string; explicits: Array<{ line: string; crafted?: boolean }> }> };
+    const withText = JSON.parse(await text('list_equipped_items', { includeItemText: true })) as { items: Array<{ slot: string; raw?: string }> };
+    assert(fullItems.items.every((i) => typeof i.raw === 'string') && compactItems.items.every((i) => i.raw === undefined), 'raw only with detail full');
+    assert(withText.items.every((i, n) => i.raw === fullItems.items[n].raw), 'includeItemText adds the same raw text');
+    fullItems.items.forEach((item, n) => {
+      const lines = compactItems.items[n].explicits;
+      assert(JSON.stringify(lines.map((l) => l.line)) === JSON.stringify(item.explicits.map((l) => l.line)), `${item.slot}: explicit lines differ`);
+      assert(lines.every((l, k) => (l.crafted === true) === item.explicits[k].crafted), `${item.slot}: crafted flags differ`);
+    });
+    const groupsCompact = JSON.parse(await text('list_skill_groups')) as { groups: Array<{ supportGems: Array<Record<string, unknown>> }> };
+    assert(groupsCompact.groups.every((g) => g.supportGems.every((s) => typeof s.index === 'number' && typeof s.name === 'string' && !('gemId' in s))), 'compact gems');
+    log('PASS: compact defaults, full shape on request');
+
+    log('Test 11: get_stats with a stats filter');
+    const all = JSON.parse(statsText) as Record<string, Record<string, unknown>>;
+    const picked = JSON.parse(await text('get_stats', { stats: ['CombinedDPS', 'Life', 'NotARealStat'] })) as { stats: Record<string, unknown> };
+    assert(JSON.stringify(Object.keys(picked.stats)) === '["CombinedDPS","Life","NotARealStat"]', `keys ${Object.keys(picked.stats)}`);
+    assert(picked.stats.CombinedDPS === all.offense.CombinedDPS && picked.stats.Life === all.defense.Life, 'filtered values match');
+    assert(picked.stats.NotARealStat === null, 'unknown stat is null');
+    log('PASS');
+
+    log('Test 12: evaluate_changes through MCP');
+    const xmlBefore = await text('export_build', { format: 'xml' });
+    const evaluated = JSON.parse(await text('evaluate_changes', {
+      variants: [
+        { label: 'boss', config: { enemyIsBoss: 'Pinnacle' } },
+        { label: 'charges', config: { usePowerCharges: true } },
+        { label: 'bad', allocate: ['Not A Real Passive Node'] },
+      ],
+      stats: ['CombinedDPS', 'Life'],
+    })) as { base: Record<string, number>; results: Array<{ label: string; error?: string; delta?: Record<string, number> }> };
+    assert(evaluated.results.length === 3 && evaluated.results[2].label === 'bad' && evaluated.results[2].error, 'refused variant listed last');
+    assert(evaluated.results[0].delta!.CombinedDPS >= evaluated.results[1].delta!.CombinedDPS, 'ranked by CombinedDPS');
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'evaluate_changes changed the build');
+    log(`PASS: ${evaluated.results.map((r) => `${r.label}=${r.delta?.CombinedDPS ?? r.error}`).join(', ')}`);
+
+    log('Test 13: input bounds');
+    const refused = async (name: string, args: Record<string, unknown>, what: string): Promise<void> => {
+      const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content?: ToolTextContent[] };
+      assert(r.isError === true, `${what} should be refused`);
+    };
+    const ids51 = Array.from({ length: 51 }, (_, i) => i + 1);
+    const ring = 'Rarity: RARE\nBound Ring\nCoral Ring\n+30 to maximum Life';
+    await refused('evaluate_changes', { variants: [{ allocate: ids51 }] }, 'evaluate_changes with 51 nodes to allocate');
+    await refused('evaluate_changes', { variants: [{ deallocate: ids51 }] }, 'evaluate_changes with 51 nodes to deallocate');
+    await refused('evaluate_changes', { variants: [{ items: Array.from({ length: 11 }, () => ({ slot: 'Ring 1', itemText: ring })) }] }, '11 items');
+    await refused('evaluate_changes', { variants: [{ items: [{ slot: 'Ring 1', itemText: ring + '\n' + 'x'.repeat(10_000) }] }] }, 'item text over 10 KB');
+    await refused('evaluate_changes', { variants: [{ gems: Array.from({ length: 21 }, () => ({ op: 'remove', group: 1, index: 1 })) }] }, '21 gem changes');
+    await refused('evaluate_changes', { variants: [{ label: 'x'.repeat(101) }] }, 'a 101-character label');
+    await refused('evaluate_changes', { variants: [{ config: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`k${i}`, true])) }] }, '51 config keys');
+    await refused('simulate_passive_change', { allocate: ids51 }, 'simulate_passive_change with 51 nodes');
+    const atBounds = JSON.parse(await text('evaluate_changes', {
+      variants: [{ label: 'x'.repeat(100), items: [{ slot: 'Ring 1', itemText: ring }], gems: [], config: { usePowerCharges: true } }],
+    })) as { results: Array<{ error?: string }> };
+    assert(atBounds.results[0].error === undefined, `a variant within the bounds failed: ${atBounds.results[0].error}`);
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'bounds checks changed the build');
+    log('PASS: oversized inputs refused');
   } finally {
     try {
       await client.close();

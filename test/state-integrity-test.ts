@@ -145,7 +145,9 @@ async function main(): Promise<void> {
       original.replace(/^Rarity: .*/m, 'Rarity: Magic'),
       original.replace(/^Rarity: .*/m, 'Rarity: Rare'),
     ];
+    const xmlBeforeCompare = extractText(await call(client, 'export_build', { format: 'xml' }));
     await call(client, 'compare_items', { slot: 'Ring 1', items: candidates });
+    assert(extractText(await call(client, 'export_build', { format: 'xml' })) === xmlBeforeCompare, 'export changed after compare_items');
     const afterCompare = await getKeyStats(client);
     assertStatsExact('compare_items', baseline, afterCompare);
     log('PASS: compare_items leaves zero drift');

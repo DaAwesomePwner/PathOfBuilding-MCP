@@ -1,6 +1,18 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
+import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
+import {
+  runProbe,
+  withoutNulls,
+  type ProbeGemChange,
+  type ProbeRequest,
+  type ProbeResponse,
+  type ProbeVariant,
+  type ProbeVariantResult,
+} from './probe.js';
+import { toNumber } from './stat-values.js';
+import { DEFAULT_MAX_POINTS, findBestNextNodes, findWorstAllocatedNodes, type RankBy, type TreeSearchResult } from './tree-search.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
 import { UserError } from './validation.js';
 
@@ -11,6 +23,97 @@ import { UserError } from './validation.js';
  * since a bridge timeout kills the engine and counts as a crash-breaker strike.
  */
 const TRADE_QUERY_TIMEOUT_MS = 90_000;
+
+/** Different passive node names one evaluate_changes call may use (each unknown one is a bridge lookup). */
+export const MAX_NODE_NAMES = 200;
+/** Candidates listed in an ambiguous-name error. */
+const MAX_LISTED_MATCHES = 12;
+
+interface NodeMatch {
+  id: number;
+  name: string;
+  type: string;
+  allocated: boolean;
+  /** Unallocated: passive points of its path from the allocated tree. */
+  points?: number;
+}
+
+/**
+ * Resolves passive node names (case-insensitive, as PoB's node names) to ids
+ * for simulate_passive_change and evaluate_changes. The index holds every
+ * allocated node and every unallocated node a path from the allocated tree
+ * reaches (ascendancy nodes, masteries and class starts excepted), read once
+ * per call and only when a name is given. A name is resolved among the nodes
+ * the change can apply to (unallocated ones to allocate, allocated ones to
+ * deallocate): exactly one is used; several are a UserError listing their
+ * ids. When none of that kind match, a single match of the other kind is used
+ * (so the engine reports e.g. "already allocated") and several are an error;
+ * a name the index lacks is looked up with getNodeInfo (one node).
+ */
+class NodeNameResolver {
+  private index?: Map<string, NodeMatch[]>;
+  private readonly single = new Map<string, number | null>();
+
+  constructor(private readonly send: <T>(command: object) => Promise<T>) {}
+
+  private async loadIndex(): Promise<Map<string, NodeMatch[]>> {
+    if (this.index) return this.index;
+    const index = new Map<string, NodeMatch[]>();
+    const add = (m: NodeMatch): void => {
+      const key = m.name.toLowerCase();
+      if (key === '') return;
+      const list = index.get(key) ?? [];
+      list.push(m);
+      index.set(key, list);
+    };
+    const allocated = await this.send<{ nodes: TreeNodeInfo[] }>({ cmd: 'getAllocatedNodesDetailed' });
+    for (const n of allocated.nodes ?? []) add({ id: n.id, name: n.name, type: n.type, allocated: true });
+    const reachable = await this.send<{ nodes: Array<{ id: number; name: string; type: string; points: number }> }>({
+      cmd: 'probe',
+      candidates: 'allocate',
+      maxPoints: 10_000,
+    });
+    for (const n of reachable.nodes ?? []) add({ id: n.id, name: n.name, type: n.type, allocated: false, points: n.points });
+    this.index = index;
+    return index;
+  }
+
+  async resolve(ref: string | number, mode: 'allocate' | 'deallocate'): Promise<number> {
+    if (typeof ref === 'number') return ref;
+    const matches = (await this.loadIndex()).get(ref.toLowerCase()) ?? [];
+    const relevant = matches.filter((m) => m.allocated === (mode === 'deallocate'));
+    if (relevant.length === 1) return relevant[0].id;
+    if (relevant.length > 1) throw ambiguousName(ref, relevant);
+    if (matches.length === 1) return matches[0].id;
+    if (matches.length > 1) throw ambiguousName(ref, matches);
+    const key = ref.toLowerCase();
+    if (!this.single.has(key)) {
+      const res = await this.send<{ node: TreeNodeInfo | null }>({ cmd: 'getNodeInfo', name: ref });
+      this.single.set(key, res.node ? res.node.id : null);
+    }
+    const id = this.single.get(key);
+    if (id === null || id === undefined) throw new UserError(`Passive node not found: "${ref}"`);
+    return id;
+  }
+
+  async resolveAll(refs: Array<string | number>, mode: 'allocate' | 'deallocate'): Promise<number[]> {
+    const ids: number[] = [];
+    for (const ref of refs) ids.push(await this.resolve(ref, mode));
+    return ids;
+  }
+}
+
+function ambiguousName(ref: string, matches: NodeMatch[]): UserError {
+  const sorted = [...matches].sort((a, b) => (a.points ?? 0) - (b.points ?? 0) || a.id - b.id);
+  const listed = sorted.slice(0, MAX_LISTED_MATCHES).map((m) =>
+    `${m.id} (${m.allocated ? 'allocated' : `unallocated, ${m.points} point${m.points === 1 ? '' : 's'} away`}, ${m.type})`,
+  );
+  const more = sorted.length > listed.length ? ` and ${sorted.length - listed.length} more` : '';
+  return new UserError(
+    `Passive node name "${ref}" matches ${matches.length} nodes: ` +
+      `${listed.join(', ')}${more}. Pass the node id instead.`,
+  );
+}
 
 /**
  * The engine was restarted after a crash or timeout since the last tool call.
@@ -54,11 +157,6 @@ export interface ItemsRestoreReport {
   mismatches?: string[];
   /** Items added since the capture (probe items) that were deleted. */
   removedItemIds?: number[];
-}
-
-/** Slot names PoB gives passive-tree jewel sockets ("Jewel <node id>"). */
-function isJewelSocketSlot(slot: string): boolean {
-  return /^Jewel \d+$/.test(slot);
 }
 
 export interface TreeSnapshot {
@@ -200,16 +298,6 @@ class AsyncMutex {
       tryAcquire();
     });
   }
-}
-
-function toNumber(value: unknown): number {
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  if (typeof value === 'boolean') return value ? 1 : 0;
-  return 0;
 }
 
 export function computeDiff(before: Stats, after: Stats): StatDiff {
@@ -718,6 +806,83 @@ export class BuildSession {
     });
   }
 
+  /**
+   * Evaluate what-if variants (nodes, items, gems, config) through PoB's own
+   * calculator without changing the build (see src/probe.ts). Records nothing
+   * in the undo stack or the crash-recovery journal.
+   */
+  async probe(request: ProbeRequest): Promise<ProbeResponse> {
+    return this.withLock(() => this.probeUnlocked(request));
+  }
+
+  private probeUnlocked(request: ProbeRequest): Promise<ProbeResponse> {
+    return runProbe(
+      {
+        send: (command) => this.bridge.send(command),
+        validateConfig: (options) => this.validateConfigOptionsUnlocked(options),
+        snapshot: () => this.snapshotAllUnlocked(),
+        restore: (snapshot) => this.restoreAllUnlocked(snapshot as FullSnapshot),
+        snapshotTree: () => this.snapshotTreeUnlocked(),
+        restoreTree: (snapshot) => this.restoreTreeUnlocked(snapshot as TreeSnapshot),
+        probeThenRestore,
+      },
+      request,
+    );
+  }
+
+  /**
+   * probe() whose variants may name passive nodes instead of giving ids, all
+   * under one lock. Names resolve as in simulate_passive_change
+   * (NodeNameResolver): a name several nodes share is refused with their ids.
+   * A variant naming a node that does not exist, or an ambiguous name, gets a
+   * user error and is not run; the others still are.
+   */
+  async probeNamed(request: Omit<ProbeRequest, 'variants'> & { variants: NamedProbeVariant[] }): Promise<ProbeResponse> {
+    const names = new Set<string>();
+    for (const v of request.variants) {
+      for (const ref of [...(v.allocate ?? []), ...(v.deallocate ?? [])]) {
+        if (typeof ref === 'string') names.add(ref.toLowerCase());
+      }
+    }
+    if (names.size > MAX_NODE_NAMES) {
+      throw new UserError(`${names.size} different node names in one call; at most ${MAX_NODE_NAMES} are allowed (pass node ids instead)`);
+    }
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const results: Array<ProbeVariantResult | undefined> = new Array(request.variants.length);
+      const toRun: number[] = [];
+      const resolved: ProbeVariant[] = [];
+      for (let i = 0; i < request.variants.length; i++) {
+        const { allocate, deallocate, ...rest } = request.variants[i];
+        try {
+          const variant: ProbeVariant = { ...rest };
+          const allocIds = allocate && (await resolver.resolveAll(allocate, 'allocate'));
+          const deallocIds = deallocate && (await resolver.resolveAll(deallocate, 'deallocate'));
+          if (allocIds !== undefined) variant.allocate = allocIds;
+          if (deallocIds !== undefined) variant.deallocate = deallocIds;
+          resolved.push(variant);
+          toRun.push(i);
+        } catch (error) {
+          if (!(error instanceof UserError)) throw error;
+          results[i] = { stats: {}, error: error.message, userError: true };
+        }
+      }
+      const { variants: _variants, ...options } = request;
+      const probed = await this.probeUnlocked({ ...options, variants: resolved });
+      toRun.forEach((index, j) => {
+        results[index] = probed.results[j];
+      });
+      return { base: probed.base, results: results.map((r) => r ?? { stats: {}, error: 'variant was not run' }) };
+    });
+  }
+
+  /** The one result of a single-variant probe; any error but a user error is thrown. */
+  private async probeOneUnlocked(tool: string, request: ProbeRequest): Promise<ProbeVariantResult> {
+    const r = (await this.probeUnlocked(request)).results[0];
+    if (r.error !== undefined && !r.userError) throw new Error(`${tool}: ${r.error}`);
+    return r;
+  }
+
   // ------------------------------------------------------------------
   // Probe helpers (partial-snapshot what-if queries)
   // ------------------------------------------------------------------
@@ -737,29 +902,6 @@ export class BuildSession {
   private async withSkillsProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
     const snap = await this.snapshotSkillsUnlocked();
     return probeThenRestore(fn, () => this.restoreSkillsUnlocked(snap));
-  }
-
-  private async withConfigProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
-    const snap = await this.snapshotConfigUnlocked();
-    return probeThenRestore(fn, () => this.restoreConfigUnlocked(snap));
-  }
-
-  /**
-   * Item probe on one slot. The whole item state is captured, not just the
-   * slot: equipping can empty other slots (a two-hander clears Weapon 2, an
-   * item with fewer abyssal sockets clears abyss jewels), and the probe's item
-   * must be deleted afterwards. A passive-tree jewel socket also needs the
-   * tree state, which owns those sockets (and the nodes that depend on them).
-   */
-  private async withSlotProbeUnlocked<T>(slot: string, fn: () => Promise<T>): Promise<T> {
-    const items = await this.captureItemsStateUnlocked();
-    if (!isJewelSocketSlot(slot)) {
-      return probeThenRestore(fn, async () => {
-        this.assertItemsExact(await this.restoreItemsStateUnlocked(items));
-      });
-    }
-    const tree = await this.snapshotTreeUnlocked();
-    return probeThenRestore(fn, () => this.restoreTreeAndItemsUnlocked(tree, items));
   }
 
   // ------------------------------------------------------------------
@@ -958,27 +1100,19 @@ export class BuildSession {
       const baselineItem = await this.snapshotSlotUnlocked(slot);
       const baselineStats = await this.bridge.getStats();
 
-      const results: ComparisonCandidate[] = [];
-      for (let i = 0; i < candidates.length; i++) {
-        const itemText = candidates[i];
-        let candidateStats: Stats | null = null;
-        let error: string | null = null;
-        await this.withSlotProbeUnlocked(slot, async () => {
-          try {
-            await this.bridge.send({ cmd: 'equipItem', slot, itemText });
-            candidateStats = await this.bridge.getStats();
-          } catch (err) {
-            error = err instanceof Error ? err.message : String(err);
-          }
-        });
-        results.push({
-          index: i,
-          itemText,
-          stats: candidateStats,
-          diff: candidateStats ? computeDiff(baselineStats, candidateStats) : {},
-          error,
-        });
-      }
+      // One probe variant per candidate, equipped as swap_item would and undone
+      // (a passive-tree jewel socket or a skill-granting item takes the probe's
+      // full-recalculation fallback). A candidate refused as input (does not
+      // fit, cannot be parsed) gets its error; any other failure fails the call.
+      const probed = await this.probeUnlocked({
+        variants: candidates.map((itemText) => ({ items: [{ slot, itemText }] })),
+      });
+      const results: ComparisonCandidate[] = candidates.map((itemText, i) => {
+        const r = probed.results[i];
+        if (r.error !== undefined && !r.userError) throw new Error(`compare_items: candidate ${i}: ${r.error}`);
+        const stats = r.error === undefined ? withoutNulls(r.stats) : null;
+        return { index: i, itemText, stats, diff: stats ? computeDiff(baselineStats, stats) : {}, error: r.error ?? null };
+      });
 
       const bestForKey = (key: string): number | null => {
         let bestIdx: number | null = null;
@@ -1137,33 +1271,15 @@ export class BuildSession {
   }
 
   async isTreeConnected(): Promise<{ connected: boolean; orphanedNodes: number[] }> {
-    return this.withLock(async () => {
-      const result = await this.bridge.send<{
-        ok: true;
-        result: { connected: boolean; orphanedNodes: number[] };
-      }>({ cmd: 'isTreeConnected' });
-      return result.result;
-    });
+    return this.withLock(() => this.treeConnectedUnlocked());
   }
 
-  private async resolveNodeIds(refs: Array<string | number>): Promise<number[]> {
-    if (refs.length === 0) return [];
-    const ids: number[] = [];
-    for (const ref of refs) {
-      if (typeof ref === 'number') {
-        ids.push(ref);
-        continue;
-      }
-      const lookup = await this.bridge.send<{ ok: true; node: TreeNodeInfo | null }>({
-        cmd: 'getNodeInfo',
-        name: ref,
-      });
-      if (!lookup.node) {
-        throw new UserError(`Passive node not found: "${ref}"`);
-      }
-      ids.push(lookup.node.id);
-    }
-    return ids;
+  private async treeConnectedUnlocked(): Promise<{ connected: boolean; orphanedNodes: number[] }> {
+    const result = await this.bridge.send<{
+      ok: true;
+      result: { connected: boolean; orphanedNodes: number[] };
+    }>({ cmd: 'isTreeConnected' });
+    return result.result;
   }
 
   async simulatePassiveChange(
@@ -1171,9 +1287,25 @@ export class BuildSession {
     deallocate: Array<string | number> = [],
   ): Promise<{ statDiff: StatDiff; valid: boolean; validationErrors: string[]; before: Stats; after: Stats }> {
     return this.withLock(async () => {
-      const allocIds = await this.resolveNodeIds(allocate);
-      const deallocIds = await this.resolveNodeIds(deallocate);
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const allocIds = await resolver.resolveAll(allocate, 'allocate');
+      const deallocIds = await resolver.resolveAll(deallocate, 'deallocate');
       const before = await this.bridge.getStats();
+
+      // Probe path: exactly one node to allocate on a connected tree. The probe
+      // allocates it with its path as allocNodes does (same stats,
+      // test/probe-test.ts), and a path from a connected tree keeps it
+      // connected, so `valid` is what isTreeConnected would say. A node the
+      // probe refuses (already allocated, unreachable, ...) goes through the
+      // mutate path below, which gives its result or error as before. Every
+      // other request (deallocations, several nodes) uses the mutate path.
+      if (allocIds.length === 1 && deallocIds.length === 0 && (await this.treeConnectedUnlocked()).connected) {
+        const r = await this.probeOneUnlocked('simulate_passive_change', { variants: [{ allocate: allocIds }] });
+        if (r.error === undefined) {
+          const probed = withoutNulls(r.stats);
+          return { before, after: probed, statDiff: computeDiff(before, probed), valid: true, validationErrors: [] };
+        }
+      }
 
       let after: Stats = before;
       let connectionResult: { connected: boolean; orphanedNodes: number[] } = {
@@ -1208,114 +1340,45 @@ export class BuildSession {
     });
   }
 
+  /**
+   * Unallocated nodes whose PoB path costs at most `maxPoints` points, ranked
+   * by gain per point (or total gain), evaluated through the probe engine
+   * (src/tree-search.ts). Changes nothing; pushes nothing to undo.
+   */
   async findBestNextNodes(
     count = 10,
     optimizeFor = 'CombinedDPS',
     includeJewelSockets = false,
-  ): Promise<NodeRanking[]> {
-    return this.withLock(async () => {
-      const reachableRes = await this.bridge.send<{ ok: true; nodes: TreeNodeInfo[] }>({
-        cmd: 'getReachableNodes',
-      });
-      let candidates = reachableRes.nodes ?? [];
-      if (!includeJewelSockets) {
-        candidates = candidates.filter((n) => !n.isJewelSocket);
-      }
-
-      const baselineStats = await this.bridge.getStats();
-      const baselineValue = toNumber(baselineStats[optimizeFor]);
-
-      const rankings: NodeRanking[] = [];
-
-      for (const node of candidates) {
-        let nodeStats: Stats | null = null;
-        await this.withTreeProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({ cmd: 'allocNode', nodeId: node.id });
-            nodeStats = await this.bridge.getStats();
-          } catch {
-            // Skip nodes that fail to allocate (e.g., disallowed paths)
-          }
-        });
-        if (!nodeStats) continue;
-        const targetValue = toNumber(nodeStats[optimizeFor]);
-        rankings.push({
-          nodeId: node.id,
-          nodeName: node.name,
-          nodeType: node.type,
-          isKeystone: node.isKeystone,
-          isNotable: node.isNotable,
-          targetStat: optimizeFor,
-          delta: targetValue - baselineValue,
-          tradeoffs: identifyTradeoffs(baselineStats, nodeStats, optimizeFor),
-          stats: node.stats,
-        });
-      }
-
-      rankings.sort((a, b) => b.delta - a.delta);
-      return rankings.slice(0, count);
-    });
+    maxPoints = DEFAULT_MAX_POINTS,
+    rankBy: RankBy = 'perPoint',
+  ): Promise<TreeSearchResult> {
+    return this.withLock(() =>
+      findBestNextNodes(this.treeSearchDeps(), { count, optimizeFor, includeJewelSockets, maxPoints, rankBy }),
+    );
   }
 
+  /**
+   * Allocated nodes ranked by the loss of removing each together with the
+   * nodes that depend on it, per refunded point (or in total), evaluated
+   * through the probe engine (src/tree-search.ts). Changes nothing.
+   */
   async findWorstAllocatedNodes(
     count = 10,
     optimizeFor = 'CombinedDPS',
-  ): Promise<NodeRanking[]> {
-    return this.withLock(async () => {
-      const allocatedRes = await this.bridge.send<{ ok: true; nodes: TreeNodeInfo[] }>({
-        cmd: 'getAllocatedNodesDetailed',
-      });
-      const allocated = allocatedRes.nodes ?? [];
-      const testable = allocated.filter(
-        (n) => !n.isKeystone && !n.isAscendancy && !n.isJewelSocket && !n.isMastery && n.type === 'Normal',
-      );
-
-      const baselineStats = await this.bridge.getStats();
-      const baselineValue = toNumber(baselineStats[optimizeFor]);
-
-      const rankings: NodeRanking[] = [];
-
-      for (const node of testable) {
-        let nodeStats: Stats | null = null;
-        let stillConnected = true;
-        await this.withTreeProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({ cmd: 'deallocNode', nodeId: node.id });
-            const conn = await this.bridge.send<{
-              ok: true;
-              result: { connected: boolean; orphanedNodes: number[] };
-            }>({ cmd: 'isTreeConnected' });
-            stillConnected = conn.result.connected;
-            if (stillConnected) {
-              nodeStats = await this.bridge.getStats();
-            }
-          } catch {
-            // Skip on error
-          }
-        });
-
-        if (!nodeStats || !stillConnected) continue;
-
-        const targetValue = toNumber(nodeStats[optimizeFor]);
-        const loss = baselineValue - targetValue;
-        rankings.push({
-          nodeId: node.id,
-          nodeName: node.name,
-          nodeType: node.type,
-          isKeystone: node.isKeystone,
-          isNotable: node.isNotable,
-          targetStat: optimizeFor,
-          delta: -loss,
-          lossIfRemoved: loss,
-          stats: node.stats,
-        });
-      }
-
-      rankings.sort((a, b) => (a.lossIfRemoved ?? 0) - (b.lossIfRemoved ?? 0));
-      return rankings.slice(0, count);
-    });
+    rankBy: RankBy = 'perPoint',
+  ): Promise<TreeSearchResult> {
+    return this.withLock(() => findWorstAllocatedNodes(this.treeSearchDeps(), { count, optimizeFor, rankBy }));
   }
 
+  private treeSearchDeps(): { send<T>(command: object): Promise<T>; probe(request: ProbeRequest): Promise<ProbeResponse> } {
+    return { send: (command) => this.bridge.send(command), probe: (request) => this.probeUnlocked(request) };
+  }
+
+  /**
+   * Remove an allocated keystone (with the nodes depending on it) or allocate
+   * an unallocated one (with its path), as deallocNode / allocNode would, in
+   * one probe variant. A keystone no path reaches is a UserError.
+   */
   async evaluateKeystone(keystoneName: string): Promise<KeystoneEvaluation> {
     return this.withLock(async () => {
       const lookup = await this.bridge.send<{ ok: true; node: TreeNodeInfo | null }>({
@@ -1328,16 +1391,11 @@ export class BuildSession {
 
       const isAllocated = node.alloc;
       const baselineStats = await this.bridge.getStats();
-
-      let after: Stats = baselineStats;
-      await this.withTreeProbeUnlocked(async () => {
-        if (isAllocated) {
-          await this.bridge.send({ cmd: 'deallocNode', nodeId: node.id });
-        } else {
-          await this.bridge.send({ cmd: 'allocNode', nodeId: node.id });
-        }
-        after = await this.bridge.getStats();
+      const r = await this.probeOneUnlocked('evaluate_keystone', {
+        variants: [isAllocated ? { deallocate: [node.id] } : { allocate: [node.id] }],
       });
+      if (r.error !== undefined) throw new UserError(r.error);
+      const after = withoutNulls(r.stats);
 
       return {
         keystone: node.name,
@@ -1410,6 +1468,61 @@ export class BuildSession {
     });
   }
 
+  /**
+   * Evaluate gem-change variants on one socket group (each list of changes is
+   * one variant), returning each variant's stats or its user error; any other
+   * failure fails the call. A normal group goes through the probe engine
+   * (PoB's calculator, nothing changes); a group granted by an item or the
+   * passive tree (the probe refuses those) keeps the old path: change the
+   * gems through the bridge, full recalc, exact skills restore.
+   */
+  private async gemVariantsUnlocked(
+    tool: string,
+    groupIndex: number,
+    variants: ProbeGemChange[][],
+  ): Promise<Array<{ stats: Stats | null; error: string | null }>> {
+    const groups = (await this.bridge.send<{ ok: true; groups: SkillGroupInfo[] }>({ cmd: 'getSocketGroups' })).groups ?? [];
+    if (!groups[groupIndex - 1]?.source) {
+      const probed = await this.probeUnlocked({ variants: variants.map((gems) => ({ gems })) });
+      return probed.results.map((r) => {
+        if (r.error === undefined) return { stats: withoutNulls(r.stats), error: null };
+        if (!r.userError) throw new Error(`${tool}: ${r.error}`);
+        return { stats: null, error: r.error.replace(/^gems\[\d+\]: /, '') };
+      });
+    }
+    const out: Array<{ stats: Stats | null; error: string | null }> = [];
+    for (const changes of variants) {
+      try {
+        const stats = await this.withSkillsProbeUnlocked(async () => {
+          for (const ch of changes) await this.sendGemChangeUnlocked(tool, ch);
+          return this.bridge.getStats();
+        });
+        out.push({ stats, error: null });
+      } catch (error) {
+        if (!(error instanceof UserError)) throw error;
+        out.push({ stats: null, error: error.message });
+      }
+    }
+    return out;
+  }
+
+  /** One gem change through the bridge's mutating gem commands (granted groups only, inside a skills probe). */
+  private async sendGemChangeUnlocked(tool: string, ch: ProbeGemChange): Promise<void> {
+    if (ch.op === 'remove') {
+      await this.bridge.send({ cmd: 'removeGem', groupIndex: ch.group, gemIndex: ch.index });
+    } else if (ch.op === 'set' && ch.name !== undefined) {
+      await this.bridge.send({ cmd: 'setGem', groupIndex: ch.group, gemIndex: ch.index, gemName: ch.name, level: ch.level, quality: ch.quality });
+    } else if (ch.op === 'set' && ch.enabled === undefined) {
+      await this.bridge.send({ cmd: 'setGemLevel', groupIndex: ch.group, gemIndex: ch.index, level: ch.level, quality: ch.quality });
+    } else {
+      throw new Error(`${tool}: gem change ${ch.op} is not supported on a granted skill group`);
+    }
+  }
+
+  /**
+   * Swap one gem (as setGem does) and return the stat diff, without changing
+   * the build (gemVariantsUnlocked). A refused change is a UserError.
+   */
   async swapGemWithDiff(
     skillGroupIndex: number,
     gemIndex: number,
@@ -1419,22 +1532,20 @@ export class BuildSession {
   ): Promise<StatDiffResult> {
     return this.withLock(async () => {
       const before = await this.bridge.getStats();
-      let after: Stats = before;
-      await this.withSkillsProbeUnlocked(async () => {
-        await this.bridge.send({
-          cmd: 'setGem',
-          groupIndex: skillGroupIndex,
-          gemIndex,
-          gemName: newGemName,
-          level,
-          quality,
-        });
-        after = await this.bridge.getStats();
-      });
-      return { before, after, diff: computeDiff(before, after) };
+      const [r] = await this.gemVariantsUnlocked('swap_gem', skillGroupIndex, [
+        [{ op: 'set', group: skillGroupIndex, index: gemIndex, name: newGemName, level, quality }],
+      ]);
+      if (!r.stats) throw new UserError(r.error ?? 'swap_gem: the change was refused');
+      return { before, after: r.stats, diff: computeDiff(before, r.stats) };
     });
   }
 
+  /**
+   * The weakest enabled support of a group (the smallest CombinedDPS loss when
+   * removed), then each candidate in its place at level 20 / quality 20. A
+   * candidate the engine refuses (unknown gem, ...) carries its error and
+   * null numbers; any other failure fails the call.
+   */
   async compareSupports(
     skillGroupIndex: number,
     candidates: string[],
@@ -1453,72 +1564,47 @@ export class BuildSession {
       const baselineStats = await this.bridge.getStats();
       const baselineDPS = toNumber(baselineStats.CombinedDPS);
 
-      // Phase 1: identify weakest support by simulating its removal.
-      let weakestIdx = supports[0].index;
-      let weakestName = supports[0].name;
-      let weakestLoss = Infinity;
-      for (const support of supports) {
-        let dpsWithout = baselineDPS;
-        await this.withSkillsProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({
-              cmd: 'removeGem',
-              groupIndex: skillGroupIndex,
-              gemIndex: support.index,
-            });
-            const stats = await this.bridge.getStats();
-            dpsWithout = toNumber(stats.CombinedDPS);
-          } catch {
-            // ignore — dpsWithout stays at baselineDPS
-          }
-        });
-        const loss = baselineDPS - dpsWithout;
-        if (loss < weakestLoss) {
-          weakestLoss = loss;
-          weakestIdx = support.index;
-          weakestName = support.name;
-        }
+      // Phase 1: the weakest support, by removing each in turn.
+      const removals = await this.gemVariantsUnlocked(
+        'compare_supports',
+        skillGroupIndex,
+        supports.map((s) => [{ op: 'remove', group: skillGroupIndex, index: s.index }]),
+      );
+      let weakest: { name: string; index: number; loss: number } | null = null;
+      for (const [i, support] of supports.entries()) {
+        const r = removals[i];
+        if (!r.stats) continue; // refused: cannot be ranked
+        const loss = baselineDPS - toNumber(r.stats.CombinedDPS);
+        if (weakest === null || loss < weakest.loss) weakest = { name: support.name, index: support.index, loss };
       }
+      if (weakest === null) {
+        throw new UserError(`No support of skill group ${skillGroupIndex} could be removed: ${removals[0]?.error ?? 'refused'}`);
+      }
+      const w = weakest;
 
-      // Phase 2: test each candidate as a replacement for the weakest support.
-      const results: SupportCandidate[] = [];
-      for (const candidateName of candidates) {
-        let candidateStats: Stats | null = null;
-        let error: string | null = null;
-        await this.withSkillsProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({
-              cmd: 'setGem',
-              groupIndex: skillGroupIndex,
-              gemIndex: weakestIdx,
-              gemName: candidateName,
-              level: 20,
-              quality: 20,
-            });
-            candidateStats = await this.bridge.getStats();
-          } catch (err) {
-            error = err instanceof Error ? err.message : String(err);
-          }
-        });
-        const cs = candidateStats as Stats | null;
-        results.push({
-          name: candidateName,
-          dps: cs ? toNumber(cs.CombinedDPS) : 0,
-          dpsDelta: cs ? toNumber(cs.CombinedDPS) - baselineDPS : 0,
-          error,
-        });
-      }
-      results.sort((a, b) => b.dps - a.dps);
+      // Phase 2: each candidate in the weakest support's place.
+      const swaps = await this.gemVariantsUnlocked(
+        'compare_supports',
+        skillGroupIndex,
+        candidates.map((name) => [{ op: 'set', group: skillGroupIndex, index: w.index, name, level: 20, quality: 20 }]),
+      );
+      const results: SupportCandidate[] = candidates.map((name, i) => {
+        const r = swaps[i];
+        const dps = r.stats ? toNumber(r.stats.CombinedDPS) : null;
+        return { name, dps, dpsDelta: dps === null ? null : dps - baselineDPS, error: r.error };
+      });
+      results.sort((a, b) => (b.dps ?? -Infinity) - (a.dps ?? -Infinity));
 
       return {
-        weakestCurrentSupport: { name: weakestName, gemIndex: weakestIdx, dpsContribution: weakestLoss },
-        slotTested: weakestIdx,
+        weakestCurrentSupport: { name: w.name, gemIndex: w.index, dpsContribution: w.loss },
+        slotTested: w.index,
         baselineDPS,
         candidates: results,
       };
     });
   }
 
+  /** CombinedDPS at each gem level (as setGemLevel would set it), without changing the build. */
   async evaluateGemLevels(
     skillGroupIndex: number,
     gemIndex: number,
@@ -1547,35 +1633,23 @@ export class BuildSession {
             return arr;
           })();
 
-      const results: GemLevelScaling[] = [];
-      for (const level of testLevels) {
-        let dps = baselineDPS;
-        let error: string | null = null;
-        await this.withSkillsProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({
-              cmd: 'setGemLevel',
-              groupIndex: skillGroupIndex,
-              gemIndex,
-              level,
-            });
-            const stats = await this.bridge.getStats();
-            dps = toNumber(stats.CombinedDPS);
-          } catch (err) {
-            error = err instanceof Error ? err.message : String(err);
-          }
-        });
-        results.push({
-          level,
-          dps,
-          dpsDelta: dps - baselineDPS,
-          error,
-        });
-      }
-      return results;
+      const probed = await this.gemVariantsUnlocked(
+        'evaluate_gem_levels',
+        skillGroupIndex,
+        testLevels.map((level) => [{ op: 'set', group: skillGroupIndex, index: gemIndex, level }]),
+      );
+      return testLevels.map((level, i) => {
+        const r = probed[i];
+        const dps = r.stats ? toNumber(r.stats.CombinedDPS) : null;
+        return { level, dps, dpsDelta: dps === null ? null : dps - baselineDPS, error: r.error };
+      });
     });
   }
 
+  /**
+   * The best support combination for an active skill in the main socket
+   * group, searched on the probe engine (src/link-search.ts). Changes nothing.
+   */
   async findOptimalLinks(
     activeSkill: string,
     availableSlots: number,
@@ -1583,126 +1657,12 @@ export class BuildSession {
     options: { topN?: number; topAlternatives?: number } = {},
   ): Promise<OptimalLinksResult> {
     if (availableSlots < 1) throw new UserError('availableSlots must be >= 1');
-    return this.withLock(async () => {
-      const skillInfo = await this.bridge.send<{ ok: true; gem: GemDataInfo }>({
-        cmd: 'getGemByName',
-        name: activeSkill,
-      });
-      if (!skillInfo.gem) throw new UserError(`Active skill not found: "${activeSkill}"`);
-      if (skillInfo.gem.isSupport) throw new UserError(`"${activeSkill}" is a support gem, not an active skill`);
-
-      const supportsRes = await this.bridge.send<{ ok: true; supports: GemDataInfo[] }>({
-        cmd: 'getAvailableSupports',
-        activeSkillTags: skillInfo.gem.tags,
-        includeAwakened: false,
-      });
-      let supportPool = supportsRes.supports.filter((s) => !constraints.includes(s.name));
-
-      const topN = options.topN ?? 25;
-      if (supportPool.length > topN) supportPool = supportPool.slice(0, topN);
-
-      const freeSlots = Math.max(0, availableSlots - constraints.length);
-      if (freeSlots === 0) {
-        const dps = await this.testSupportCombinationLocked(activeSkill, constraints);
-        return {
-          activeSkill,
-          lockedSupports: constraints,
-          bestCombination: [],
-          bestDPS: dps,
-          singleSupportDPS: [],
-          topAlternatives: [],
-        };
-      }
-
-      // Phase A: single-support DPS
-      const singleResults: Array<{ name: string; dps: number }> = [];
-      for (const support of supportPool) {
-        const dps = await this.testSupportCombinationLocked(activeSkill, [...constraints, support.name]);
-        singleResults.push({ name: support.name, dps });
-      }
-      singleResults.sort((a, b) => b.dps - a.dps);
-
-      // Phase B: top-K combination
-      const initialCombo = singleResults.slice(0, freeSlots).map((s) => s.name);
-      let bestCombo = [...initialCombo];
-      let bestDPS = await this.testSupportCombinationLocked(activeSkill, [...constraints, ...bestCombo]);
-      const seen = new Map<string, number>();
-      seen.set(bestCombo.slice().sort().join('|'), bestDPS);
-
-      // Phase C: swap iteration — try replacing each slot with next-best candidates
-      const swapDepth = Math.min(8, singleResults.length - freeSlots);
-      for (let slot = 0; slot < freeSlots; slot++) {
-        for (let alt = freeSlots; alt < freeSlots + swapDepth; alt++) {
-          if (alt >= singleResults.length) break;
-          const candidate = singleResults[alt].name;
-          if (bestCombo.includes(candidate)) continue;
-          const testCombo = [...bestCombo];
-          testCombo[slot] = candidate;
-          const key = testCombo.slice().sort().join('|');
-          if (seen.has(key)) continue;
-          const dps = await this.testSupportCombinationLocked(activeSkill, [...constraints, ...testCombo]);
-          seen.set(key, dps);
-          if (dps > bestDPS) {
-            bestDPS = dps;
-            bestCombo = [...testCombo];
-          }
-        }
-      }
-
-      const topAltCount = options.topAlternatives ?? 5;
-      const sortedAlts = Array.from(seen.entries())
-        .map(([key, dps]) => ({ combo: key.split('|'), dps }))
-        .sort((a, b) => b.dps - a.dps)
-        .slice(0, topAltCount);
-
-      return {
-        activeSkill,
-        lockedSupports: constraints,
-        bestCombination: bestCombo,
-        bestDPS,
-        singleSupportDPS: singleResults,
-        topAlternatives: sortedAlts,
-      };
-    });
-  }
-
-  /**
-   * Test a single (active skill, supports) combination by atomically replacing
-   * the main skill group's gem list via `replaceSocketGroup` (one bridge
-   * round-trip, one OnFrame recalc), reading stats, then restoring.
-   *
-   * Previously this did N removeGem + M addGem calls, each triggering a full
-   * PoB OnFrame recalc (~55-65ms each). `replaceSocketGroup` wipes the
-   * gemList in Lua, inserts the new gems without per-gem recalcs, then calls
-   * ProcessSocketGroup + OnFrame once — same approach as restoreSkills.
-   * Profiling showed 91% of findOptimalLinks time was removeGem/addGem;
-   * this optimization yields ~64% wall-clock reduction.
-   *
-   * Caller MUST already hold the lock.
-   */
-  private async testSupportCombinationLocked(
-    activeSkill: string,
-    supports: string[],
-  ): Promise<number> {
-    const groupsRes = await this.bridge.send<{ ok: true; groups: SkillGroupInfo[] }>({
-      cmd: 'getSocketGroups',
-    });
-    let mainIndex = groupsRes.groups.findIndex((g) => g.isMainGroup);
-    if (mainIndex < 0) mainIndex = 0;
-    const groupNumber = mainIndex + 1;
-
-    // Replace the entire main group atomically: one Lua call, one OnFrame recalc.
-    // Avoids N removeGem + M addGem calls each triggering a full PoB recalculation.
-    // A probe error stays visible when the restore fails too (probeThenRestore).
-    return this.withSkillsProbeUnlocked(async () => {
-      const gems = [
-        { name: activeSkill, level: 20, quality: 20 },
-        ...supports.map((sup) => ({ name: sup, level: 20, quality: 20 })),
-      ];
-      await this.bridge.send({ cmd: 'replaceSocketGroup', groupIndex: groupNumber, gems });
-      const stats = await this.bridge.getStats();
-      return toNumber(stats.CombinedDPS);
-    });
+    return this.withLock(() =>
+      findOptimalLinks(
+        { send: (command) => this.bridge.send(command), probe: (request) => this.probeUnlocked(request) },
+        { activeSkill, supportSlots: availableSlots, constraints, topN: options.topN, topAlternatives: options.topAlternatives },
+      ),
+    );
   }
 
   // ------------------------------------------------------------------
@@ -1835,8 +1795,26 @@ export class BuildSession {
   }
 
   /**
-   * Apply config changes inside a snapshot/restore cycle; the build
-   * config is fully restored after the call.
+   * Evaluate config variants (each validated like set_config, which the
+   * caller has done) on the probe engine: each variant's stats, or its user
+   * error; any other failure fails the call. The build never changes.
+   */
+  private async configVariantsUnlocked(
+    tool: string,
+    variants: Array<Record<string, unknown>>,
+  ): Promise<Array<{ stats: Stats | null; error: string | null }>> {
+    const probed = await this.probeUnlocked({ variants: variants.map((config) => ({ config })) });
+    return probed.results.map((r) => {
+      if (r.error === undefined) return { stats: withoutNulls(r.stats), error: null };
+      if (!r.userError) throw new Error(`${tool}: ${r.error}`);
+      return { stats: null, error: r.error };
+    });
+  }
+
+  /**
+   * Stats with config changes applied (as set_config applies them), evaluated
+   * on the probe engine; the build never changes. An unknown key or a bad
+   * value is a UserError.
    */
   async simulateConfig(
     options: Record<string, unknown>,
@@ -1844,12 +1822,9 @@ export class BuildSession {
     return this.withLock(async () => {
       await this.validateConfigOptionsUnlocked(options);
       const before = await this.bridge.getStats();
-      let after: Stats = before;
-      await this.withConfigProbeUnlocked(async () => {
-        await this.bridge.setConfig(options);
-        after = await this.bridge.getStats();
-      });
-      return { before, after, diff: computeDiff(before, after) };
+      const [r] = await this.configVariantsUnlocked('simulate config', [options]);
+      if (!r.stats) throw new UserError(r.error ?? 'the config change was refused');
+      return { before, after: r.stats, diff: computeDiff(before, r.stats) };
     });
   }
 
@@ -1869,6 +1844,11 @@ export class BuildSession {
     };
   }
 
+  /**
+   * Every scenario as one probe variant. A preset key PoB does not have fails
+   * the whole call before anything runs; a scenario the engine refuses
+   * carries its error (null `after` / `diff`); any other failure fails the call.
+   */
   async compareScenarios(scenarios: string[]): Promise<ScenarioComparison> {
     if (scenarios.length === 0) throw new UserError('compareScenarios requires at least one scenario');
     for (const s of scenarios) {
@@ -1882,31 +1862,28 @@ export class BuildSession {
         await this.validateConfigOptionsUnlocked(SCENARIO_PRESETS[scenario].options, `scenario "${scenario}"`);
       }
       const baseline = await this.bridge.getStats();
-      const results: ScenarioResult[] = [];
-      for (const scenario of scenarios) {
+      const probed = await this.configVariantsUnlocked(
+        'compare_scenarios',
+        scenarios.map((s) => SCENARIO_PRESETS[s].options),
+      );
+      const results: ScenarioComparisonEntry[] = scenarios.map((scenario, i) => {
         const preset = SCENARIO_PRESETS[scenario];
-        let after: Stats = baseline;
-        await this.withConfigProbeUnlocked(async () => {
-          try {
-            await this.bridge.setConfig(preset.options);
-            after = await this.bridge.getStats();
-          } catch {
-            // ignore — after stays at baseline
-          }
-        });
-        results.push({
+        const after = probed[i].stats;
+        return {
           scenario,
           description: preset.description,
           options: preset.options,
           before: baseline,
           after,
-          diff: computeDiff(baseline, after),
-        });
-      }
+          diff: after ? computeDiff(baseline, after) : null,
+          ...(probed[i].error !== null ? { error: probed[i].error as string } : {}),
+        };
+      });
       return { baseline, scenarios: results };
     });
   }
 
+  /** Buffs / charges toggled as config options (BUFF_KEY_MAP aliases), through simulateConfig. */
   async toggleBuffs(buffs: Record<string, boolean | number | string>): Promise<StatDiffResult> {
     // Null-prototype so a "__proto__" key stays an own property (and gets rejected by validation).
     const options: Record<string, unknown> = Object.create(null);
@@ -1988,57 +1965,50 @@ export class BuildSession {
       const itemsBySlot = new Map<string, EquippedItem>();
       for (const item of itemsRes.items) itemsBySlot.set(item.slot, item);
 
-      // Take a single full snapshot up front; restore once at the end.
-      // Per-iteration restore uses the same snapshot so item/skill drift
-      // can't accumulate across slots.
-      const fullSnap = await this.snapshotAllUnlocked();
-
-      // Both restores go through probeThenRestore: a restore failure is an
-      // internal error that keeps the probe's error as its cause.
+      // One probe variant per equipped slot: the slot emptied as unequip_item
+      // would, then undone (a jewel socket or a skill-granting item takes the
+      // probe's full-recalculation fallback). A slot refused as input gets its
+      // error in the result; any other failure fails the call.
+      const equipped = focusSlots.filter((slot) => itemsBySlot.has(slot));
+      const probed = equipped.length > 0
+        ? await this.probeUnlocked({ variants: equipped.map((slot) => ({ items: [{ slot, unequip: true as const }] })) })
+        : { base: {}, results: [] };
       const out: UpgradeSuggestion[] = [];
-      await probeThenRestore(async () => {
-        for (const slot of focusSlots) {
-          const item = itemsBySlot.get(slot) ?? null;
-          if (!item) {
-            out.push({
-              slot,
-              currentItem: null,
-              currentItemName: null,
-              empty: true,
-              dpsContribution: 0,
-              ehpContribution: 0,
-              priority: 100,
-              suggestedMods: getSuggestedMods(slot, archetype, budget),
-            });
-            continue;
-          }
-          let dpsLoss = 0;
-          let ehpLoss = 0;
-          await probeThenRestore(async () => {
-            try {
-              await this.bridge.send({ cmd: 'unequipItem', slot });
-              const without = await this.bridge.getStats();
-              dpsLoss = toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS);
-              ehpLoss = toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP);
-            } catch {
-              /* ignore — slot may not exist; will record zero contribution */
-            }
-          }, () => this.restoreAllUnlocked(fullSnap));
+      for (const slot of focusSlots) {
+        const item = itemsBySlot.get(slot) ?? null;
+        if (!item) {
           out.push({
             slot,
-            currentItem: item,
-            currentItemName: item.name ?? item.baseName ?? null,
-            empty: false,
-            dpsContribution: dpsLoss,
-            ehpContribution: ehpLoss,
-            priority: computeUpgradePriority(dpsLoss, ehpLoss, baseline),
+            currentItem: null,
+            currentItemName: null,
+            empty: true,
+            dpsContribution: 0,
+            ehpContribution: 0,
+            priority: 100,
             suggestedMods: getSuggestedMods(slot, archetype, budget),
           });
+          continue;
         }
-        // Belt-and-suspenders final restore in case any iteration's restore was skipped.
-      }, () => this.restoreAllUnlocked(fullSnap));
+        const r = probed.results[equipped.indexOf(slot)];
+        if (r.error !== undefined && !r.userError) throw new Error(`suggest_upgrades: ${slot}: ${r.error}`);
+        const without = r.error === undefined ? withoutNulls(r.stats) : null;
+        const dpsLoss = without ? toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS) : 0;
+        const ehpLoss = without ? toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP) : 0;
+        out.push({
+          slot,
+          currentItem: item,
+          currentItemName: item.name ?? item.baseName ?? null,
+          empty: false,
+          dpsContribution: dpsLoss,
+          ehpContribution: ehpLoss,
+          priority: without ? computeUpgradePriority(dpsLoss, ehpLoss, baseline) : 0,
+          suggestedMods: getSuggestedMods(slot, archetype, budget),
+          ...(r.error !== undefined ? { error: r.error } : {}),
+        });
+      }
 
       out.sort((a, b) => {
+        if ((a.error === undefined) !== (b.error === undefined)) return a.error === undefined ? -1 : 1;
         if (a.empty && !b.empty) return -1;
         if (!a.empty && b.empty) return 1;
         return (a.dpsContribution + a.ehpContribution) - (b.dpsContribution + b.ehpContribution);
@@ -2232,21 +2202,6 @@ function describeConfigValueProblem(meta: ConfigVarMetadata | undefined, value: 
   }
 }
 
-function identifyTradeoffs(before: Stats, after: Stats, primaryStat: string): string[] {
-  const tradeoffs: string[] = [];
-  const defensiveKeys = ['TotalEHP', 'Life', 'EnergyShield', 'Armour', 'Evasion', 'Ward'];
-  const offensiveKeys = ['CombinedDPS', 'TotalDPS', 'AverageDamage'];
-  const isOffenseFocus = /DPS|Damage|Crit|Speed/i.test(primaryStat);
-  const checkKeys = isOffenseFocus ? defensiveKeys : offensiveKeys;
-  for (const key of checkKeys) {
-    const delta = toNumber(after[key]) - toNumber(before[key]);
-    if (delta < -0.5) {
-      tradeoffs.push(`${key}: ${delta.toFixed(1)}`);
-    }
-  }
-  return tradeoffs;
-}
-
 export interface GemDescription {
   nameSpec?: string;
   gemId?: string;
@@ -2336,6 +2291,12 @@ export interface ComparisonResult {
   bestForEHP: number | null;
   bestForLife: number | null;
 }
+
+/** A probe variant whose passive nodes may be given by name (see BuildSession.probeNamed). */
+export type NamedProbeVariant = Omit<ProbeVariant, 'allocate' | 'deallocate'> & {
+  allocate?: Array<string | number>;
+  deallocate?: Array<string | number>;
+};
 
 export interface TreeNodeInfo {
   id: number;
@@ -2440,18 +2401,7 @@ export interface PassiveTreeInfo {
   summary: PassiveTreeSummary;
 }
 
-export interface NodeRanking {
-  nodeId: number;
-  nodeName: string;
-  nodeType: string;
-  isKeystone: boolean;
-  isNotable: boolean;
-  targetStat: string;
-  delta: number;
-  lossIfRemoved?: number;
-  tradeoffs?: string[];
-  stats?: string[];
-}
+export type { NodeRanking, RankBy, TreeSearchResult } from './tree-search.js';
 
 export interface KeystoneEvaluation {
   keystone: string;
@@ -2524,8 +2474,9 @@ export interface SkillsSnapshot {
 
 export interface SupportCandidate {
   name: string;
-  dps: number;
-  dpsDelta: number;
+  /** null when the candidate was refused (see error). */
+  dps: number | null;
+  dpsDelta: number | null;
   error: string | null;
 }
 
@@ -2538,19 +2489,13 @@ export interface SupportComparison {
 
 export interface GemLevelScaling {
   level: number;
-  dps: number;
-  dpsDelta: number;
+  /** null when the level was refused (see error). */
+  dps: number | null;
+  dpsDelta: number | null;
   error: string | null;
 }
 
-export interface OptimalLinksResult {
-  activeSkill: string;
-  lockedSupports: string[];
-  bestCombination: string[];
-  bestDPS: number;
-  singleSupportDPS: Array<{ name: string; dps: number }>;
-  topAlternatives: Array<{ combo: string[]; dps: number }>;
-}
+export type { OptimalLinksResult } from './link-search.js';
 
 // ---------------------------------------------------------------------------
 // Phase 6: Config / scenario types
@@ -2599,9 +2544,16 @@ export interface ScenarioResult {
   diff: StatDiff;
 }
 
+/** A compare_scenarios entry: `after` and `diff` are null when the engine refused the scenario (see error). */
+export interface ScenarioComparisonEntry extends Omit<ScenarioResult, 'after' | 'diff'> {
+  after: Stats | null;
+  diff: StatDiff | null;
+  error?: string;
+}
+
 export interface ScenarioComparison {
   baseline: Stats;
-  scenarios: ScenarioResult[];
+  scenarios: ScenarioComparisonEntry[];
 }
 
 // ---------------------------------------------------------------------------
@@ -2624,6 +2576,8 @@ export interface UpgradeSuggestion {
   ehpContribution: number;
   priority: number;
   suggestedMods: string[];
+  /** The slot could not be measured (refused as input); its contributions are 0. */
+  error?: string;
 }
 
 type BuildArchetype = 'archmage' | 'minion' | 'totem' | 'dot' | 'generic';

@@ -48,6 +48,19 @@ package.cpath = POB_PATH .. "/?.dll;"
 	.. POB_PATH .. "/runtime/?.so;"
 	.. package.cpath
 
+-- PoB 2.68+ uses compound assignments (`count += 1`) that only PoB's patched
+-- LuaJIT parses. Every PoB file is loaded through this loadfile, which tries the
+-- file as-is first and rewrites compound assignments only when that fails to
+-- parse. Nothing is written to the PoB install; the rewrite happens in memory.
+local pobLoadfile
+do
+	local bridgeDir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]*$") or "."
+	local compoundAssign = dofile(bridgeDir .. "/compound-assign.lua")
+	pobLoadfile = compoundAssign.loadfile
+	-- `require` of PoB modules (e.g. Classes.CompareBuySimilar) goes through the same loader.
+	table.insert(package.loaders, 2, compoundAssign.searcher)
+end
+
 -- ---------------------------------------------------------------------------
 -- Protocol stream protection. stdout carries exactly one JSON object per line
 -- and nothing else. Anything PoB (or a library) prints goes to stderr instead.
@@ -550,7 +563,7 @@ function LoadModule(fileName, ...)
 	if not fileName:match("%.lua") then
 		fileName = fileName .. ".lua"
 	end
-	local func, err = loadfile(fileName)
+	local func, err = pobLoadfile(fileName)
 	if func then
 		return func(...)
 	else
@@ -561,7 +574,7 @@ function PLoadModule(fileName, ...)
 	if not fileName:match("%.lua") then
 		fileName = fileName .. ".lua"
 	end
-	local func, err = loadfile(fileName)
+	local func, err = pobLoadfile(fileName)
 	if func then
 		return PCall(func, ...)
 	else
@@ -696,7 +709,7 @@ local function stripColorCodes(text)
 	return (tostring(text):gsub("%^x%x%x%x%x%x%x", ""):gsub("%^%d", ""))
 end
 
-dofile(SCRIPT_PATH .. "/Launch.lua")
+assert(pobLoadfile(SCRIPT_PATH .. "/Launch.lua"))()
 mainObject.continuousIntegrationMode = os.getenv("CI")
 runCallback("OnInit")
 runCallback("OnFrame")
@@ -910,11 +923,31 @@ local function slotRefusalReason(tab, item, slotName)
 	return "a " .. kind .. " item does not go in that slot"
 end
 
+-- PoB 2.68 split object construction into `new("X"):X(args)` and rejects
+-- `new("X", args)`; older PoB only has the latter. Detected once by asking `new`
+-- about a class that does not exist: only the new `new` complains about the
+-- extra argument.
+local construct
+do
+	local split
+	function construct(className, ...)
+		if split == nil then
+			local ok, err = pcall(new, "pobmcp-no-such-class", true)
+			split = not ok and tostring(err):find("Extra argument", 1, true) ~= nil
+		end
+		if split then
+			local object = new(className)
+			return object[className](object, ...)
+		end
+		return new(className, ...)
+	end
+end
+
 -- Parse item text exactly as ItemsTab:CreateDisplayItemFromRaw does (without
 -- normalising), but never through the items tab's displayItem: a parse
 -- failure can then never leave an earlier display item behind to be equipped.
 local function parseItemText(itemRaw, slotName)
-	local ok, item = pcall(new, "Item", itemRaw)
+	local ok, item = pcall(construct, "Item", itemRaw)
 	if not ok then
 		userError("Could not parse the item text for " .. slotName .. ": " .. stripColorCodes(tostring(item)))
 	end
@@ -1518,7 +1551,7 @@ local function installSpec(version, state)
 	if type(versions) ~= "table" or not versions[version] then
 		error("Tree convert failed: unknown tree version " .. tostring(version))
 	end
-	local newSpec = new("PassiveSpec", build, version)
+	local newSpec = construct("PassiveSpec", build, version)
 	newSpec.title = state.title
 	newSpec.jewels = shallowCopy(state.jewels)
 	local overrides = shallowCopy(state.hashOverrides)
@@ -1916,7 +1949,96 @@ local function restoreTreeState(encoded)
 	return report
 end
 
-local function getFullConfigInput()
+-- The config tables of the active config set. PoB keeps `input` and
+-- `placeholder` both on the config set and as configTab.input /
+-- configTab.placeholder (the same tables; older PoB has no config sets).
+-- PoB 2.67's ConfigTab:Save writes them with pairs(), so their iteration
+-- order is part of the export: a key added and removed again can resize the
+-- table and reorder it. What-ifs therefore never write to these tables: they
+-- swap in copies and later put the very same objects back. (One table of
+-- functions: the main chunk is at Lua's limit of 200 locals.)
+local ConfigTables = { stash = nil }
+do
+	local function current()
+		local configTab = build.configTab
+		local set = configTab.configSets and configTab.activeConfigSetId and configTab.configSets[configTab.activeConfigSetId]
+		return { input = configTab.input, placeholder = configTab.placeholder, set = set,
+			setInput = set and set.input, setPlaceholder = set and set.placeholder }
+	end
+
+	local function attach(t)
+		local configTab = build.configTab
+		configTab.input, configTab.placeholder = t.input, t.placeholder
+		if t.set then t.set.input, t.set.placeholder = t.setInput, t.setPlaceholder end
+	end
+
+	local function shallowCopy(t)
+		local out = { }
+		for k, v in pairs(t or { }) do out[k] = v end
+		return out
+	end
+
+	ConfigTables.current = current
+	ConfigTables.attach = attach
+
+	-- Installs copies of the `orig` config tables (with `changes` applied to
+	-- the input copy).
+	local function attachCopies(orig, changes)
+		local input, placeholder = shallowCopy(orig.input), shallowCopy(orig.placeholder)
+		for key, value in pairs(changes or { }) do input[key] = value end
+		attach({ input = input, placeholder = placeholder, set = orig.set, setInput = input, setPlaceholder = placeholder })
+	end
+
+	-- Installs copies of the active config tables (with `changes` applied to
+	-- the input copy) and returns the originals, untouched, for restore.
+	function ConfigTables.detach(changes)
+		local orig = current()
+		attachCopies(orig, changes)
+		return orig
+	end
+
+	-- Puts the original config tables back and rebuilds the config mod list
+	-- (and the config controls, which BuildModList also sets) from them.
+	-- BuildModList writes placeholders and the boss damage type into its
+	-- tables, so it runs on copies of them: the originals are never written
+	-- and keep their iteration order.
+	function ConfigTables.restore(orig)
+		attachCopies(orig, nil)
+		local ok, err = pcall(function() build.configTab:BuildModList() end)
+		attach(orig)
+		if not ok then error(err, 0) end
+	end
+
+	-- True when a live config value and a snapshot value (which came back
+	-- through JSON, so a number may be rounded to 14 significant digits) are
+	-- the same.
+	function ConfigTables.sameValue(live, snap)
+		if live == snap then return true end
+		if type(live) ~= "number" or type(snap) ~= "number" then return false end
+		return math.abs(live - snap) <= 1e-12 * math.max(math.abs(live), math.abs(snap))
+	end
+
+	-- True when `input` holds the values of `snapshot` (by value).
+	function ConfigTables.sameInput(input, snapshot)
+		local n = 0
+		for key, value in pairs(input) do
+			local v = copyValue(value)
+			if v == nil or not ConfigTables.sameValue(v, snapshot[key]) then return false end
+			n = n + 1
+		end
+		for _ in pairs(snapshot) do n = n - 1 end
+		return n == 0
+	end
+
+	-- probeCommit detached the config tables for a fallback variant: the
+	-- restore that follows puts `orig` back (while `detached` is still the
+	-- live input table), before comparing or changing any key.
+	function ConfigTables.stashCommitted(orig, detached)
+		ConfigTables.stash = { orig = orig, detached = detached }
+	end
+end
+
+function ConfigTables.fullInput()
 	local result = { }
 	if build.configTab and build.configTab.input then
 		for key, value in pairs(build.configTab.input) do
@@ -1926,18 +2048,37 @@ local function getFullConfigInput()
 	return result
 end
 
-local function restoreConfigInput(input)
+-- set_config undo and the full snapshot restore (restoreConfig).
+function ConfigTables.restoreInput(input)
 	if not (build.configTab and build.configTab.input) then
 		error("Config tab not available")
 	end
-	-- Wipe current input and replace with snapshot
-	for key, _ in pairs(build.configTab.input) do
-		build.configTab.input[key] = nil
+	input = input or { }
+	local stash = ConfigTables.stash
+	ConfigTables.stash = nil
+	if stash and stash.detached == build.configTab.input then
+		-- After a fallback variant with config: the committed tables, never
+		-- written, go back first; the copies are dropped.
+		ConfigTables.attach(stash.orig)
 	end
-	for key, value in pairs(input or { }) do
-		build.configTab.input[key] = value
+	local current = ConfigTables.current()
+	if ConfigTables.sameInput(current.input, input) then
+		-- Nothing to change (a restore after a fallback variant, or after a
+		-- non-config change): rebuild the mod list without writing to the
+		-- tables, so their values and order stay.
+		ConfigTables.restore(current)
+	else
+		-- Change only the keys that differ (set_config undo); a value equal
+		-- but for JSON rounding is left as it is.
+		local target = current.input
+		for key in pairs(target) do
+			if input[key] == nil then target[key] = nil end
+		end
+		for key, value in pairs(input) do
+			if not ConfigTables.sameValue(target[key], value) then target[key] = value end
+		end
+		build.configTab:BuildModList()
 	end
-	build.configTab:BuildModList()
 	build.buildFlag = true
 	runCallback("OnFrame")
 end
@@ -3106,7 +3247,7 @@ local function tradeStateOrError()
 		end
 		h:close()
 	end
-	local gen = new("TradeQueryGenerator", { itemsTab = build.itemsTab })
+	local gen = construct("TradeQueryGenerator", { itemsTab = build.itemsTab })
 	local _, helpers = findUpvalue(gen.StartQuery, "tradeHelpers")
 	helpers = helpers or LoadModule("Classes/TradeHelpers")
 	local texts, pseudo = { }, { }
@@ -3181,6 +3322,82 @@ local function influenceIndex(name)
 	userError("Unknown influence '" .. tostring(name) .. "'")
 end
 
+-- PoB 2.67 and older cap the weight group with an upvalue (MAX_FILTERS);
+-- 2.68 counts a trade-site complexity budget in a FinishQuery local instead,
+-- reachable only from a debug hook. Both are lifted for the call so every
+-- weight comes back; returns a function that undoes the lift and reports
+-- whether it took effect. The line hook (which turns the JIT off while it is
+-- set) is installed only once FinishQuery has run its item calculation (at
+-- its WeightedRatioOutputs call; from the start when that is missing) and
+-- removed as soon as the local is set.
+local tradeCompat = { }
+function tradeCompat.liftFilterCap(finishQuery)
+	local maxIdx, maxOrig = findUpvalue(finishQuery, "MAX_FILTERS")
+	if maxIdx then
+		debug.setupvalue(finishQuery, maxIdx, 100000)
+		return function() debug.setupvalue(finishQuery, maxIdx, maxOrig) return true end
+	end
+	local hook, mask, count = debug.gethook()
+	local lifted, hooked = false, false
+	local function unhook()
+		if not hooked then return end
+		hooked = false
+		if hook then debug.sethook(hook, mask, count) else debug.sethook() end
+	end
+	local function onLine()
+		local info = debug.getinfo(2, "f")
+		if not (info and info.func == finishQuery) then return end
+		for i = 1, 250 do
+			local name = debug.getlocal(2, i)
+			if name == nil then return end
+			if name == "complexityBudget" then
+				debug.setlocal(2, i, 1e9)
+				lifted = true
+				unhook()
+				return
+			end
+		end
+	end
+	local function hookNow()
+		if hooked or lifted then return end
+		hooked = true
+		debug.sethook(onLine, "l")
+	end
+	local _, class = findUpvalue(finishQuery, "TradeQueryGeneratorClass")
+	local ratio = type(class) == "table" and rawget(class, "WeightedRatioOutputs")
+	if type(ratio) ~= "function" then ratio = nil end
+	local undo = function()
+		if ratio then class.WeightedRatioOutputs = ratio end
+		unhook()
+		return lifted
+	end
+	if ratio then
+		class.WeightedRatioOutputs = function(...) hookNow() return ratio(...) end
+	else
+		hookNow()
+	end
+	return undo
+end
+
+-- PoB 2.68 hands the callback the query table (no sort/engine wrapper, empty
+-- "and"/"not" groups always present) and no longer applies influences. Bring
+-- it to the 2.67 shape: { query, sort, engine } JSON, no empty groups, and
+-- the influence requirements 2.67 put in an "and" group.
+function tradeCompat.normaliseQuery(query, influenceIds)
+	if type(query) ~= "table" then return query end
+	local stats, kept = query.stats or { }, { }
+	for i, group in ipairs(stats) do
+		if i == 1 or #(group.filters or { }) > 0 then kept[#kept + 1] = group end
+	end
+	if #influenceIds > 0 then
+		local filters = { }
+		for _, id in ipairs(influenceIds) do filters[#filters + 1] = { id = id } end
+		kept[#kept + 1] = { type = "and", filters = filters }
+	end
+	query.stats = kept
+	return dkjson.encode({ query = query, sort = { ["statgroup.0"] = "desc" }, engine = "new" })
+end
+
 local function runTradeQuery(cmd)
 	local st = tradeStateOrError()
 	local slot = tradeSlotOrError(cmd.slot, st.helpers)
@@ -3231,16 +3448,24 @@ local function runTradeQuery(cmd)
 	gen.lastMaxPrice, gen.lastMaxPriceTypeIndex, gen.lastMaxLevel = nil, nil, nil
 	gen.tradeTypeIndex = tradeTypeIndex
 	gen.calcContext = { }
+	-- PoB without influence support (2.68+): require the influences with the
+	-- same trade filters 2.67 added (the weights cannot use them there).
+	local influenceIds = { }
+	if not findUpvalue(gen.FinishQuery, "hasInfluenceModIds") then
+		for _, idx in ipairs({ options.influence1, options.influence2 }) do
+			if idx > 1 then
+				influenceIds[#influenceIds + 1] = "pseudo.pseudo_has_"
+					.. string.lower(itemLib.influenceInfo.default[idx - 1].display) .. "_influence"
+			end
+		end
+	end
 	local captured = nil
 	gen.requesterContext = nil
 	gen.requesterCallback = function(_ctx, json, errMsg) captured = { json = json, err = errMsg } end
-	-- Lift PoB's 36-filter cap so every weight comes back; the caller applies
-	-- the cap after its own adjustments.
-	local maxIdx, maxOrig = findUpvalue(gen.FinishQuery, "MAX_FILTERS")
 	local openOrig, closeOrig = rawget(main, "OpenPopup"), rawget(main, "ClosePopup")
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
-	if maxIdx then debug.setupvalue(gen.FinishQuery, maxIdx, 100000) end
+	local capLifted = false
 	local started = os.clock()
 	local ok, err = pcall(function()
 		gen:StartQuery(slot, options)
@@ -3253,14 +3478,19 @@ local function runTradeQuery(cmd)
 			if not resumed then error("trade weight calculation failed: " .. tostring(msg), 0) end
 		end
 		gen.calcContext.co = nil
-		gen:FinishQuery()
+		-- Lift PoB's filter cap so every weight comes back; the caller applies
+		-- the cap after its own adjustments.
+		local unlift = tradeCompat.liftFilterCap(gen.FinishQuery)
+		local finished, finishErr = pcall(gen.FinishQuery, gen)
+		capLifted = unlift()
+		if not finished then error(finishErr, 0) end
 	end)
 	local elapsed = os.clock() - started
-	if maxIdx then debug.setupvalue(gen.FinishQuery, maxIdx, maxOrig) end
 	main.OpenPopup, main.ClosePopup = openOrig, closeOrig
 	gen.calcContext = { }
 	gen.requesterCallback = nil
 	if not ok then error(err, 0) end
+	if captured then captured.json = tradeCompat.normaliseQuery(captured.json, influenceIds) end
 	if not captured or type(captured.json) ~= "string" then
 		error("Path of Building produced no trade query", 0)
 	end
@@ -3274,7 +3504,7 @@ local function runTradeQuery(cmd)
 	return {
 		queryJson = captured.json,
 		pobMessage = captured.err or dkjson.null,
-		capLifted = maxIdx ~= nil,
+		capLifted = capLifted,
 		itemCategory = category or dkjson.null,
 		categoryQuery = queryStr or dkjson.null,
 		currentItem = item and (item.title or item.name) or dkjson.null,
@@ -3538,7 +3768,7 @@ local DISPATCH = {
 		handler = function(_cmd) return { metadata = getConfigMetadata() } end,
 	},
 	getFullConfig = {
-		handler = function(_cmd) return { input = getFullConfigInput() } end,
+		handler = function(_cmd) return { input = ConfigTables.fullInput() } end,
 	},
 	setConfig = {
 		-- Inline mutation: options loop + rebuild before stats
@@ -3553,7 +3783,7 @@ local DISPATCH = {
 		end,
 	},
 	restoreConfig = {
-		handler = function(cmd) restoreConfigInput(cmd.input or { }) return { } end,
+		handler = function(cmd) ConfigTables.restoreInput(cmd.input or { }) return { } end,
 		mutating = true,
 	},
 
@@ -3867,6 +4097,34 @@ local DISPATCH = {
 		end,
 	},
 }
+
+-- Read-only what-if probes through PoB's calculator (lua/probe.lua). `probe`
+-- never changes the committed build; `probeCommit` applies one variant for
+-- real and is only sent between a full snapshot and its restore.
+do
+	local source = debug.getinfo(1, "S").source
+	local bridgeDir = (source:sub(1, 1) == "@" and source:sub(2) or (arg and arg[0] or "")):match("^(.*)[/\\][^/\\]*$") or "."
+	local probe = dofile(bridgeDir .. "/probe.lua")({
+		userError = userError,
+		USER_ERROR_PREFIX = USER_ERROR_PREFIX,
+		jsonNull = dkjson.null,
+		statKeys = statKeys,
+		copyValue = copyValue,
+		parseItemText = parseItemText,
+		assertItemFitsSlot = assertItemFitsSlot,
+		findGemByName = findGemByName,
+		getConfigMetadata = getConfigMetadata,
+		equipItemInSlot = equipItemInSlot,
+		detachConfigTables = ConfigTables.detach,
+		restoreConfigTables = ConfigTables.restore,
+		stashCommittedConfigTables = ConfigTables.stashCommitted,
+		allocNodesBatch = allocNodesBatch,
+		deallocNodesBatch = deallocNodesBatch,
+		pumpAndRead = pumpAndRead,
+	})
+	DISPATCH.probe = { handler = function(cmd) return probe.probe(cmd) end }
+	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
+end
 
 local function dispatch(cmd)
 	if type(cmd) ~= "table" then

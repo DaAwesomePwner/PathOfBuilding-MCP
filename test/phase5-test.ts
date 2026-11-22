@@ -3,6 +3,10 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { BuildSession } from '../src/build-session.js';
+import { LuaBridge, type Stats } from '../src/lua-bridge.js';
+import type { ResolvedPaths } from '../src/paths.js';
+import { UserError } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -201,17 +205,17 @@ async function main(): Promise<void> {
       weakestCurrentSupport: { name: string; gemIndex: number; dpsContribution: number };
       slotTested: number;
       baselineDPS: number;
-      candidates: Array<{ name: string; dps: number; dpsDelta: number; error: string | null }>;
+      candidates: Array<{ name: string; dps: number | null; dpsDelta: number | null; error: string | null }>;
     };
     assert(compareResp.candidates.length === 3, `expected 3 candidates, got ${compareResp.candidates.length}`);
     assert(typeof compareResp.weakestCurrentSupport.name === 'string', 'weakest support must be named');
     // Sorted descending by dps
     for (let i = 1; i < compareResp.candidates.length; i++) {
-      assert(compareResp.candidates[i - 1].dps >= compareResp.candidates[i].dps, 'candidates should be sorted by dps desc');
+      assert((compareResp.candidates[i - 1].dps ?? -Infinity) >= (compareResp.candidates[i].dps ?? -Infinity), 'candidates should be sorted by dps desc');
     }
     log(`  Weakest current="${compareResp.weakestCurrentSupport.name}" loss=${compareResp.weakestCurrentSupport.dpsContribution.toFixed(1)}`);
     for (const c of compareResp.candidates) {
-      log(`    ${c.name}: dps=${c.dps.toFixed(0)} delta=${c.dpsDelta.toFixed(0)}${c.error ? ` (error: ${c.error})` : ''}`);
+      log(`    ${c.name}: dps=${c.dps?.toFixed(0)} delta=${c.dpsDelta?.toFixed(0)}${c.error ? ` (error: ${c.error})` : ''}`);
     }
     const afterCompare = await getKeyStats(client);
     log(`  After compare: Life=${afterCompare.Life}, DPS=${afterCompare.CombinedDPS}, EHP=${afterCompare.TotalEHP}`);
@@ -228,10 +232,11 @@ async function main(): Promise<void> {
       skillGroupIndex: mainGroup.index,
       gemIndex: triedIndex, // reuse the index we know is valid
       levels: [19, 20, 21],
-    }))) as { count: number; scaling: Array<{ level: number; dps: number; dpsDelta: number; error: string | null }> };
+    }))) as { count: number; scaling: Array<{ level: number; dps: number | null; dpsDelta: number | null; error: string | null }> };
     assert(scaling.count === 3, `expected 3 levels, got ${scaling.count}`);
     for (const s of scaling.scaling) {
-      log(`    level=${s.level} dps=${s.dps.toFixed(0)} delta=${s.dpsDelta.toFixed(0)}${s.error ? ` (error: ${s.error})` : ''}`);
+      assert(s.error === null && s.dps !== null, `level ${s.level}: ${s.error}`);
+      log(`    level=${s.level} dps=${s.dps.toFixed(0)} delta=${s.dpsDelta?.toFixed(0)}`);
     }
     const afterLevels = await getKeyStats(client);
     log(`  After levels: Life=${afterLevels.Life}, DPS=${afterLevels.CombinedDPS}, EHP=${afterLevels.TotalEHP}`);
@@ -241,7 +246,7 @@ async function main(): Promise<void> {
     log('PASS: evaluate_gem_levels scaling computed and state restored');
 
     // Test 10: find_optimal_links — small topN to keep runtime sane
-    log('Test 10: find_optimal_links (Vortex, 4 slots, topN=8) — may take ~30s');
+    log('Test 10: find_optimal_links (Vortex, 4 slots, topN=8)');
     const startOpt = Date.now();
     const optResp = JSON.parse(extractText(await call(client, 'find_optimal_links', {
       activeSkill: 'Vortex',
@@ -254,8 +259,16 @@ async function main(): Promise<void> {
       bestDPS: number;
       singleSupportDPS: Array<{ name: string; dps: number }>;
       topAlternatives: Array<{ combo: string[]; dps: number }>;
+      baselineDPS: number;
+      dpsDelta: number;
+      search: { method: string; supportsEvaluated: number; poolSize: number; combinationsEvaluated: number };
     };
     const optMs = Date.now() - startOpt;
+    assert(approxEq(optResp.baselineDPS, baseline.CombinedDPS, 1e-9), `baselineDPS ${optResp.baselineDPS} vs ${baseline.CombinedDPS}`);
+    assert(optResp.dpsDelta === optResp.bestDPS - optResp.baselineDPS, 'dpsDelta is not bestDPS - baselineDPS');
+    assert(optResp.search.poolSize === 8 && optResp.search.supportsEvaluated >= 8 && optResp.search.combinationsEvaluated > 0,
+      `search: ${JSON.stringify(optResp.search)}`);
+    assert(optResp.topAlternatives[0].dps === optResp.bestDPS, 'the best alternative is not the best combination');
     log(`  Best: [${optResp.bestCombination.join(', ')}] DPS=${optResp.bestDPS.toFixed(0)} (${optMs}ms)`);
     assert(optResp.bestCombination.length === 3, `expected 3 supports for 4-slot link, got ${optResp.bestCombination.length}`);
     assert(optResp.bestDPS > 0, 'bestDPS should be positive');
@@ -290,9 +303,10 @@ async function main(): Promise<void> {
       activeSkill: 'Vortex',
       availableSlots: 6,
       topN: 25,
-    }))) as { bestCombination: string[]; bestDPS: number };
+    }))) as { bestCombination: string[]; bestDPS: number; search: { method: string; combinationsEvaluated: number } };
     const dt = Date.now() - t0;
-    log(`PASS: find_optimal_links (topN=25, 6-slot) returned in ${dt}ms, best=[${timingResp.bestCombination.join(', ')}] DPS=${timingResp.bestDPS.toFixed(0)}`);
+    log(`PASS: find_optimal_links (topN=25, 6-slot) returned in ${dt}ms (target 3000 ms), best=[${timingResp.bestCombination.join(', ')}] ` +
+      `DPS=${timingResp.bestDPS.toFixed(0)}, ${timingResp.search.method}, ${timingResp.search.combinationsEvaluated} combinations`);
 
     // Final integrity check
     log('Test 13: final overall state integrity');
@@ -306,6 +320,186 @@ async function main(): Promise<void> {
     log('PASS: build pristine after all phase 5 operations (Test 13)');
   } finally {
     try { await client.close(); } catch { /* ignore */ }
+  }
+  await directParity(paths, xml);
+}
+
+/**
+ * Test 14: the gem tools on the probe engine give exactly what the mutate
+ * path (the bridge's gem commands + full recalc, inside an exact restore)
+ * gives for the same change, every stat; each leaves the export
+ * byte-identical and the undo depth unchanged. Timings are printed (targets
+ * asserted only when ASSERT_TIMINGS=1: parallel test runs make them flaky).
+ */
+async function directParity(paths: ResolvedPaths, xml: string): Promise<void> {
+  log('Test 14: gem tools vs the mutate path (direct session)');
+  const BAD = 'Definitely Not A Gem';
+  const bridge = new LuaBridge(paths, 120_000);
+  const session = new BuildSession(bridge);
+  const num = (v: unknown): number => (typeof v === 'number' ? v : 0);
+  const viaMutate = (apply: (b: LuaBridge) => Promise<unknown>): Promise<Stats> =>
+    session.withTemporaryChange(async (b) => {
+      await apply(b);
+      return b.getStats();
+    });
+  const sameStats = (a: Stats, b: Stats, label: string): void => {
+    const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
+    const diff = keys.filter((k) => a[k] !== b[k]).map((k) => `${k}: ${a[k]} vs ${b[k]}`);
+    assert(diff.length === 0, `${label}: differs from the mutate path: ${diff.join('; ')}`);
+  };
+  const assertTimings = process.env.ASSERT_TIMINGS === '1';
+  async function readOnly<T>(label: string, fn: () => Promise<T>, targetMs?: number): Promise<T> {
+    const before = await session.exportXML();
+    const depth = session.undoStackDepth();
+    const t = performance.now();
+    const out = await fn();
+    const ms = performance.now() - t;
+    const over = targetMs !== undefined && ms >= targetMs;
+    log(`  ${label}: ${ms.toFixed(0)} ms${targetMs ? ` (target ${targetMs} ms${over ? ', OVER' : ''})` : ''}`);
+    if (assertTimings) assert(!over, `${label} took ${ms.toFixed(0)} ms`);
+    assert((await session.exportXML()) === before, `${label}: export changed`);
+    assert(session.undoStackDepth() === depth, `${label}: undo depth changed`);
+    return out;
+  }
+  async function userError(p: Promise<unknown>, text: RegExp, label: string): Promise<void> {
+    try {
+      await p;
+    } catch (e) {
+      assert(e instanceof UserError && text.test(e.message), `${label}: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    throw new Error(`${label}: expected a user error`);
+  }
+
+  try {
+    await session.loadBuild(xml);
+    const base = await session.getStats();
+    const groups = await session.listSkillGroups();
+    const main = groups.find((g) => g.isMainGroup);
+    assert(main, 'no main group');
+    const G = main.index;
+    const vortex = main.gems.findIndex((g) => g.name === 'Vortex') + 1;
+    const supports = main.gems.filter((g) => g.isSupport && g.enabled);
+    assert(vortex > 0 && supports.length >= 3, `main group: ${JSON.stringify(main.gems.map((g) => g.name))}`);
+
+    // swap_gem: with and without level / quality (setGem keeps the old gem's when not given).
+    const swapCases: Array<[string, number | undefined, number | undefined]> = [
+      ['swap_gem (level 20 / quality 20)', 20, 20],
+      ['swap_gem (keeps level / quality)', undefined, undefined],
+    ];
+    for (const [label, level, quality] of swapCases) {
+      const r = await readOnly(label, () => session.swapGemWithDiff(G, supports[0].index, 'Elemental Focus', level, quality));
+      const m = await viaMutate((b) => b.send({ cmd: 'setGem', groupIndex: G, gemIndex: supports[0].index, gemName: 'Elemental Focus', level, quality }));
+      sameStats(r.after, m, label);
+      sameStats(r.before, base, `${label} before`);
+    }
+    await userError(session.swapGemWithDiff(G, supports[0].index, BAD), /Definitely Not A Gem/, 'swap_gem unknown gem');
+    await userError(session.swapGemWithDiff(99, 1, 'Elemental Focus'), /group/i, 'swap_gem bad group');
+    await userError(session.swapGemWithDiff(G, 99, 'Elemental Focus'), /gem not found/i, 'swap_gem bad gem index');
+
+    // compare_supports: the weakest support and every candidate, plus a refused one.
+    const cmp = await readOnly('compare_supports (3 candidates)', () =>
+      session.compareSupports(G, ['Increased Critical Damage', 'Elemental Focus', BAD]), 200);
+    const losses = new Map<number, number>();
+    for (const s of supports) {
+      const m = await viaMutate((b) => b.send({ cmd: 'removeGem', groupIndex: G, gemIndex: s.index }));
+      losses.set(s.index, num(base.CombinedDPS) - num(m.CombinedDPS));
+    }
+    assert(cmp.weakestCurrentSupport.dpsContribution === losses.get(cmp.slotTested),
+      `weakest loss ${cmp.weakestCurrentSupport.dpsContribution} vs removeGem ${losses.get(cmp.slotTested)}`);
+    assert([...losses.values()].every((l) => l >= cmp.weakestCurrentSupport.dpsContribution), 'a support loses less than the weakest');
+    for (const c of cmp.candidates.filter((x) => x.error === null)) {
+      const m = await viaMutate((b) => b.send({ cmd: 'setGem', groupIndex: G, gemIndex: cmp.slotTested, gemName: c.name, level: 20, quality: 20 }));
+      assert(c.dps === m.CombinedDPS && c.dpsDelta === num(m.CombinedDPS) - num(base.CombinedDPS),
+        `compare_supports ${c.name}: ${c.dps} vs setGem ${m.CombinedDPS}`);
+    }
+    const refused = cmp.candidates[cmp.candidates.length - 1];
+    assert(refused.name === BAD && refused.dps === null && refused.dpsDelta === null && /Definitely Not A Gem/.test(refused.error ?? ''),
+      `refused candidate: ${JSON.stringify(refused)}`);
+    assert(cmp.candidates.filter((x) => x.error === null).length === 2, 'valid candidates were refused');
+    {
+      // An internal failure of one candidate (injected by a test-only wrapper
+      // around this process's LuaBridge.send) fails the call instead of
+      // becoming a zero delta.
+      const spy = bridge as unknown as { send: (cmd: object, ...rest: unknown[]) => Promise<unknown> };
+      const realSend = spy.send;
+      spy.send = async (cmd: object, ...rest: unknown[]) => {
+        const out = (await realSend.call(bridge, cmd, ...rest)) as { results?: Array<Record<string, unknown>> };
+        const c = cmd as { cmd?: string; classifyOnly?: boolean; variants?: unknown[] };
+        if (c.cmd === 'probe' && !c.classifyOnly && c.variants?.length === 2 && out.results) {
+          out.results[1] = { error: 'test failure', userError: false };
+        }
+        return out;
+      };
+      let failure: unknown;
+      try {
+        await session.compareSupports(G, ['Increased Critical Damage', 'Elemental Focus']);
+      } catch (e) {
+        failure = e;
+      } finally {
+        spy.send = realSend;
+      }
+      assert(failure instanceof Error && !(failure instanceof UserError) && /test failure/.test(failure.message),
+        `an internal candidate failure did not fail compare_supports: ${String(failure)}`);
+    }
+
+    // evaluate_gem_levels: every default level.
+    const levels = await readOnly('evaluate_gem_levels (default levels)', () => session.evaluateGemLevels(G, vortex), 200);
+    assert(levels.length >= 5, `only ${levels.length} levels`);
+    for (const l of levels) {
+      const m = await viaMutate((b) => b.send({ cmd: 'setGemLevel', groupIndex: G, gemIndex: vortex, level: l.level }));
+      assert(l.error === null && l.dps === m.CombinedDPS && l.dpsDelta === num(m.CombinedDPS) - num(base.CombinedDPS),
+        `level ${l.level}: ${l.dps} vs setGemLevel ${m.CombinedDPS}`);
+    }
+    await userError(session.evaluateGemLevels(G, 99), /not found/, 'evaluate_gem_levels bad gem');
+
+    // A granted skill group (the monster-explosion group from the build's items) keeps the mutate path.
+    const explode = groups.find((g) => g.source === 'Explode');
+    if (explode) {
+      const lv = explode.gems[0].level ?? 1;
+      const r = await readOnly('evaluate_gem_levels (granted group)', () => session.evaluateGemLevels(explode.index, 1, [lv]));
+      assert(r.length === 1 && r[0].error === null && r[0].dps === base.CombinedDPS, `granted group: ${JSON.stringify(r)}`);
+    }
+
+    // find_optimal_links: candidates come from PoB's own support check; the
+    // winner equals replaceSocketGroup + full recalc with the reported levels.
+    type GemSpec = { name: string; level: number; quality: number };
+    const replaced = (gems: GemSpec[]) => (b: LuaBridge) => b.send({ cmd: 'replaceSocketGroup', groupIndex: G, gems });
+    const naturalLevel = async (name: string): Promise<number> => Math.min(20, (await session.getGemByName(name)).naturalMaxLevel ?? 20);
+    const compatible = await bridge.send<{ supports: Array<{ name: string; naturalMaxLevel?: number }> }>(
+      { cmd: 'probe', supportsFor: { active: 'Vortex', locked: [] } });
+    const compatibleNames = new Set(compatible.supports.map((x) => x.name));
+    const coarse = await session.getAvailableSupports((await session.getGemByName('Vortex')).tags, false);
+    assert(compatibleNames.has('Inspiration') && !coarse.some((x) => x.name === 'Inspiration'),
+      "Inspiration should be a candidate through PoB's check (and missing from the old tag match)");
+    assert(!compatibleNames.has('Melee Physical Damage'), "an attack-only support passed PoB's check for a spell");
+    log(`  PoB's check: ${compatibleNames.size} supports can support Vortex (the tag match listed ${coarse.length})`);
+    const six = await readOnly('find_optimal_links (6-link)', () => session.findOptimalLinks('Vortex', 5), 3000);
+    log(`  6-link: [${six.bestCombination.join(', ')}] ${six.bestDPS.toFixed(0)} (delta ${six.dpsDelta.toFixed(0)}), ` +
+      `${six.search.method}, ${six.search.supportsEvaluated} supports, ${six.search.combinationsEvaluated} combinations`);
+    assert(six.search.supportsEvaluated === [...compatibleNames].filter((n) => !n.startsWith('Awakened ')).length,
+      `supportsEvaluated ${six.search.supportsEvaluated} vs PoB's check`);
+    assert(six.bestCombination.length === 5 && new Set(six.bestCombination).size === 5, `combination ${six.bestCombination}`);
+    assert(six.mainGroup.index === G && six.baselineDPS === base.CombinedDPS && six.dpsDelta === six.bestDPS - six.baselineDPS, 'baseline / delta');
+    assert(JSON.stringify(six.bestGroup.map((g) => g.name)) === JSON.stringify(['Vortex', ...six.bestCombination]), 'bestGroup names');
+    for (const g of six.bestGroup) assert(g.level === await naturalLevel(g.name) && g.quality === 20, `bestGroup level of ${g.name}: ${g.level}`);
+    assert((await viaMutate(replaced(six.bestGroup))).CombinedDPS === six.bestDPS, 'find_optimal_links winner differs from replaceSocketGroup');
+    const single = six.singleSupportDPS[0];
+    const singleGroup = await Promise.all(['Vortex', single.name].map(async (name) => ({ name, level: await naturalLevel(name), quality: 20 })));
+    assert((await viaMutate(replaced(singleGroup))).CombinedDPS === single.dps, `single ${single.name} differs from replaceSocketGroup`);
+    assert(six.topAlternatives.every((a, i) => i === 0 || a.dps <= six.topAlternatives[i - 1].dps), 'alternatives not sorted');
+    const locked = await readOnly('find_optimal_links (4-link, one locked)', () => session.findOptimalLinks('Vortex', 3, ['Concentrated Effect']));
+    assert(locked.bestCombination.length === 2 && !locked.bestCombination.includes('Concentrated Effect'), `locked: ${locked.bestCombination}`);
+    assert(locked.bestGroup[1].name === 'Concentrated Effect', 'the locked support is not in bestGroup');
+    assert((await viaMutate(replaced(locked.bestGroup))).CombinedDPS === locked.bestDPS, 'locked find_optimal_links winner differs from replaceSocketGroup');
+    await userError(session.findOptimalLinks('Vortex', 3, [BAD]), /Definitely Not A Gem/, 'find_optimal_links unknown locked gem');
+    await userError(session.findOptimalLinks('Concentrated Effect', 3), /support gem/, 'find_optimal_links with a support as the skill');
+    await userError(session.findOptimalLinks('Vortex', 3, ['Frostbolt']), /active skill gem, not a support/, 'locked active gem');
+    await userError(session.findOptimalLinks('Vortex', 3, ['Concentrated Effect', 'Concentrated Effect']), /more than once/, 'locked duplicate');
+    await userError(session.findOptimalLinks('Vortex', 3, ['Vortex']), /active skill itself/, 'locked active skill');
+    log('PASS: gem tools equal the mutate path; export and undo depth unchanged');
+  } finally {
+    await bridge.dispose();
   }
 }
 
