@@ -31,6 +31,18 @@ for later.
   PoB. The same change adapts the bridge to 2.68's split constructors
   (`new("Item"):Item(raw)`), so 2.68.1 boots and passes `test:bridge`/`test:session`.
   CI still pins `v2.67.2`; moving the pin to a 2.68 tag is separate work.
+- **Trade search on PoB 2.68: known gaps.** `generate_trade_search` works on 2.67
+  and 2.68 (the bridge lifts 2.68's complexity budget through a scoped line hook,
+  turns its query table into the 2.67 JSON shape and drops its empty `and`/`not`
+  groups). Left open: (1) PoB 2.68 caps a query by the trade site's complexity
+  limit (200; 54 for the weight group, 4 per filter) instead of 36 filters; our
+  TS cap is still `MAX_FILTERS = 36`, which can exceed that limit when many
+  required mods or options are set. (2) 2.68 dropped influences from the
+  generator: the bridge still adds the `pseudo.pseudo_has_*_influence`
+  requirements, but the weights are no longer computed on an influenced copy of
+  the item. (3) 2.68 offers the eldritch option on Amulet; we still refuse
+  `includeEldritch: "keep..."` there. (4) 2.68's blocked mods (`not` group) are
+  not exposed.
 - **`zlib1.dll` is held open in the install**, in addition to
   `lua-utf8.dll` (see "Do first").
 - **Write-guard path forms.** UNC paths, 8.3 short names and junctions into the

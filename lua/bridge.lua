@@ -3214,6 +3214,57 @@ local function influenceIndex(name)
 	userError("Unknown influence '" .. tostring(name) .. "'")
 end
 
+-- PoB 2.67 and older cap the weight group with an upvalue (MAX_FILTERS);
+-- 2.68 counts a trade-site complexity budget in a FinishQuery local instead.
+-- Both are lifted for the call so every weight comes back; returns a
+-- function that undoes the lift and reports whether it took effect.
+local tradeCompat = { }
+function tradeCompat.liftFilterCap(finishQuery)
+	local maxIdx, maxOrig = findUpvalue(finishQuery, "MAX_FILTERS")
+	if maxIdx then
+		debug.setupvalue(finishQuery, maxIdx, 100000)
+		return function() debug.setupvalue(finishQuery, maxIdx, maxOrig) return true end
+	end
+	local hook, mask, count = debug.gethook()
+	local lifted = false
+	debug.sethook(function()
+		local info = debug.getinfo(2, "f")
+		if not (info and info.func == finishQuery) then return end
+		for i = 1, 250 do
+			local name = debug.getlocal(2, i)
+			if name == nil then return end
+			if name == "complexityBudget" then
+				debug.setlocal(2, i, 1e9)
+				lifted = true
+				return
+			end
+		end
+	end, "l")
+	return function()
+		if hook then debug.sethook(hook, mask, count) else debug.sethook() end
+		return lifted
+	end
+end
+
+-- PoB 2.68 hands the callback the query table (no sort/engine wrapper, empty
+-- "and"/"not" groups always present) and no longer applies influences. Bring
+-- it to the 2.67 shape: { query, sort, engine } JSON, no empty groups, and
+-- the influence requirements 2.67 put in an "and" group.
+function tradeCompat.normaliseQuery(query, influenceIds)
+	if type(query) ~= "table" then return query end
+	local stats, kept = query.stats or { }, { }
+	for i, group in ipairs(stats) do
+		if i == 1 or #(group.filters or { }) > 0 then kept[#kept + 1] = group end
+	end
+	if #influenceIds > 0 then
+		local filters = { }
+		for _, id in ipairs(influenceIds) do filters[#filters + 1] = { id = id } end
+		kept[#kept + 1] = { type = "and", filters = filters }
+	end
+	query.stats = kept
+	return dkjson.encode({ query = query, sort = { ["statgroup.0"] = "desc" }, engine = "new" })
+end
+
 local function runTradeQuery(cmd)
 	local st = tradeStateOrError()
 	local slot = tradeSlotOrError(cmd.slot, st.helpers)
@@ -3264,16 +3315,24 @@ local function runTradeQuery(cmd)
 	gen.lastMaxPrice, gen.lastMaxPriceTypeIndex, gen.lastMaxLevel = nil, nil, nil
 	gen.tradeTypeIndex = tradeTypeIndex
 	gen.calcContext = { }
+	-- PoB without influence support (2.68+): require the influences with the
+	-- same trade filters 2.67 added (the weights cannot use them there).
+	local influenceIds = { }
+	if not findUpvalue(gen.FinishQuery, "hasInfluenceModIds") then
+		for _, idx in ipairs({ options.influence1, options.influence2 }) do
+			if idx > 1 then
+				influenceIds[#influenceIds + 1] = "pseudo.pseudo_has_"
+					.. string.lower(itemLib.influenceInfo.default[idx - 1].display) .. "_influence"
+			end
+		end
+	end
 	local captured = nil
 	gen.requesterContext = nil
 	gen.requesterCallback = function(_ctx, json, errMsg) captured = { json = json, err = errMsg } end
-	-- Lift PoB's 36-filter cap so every weight comes back; the caller applies
-	-- the cap after its own adjustments.
-	local maxIdx, maxOrig = findUpvalue(gen.FinishQuery, "MAX_FILTERS")
 	local openOrig, closeOrig = rawget(main, "OpenPopup"), rawget(main, "ClosePopup")
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
-	if maxIdx then debug.setupvalue(gen.FinishQuery, maxIdx, 100000) end
+	local capLifted = false
 	local started = os.clock()
 	local ok, err = pcall(function()
 		gen:StartQuery(slot, options)
@@ -3286,14 +3345,19 @@ local function runTradeQuery(cmd)
 			if not resumed then error("trade weight calculation failed: " .. tostring(msg), 0) end
 		end
 		gen.calcContext.co = nil
-		gen:FinishQuery()
+		-- Lift PoB's filter cap so every weight comes back; the caller applies
+		-- the cap after its own adjustments.
+		local unlift = tradeCompat.liftFilterCap(gen.FinishQuery)
+		local finished, finishErr = pcall(gen.FinishQuery, gen)
+		capLifted = unlift()
+		if not finished then error(finishErr, 0) end
 	end)
 	local elapsed = os.clock() - started
-	if maxIdx then debug.setupvalue(gen.FinishQuery, maxIdx, maxOrig) end
 	main.OpenPopup, main.ClosePopup = openOrig, closeOrig
 	gen.calcContext = { }
 	gen.requesterCallback = nil
 	if not ok then error(err, 0) end
+	if captured then captured.json = tradeCompat.normaliseQuery(captured.json, influenceIds) end
 	if not captured or type(captured.json) ~= "string" then
 		error("Path of Building produced no trade query", 0)
 	end
@@ -3307,7 +3371,7 @@ local function runTradeQuery(cmd)
 	return {
 		queryJson = captured.json,
 		pobMessage = captured.err or dkjson.null,
-		capLifted = maxIdx ~= nil,
+		capLifted = capLifted,
 		itemCategory = category or dkjson.null,
 		categoryQuery = queryStr or dkjson.null,
 		currentItem = item and (item.title or item.name) or dkjson.null,

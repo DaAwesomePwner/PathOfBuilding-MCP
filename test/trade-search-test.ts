@@ -145,6 +145,8 @@ async function main(): Promise<void> {
     const q = decodeQuery(base.url);
     const weights = q.query.stats[0];
     assert(weights.type === 'weight', 'first stat group should be the weight group');
+    // PoB 2.68 always emits empty "and"/"not" groups; the bridge drops them so every version gives one shape.
+    assert(q.query.stats.length === 1, `only the weight group without required mods: ${JSON.stringify(q.query.stats.map((g) => g.type))}`);
     assert(q.sort['statgroup.0'] === 'desc', 'sorted by weighted sum, highest first');
     assert(weights.filters.length > 0 && weights.filters.length <= 36, `filters: ${weights.filters.length}`);
     assert(weights.filters.every((f) => typeof f.value?.weight === 'number' && f.value.weight !== 0), 'every filter has a weight');
