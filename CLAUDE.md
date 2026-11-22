@@ -36,6 +36,7 @@ npm run test:trade    # generate_trade_search / search_trade_mods (PoB's weighte
 npm run test:probe    # read-only probe engine: parity with mutate+recalc, fallbacks, speed, the what-if tools on it
 npm run test:evaluate # evaluate_changes: mixed 30-variant ranking, parity with single probes/tools, build unchanged
 npm run test:lua-compat  # lua/compound-assign.lua rewrite of PoB 2.68's `x += 1` syntax (LuaJIT only, no PoB)
+npm run test:wickerman  # 3.30 Wickerman slots: tree-gated slot listing/refusal, Viscera game text
 npm run test:errors   # input validation paths
 npm run test:all      # everything, in parallel (~2.5 min on a desktop); `npm run test:all -- bridge phase4` runs a subset
 ```
@@ -68,7 +69,7 @@ Claude Desktop  <-stdio MCP->  pob-mcp-server  <-stdio JSON->  bridge.lua (LuaJI
 | Install inspection | `src/pob-install.ts` | Layout + `manifest.xml` version, PoE2 detection, install fingerprint (version + mtime), PoB self-updater state (`Update/opFile.txt` = staged, `Update/manifest.xml` without it = applying). Read-only. |
 | Config store | `src/config-store.ts` | Per-user `config.json` written by `configure_pob_path`. |
 | Engine manager | `src/engine-manager.ts` | Owns the LuaBridge + BuildSession pair. Lazy/background boot, `run()` gate (unconfigured / updating / stale → `EngineNotReadyError`), `configure()`, `reload()` (export build → dispose old bridge → boot → reload build), `info()`. |
-| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), loads PoB's files through `lua/compound-assign.lua` (rewrites `+=`-style syntax plain LuaJIT can't parse), runs `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. Knows nothing about MCP. |
+| Lua bridge | `lua/bridge.lua` | Stubs out PoB's graphics host (the same job upstream's `HeadlessWrapper.lua` does for the busted test suite), loads PoB's files through `lua/compound-assign.lua` (rewrites `+=`-style syntax plain LuaJIT can't parse), runs `Launch.lua`, reads JSON commands from stdin, dispatches to `build.itemsTab`, `build.skillsTab`, `build.spec`, `build.configTab`. PoB classes are created through `construct(className, ...)`, which detects once whether PoB uses 2.68's `new("X"):X(...)` or the older `new("X", ...)`. Knows nothing about MCP. |
 | BuildSession | `src/build-session.ts` | TS class owning the LuaJIT subprocess. Snapshot/restore, undo stack, `withTemporaryChange`, async mutex, build-code/URL/XML loading, higher-level workflows. |
 | Probe engine | `lua/probe.lua`, `src/probe.ts` | Read-only what-ifs: `BuildSession.probe(req)` evaluates variants (`allocate` / `deallocate` node ids, `items`, `gems` ops, `config`) through PoB's calculator (`CalcsTab:GetMiscCalculator`, what its tooltips use), ~3-5 ms each, without changing or recalculating the committed build. Kinds it cannot reproduce exactly come back `fallback` and run through the snapshot/apply/recalc/exact-restore path (at most `MAX_FALLBACK_VARIANTS` = 50 per call; `MAX_PROBE_VARIANTS` = 500 variants per call); per-variant `error` / `userError`. |
 | Searches on the probe | `src/tree-search.ts`, `src/link-search.ts`, `src/evaluate-changes.ts` | `find_best_next_nodes` / `find_worst_allocated_nodes`; `find_optimal_links`; `evaluate_changes` (many mixed variants, node names resolved by `BuildSession.probeNamed`, a compact table ranked by one stat). |
@@ -99,7 +100,8 @@ All engine-backed tools follow this pattern.
 
 ## Conventions
 
-- **Item text format** in MCP tools comes from PoB's "Copy item" (right-click) — must start with a `Rarity:` line. The server validates strictly.
+- **Item text format** in MCP tools comes from PoB's "Copy item" (right-click) — must start with a `Rarity:` line. The server validates strictly. The one exception is Viscera (Wickerman) item text copied from the game: first line `Item Class: Viscera`, no `Rarity:` line (PoB parses it as Normal). A leading UTF-8 BOM is stripped before the text reaches the engine (`normalizeItemText`).
+- **Slot visibility.** Slots PoB shows only on some passive tree versions (Wickerman `Head`/`Body`/`Arm`/`Leg` on 3.30, `Graft 1`/`Graft 2` on 3.27; PoB's own `slot.shown`) are left out of `list_valid_slots` while hidden, and `swap_item`, `compare_items` and probe item variants (`evaluate_changes`, `suggest_upgrades`, ...) into them are a `UserError` (naming the remedy) before any change. `unequip_item` on a hidden slot is allowed, and `list_equipped_items` lists an occupied hidden slot with `hidden: true` and a note: PoB still counts a hidden Wickerman item (CalcSetup's `^Wickerman ` check matches no slot name) but skips a hidden graft. Items already in a hidden slot are kept by export, probes and undo. Weapon swap, Ring 3 and abyssal sockets are listed and accepted regardless (`slotChecks` in `lua/bridge.lua`).
 - **Build code round-trip is lossless.** `export_build({format:"code"})` produces a base64 zlib string that `load_build` accepts back. Same for `xml`.
 
 ## Reference files

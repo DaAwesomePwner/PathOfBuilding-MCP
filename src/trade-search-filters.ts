@@ -35,6 +35,21 @@ function adjustmentTargets(args: TradeSearchArgs, raw: TradeQueryRaw): Map<strin
   return out;
 }
 
+/** The "and" filter id PoB (or the bridge, on PoB 2.68+) adds for a required influence. */
+export const influenceTradeId = (influence: string) => `pseudo.pseudo_has_${influence}_influence`;
+
+/**
+ * How many weight filters fit next to the other filters: 36 filters in all (2 base filters, each option filter,
+ * each distinct influence / required mod id).
+ */
+function weightFilterBudget(args: TradeSearchArgs): number {
+  const optionFilters = (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
+    + (args.sockets ? 1 : 0) + (args.links ? 1 : 0);
+  // Distinct "and" ids: a required pseudo_has_<influence>_influence also named in influences is emitted once.
+  const andFilters = new Set([...(args.influences ?? []).map(influenceTradeId), ...(args.requiredMods ?? []).map((m) => m.tradeId)]).size;
+  return MAX_FILTERS - 2 - optionFilters - andFilters;
+}
+
 /** Applies weight adjustments, the filter cap (pinning adjusted filters), the min override and required mods. */
 export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): WeightedQuery {
   const texts = new Map(raw.texts.map((t) => [t.id, t.text]));
@@ -58,9 +73,7 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   }
 
   const requiredMods = args.requiredMods ?? [];
-  const extras = 2 + (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
-    + (args.sockets ? 1 : 0) + (args.links ? 1 : 0) + (args.influences?.length ?? 0) + requiredMods.length;
-  const budget = MAX_FILTERS - extras;
+  const budget = weightFilterBudget(args);
   if (pinned.length > budget) {
     throw new UserError(`Too many weightAdjustments: ${pinned.length} filters are pinned but only ${budget} fit with the other filters (limit ${MAX_FILTERS}).`);
   }
@@ -74,10 +87,19 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   weightGroup.filters = kept.map((f) => ({ id: f.tradeId, value: { weight: round(f.weight) } }));
   weightGroup.value = { min: minWeightedSum };
   if (requiredMods.length > 0) {
-    query.query.stats.push({
-      type: 'and',
-      filters: requiredMods.map((m) => (m.min === undefined ? { id: m.tradeId } : { id: m.tradeId, value: { min: m.min } })),
-    });
+    // One "and" group: required mods join the influence filters when there are any; a required mod with the
+    // same id as an influence filter replaces it (keeping its min), so each id is emitted once.
+    const filters = requiredMods.map((m) => (m.min === undefined ? { id: m.tradeId } : { id: m.tradeId, value: { min: m.min } }));
+    const andGroup = query.query.stats.find((g) => g.type === 'and');
+    if (!andGroup) query.query.stats.push({ type: 'and', filters });
+    else {
+      const existing = andGroup.filters as { id?: string }[];
+      for (const f of filters) {
+        const at = existing.findIndex((e) => e.id === f.id);
+        if (at >= 0) existing[at] = f;
+        else existing.push(f);
+      }
+    }
   }
   return { query, texts, kept, dropped, budget, pobDefaultMin, minWeightedSum };
 }

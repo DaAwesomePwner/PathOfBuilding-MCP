@@ -113,7 +113,11 @@ async function userError(name: string, args: Record<string, unknown>, expect: Re
 }
 function decodeQuery(url: string, prefix = SEARCH_PREFIX): Query {
   assert(url.startsWith(prefix), `url should start with ${prefix}: ${url.slice(0, 120)}`);
-  return JSON.parse(decodeURIComponent(url.slice(prefix.length))) as Query;
+  const q = JSON.parse(decodeURIComponent(url.slice(prefix.length))) as Query;
+  assert(q.query.stats[0]?.type === 'weight', 'first stat group should be the weight group');
+  assert(q.query.stats.slice(1).every((g) => g.filters.length > 0), `no empty stat groups: ${JSON.stringify(q.query.stats.map((g) => g.type))}`);
+  assert(q.query.stats.filter((g) => g.type === 'and').length <= 1, 'at most one "and" group');
+  return q;
 }
 const search = (args: Record<string, unknown>) => ok<Search>('generate_trade_search', { slot: 'Helmet', league: LEAGUE, ...args });
 
@@ -279,6 +283,7 @@ async function main(): Promise<void> {
     assert(oq.filters.misc_filters.filters.mirrored === false, 'includeMirrored false');
     const infl = oq.stats.find((g) => g.type === 'and')?.filters.map((f) => f.id) ?? [];
     assert(infl.includes('pseudo.pseudo_has_shaper_influence') && infl.includes('pseudo.pseudo_has_elder_influence'), `influences: ${infl}`);
+    // 36 - 2 - 5 options - 2 influences = 27.
     assert(opts.filterBudget === 27 && oq.stats[0].filters.length <= 27, `budget shrinks with every extra filter: ${opts.filterBudget}`);
     log('PASS');
 
@@ -301,6 +306,18 @@ async function main(): Promise<void> {
     assert(and?.filters.some((f) => f.id === 'pseudo.pseudo_total_life' && f.value === undefined), 'required mod without min');
     assert(rq.stats[0].value?.min === 123.5 && req.minWeightedSum === 123.5, 'min override applies');
     assert(rq.stats[0].filters.length + 2 <= 36, 'required mods count toward the cap');
+    assert(req.filterBudget === 32, `required mods shrink the budget: ${req.filterBudget}`);
+    const inflReq = await search({ influences: ['hunter'], requiredMods: [{ tradeId: lifeId, min: 50 }] });
+    const irAnd = decodeQuery(inflReq.url).query.stats.filter((g) => g.type === 'and');
+    assert(irAnd.length === 1 && irAnd[0].filters.map((f) => f.id).join() === `pseudo.pseudo_has_hunter_influence,${lifeId}`,
+      `influence and required mod share one "and" group: ${JSON.stringify(irAnd)}`);
+    // The influence filter also given as a required mod (with a min) is emitted once and counted once.
+    const hunter = 'pseudo.pseudo_has_hunter_influence';
+    const dup = await search({ influences: ['hunter'], requiredMods: [{ tradeId: hunter, min: 1 }, { tradeId: lifeId, min: 50 }] });
+    const dupAnd = decodeQuery(dup.url).query.stats.filter((g) => g.type === 'and');
+    assert(dupAnd.length === 1 && dupAnd[0].filters.length === 2 && dupAnd[0].filters.filter((f) => f.id === hunter).length === 1
+      && dupAnd[0].filters.find((f) => f.id === hunter)?.value?.min === 1, `influence filter emitted once: ${JSON.stringify(dupAnd)}`);
+    assert(dup.filterBudget === inflReq.filterBudget, `the duplicate is counted once: ${dup.filterBudget} vs ${inflReq.filterBudget}`);
     log('PASS');
 
     log('Test 6: input errors are user errors');
