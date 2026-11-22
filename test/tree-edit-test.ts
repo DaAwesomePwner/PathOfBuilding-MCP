@@ -17,6 +17,20 @@
 //   6. Through the MCP server: allocate_nodes / deallocate_nodes are listed
 //      with undoable annotations, return the compact result, export_build
 //      holds the node, undo_last_change reverts it.
+//   7. A Large Cluster Jewel socket: deallocating it drops its subgraph nodes
+//      (ids above 65535) from the tree; `removed` and the refunded points
+//      still list every one of them (described before the change). Undo and
+//      a crash replay restore the tree.
+//   8. Fault seams: a failure after the tree changed (treeEditFailsAfterChange)
+//      commits the change (undo entry + journal record, the error says it was
+//      applied, a crash restores it); a batch that fails and rolls back
+//      (batchFailsAfterChange) is a UserError that pushes nothing; a rollback
+//      that is not exact (treeRollbackInexact) is an internal error with an
+//      undo entry but no journal record, and undo restores the tree.
+//   Points: every result's passive `pointCost` count equals the change in
+//   PoB's own point total.
+//   (No fixture has an ascendancy choice node, so `removed` for one option
+//   replacing another is not exercised here.)
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
@@ -44,8 +58,8 @@ const occXml = readFileSync(fixturePath, 'utf8');
 const bridges: LuaBridge[] = [];
 const tempDirs: string[] = [];
 
-function newBridge(): LuaBridge {
-  const b = new LuaBridge(paths, 120_000);
+function newBridge(testFaults?: string): LuaBridge {
+  const b = new LuaBridge(paths, 120_000, { testFaults });
   bridges.push(b);
   return b;
 }
@@ -79,7 +93,9 @@ interface State {
 }
 
 async function state(session: BuildSession): Promise<State> {
-  return { xml: await session.exportXML(), stats: await session.getStats() };
+  // Stats first: reading them runs PoB's recalculation, whose output the export's PlayerStat lines carry.
+  const stats = await session.getStats();
+  return { xml: await session.exportXML(), stats };
 }
 
 function assertSameStats(label: string, actual: Stats, expected: Stats): void {
@@ -138,6 +154,7 @@ async function test1To4(): Promise<void> {
   log(`Test 1: allocate_nodes ${target.id} (${target.name}, ${target.points} points) matches the probe`);
   const base = await state(session);
   const depth0 = session.undoStackDepth();
+  const pointsBase = (await session.getPassiveTree()).summary.totalPoints;
   const journal0 = bridge.committedCount();
   const simulated = await session.simulatePassiveChange([target.id]);
   assert(simulated.valid, 'simulate_passive_change: tree valid');
@@ -151,6 +168,7 @@ async function test1To4(): Promise<void> {
   }
   assert(Object.keys(result.diff).length > 0, 'the allocation changes some stat');
   assert(result.summary.totalPoints === Number((await session.getPassiveTree()).summary.totalPoints), 'summary is the tree after');
+  assert(passivePoints(result.added) === result.summary.totalPoints - pointsBase, 'passive points used = PoB total change');
   assertSameStats('stats after allocate_nodes', await session.getStats(), result.after);
   const allocated = await state(session);
   const nodes = specNodes(allocated.xml);
@@ -349,11 +367,125 @@ async function test6Mcp(): Promise<void> {
   log('PASS 6');
 }
 
+function passivePoints(nodes: Array<{ pointCost: string }>): number {
+  return nodes.filter((n) => n.pointCost === 'passive').length;
+}
+
+async function allocatedIds(bridge: LuaBridge): Promise<number[]> {
+  const r = await bridge.send<{ nodeIds: number[] }>({ cmd: 'getAllocatedNodes' });
+  return [...r.nodeIds].sort((a, b) => a - b);
+}
+
+const CLUSTER_SOCKET = 21984;
+const CLUSTER_NOTABLE = 65898; // Smoking Remains on the subgraph of the jewel below
+const LARGE_CLUSTER = `Rarity: RARE
+Tree Edit Cluster
+Large Cluster Jewel
+Item Level: 84
+Implicits: 3
+Adds 8 Passive Skills (enchant)
+2 Added Passive Skills are Jewel Sockets (enchant)
+Added Small Passive Skills grant: 12% increased Fire Damage (enchant)
+1 Added Passive Skill is Prismatic Heart
+1 Added Passive Skill is Smoking Remains`;
+
+async function test7Cluster(): Promise<void> {
+  log('Test 7: deallocating a Large Cluster Jewel socket reports its subgraph nodes');
+  const bridge = newBridge();
+  const session = await primedSession(bridge);
+  await session.allocateNodes([CLUSTER_SOCKET]);
+  await session.swapItemWithDiff(`Jewel ${CLUSTER_SOCKET}`, LARGE_CLUSTER);
+  const alloc = await session.allocateNodes([CLUSTER_NOTABLE]);
+  assert(alloc.added.some((n) => n.id === CLUSTER_NOTABLE), 'the cluster notable is allocated');
+  assert(alloc.added.every((n) => n.id > 65535), `the path runs on the subgraph: ${JSON.stringify(alloc.added)}`);
+  const withCluster = await state(session);
+  const idsBefore = await allocatedIds(bridge);
+  const pointsBefore = (await session.getPassiveTree()).summary.totalPoints;
+  const depth = session.undoStackDepth();
+  const journal = bridge.committedCount();
+
+  const dealloc = await session.deallocateNodes([CLUSTER_SOCKET]);
+  const idsAfter = await allocatedIds(bridge);
+  const lost = idsBefore.filter((id) => !idsAfter.includes(id));
+  const removedIds = dealloc.removed.map((n) => n.id).sort((a, b) => a - b);
+  assert(JSON.stringify(removedIds) === JSON.stringify(lost), `removed ${JSON.stringify(removedIds)} != lost ${JSON.stringify(lost)}`);
+  assert(removedIds.includes(CLUSTER_NOTABLE) && removedIds.filter((id) => id > 65535).length === alloc.added.length, 'every subgraph node is listed');
+  const notable = dealloc.removed.find((n) => n.id === CLUSTER_NOTABLE);
+  assert(notable && notable.name === 'Smoking Remains' && notable.pointCost === 'passive', `subgraph node described: ${JSON.stringify(notable)}`);
+  assert(passivePoints(dealloc.removed) === pointsBefore - dealloc.summary.totalPoints,
+    `refunded ${passivePoints(dealloc.removed)} != PoB's ${pointsBefore - dealloc.summary.totalPoints}`);
+  assert(session.undoStackDepth() === depth + 1 && bridge.committedCount() === journal + 1, 'one undo entry and journal record');
+  const deallocated = await state(session);
+
+  await session.undoLastChange();
+  assertSame('undo of the socket deallocation', await state(session), withCluster);
+  await session.deallocateNodes([CLUSTER_SOCKET]);
+  await crash(bridge);
+  await expectRestart('after the cluster deallocation', session.getStats());
+  assertSame('respawned after the cluster deallocation', await state(session), deallocated);
+  log('PASS 7');
+}
+
+async function twoPointNotable(bridge: LuaBridge): Promise<Candidate> {
+  const target = (await candidates(bridge)).find((c) => c.type === 'Notable' && c.points === 2);
+  assert(target, 'a 2-point notable');
+  return target;
+}
+
+async function test8Faults(): Promise<void> {
+  log('Test 8: fault seams around the tree change');
+  {
+    const bridge = newBridge('treeEditFailsAfterChange');
+    const session = await primedSession(bridge);
+    const base = await state(session);
+    const target = await twoPointNotable(bridge);
+    const e = await rejection(session.allocateNodes([target.id]));
+    assert(!(e instanceof UserError) && /WAS applied/.test(e.message) && /test fault/.test(e.message), `applied-but-failed error: ${e.message}`);
+    assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'the applied change is committed with its journal record');
+    const applied = await state(session);
+    assert(specNodes(applied.xml).includes(target.id), 'the change is in the build');
+    await session.undoLastChange();
+    assertSame('undo of the applied-but-failed change', await state(session), base);
+    assert(bridge.committedCount() === 0, 'undo truncates the journal');
+    await rejection(session.allocateNodes([target.id]));
+    await crash(bridge);
+    await expectRestart('after the applied-but-failed change', session.getStats());
+    assertSame('respawned after the applied-but-failed change', await state(session), applied);
+    const d = await rejection(session.deallocateNodes([target.id]));
+    assert(/WAS applied/.test(d.message) && !specNodes((await state(session)).xml).includes(target.id), `dealloc applied-but-failed: ${d.message}`);
+    assert(session.undoStackDepth() === 1 && bridge.committedCount() === 2, 'dealloc committed too');
+  }
+  {
+    const bridge = newBridge('batchFailsAfterChange');
+    const session = await primedSession(bridge);
+    const base = await state(session);
+    const target = await twoPointNotable(bridge);
+    const e = await rejection(session.allocateNodes([target.id]));
+    assert(e instanceof UserError && /test fault/.test(e.message), `rolled-back batch: ${e.message}`);
+    assert((await state(session)).xml === base.xml, 'export unchanged after the rollback');
+    assert(session.undoStackDepth() === 0 && bridge.committedCount() === 0, 'nothing pushed or journaled');
+  }
+  {
+    const bridge = newBridge('batchFailsAfterChange,treeRollbackInexact');
+    const session = await primedSession(bridge);
+    const base = await state(session);
+    const target = await twoPointNotable(bridge);
+    const e = await rejection(session.allocateNodes([target.id]));
+    assert(!(e instanceof UserError) && /rolling the passive tree back also failed/.test(e.message), `inexact rollback: ${e.message}`);
+    assert(session.undoStackDepth() === 1 && bridge.committedCount() === 0, 'an undo entry, no journal record');
+    await session.undoLastChange();
+    assertSame('undo after the inexact rollback', await state(session), base);
+  }
+  log('PASS 8');
+}
+
 async function main(): Promise<void> {
   try {
     await test1To4();
     await test5CrashReplay();
     await test6Mcp();
+    await test7Cluster();
+    await test8Faults();
     log('ALL PASS');
   } finally {
     for (const b of bridges) await b.shutdown().catch(() => undefined);

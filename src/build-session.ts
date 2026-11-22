@@ -1274,14 +1274,25 @@ export class BuildSession {
       const entry: UndoEntry = { kind: 'tree', snapshot: await this.snapshotTreeUnlocked() };
       const journal = this.bridge.committedCount();
       const before = await this.bridge.getStats();
-      let res: { ok: true; added?: unknown; removed?: unknown };
+      let res: TreeEditApplied;
+      let failure: unknown;
       try {
         res = await this.bridge.send({ cmd: mode === 'allocate' ? 'allocNodes' : 'deallocNodes', nodeIds: ids, strict: true });
       } catch (err) {
-        // A refusal changed nothing (the bridge checks first and rolls a failed
-        // batch back exactly); any other failure may have: undo reverts it.
-        if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
-        throw err;
+        // The batch records what it changed once the tree has changed; a failure
+        // after that (PoB's recalculation, the stats, an error popup) leaves the
+        // change applied, so it is committed below and the error says so.
+        const applied = this.bridge.isRunning() ? await this.treeEditAppliedUnlocked() : null;
+        if (!applied) {
+          // A refusal changed nothing (the bridge checks first and rolls a
+          // failed batch back exactly). Any other failure may have left part of
+          // a change (a rollback that failed): undo can revert it, but it is
+          // never replayed, as for set_config.
+          if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+          throw err;
+        }
+        res = applied;
+        failure = err;
       }
       const added = treeEditNodes(res.added);
       const removed = treeEditNodes(res.removed);
@@ -1290,11 +1301,23 @@ export class BuildSession {
           ? { cmd: 'allocNodes', nodeIds: added.map((n) => n.id) }
           : { cmd: 'deallocNodes', nodeIds: ids };
       return this.commitAfterUnlocked(entry, journal, command, async () => {
+        if (failure !== undefined) throw failure;
         const after = await this.bridge.getStats();
         const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
         return { added, removed, summary: summary.summary, before, after, diff: computeDiff(before, after) };
       });
     });
+  }
+
+  /** What the last strict node batch changed, when it changed the tree; null if unknown. */
+  private async treeEditAppliedUnlocked(): Promise<TreeEditApplied | null> {
+    try {
+      const res = await this.bridge.send<{ ok: true; applied: TreeEditApplied | null }>({ cmd: 'treeEditApplied' });
+      return res.applied && typeof res.applied === 'object' ? res.applied : null;
+    } catch (e) {
+      console.error('[pob-mcp] could not read what a failed tree edit changed:', (e as Error).message);
+      return null;
+    }
   }
 
   async getPassiveTree(): Promise<PassiveTreeInfo> {
@@ -2398,6 +2421,14 @@ export interface TreeEditNode {
   name: string;
   type: string;
   ascendancyName?: string;
+  /** What the node costs, as PoB counts points (class starts and ascendancy choice options cost none). */
+  pointCost: 'passive' | 'ascendancy' | 'none';
+}
+
+/** The bridge's report of a strict node batch (allocNodes / deallocNodes / treeEditApplied). */
+interface TreeEditApplied {
+  added?: unknown;
+  removed?: unknown;
 }
 
 export interface TreeEditResult extends StatDiffResult {
@@ -2416,6 +2447,7 @@ function treeEditNodes(value: unknown): TreeEditNode[] {
     name: n.name,
     type: n.type,
     ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+    pointCost: n.pointCost === 'ascendancy' || n.pointCost === 'none' ? n.pointCost : 'passive',
   }));
 }
 

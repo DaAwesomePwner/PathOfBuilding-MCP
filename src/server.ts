@@ -505,16 +505,12 @@ const nodeRefsSchema = z
   .min(1)
   .max(50);
 
-/** Passive points a set of nodes costs (ascendancy nodes and class starts counted apart, as PoB does). */
+/** Passive and ascendancy points a set of nodes costs, as PoB's CountAllocNodes counts them (`pointCost`). */
 function pointCounts(nodes: TreeEditNode[]): { points: number; ascendancyPoints: number } {
-  let points = 0;
-  let ascendancyPoints = 0;
-  for (const n of nodes) {
-    if (n.type === 'ClassStart' || n.type === 'AscendClassStart') continue;
-    if (n.ascendancyName) ascendancyPoints++;
-    else points++;
-  }
-  return { points, ascendancyPoints };
+  return {
+    points: nodes.filter((n) => n.pointCost === 'passive').length,
+    ascendancyPoints: nodes.filter((n) => n.pointCost === 'ascendancy').length,
+  };
 }
 
 function treeEditResponse(result: TreeEditResult, verb: 'allocated' | 'deallocated'): unknown {
