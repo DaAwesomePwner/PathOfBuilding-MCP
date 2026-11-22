@@ -1116,6 +1116,22 @@ return function(ctx)
 		return { active = activeData.name, supports = out, errors = errors }
 	end
 
+	-- Items of a checked variant equipped (or slots emptied) for real, as
+	-- the bridge's equipItem / unequipItem commands do.
+	local function commitItems(parsed)
+		for _, p in ipairs(parsed) do
+			if p.unequip then
+				-- As the bridge's unequipItem command does.
+				p.slot:SetSelItemId(0)
+				build.buildFlag = true
+				build.itemsTab:PopulateSlots()
+				runCallback("OnFrame")
+			else
+				ctx.equipItemInSlot(p.slot.slotName, p.itemText)
+			end
+		end
+	end
+
 	-- A fallback variant, applied for real: the caller snapshots the whole
 	-- build before and restores it exactly after (BuildSession.probe).
 	function M.probeCommit(cmd)
@@ -1131,17 +1147,7 @@ return function(ctx)
 			ctx.stashCommittedConfigTables(orig, build.configTab.input)
 		end
 		if #checked.gems > 0 then applyGems(checked.gems) end
-		for _, p in ipairs(checked.items) do
-			if p.unequip then
-				-- As the bridge's unequipItem command does.
-				p.slot:SetSelItemId(0)
-				build.buildFlag = true
-				build.itemsTab:PopulateSlots()
-				runCallback("OnFrame")
-			else
-				ctx.equipItemInSlot(p.slot.slotName, p.itemText)
-			end
-		end
+		commitItems(checked.items)
 		local function ids(list)
 			local out = { }
 			for i, node in ipairs(list) do out[i] = node.id end
@@ -1162,6 +1168,96 @@ return function(ctx)
 		local result = { stats = readStats(output, keys, cmd.useFullDPS == false), fallback = true }
 		if next(added) then result.nodesAdded, result.pointsAdded = describeSet(added) end
 		if next(removed) then result.nodesRemoved, result.pointsRemoved = describeSet(removed) end
+		return result
+	end
+
+	-- apply_changes: one variant applied for real and kept (BuildSession
+	-- takes a full snapshot first, for undo and to roll back a change that
+	-- fails part-way). Everything that can be checked against the committed
+	-- build is checked before anything changes: the variant as `probe` checks
+	-- it, and the gem changes by applying them to copies and undoing them.
+	-- Then, in the probe's order: config (as set_config sets it), gems (as
+	-- `probe` changes them; the copies stay), items (as equip_item /
+	-- unequip_item), deallocations, allocations (as the node batches),
+	-- recorded in ctx.buildEdit (see bridge.lua) once started and once
+	-- applied. Returns the nodes added (the allocation's nodes in the order
+	-- they joined the tree first) and removed, as nodeBatch.describe tables,
+	-- plus what a crash replay needs: `allocOrder` (the ids the allocation
+	-- added, in join order) and `gemNames` (each gem change's gem as PoB
+	-- names it, or null).
+	-- With `replay` (a crash replay of a committed apply_changes) the node
+	-- lists are applied as recorded: `deallocate` as requested, `allocate` in
+	-- join order, so every node is next to the tree when it is allocated and
+	-- the replay never depends on which of several equally short paths PoB
+	-- would pick.
+	function M.applyChanges(cmd)
+		flushPendingRecalc()
+		local edit, nodeBatch = ctx.buildEdit, ctx.nodeBatch
+		local variant = cmd.variant
+		if type(variant) ~= "table" or (next(variant) ~= nil and isArray(variant)) then userError("variant must be an object") end
+		local items, config, gems, allocIds, deallocIds
+		if cmd.replay == true then
+			items = M.checkItems(variant)
+			config = checkConfig(variant)
+			gems = variant.gems or { }
+			allocIds, deallocIds = variant.allocate or { }, variant.deallocate or { }
+		else
+			local checked = checkVariant(variant)
+			items, config, gems = checked.items, checked.config, checked.gems
+			allocIds, deallocIds = { }, { }
+			for i, node in ipairs(checked.addList) do allocIds[i] = node.id end
+			for i, node in ipairs(checked.removeList) do deallocIds[i] = node.id end
+		end
+		local gemNames = { }
+		if #gems > 0 then
+			local ok, err = pcall(function()
+				local undo = applyGems(gems)
+				undo()
+			end)
+			if not ok then
+				-- applyGems undoes its own failed changes; anything but a refusal
+				-- may have left the gem lists different: roll back.
+				if not isUserErr(err) then edit.started() end
+				error(err, 0)
+			end
+			for i, ch in ipairs(gems) do
+				gemNames[i] = ch.name ~= nil and lookupGem(ch.name, "gems[" .. i .. "]").name or jsonNull
+			end
+		end
+
+		local before = nodeBatch.captureAllocated()
+		edit.started()
+		if config then ctx.setConfigInput(config) end
+		if #gems > 0 then
+			applyGems(gems)
+			build.buildFlag = true
+		end
+		edit.testFaultMidway(cmd.replay == true)
+		commitItems(items)
+		if #deallocIds > 0 then ctx.deallocNodesBatch(deallocIds) end
+		local allocOrder = { }
+		if #allocIds > 0 then
+			for i, node in ipairs(ctx.allocNodesBatch(allocIds).added) do allocOrder[i] = node.id end
+		end
+		build.buildFlag = true
+
+		local added, listed = { }, { }
+		for _, id in ipairs(allocOrder) do
+			local node = build.spec.allocNodes[id]
+			if node and not before[id] then
+				added[#added + 1] = nodeBatch.describe(node)
+				listed[id] = true
+			end
+		end
+		local extra = { }
+		for id in pairs(build.spec.allocNodes) do
+			if not before[id] and not listed[id] then extra[#extra + 1] = id end
+		end
+		table.sort(extra)
+		for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
+		local result = { added = added, removed = nodeBatch.lostSince(before), allocOrder = allocOrder, gemNames = gemNames }
+		edit.applied(result, cmd.replay == true)
+		runCallback("OnFrame")
 		return result
 	end
 

@@ -140,8 +140,8 @@ export async function evaluateChanges(session: BuildSession, input: EvaluateChan
 
 const nodeRef = z.union([z.number().int(), z.string().min(1)]);
 const groupIndex = z.number().int().min(1);
-const gemLevel = z.number().int().min(1).max(40);
-const gemQuality = z.number().int().min(0).max(40);
+export const gemLevel = z.number().int().min(1).max(40);
+export const gemQuality = z.number().int().min(0).max(40);
 
 const gemChange = z.discriminatedUnion('op', [
   z.object({
@@ -166,7 +166,7 @@ const gemChange = z.discriminatedUnion('op', [
   z.object({ op: z.literal('clear'), group: groupIndex }),
 ]);
 
-const variantSchema = z.object({
+export const variantSchema = z.object({
   label: z.string().max(MAX_LABEL).optional().describe('Your name for the variant, echoed back.'),
   allocate: z.array(nodeRef).max(MAX_VARIANT_NODES).optional().describe('Passive nodes to allocate (names or ids), each with its path from the allocated tree.'),
   deallocate: z.array(nodeRef).max(MAX_VARIANT_NODES).optional().describe('Allocated passive nodes to remove (names or ids), each with the nodes depending on it.'),
@@ -207,8 +207,7 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
         'Each variant may combine passive nodes to allocate/deallocate (names or ids), items to equip or unequip, gem changes and config options; ' +
         "they apply in the order config, gems, items, nodes. Every variant is evaluated through Path of Building's own calculator (a few ms each); " +
         `variants it cannot reproduce exactly (several node changes in one variant, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored instead (~0.3-0.5 s each, at most ${MAX_FALLBACK_VARIANTS} per call) and marked \`fallback\`. ` +
-        'NOTHING IS APPLIED TO THE BUILD and nothing is pushed to undo. To keep a winner, commit it with swap_item / unequip_item (items) or set_config (config); ' +
-        'passive-tree and gem changes have no committing tool here, so make them in Path of Building. ' +
+        'NOTHING IS APPLIED TO THE BUILD and nothing is pushed to undo. To keep a winner, pass the same variant to apply_changes (one undoable step). ' +
         'Returns `base` (the requested stats now), then `results` sorted by the change of `rankBy` (default CombinedDPS, `order` desc): ' +
         'each row has `index` (position in `variants`), `label`, `value` (the variant\'s rankBy stat), `delta` (change of every requested stat, null when not a number), ' +
         '`pointsAdded` / `pointsRemoved` for node changes, and `fallback`. A refused variant (unknown node or gem, item that does not fit, bad config) is listed after the others with its `error`; the call still succeeds. ' +

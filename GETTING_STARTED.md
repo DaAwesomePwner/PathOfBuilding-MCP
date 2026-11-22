@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   42 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   46 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -23,7 +23,7 @@ Three layers, three responsibilities:
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
 | **Probe engine** | `lua/probe.lua`, `src/probe.ts` | Evaluates what-if variants through PoB's own calculator (the one its tooltips use) without changing or recalculating the build; `src/tree-search.ts`, `src/link-search.ts` and `src/evaluate-changes.ts` build the node searches, the link search and `evaluate_changes` on it. |
-| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 42 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
+| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 46 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -36,7 +36,7 @@ Three layers, three responsibilities:
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 42 tools
+## The 46 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -67,7 +67,7 @@ Three layers, three responsibilities:
 - `deallocate_nodes` — `{ nodes: [ids or names] }`: remove each node together with every node that depends on it. **Mutates** (undoable). Returns the nodes removed, points refunded and the stat diff.
 - `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
-### Skill gems and links (7)
+### Skill gems and links (10)
 - `list_skill_groups` — every socket group with active gems and supports (each with its 1-based `index`, name, level, quality), slot, isMainSkill flag; `detail: "full"` adds gem ids and colors.
 - `lookup_gem` — gem metadata by name (tags, isSupport, awakened flag).
 - `list_available_supports` — every support gem in the data tables, optionally filtered by active-skill tags.
@@ -75,6 +75,9 @@ Three layers, three responsibilities:
 - `compare_supports` — identifies the weakest support in a group, ranks 1-10 candidate replacements; a candidate PoB refuses gets its own `error`.
 - `evaluate_gem_levels` — DPS scaling from current -1 through +4 (capped at 24), or the levels you pass.
 - `find_optimal_links` — scores every support PoB's own compatibility check accepts for the skill (each at its natural maximum level up to 20, quality 20) alone, then searches combinations of the best `topN` (exhaustive when they fit the budget, else the best few exhaustively plus pairwise swaps). Honors locked-in supports as constraints; reports `bestDPS`, `dpsDelta` vs the build as it is, and how many combinations were evaluated. ~1-3s for a 6-link.
+- `create_socket_group` — `{ gems: [{ name, level?, quality?, enabled? }], slot?, label?, enabled?, setAsMain? }`: add a socket group after the existing ones (`setAsMain: true` makes it the main skill). **Mutates** (undoable). Returns its index, its gems and the stat diff. An unknown gem is refused without changing anything.
+- `delete_socket_group` — `{ group }`: delete a group; every later group moves up by one index (re-read `list_skill_groups`). Deleting the main group makes the group taking its place main. A group granted by an item or the passive tree is refused. **Mutates** (undoable).
+- `set_main_skill` — `{ group, activeSkill? }`: make a group the main skill group (what the DPS numbers describe) and optionally pick which of its active skills is main. **Mutates** (undoable).
 
 ### Configuration & scenarios (6)
 - `get_config` — every config var grouped into 8 sections (Combat, Enemy, Map, Skill Options, etc.) with type metadata.
@@ -84,12 +87,13 @@ Three layers, three responsibilities:
 - `compare_scenarios` — DPS/EHP across 2-6 scenarios in one call; a scenario PoB refuses gets its own `error`.
 - `toggle_buffs` — friendly-named on/off for buffs (`onslaught`, `fortify`, etc.).
 
-### Optimization advisor (6)
+### Optimization advisor (7)
 - `evaluate_changes` — try up to 500 what-if variants in one call (each mixing node allocations/deallocations by name or id, item swaps or unequips, gem ops and config) and get one short row per variant ranked by `rankBy` (default CombinedDPS). Read-only; see the example below.
+- `apply_changes` — `{ variant }`: commit one `evaluate_changes` variant exactly as written (nodes by name or id, items, gem ops, config) as a single undoable step; its stats are the ones `evaluate_changes` reported. The whole variant is checked first (unknown or unreachable node, bad gem name or index, item that does not fit, unknown config key → refused, nothing changes). **Mutates** (undoable; kept by `export_build`; replayed after an engine crash). Returns the nodes added / removed, points and the stat diff.
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`. Returns `{ checks }`.
 - `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only, well under a second), ranks by upgrade priority, suggests archetype-aware mods. Returns `{ suggestions }`.
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
-- `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/convert_tree_to_latest; what-if tools push nothing).
+- `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/allocate_nodes/deallocate_nodes/apply_changes/create_socket_group/delete_socket_group/set_main_skill/convert_tree_to_latest; what-if tools push nothing).
 - `reset_build` — discard everything, return to the originally loaded state.
 
 ### Trade searches (2)
@@ -194,7 +198,7 @@ The reply is one compact table, sorted by the CombinedDPS change (on the OccVort
  {"index":4,"label":"power charges","value":975099.75,"delta":{"CombinedDPS":0,"TotalEHP":0,"Life":0}}]}
 ```
 
-Nothing was changed. To keep a winner, commit items with `swap_item` / `unequip_item` and config with `set_config` (each undoable); passive-tree and gem changes are made in Path of Building itself. Rank by something else with `rankBy: "TotalEHP"` (`order: "asc"` puts the smallest first). A variant PoB refuses (unknown node or gem, a node name several nodes share, an item that does not fit the slot, a bad config key) comes back last with its `error` instead of failing the call.
+Nothing was changed. To keep a winner, pass that variant to `apply_changes` (one undoable step, the same numbers), or commit single changes with `swap_item` / `unequip_item`, `set_config` or `allocate_nodes` (each undoable). Rank by something else with `rankBy: "TotalEHP"` (`order: "asc"` puts the smallest first). A variant PoB refuses (unknown node or gem, a node name several nodes share, an item that does not fit the slot, a bad config key) comes back last with its `error` instead of failing the call.
 
 To shop for an upgrade on the trade site:
 

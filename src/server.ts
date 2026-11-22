@@ -15,6 +15,7 @@ import {
   TreeEditNode,
   TreeEditResult,
 } from './build-session.js';
+import { registerBuildEditTools } from './build-edit-tools.js';
 import { registerEvaluateChanges } from './evaluate-changes.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
@@ -399,7 +400,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes or convert_tree_to_latest). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -563,6 +564,8 @@ tools.engine<{ nodes: Array<string | number> }>(
   },
   async ({ nodes }, session) => treeEditResponse(await session.deallocateNodes(nodes), 'deallocated'),
 );
+
+registerBuildEditTools(tools, summarizeStatDiff);
 
 const rankBySchema = z.enum(['perPoint', 'total']);
 

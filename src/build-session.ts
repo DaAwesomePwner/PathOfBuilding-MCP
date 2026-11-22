@@ -3,6 +3,9 @@ import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engi
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
 import {
+  checkVariant,
+  committedFingerprint,
+  fingerprintDiff,
   runProbe,
   withoutNulls,
   type ProbeGemChange,
@@ -266,6 +269,8 @@ export type UndoEntry = (
   | { kind: 'spec'; state: SpecState }
   /** Committed node allocation / deallocation: restores the tree exactly (items are untouched). */
   | { kind: 'tree'; snapshot: TreeSnapshot }
+  /** Committed socket group edit (create / delete / main skill): restores every skill set exactly. */
+  | { kind: 'skills'; snapshot: SkillsSnapshot }
 ) & {
   /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
   journal?: number;
@@ -955,11 +960,16 @@ export class BuildSession {
       }
       if (entry.kind === 'full') {
         await this.restoreAllUnlocked(entry.snapshot);
+        // apply_changes can change the main skill (a gem change), so the cached build info may differ.
+        await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'spec') {
         await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
         await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'tree') {
         await this.restoreTreeUnlocked(entry.snapshot);
+      } else if (entry.kind === 'skills') {
+        await this.restoreSkillsUnlocked(entry.snapshot);
+        await this.refreshBuildInfoUnlocked();
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
@@ -1322,9 +1332,12 @@ export class BuildSession {
       await this.bridge.getStats();
       return failure;
     } catch (e) {
-      const message =
-        `${(failure as Error).message} (PoB's recalculation also failed: ${(e as Error).message}; ` +
-        'stats and export_build may show values from before the change until a later call recalculates)';
+      // With the engine gone the change is not committed (the restarted
+      // engine will not have it), so there are no stale values to warn about.
+      const stale = this.bridge.isRunning()
+        ? '; stats and export_build may show values from before the change until a later call recalculates'
+        : '';
+      const message = `${(failure as Error).message} (PoB's recalculation also failed: ${(e as Error).message}${stale})`;
       return new Error(message, { cause: failure });
     }
   }
@@ -1340,6 +1353,187 @@ export class BuildSession {
       return { started: res.started === true, applied };
     } catch (e) {
       console.error('[pob-mcp] could not read what a failed tree edit changed:', (e as Error).message);
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Committed build edits: apply_changes and socket group edits
+  // ------------------------------------------------------------------
+
+  /**
+   * Commit one evaluate_changes variant (apply_changes) as one undo step.
+   * Node names resolve as in evaluate_changes; the variant is checked as the
+   * probe checks it, and the bridge checks it against the build (gem changes
+   * by applying them to copies and undoing them) before anything changes, so
+   * a refusal changes nothing and pushes nothing. Then config, gems, items,
+   * deallocations and allocations are applied in that order, as the probe
+   * applies them. A change that fails part-way is rolled back to the full
+   * snapshot taken first (the undo entry). Records, for crash replay, the
+   * variant with gem names as PoB names them and the allocated node ids in
+   * the order they joined the tree.
+   */
+  async applyChanges(variant: NamedProbeVariant): Promise<ApplyChangesResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    const hasConfig = variant.config !== undefined && Object.keys(variant.config).length > 0;
+    const lists = [variant.allocate, variant.deallocate, variant.items, variant.gems];
+    if (!hasConfig && lists.every((list) => list === undefined || list.length === 0)) {
+      throw new UserError('The variant changes nothing: give at least one of allocate, deallocate, items, gems or config');
+    }
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const { allocate, deallocate, ...rest } = variant;
+      const resolved: ProbeVariant = { ...rest };
+      if (!hasConfig) delete resolved.config;
+      if (allocate?.length) resolved.allocate = await resolver.resolveAll(allocate, 'allocate');
+      if (deallocate?.length) resolved.deallocate = await resolver.resolveAll(deallocate, 'deallocate');
+      const toEngine = await checkVariant({ validateConfig: (options) => this.validateConfigOptionsUnlocked(options) }, resolved);
+      const undoSnap = await this.snapshotAllUnlocked();
+      const entry: UndoEntry = { kind: 'full', snapshot: undoSnap };
+      const before = undoSnap.stats;
+      const journal = this.bridge.committedCount();
+      const { res, failure } = await this.sendBuildEditUnlocked<RawApplyChanges>(
+        { cmd: 'applyChanges', variant: toEngine },
+        entry,
+        journal,
+        () => this.restoreAllUnlocked(undoSnap),
+      );
+      const added = treeEditNodes(res.added);
+      const removed = treeEditNodes(res.removed);
+      // The replay: gem names as PoB names them, allocations in join order.
+      const gemNames = Array.isArray(res.gemNames) ? res.gemNames : [];
+      const replay: ProbeVariant = { ...toEngine };
+      if (toEngine.gems) {
+        replay.gems = toEngine.gems.map((ch, i) => {
+          const name = gemNames[i];
+          return typeof name === 'string' && 'name' in ch && ch.name !== undefined ? { ...ch, name } : ch;
+        });
+      }
+      delete replay.allocate;
+      if (Array.isArray(res.allocOrder) && res.allocOrder.length > 0) replay.allocate = res.allocOrder;
+      return this.commitAfterUnlocked(entry, journal, { cmd: 'applyChanges', replay: true, variant: replay }, async () => {
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        let summary: PassiveTreeSummary | undefined;
+        if (added.length + removed.length > 0) {
+          summary = (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
+        }
+        await this.refreshBuildInfoUnlocked();
+        return { added, removed, ...(summary ? { summary } : {}), before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * Add a socket group (create_socket_group) at the end of the active skill
+   * set, optionally as the main skill group. One skills undo entry; the
+   * command is recorded for replay with gem names as PoB names them.
+   */
+  async createSocketGroup(spec: CreateSocketGroupSpec): Promise<SkillEditResult> {
+    return this.skillsEdit({ cmd: 'createSocketGroup', ...spec }, (res) => {
+      const names = (res.group as { gems?: Array<{ name?: string }> } | undefined)?.gems ?? [];
+      return { cmd: 'createSocketGroup', ...spec, gems: spec.gems.map((g, i) => ({ ...g, name: names[i]?.name || g.name })), replay: true };
+    });
+  }
+
+  /** Delete a socket group (delete_socket_group); later groups move up by one. */
+  async deleteSocketGroup(group: number): Promise<SkillEditResult> {
+    return this.skillsEdit({ cmd: 'deleteSocketGroup', group });
+  }
+
+  /** Make a group the main skill group, optionally picking its active skill (set_main_skill). */
+  async setMainSkill(group: number, activeSkill?: number): Promise<SkillEditResult> {
+    return this.skillsEdit({ cmd: 'setMainSkill', group, ...(activeSkill !== undefined ? { activeSkill } : {}) });
+  }
+
+  /**
+   * A socket group edit: one skills undo entry and one journal record
+   * (`replayOf` the bridge's report; marked `replay`, which the bridge's
+   * test faults skip).
+   */
+  private async skillsEdit(
+    command: Record<string, unknown>,
+    replayOf: (res: Record<string, unknown>) => object = () => ({ ...command, replay: true }),
+  ): Promise<SkillEditResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    return this.withLock(async () => {
+      const snapshot = await this.snapshotSkillsUnlocked();
+      const entry: UndoEntry = { kind: 'skills', snapshot };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const { res, failure } = await this.sendBuildEditUnlocked<Record<string, unknown>>(command, entry, journal, () =>
+        this.restoreSkillsUnlocked(snapshot),
+      );
+      return this.commitAfterUnlocked(entry, journal, replayOf(res), async () => {
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        const { ok: _ok, ...details } = res;
+        return { details, mainSkill: this.buildInfo?.mainSkill ?? null, before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * Send a build edit (applyChanges or a socket group edit). When it fails
+   * with the engine alive, the bridge's record (buildEditApplied) says how
+   * far it got: not started (a refusal, or a failure before any change) is
+   * rethrown; applied in full is returned with the failure, to be committed
+   * (commitAfterUnlocked); started but not finished (or unknown) is rolled
+   * back with `rollback` and rethrown. The rollback must give back the
+   * committed state the command started from, compared by value as probe
+   * fallbacks compare it (`probe` with `fingerprint`). A rollback that fails
+   * or leaves the state different pushes the undo entry (undo can try again;
+   * nothing is journaled) and throws an internal error naming reset_build.
+   */
+  private async sendBuildEditUnlocked<R extends object>(
+    command: object,
+    entry: UndoEntry,
+    journal: number,
+    rollback: () => Promise<void>,
+  ): Promise<{ res: R & { ok?: true }; failure?: unknown }> {
+    const deps = { send: <T>(c: object) => this.bridge.send<T>(c) };
+    const before = await committedFingerprint(deps);
+    try {
+      return { res: await this.bridge.send<R & { ok: true }>(command) };
+    } catch (err) {
+      if (!this.bridge.isRunning()) throw err;
+      const record = await this.buildEditRecordUnlocked<R>();
+      if (record?.applied) return { res: record.applied, failure: err };
+      if (record && !record.started) throw err;
+      try {
+        await rollback();
+        const diff = fingerprintDiff(before, await committedFingerprint(deps));
+        if (diff !== null) {
+          throw new Error(`rolling the build back after a failed build edit was not exact (${diff}); call reset_build`);
+        }
+      } catch (rollbackError) {
+        this.pushUndoEntryUnlocked(entry, journal);
+        throw withRestoreFailure(err, rollbackError);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The error to report for a build edit that was applied but failed: the
+   * recalculation runs (recalcAfterAppliedFailureUnlocked) and the cached
+   * build info (main skill) is re-read when the engine allows it.
+   */
+  private async editFailureAfterApplyUnlocked(failure: unknown): Promise<unknown> {
+    const error = await this.recalcAfterAppliedFailureUnlocked(failure);
+    await this.refreshBuildInfoUnlocked().catch(() => undefined);
+    return error;
+  }
+
+  /** Read right after a failed build edit: whether it started and what it applied. Null when it cannot be read. */
+  private async buildEditRecordUnlocked<R>(): Promise<{ started: boolean; applied: R | null } | null> {
+    try {
+      const res = await this.bridge.send<{ ok: true; started: boolean; applied: R | null }>({ cmd: 'buildEditApplied' });
+      const applied = res.applied && typeof res.applied === 'object' ? res.applied : null;
+      return { started: res.started === true, applied };
+    } catch (e) {
+      console.error('[pob-mcp] could not read what a failed build edit changed:', (e as Error).message);
       return null;
     }
   }
@@ -2473,6 +2667,40 @@ function treeEditNodes(value: unknown): TreeEditNode[] {
     ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
     pointCost: n.pointCost === 'ascendancy' || n.pointCost === 'none' ? n.pointCost : 'passive',
   }));
+}
+
+/** The bridge's report of an applyChanges command (lua/probe.lua). */
+interface RawApplyChanges {
+  added?: unknown;
+  removed?: unknown;
+  /** Ids the allocation added, in the order they joined the tree. */
+  allocOrder?: number[];
+  /** Each gem change's gem as PoB names it, or null. */
+  gemNames?: Array<string | null>;
+}
+
+export interface ApplyChangesResult extends StatDiffResult {
+  /** Allocated by the change (the allocation's nodes, in the order they joined the tree, first). */
+  added: TreeEditNode[];
+  /** Deallocated by the change, by id. */
+  removed: TreeEditNode[];
+  /** The tree after the change (point counts), when nodes changed. */
+  summary?: PassiveTreeSummary;
+}
+
+export interface CreateSocketGroupSpec {
+  gems: Array<{ name: string; level?: number; quality?: number; enabled?: boolean }>;
+  slot?: string;
+  label?: string;
+  enabled?: boolean;
+  setAsMain?: boolean;
+}
+
+export interface SkillEditResult extends StatDiffResult {
+  /** What the bridge reported (the new group, the deleted group, the main group). */
+  details: Record<string, unknown>;
+  /** The build's main skill after the change. */
+  mainSkill: string | null;
 }
 
 export interface PassiveTreeSummary {

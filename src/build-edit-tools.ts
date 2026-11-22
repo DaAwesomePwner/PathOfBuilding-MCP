@@ -1,0 +1,153 @@
+// Committed build edits beyond items, config and the passive tree:
+// apply_changes (keep an evaluate_changes variant as one undoable step) and
+// the socket group edits create_socket_group, delete_socket_group and
+// set_main_skill. Each pushes one undo entry and records one command for
+// crash replay (BuildSession).
+
+import { z } from 'zod';
+import type { ApplyChangesResult, SkillEditResult, StatDiffResult, TreeEditNode } from './build-session.js';
+import { type EvaluateChangesVariant, gemLevel, gemQuality, MAX_LABEL, MAX_VARIANT_GEMS, variantSchema } from './evaluate-changes.js';
+import type { ToolRegistrar } from './tool-registry.js';
+
+/** server.ts's swap_item result shape (`diff` by category, `keyDeltas`). */
+type SummarizeStatDiff = (result: StatDiffResult) => unknown;
+
+/** The slots a socket group can be socketed in (PoB's "Socketed in" list). */
+const GROUP_SLOTS = [
+  'Weapon 1', 'Weapon 2', 'Weapon 1 Swap', 'Weapon 2 Swap', 'Helmet', 'Body Armour', 'Gloves', 'Boots',
+  'Amulet', 'Ring 1', 'Ring 2', 'Ring 3', 'Belt',
+] as const;
+
+const UNDO = 'Call undo_last_change to revert this change (one step).';
+
+function node(n: TreeEditNode): Record<string, unknown> {
+  return { id: n.id, name: n.name, type: n.type, ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}) };
+}
+
+function points(nodes: TreeEditNode[], cost: 'passive' | 'ascendancy'): number {
+  return nodes.filter((n) => n.pointCost === cost).length;
+}
+
+function applyResponse(result: ApplyChangesResult, label: string | undefined, summarize: SummarizeStatDiff): unknown {
+  const s = result.summary;
+  return {
+    status: 'applied',
+    ...(label !== undefined ? { label } : {}),
+    ...(result.added.length > 0 ? { added: result.added.map(node) } : {}),
+    ...(result.removed.length > 0 ? { removed: result.removed.map(node) } : {}),
+    ...(s
+      ? {
+          pointsUsed: points(result.added, 'passive'),
+          pointsRefunded: points(result.removed, 'passive'),
+          ascendancyPointsUsed: points(result.added, 'ascendancy'),
+          ascendancyPointsRefunded: points(result.removed, 'ascendancy'),
+          points: {
+            used: s.totalPoints,
+            max: s.maxNormalPoints,
+            remaining: s.maxNormalPoints - s.totalPoints,
+            ascendancyUsed: s.ascendancyPoints,
+            ascendancyMax: s.maxAscendancyPoints,
+          },
+        }
+      : {}),
+    ...(summarize(result) as object),
+    undo: UNDO,
+  };
+}
+
+function skillEditResponse(status: string, fields: Record<string, unknown>, result: SkillEditResult, summarize: SummarizeStatDiff): unknown {
+  return { status, ...fields, mainSkill: result.mainSkill, ...(summarize(result) as object), undo: UNDO };
+}
+
+export function registerBuildEditTools(tools: ToolRegistrar, summarize: SummarizeStatDiff): void {
+  tools.engine<{ variant: EvaluateChangesVariant }>(
+    'apply_changes',
+    {
+      description:
+        'Apply one what-if variant to the build and keep it: exactly the variant format evaluate_changes takes (passive nodes to allocate / deallocate by name or id, items to equip or unequip, gem changes, config options; `label` is optional and echoed back), ' +
+        'applied in the same order (config, gems, items, nodes) and as ONE undo step, so a winning evaluate_changes variant can be committed as-is with the stats evaluate_changes reported for it. PERMANENTLY mutates the build (undo_last_change reverts the whole variant; export_build includes it). ' +
+        'The whole variant is checked first and refused with an error (nothing changes) if any node is unknown, ambiguous, already allocated, unreachable or a mastery, an item does not fit its slot or cannot be parsed, a gem name or group / gem index is wrong (indices refer to the group as it is when that change applies), a gem change targets a group granted by an item or the passive tree, or a config key is unknown. ' +
+        'Returns the nodes `added` (each allocation with its path, tree side first) and `removed`, the points used / refunded and the tree\'s point totals when nodes changed, and the before/after stat diff (as swap_item).',
+      inputSchema: {
+        variant: variantSchema.describe('One variant, as in evaluate_changes `variants`.'),
+      },
+    },
+    async ({ variant }, session) => {
+      const { label, ...rest } = variant;
+      return applyResponse(await session.applyChanges(rest), label, summarize);
+    },
+  );
+
+  tools.engine<{
+    gems: Array<{ name: string; level?: number; quality?: number; enabled?: boolean }>;
+    slot?: (typeof GROUP_SLOTS)[number];
+    label?: string;
+    enabled?: boolean;
+    setAsMain?: boolean;
+  }>(
+    'create_socket_group',
+    {
+      description:
+        'Add a new socket group (skill setup) to the build, after the existing groups, and return its index, its gems and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes it). ' +
+        'Gems are given by name (abbreviations as lookup_gem takes them), level defaults to 20 and quality to 0 (PoB caps a level the gem cannot have). `setAsMain: true` also makes it the main skill group. ' +
+        'Refused without changing anything when a gem is unknown. Edit its gems afterwards with apply_changes (gem ops on the returned group index).',
+      inputSchema: {
+        gems: z
+          .array(
+            z.object({
+              name: z.string().min(1),
+              level: gemLevel.optional(),
+              quality: gemQuality.optional(),
+              enabled: z.boolean().optional(),
+            }),
+          )
+          .min(1)
+          .max(MAX_VARIANT_GEMS)
+          .describe('The gems, in order (active skill gems and supports).'),
+        slot: z.enum(GROUP_SLOTS).optional().describe('Item slot the gems are socketed in (default none).'),
+        label: z.string().max(MAX_LABEL).optional().describe('Group label (default none: PoB names it after its active skills).'),
+        enabled: z.boolean().optional().describe('Whether the group is enabled (default true).'),
+        setAsMain: z.boolean().optional().describe('Make it the main skill group (default false).'),
+      },
+    },
+    async (args, session) => {
+      const result = await session.createSocketGroup(args);
+      const group = result.details.group as { index?: number; gems?: unknown } | undefined;
+      return skillEditResponse('created', { group: result.details.index, gems: group?.gems ?? [] }, result, summarize);
+    },
+  );
+
+  tools.engine<{ group: number }>(
+    'delete_socket_group',
+    {
+      description:
+        'Delete a socket group from the build and return the deleted group, the main skill group after the change and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). ' +
+        'Every group after it moves up by one index (re-read indices with list_skill_groups before using them again). Deleting the main skill group makes the group that takes its place (the last group, if it was last) the main one. ' +
+        'A group granted by an item or the passive tree is refused (remove the item or node instead), as is an index with no group.',
+      inputSchema: {
+        group: z.number().int().positive().describe('1-based socket group index from list_skill_groups.'),
+      },
+    },
+    async ({ group }, session) => {
+      const result = await session.deleteSocketGroup(group);
+      return skillEditResponse('deleted', { deleted: result.details.deleted, mainGroup: result.details.mainSocketGroup }, result, summarize);
+    },
+  );
+
+  tools.engine<{ group: number; activeSkill?: number }>(
+    'set_main_skill',
+    {
+      description:
+        "Make a socket group the build's main skill group (the skill get_stats and the DPS numbers describe) and, with `activeSkill`, pick which of its active skills is the main one when it has several (1-based, in the group's order). Returns the main group, the main skill and the before/after stat diff. " +
+        'PERMANENTLY mutates the build (use undo_last_change to revert). A group with no enabled active skill gem, or an out-of-range index, is refused without changing anything.',
+      inputSchema: {
+        group: z.number().int().positive().describe('1-based socket group index from list_skill_groups.'),
+        activeSkill: z.number().int().positive().optional().describe('1-based active skill within the group (default: keep its current choice).'),
+      },
+    },
+    async ({ group, activeSkill }, session) => {
+      const result = await session.setMainSkill(group, activeSkill);
+      return skillEditResponse('set', { mainGroup: result.details.mainSocketGroup, activeSkill: result.details.activeSkill }, result, summarize);
+    },
+  );
+}

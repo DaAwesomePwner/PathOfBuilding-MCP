@@ -46,6 +46,10 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   convert_tree_to_latest: UNDOABLE,
   allocate_nodes: UNDOABLE,
   deallocate_nodes: UNDOABLE,
+  apply_changes: UNDOABLE,
+  create_socket_group: UNDOABLE,
+  delete_socket_group: UNDOABLE,
+  set_main_skill: UNDOABLE,
   // Session-scoped stat snapshots only; the build is untouched.
   snapshot_and_compare: { ...UNDOABLE, idempotentHint: true },
   // Reads
