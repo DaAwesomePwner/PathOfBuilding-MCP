@@ -2,7 +2,18 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { BuildSession, ComparisonResult, computeDiff, DiagnosticCheck, SCENARIO_NAMES, StatDiffResult, UpgradeSuggestion } from './build-session.js';
+import {
+  BuildSession,
+  ComparisonResult,
+  computeDiff,
+  EquippedItem,
+  ItemModLine,
+  PassiveTreeInfo,
+  SCENARIO_NAMES,
+  SkillGemInstance,
+  StatDiffResult,
+} from './build-session.js';
+import { registerEvaluateChanges } from './evaluate-changes.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
 import type { Stats } from './lua-bridge.js';
@@ -109,6 +120,7 @@ const tools = createToolRegistrar(server, engine);
 
 registerEngineTools(tools, engine);
 registerTradeTools(tools);
+registerEvaluateChanges(tools);
 
 tools.engine<{ source: string }>(
   'load_build',
@@ -143,19 +155,33 @@ tools.engine<{ source: string }>(
   },
 );
 
-tools.engine<{ categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'> }>(
+tools.engine<{
+  categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'>;
+  stats?: string[];
+}>(
   'get_stats',
   {
     description:
-      'Get calculated stats for the currently loaded build, organized by category. Categories: offense, defense, sustain, charges, attributes, movement. Returns only non-zero stats.',
+      'Get calculated stats for the currently loaded build, organized by category. Categories: offense, defense, sustain, charges, attributes, movement. Returns only non-zero stats. ' +
+      'Pass `stats` instead to read exactly those Path of Building output keys (any key PoB calculates, e.g. ["CombinedDPS","Life","CritChance"]): the result is then `{ stats: { key: value } }` with null for a key PoB does not have, and `categories` is ignored.',
     inputSchema: {
       categories: z
         .array(z.enum(['offense', 'defense', 'sustain', 'charges', 'attributes', 'movement']))
         .optional()
         .describe('Optional category filter. Omit for all categories.'),
+      stats: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Exact PoB output stat keys to return (unknown keys come back as null).'),
     },
   },
-  async ({ categories }, session) => {
+  async ({ categories, stats: keys }, session) => {
+    if (keys) {
+      const { base } = await session.probe({ stats: [...new Set(keys)], variants: [] });
+      return { stats: base };
+    }
     const stats = await session.getStats();
     return categorizeStats(stats, categories);
   },
@@ -180,16 +206,48 @@ tools.engine<{ skillIndex?: number }>(
   },
 );
 
-tools.engine<Record<string, never>>(
+/** A mod line with only its true flags (`{ line, crafted: true }`), so `line` and flag checks keep working. */
+function compactMod(mod: ItemModLine): Partial<ItemModLine> & { line: string } {
+  const out: Partial<ItemModLine> & { line: string } = { line: mod.line };
+  for (const flag of ['crafted', 'fractured', 'enchant', 'implicit'] as const) {
+    if (mod[flag]) out[flag] = true;
+  }
+  return out;
+}
+
+/** An equipped item without its item text and false flags (detail: 'full' gives everything). */
+function compactItem(item: EquippedItem, includeItemText: boolean): Record<string, unknown> {
+  const { raw, implicits, explicits, enchants, corrupted, shaper, elder, ...rest } = item;
+  return {
+    ...rest,
+    ...(corrupted ? { corrupted } : {}),
+    ...(shaper ? { shaper } : {}),
+    ...(elder ? { elder } : {}),
+    implicits: implicits.map(compactMod),
+    explicits: explicits.map(compactMod),
+    enchants: enchants.map(compactMod),
+    ...(includeItemText && raw !== undefined ? { raw } : {}),
+  };
+}
+
+const detailSchema = z.enum(['summary', 'full']);
+
+tools.engine<{ detail?: 'summary' | 'full'; includeItemText?: boolean }>(
   'list_equipped_items',
   {
     description:
-      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets.',
-    inputSchema: {},
+      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. ' +
+      'By default each mod is `{ line }` plus only its true flags (e.g. `crafted: true`), false item flags are left out and the item text is not included; ' +
+      '`includeItemText: true` adds each item\'s PoB text as `raw`; `detail: "full"` returns every field (all flags and `raw`).',
+    inputSchema: {
+      detail: detailSchema.optional().describe('"summary" (default) or "full" (every field, including the item text).'),
+      includeItemText: z.boolean().optional().describe('Add each item\'s PoB "Copy item" text as `raw` (default false).'),
+    },
   },
-  async (_args, session) => {
+  async ({ detail, includeItemText }, session) => {
     const items = await session.listEquippedItems();
-    return { count: items.length, items };
+    if (detail === 'full') return { count: items.length, items };
+    return { count: items.length, items: items.map((item) => compactItem(item, includeItemText === true)) };
   },
 );
 
@@ -341,15 +399,35 @@ tools.engine<Record<string, never>>(
 // Phase 4 tools: passive tree analysis
 // ---------------------------------------------------------------------------
 
-tools.engine<Record<string, never>>(
+/** get_passive_tree's default: node stats only for keystones and notables. */
+function compactTree(tree: PassiveTreeInfo): unknown {
+  const named = (n: { id: number; name: string; stats?: string[] }) => ({ id: n.id, name: n.name, stats: n.stats ?? [] });
+  return {
+    summary: tree.summary,
+    keystones: tree.keystones.map(named),
+    notables: tree.notables.map(named),
+    allocatedNodes: tree.allocatedNodes.map((n) => ({
+      id: n.id,
+      name: n.name,
+      type: n.type,
+      ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+    })),
+  };
+}
+
+tools.engine<{ detail?: 'summary' | 'full' }>(
   'get_passive_tree',
   {
     description:
-      'Return the full passive tree state: all allocated nodes with stats, active keystones, allocated notables, point counts, and class info.',
-    inputSchema: {},
+      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type). ' +
+      '`detail: "full"` returns every allocated node with all its fields and stats.',
+    inputSchema: {
+      detail: detailSchema.optional().describe('"summary" (default) or "full" (every allocated node with its stats and flags).'),
+    },
   },
-  async (_args, session) => {
-    return session.getPassiveTree();
+  async ({ detail }, session) => {
+    const tree = await session.getPassiveTree();
+    return detail === 'full' ? tree : compactTree(tree);
   },
 );
 
@@ -517,23 +595,41 @@ tools.engine<{ keystone: string }>(
 // Phase 5 tools: skill gems
 // ---------------------------------------------------------------------------
 
-tools.engine<Record<string, never>>(
+/** A gem with its index, name, level and quality, plus disabled / count / error only when they apply. */
+function compactGem(gem: SkillGemInstance): Record<string, unknown> {
+  return {
+    index: gem.index,
+    name: gem.name,
+    level: gem.level,
+    quality: gem.quality,
+    ...(gem.enabled ? {} : { enabled: false }),
+    ...(gem.count !== undefined && gem.count !== 1 ? { count: gem.count } : {}),
+    ...(gem.errMsg ? { errMsg: gem.errMsg } : {}),
+  };
+}
+
+tools.engine<{ detail?: 'summary' | 'full' }>(
   'list_skill_groups',
   {
     description:
-      'List every socket group (skill setup) with active gems, support gems, slot, label, and which group is the main skill.',
-    inputSchema: {},
+      'List every socket group (skill setup) with active gems, support gems, slot, label, and which group is the main skill. ' +
+      'Each gem has its `index` in the group (the 1-based index swap_gem and evaluate_changes take), name, level and quality, plus `enabled: false` / `count` / `errMsg` only when they apply; ' +
+      '`detail: "full"` returns every gem field (gem and skill ids, color, isSupport).',
+    inputSchema: {
+      detail: detailSchema.optional().describe('"summary" (default) or "full" (every gem field).'),
+    },
   },
-  async (_args, session) => {
+  async ({ detail }, session) => {
     const groups = await session.listSkillGroups();
+    const gems = (list: SkillGemInstance[]) => (detail === 'full' ? list : list.map(compactGem));
     const formatted = groups.map((g) => ({
       index: g.index,
       label: g.label,
       slot: g.slotName,
       enabled: g.enabled,
       isMainSkill: g.isMainGroup,
-      activeGems: g.gems.filter((gem) => !gem.isSupport),
-      supportGems: g.gems.filter((gem) => gem.isSupport),
+      activeGems: gems(g.gems.filter((gem) => !gem.isSupport)),
+      supportGems: gems(g.gems.filter((gem) => gem.isSupport)),
     }));
     return { count: formatted.length, groups: formatted };
   },
@@ -774,42 +870,11 @@ tools.engine<{ buffs: Record<string, boolean | number | string> }>(
 // Phase 7: Optimization advisor
 // ---------------------------------------------------------------------------
 
-function formatDiagnostics(checks: DiagnosticCheck[]): string {
-  if (checks.length === 0) return 'No issues found — build looks solid!';
-  const lines: string[] = ['## Build Diagnosis', ''];
-  for (const c of checks) {
-    const tag = c.severity === 'critical' ? '[CRITICAL]' : c.severity === 'warning' ? '[WARNING]' : '[INFO]';
-    lines.push(`${tag} (${c.category}) ${c.message}`);
-    lines.push(`  -> ${c.suggestion}`);
-    lines.push('');
-  }
-  return lines.join('\n').trimEnd();
-}
-
-function formatUpgrades(suggestions: UpgradeSuggestion[]): string {
-  const lines: string[] = ['## Upgrade Suggestions (lowest contribution first)', ''];
-  for (let i = 0; i < suggestions.length; i++) {
-    const s = suggestions[i];
-    lines.push(`${i + 1}. ${s.slot}${s.empty ? ' (EMPTY)' : ''}`);
-    if (s.currentItemName) lines.push(`   Current: ${s.currentItemName}`);
-    if (s.error !== undefined) {
-      lines.push(`   Not measured: ${s.error}`);
-    } else {
-      lines.push(
-        `   Contribution: ${Math.round(s.dpsContribution).toLocaleString()} DPS, ${Math.round(s.ehpContribution).toLocaleString()} EHP (priority ${s.priority}/100)`,
-      );
-    }
-    if (s.suggestedMods.length > 0) lines.push(`   Look for: ${s.suggestedMods.join(', ')}`);
-    lines.push('');
-  }
-  return lines.join('\n').trimEnd();
-}
-
 tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   'diagnose_build',
   {
     description:
-      'Run a comprehensive read-only analysis of the current build. Identifies uncapped resistances, low EHP, crit/hit-chance issues, sub-level-20 main gems, missing movement/guard skills, etc. Pass `focus` to narrow to defense, offense, qol, or balance.',
+      'Run a comprehensive read-only analysis of the current build. Identifies uncapped resistances, low EHP, crit/hit-chance issues, sub-level-20 main gems, missing movement/guard skills, etc. Pass `focus` to narrow to defense, offense, qol, or balance. Returns `checks` (severity, category, message, suggestion), most severe first; an empty list means no issues were found.',
     inputSchema: {
       focus: z
         .enum(['defense', 'offense', 'qol', 'balance'])
@@ -819,12 +884,7 @@ tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   },
   async ({ focus }, session) => {
     const checks = await session.diagnoseBuild(focus);
-    return {
-      content: [
-        { type: 'text', text: formatDiagnostics(checks) },
-        { type: 'text', text: JSON.stringify({ checks }, null, 2) },
-      ],
-    };
+    return { checks };
   },
 );
 
@@ -832,7 +892,7 @@ tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   'suggest_upgrades',
   {
     description:
-      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`.",
+      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (lowest contribution first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods; list_equipped_items / get_item_in_slot give the items themselves.",
     inputSchema: {
       slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
       budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),
@@ -840,12 +900,7 @@ tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
   },
   async ({ slot, budget }, session) => {
     const suggestions = await session.suggestUpgrades(slot, budget);
-    return {
-      content: [
-        { type: 'text', text: formatUpgrades(suggestions) },
-        { type: 'text', text: JSON.stringify({ suggestions }, null, 2) },
-      ],
-    };
+    return { suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest) };
   },
 );
 

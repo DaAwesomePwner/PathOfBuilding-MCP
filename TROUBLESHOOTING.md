@@ -102,7 +102,7 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 ## State drift / unexpected stat values after multiple operations
 
-**Cause:** Should not happen — `withTemporaryChange`, `compare_items`, `find_best_next_nodes`, `simulate_scenario`, etc. all snapshot/restore. If you see drift, it means a snapshot field is missing.
+**Cause:** Should not happen. The what-if tools (`evaluate_changes`, `compare_items`, `find_best_next_nodes`, `simulate_scenario`, etc.) run through PoB's calculator (`lua/probe.lua`) without changing or recalculating the build. The variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored, and the restore is compared with a fingerprint of the build taken before; a mismatch is an internal error naming `reset_build`. If you see drift anyway, a snapshot or fingerprint field is missing.
 
 **Diagnostic steps:**
 1. Run `npm run test:integrity` — this exact scenario is the regression suite.
@@ -111,7 +111,7 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 ## "Nothing to undo"
 
-The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` cleared the stack. Note that *failed* mutating tools (e.g. `swap_item` with malformed text) still push an undo entry **before** their mutation, so you may sometimes have an undo entry that is effectively a no-op.
+The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only `swap_item`, `unequip_item`, `set_config` and `convert_tree_to_latest` push an entry, and only when the change succeeded; the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
 
 ## "The Path of Building engine was restarted … Retry the call"
 
@@ -129,13 +129,14 @@ A tool call was queued or running when the engine was replaced (`reload_engine`,
 |---|---|
 | `load_build` | 1–3 s |
 | `get_stats` | <50 ms |
-| `compare_items` (3 candidates) | ~3 s |
-| `find_best_next_nodes` (count=10) | 25–35 s |
-| `find_worst_allocated_nodes` | 15–20 s |
-| `compare_supports` (3 candidates) | 4–8 s |
-| `find_optimal_links` (default topN) | 15–60 s |
-| `suggest_upgrades` (all slots) | 25–40 s |
-| `simulate_scenario` | <500 ms |
+| `evaluate_changes` (30 single-change variants) | ~0.15 s (a few ms per variant; each `fallback` variant ~0.3–0.5 s) |
+| `compare_items` (2–5 candidates) | <0.2 s |
+| `find_best_next_nodes` (default `maxPoints` 3) | ~2 s (~0.4 s with `maxPoints: 1`) |
+| `find_worst_allocated_nodes` | 2–3 s |
+| `compare_supports`, `swap_gem`, `evaluate_gem_levels` | milliseconds |
+| `find_optimal_links` (6-link, default topN) | 1–3 s |
+| `suggest_upgrades` (all slots) | <1 s |
+| `simulate_scenario`, `compare_scenarios`, `toggle_buffs` | milliseconds |
 
 Run the server with `POB_TIMING=1` to log every Lua bridge command's wall time to stderr.
 

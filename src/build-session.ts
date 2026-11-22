@@ -2,7 +2,15 @@ import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
 import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
-import { runProbe, withoutNulls, type ProbeGemChange, type ProbeRequest, type ProbeResponse, type ProbeVariantResult } from './probe.js';
+import {
+  runProbe,
+  withoutNulls,
+  type ProbeGemChange,
+  type ProbeRequest,
+  type ProbeResponse,
+  type ProbeVariant,
+  type ProbeVariantResult,
+} from './probe.js';
 import { toNumber } from './stat-values.js';
 import { DEFAULT_MAX_POINTS, findBestNextNodes, findWorstAllocatedNodes, type RankBy, type TreeSearchResult } from './tree-search.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
@@ -729,6 +737,75 @@ export class BuildSession {
       },
       request,
     );
+  }
+
+  /**
+   * probe() whose variants may name passive nodes instead of giving ids, all
+   * under one lock. A deallocate name is matched against the allocated nodes
+   * first (several nodes share names like "Strength"); any other name is
+   * looked up as simulate_passive_change does. A variant naming a node that
+   * does not exist gets a user error and is not run; the others still are.
+   */
+  async probeNamed(request: Omit<ProbeRequest, 'variants'> & { variants: NamedProbeVariant[] }): Promise<ProbeResponse> {
+    return this.withLock(async () => {
+      const byName = new Map<string, number | null>();
+      let allocatedByName: Map<string, number> | undefined;
+      const lookup = async (ref: string | number, allocatedFirst: boolean): Promise<number | null> => {
+        if (typeof ref === 'number') return ref;
+        const key = ref.toLowerCase();
+        if (allocatedFirst) {
+          if (!allocatedByName) {
+            const res = await this.bridge.send<{ ok: true; nodes: TreeNodeInfo[] }>({ cmd: 'getAllocatedNodesDetailed' });
+            allocatedByName = new Map();
+            for (const n of res.nodes ?? []) {
+              if (n.name && !allocatedByName.has(n.name.toLowerCase())) allocatedByName.set(n.name.toLowerCase(), n.id);
+            }
+          }
+          const id = allocatedByName.get(key);
+          if (id !== undefined) return id;
+        }
+        if (!byName.has(key)) {
+          const res = await this.bridge.send<{ ok: true; node: TreeNodeInfo | null }>({ cmd: 'getNodeInfo', name: ref });
+          byName.set(key, res.node ? res.node.id : null);
+        }
+        return byName.get(key) ?? null;
+      };
+      const resolveAll = async (refs: Array<string | number> | undefined, allocatedFirst: boolean): Promise<number[] | undefined> => {
+        if (refs === undefined) return undefined;
+        const ids: number[] = [];
+        for (const ref of refs) {
+          const id = await lookup(ref, allocatedFirst);
+          if (id === null) throw new UserError(`Passive node not found: "${ref}"`);
+          ids.push(id);
+        }
+        return ids;
+      };
+
+      const results: Array<ProbeVariantResult | undefined> = new Array(request.variants.length);
+      const toRun: number[] = [];
+      const resolved: ProbeVariant[] = [];
+      for (let i = 0; i < request.variants.length; i++) {
+        const { allocate, deallocate, ...rest } = request.variants[i];
+        try {
+          const variant: ProbeVariant = { ...rest };
+          const allocIds = await resolveAll(allocate, false);
+          const deallocIds = await resolveAll(deallocate, true);
+          if (allocIds !== undefined) variant.allocate = allocIds;
+          if (deallocIds !== undefined) variant.deallocate = deallocIds;
+          resolved.push(variant);
+          toRun.push(i);
+        } catch (error) {
+          if (!(error instanceof UserError)) throw error;
+          results[i] = { stats: {}, error: error.message, userError: true };
+        }
+      }
+      const { variants: _variants, ...options } = request;
+      const probed = await this.probeUnlocked({ ...options, variants: resolved });
+      toRun.forEach((index, j) => {
+        results[index] = probed.results[j];
+      });
+      return { base: probed.base, results: results.map((r) => r ?? { stats: {}, error: 'variant was not run' }) };
+    });
   }
 
   /** The one result of a single-variant probe; any error but a user error is thrown. */
@@ -2165,6 +2242,12 @@ export interface ComparisonResult {
   bestForEHP: number | null;
   bestForLife: number | null;
 }
+
+/** A probe variant whose passive nodes may be given by name (see BuildSession.probeNamed). */
+export type NamedProbeVariant = Omit<ProbeVariant, 'allocate' | 'deallocate'> & {
+  allocate?: Array<string | number>;
+  deallocate?: Array<string | number>;
+};
 
 export interface TreeNodeInfo {
   id: number;

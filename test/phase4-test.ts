@@ -118,7 +118,7 @@ async function main(): Promise<void> {
 
     // Test 1: get_passive_tree
     log('Test 1: get_passive_tree');
-    const tree = JSON.parse(extractText(await call(client, 'get_passive_tree'))) as {
+    const tree = JSON.parse(extractText(await call(client, 'get_passive_tree', { detail: 'full' }))) as {
       allocatedNodes: Array<{ id: number; name: string; isKeystone: boolean; isNotable: boolean; alloc: boolean }>;
       keystones: Array<{ id: number; name: string }>;
       notables: Array<{ id: number; name: string }>;
@@ -138,6 +138,24 @@ async function main(): Promise<void> {
     assert(tree.summary.ascendClassName === 'Occultist', `expected Occultist, got ${tree.summary.ascendClassName}`);
     assert(tree.allocatedNodes.every((n) => n.alloc === true), 'all allocated nodes should have alloc=true');
     log(`PASS: ${tree.allocatedNodes.length} allocated, ${tree.keystones.length} keystones, ${tree.notables.length} notables, points=${tree.summary.totalPoints}/${tree.summary.maxNormalPoints}`);
+
+    log('Test 1b: get_passive_tree default (compact)');
+    const compact = JSON.parse(extractText(await call(client, 'get_passive_tree'))) as {
+      allocatedNodes: Array<Record<string, unknown>>;
+      keystones: Array<{ id: number; name: string; stats: string[] }>;
+      notables: Array<{ id: number; name: string; stats: string[] }>;
+      summary: { totalPoints: number };
+    };
+    assert(
+      JSON.stringify(compact.allocatedNodes.map((n) => n.id)) === JSON.stringify(tree.allocatedNodes.map((n) => n.id)),
+      'compact allocatedNodes lists the same nodes',
+    );
+    assert(compact.allocatedNodes.every((n) => typeof n.name === 'string' && typeof n.type === 'string' && !('stats' in n)),
+      'compact allocatedNodes: id, name, type, no stats');
+    assert(compact.keystones.length === tree.keystones.length && compact.keystones.every((k) => k.stats.length > 0), 'keystones keep their stats');
+    assert(compact.notables.length === tree.notables.length, 'notables are all listed');
+    assert(compact.summary.totalPoints === tree.summary.totalPoints, 'summary unchanged');
+    log('PASS: compact tree');
 
     const firstKeystone = tree.keystones[0];
 
