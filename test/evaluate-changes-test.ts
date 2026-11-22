@@ -290,6 +290,169 @@ async function main(): Promise<void> {
     assert((await session.exportXML()) === xml0, 'export changed after the name checks');
     log('   PASS');
 
+    // ------------------------------------------------------------------
+    log('7. objective / constraints: backwards compatibility');
+    const good = variants.filter((v) => !REFUSED.has(v.label!));
+    const plain = await evaluateChanges(session, { variants });
+    assert(JSON.stringify(Object.keys(plain)) === '["rankBy","order","base","evaluated","failed","fallbacks","results"]', `plain keys ${Object.keys(plain)}`);
+    const OLD_ROW_KEYS = ['index', 'label', 'value', 'delta', 'pointsAdded', 'pointsRemoved', 'fallback', 'error', 'userError'];
+    for (const r of plain.results) assert(Object.keys(r).every((k) => OLD_ROW_KEYS.includes(k)), `plain row keys ${Object.keys(r)}`);
+    assert(JSON.stringify(plain.results.map((r) => r.index)) === JSON.stringify(result.results.map((r) => r.index)), 'plain call keeps the same order');
+    // Constraints nobody breaks change nothing but the `violating` counter.
+    const loose = await evaluateChanges(session, { variants, constraints: [{ stat: 'Life', min: -1e9 }] });
+    assert(loose.violating === 0, `loose violating ${loose.violating}`);
+    assert(JSON.stringify(loose.results.map((r) => r.index)) === JSON.stringify(plain.results.map((r) => r.index)), 'unbroken constraints keep the order');
+    assert(loose.results.every((r) => r.violates === undefined), 'no violates when nothing is broken');
+    log('   PASS');
+
+    // ------------------------------------------------------------------
+    log('8. objective: weighted ranking');
+    const ratio = (r: { delta?: Record<string, number | null> }, key: string): number => r.delta![key]! / Math.abs(num(stats0[key]));
+    // A pair where A gains more DPS but B gains more EHP: the weights decide which comes first.
+    const dpsEhp = good.length > 0 ? (await evaluateChanges(session, { variants: good, stats: ['CombinedDPS', 'TotalEHP'] })).results : [];
+    let pair: [typeof dpsEhp[number], typeof dpsEhp[number]] | undefined;
+    for (const a of dpsEhp) {
+      for (const b of dpsEhp) {
+        if (a === b) continue;
+        const dd = ratio(a, 'CombinedDPS') - ratio(b, 'CombinedDPS');
+        const de = ratio(b, 'TotalEHP') - ratio(a, 'TotalEHP');
+        const best = pair ? ratio(pair[0], 'CombinedDPS') - ratio(pair[1], 'CombinedDPS') : 0;
+        if (dd > 1e-6 && de > 1e-6 && dd > best) pair = [a, b];
+      }
+    }
+    assert(pair, 'fixture variants need a DPS-up/EHP-down vs DPS-down/EHP-up pair');
+    const [A, B] = pair;
+    const dd = ratio(A, 'CombinedDPS') - ratio(B, 'CombinedDPS');
+    const de = ratio(B, 'TotalEHP') - ratio(A, 'TotalEHP');
+    log(`   pair: ${A.label} (DPS ${A.delta!.CombinedDPS}, EHP ${A.delta!.TotalEHP}) vs ${B.label} (DPS ${B.delta!.CombinedDPS}, EHP ${B.delta!.TotalEHP})`);
+    const posOf = (res: EvaluateChangesResult, label: string): number => res.results.findIndex((r) => r.label === label);
+    const dpsHeavy = await evaluateChanges(session, { variants: good, objective: { weights: { CombinedDPS: 1, TotalEHP: (0.5 * dd) / de } } });
+    const ehpHeavy = await evaluateChanges(session, { variants: good, objective: { weights: { CombinedDPS: (0.5 * de) / dd, TotalEHP: 1 } } });
+    assert(posOf(dpsHeavy, A.label!) < posOf(dpsHeavy, B.label!), `DPS-heavy weights: ${A.label} should come before ${B.label}`);
+    assert(posOf(ehpHeavy, B.label!) < posOf(ehpHeavy, A.label!), `EHP-heavy weights: ${B.label} should come before ${A.label}`);
+    assert(dpsHeavy.rankBy === undefined && dpsHeavy.objective?.mode === 'relative', `objective header ${JSON.stringify(dpsHeavy.objective)}`);
+    assert(dpsHeavy.results.every((r) => r.value === undefined && typeof r.score === 'number'), 'rows carry score, not value');
+    for (const res of [dpsHeavy, ehpHeavy]) {
+      for (let i = 1; i < res.results.length; i++) assert(res.results[i - 1].score! >= res.results[i].score!, `score rows ${i - 1}/${i} out of order`);
+      assert(Object.keys(res.base).includes('CombinedDPS') && Object.keys(res.base).includes('TotalEHP'), 'weighted stats are in base');
+    }
+    // The score is exactly sum(weight * delta / |base|).
+    const w = { CombinedDPS: 1, TotalEHP: (0.5 * dd) / de };
+    for (const r of dpsHeavy.results) {
+      const want = w.CombinedDPS * ratio(r, 'CombinedDPS') + w.TotalEHP * ratio(r, 'TotalEHP');
+      // the score is rounded like every number (2 decimals at 1 and above), the deltas it is checked against already are
+      assert(Math.abs(r.score! - want) <= 0.01 + 1e-3 * Math.abs(want),`${r.label}: score ${r.score} vs ${want}`);
+    }
+    // Absolute mode, a negative weight, and stats added to `stats`.
+    const abs = await evaluateChanges(session, { variants: good, stats: ['CombinedDPS'], objective: { mode: 'absolute', weights: { Life: 1, Mana: -2 } } });
+    assert(JSON.stringify(Object.keys(abs.base)) === '["CombinedDPS","Life","Mana"]', `objective stats added: ${Object.keys(abs.base)}`);
+    for (const r of abs.results) {
+      const want = r.delta!.Life! - 2 * r.delta!.Mana!;
+      assert(Math.abs(r.score! - want) <= 0.02, `${r.label}: absolute score ${r.score} vs ${want}`);
+    }
+    assert(abs.objective!.mode === 'absolute' && abs.objective!.ignored === undefined, 'absolute header');
+    const ascObj = await evaluateChanges(session, { variants: good, objective: { weights: { Life: 1 } }, order: 'asc' });
+    for (let i = 1; i < ascObj.results.length; i++) assert(ascObj.results[i - 1].score! <= ascObj.results[i].score!, 'asc objective order');
+    // An unknown stat (null) contributes nothing and is listed; the others still score.
+    const unk = await evaluateChanges(session, { variants: good, objective: { weights: { Life: 1, NotARealStat: 5 } } });
+    assert(JSON.stringify(unk.objective) === '{"mode":"relative","ignored":["NotARealStat"]}', `ignored ${JSON.stringify(unk.objective)}`);
+    const lifeOnly = await evaluateChanges(session, { variants: good, objective: { weights: { Life: 1 } } });
+    assert(JSON.stringify(unk.results.map((r) => [r.index, r.score])) === JSON.stringify(lifeOnly.results.map((r) => [r.index, r.score])), 'unknown stat adds nothing');
+    log('   PASS');
+
+    // ------------------------------------------------------------------
+    log('9. constraints: violators after passing rows, onlyPassing');
+    const lifeBase = num(stats0.Life);
+    const keepLife = await evaluateChanges(session, { variants, constraints: [{ stat: 'Life', min: lifeBase }] });
+    const lifeDown = plain.results.filter((r) => r.error === undefined && r.delta!.Life! < 0).length;
+    assert(lifeDown >= 1, 'fixture needs a variant that lowers Life');
+    assert(keepLife.violating === lifeDown, `violating ${keepLife.violating} vs ${lifeDown}`);
+    const okKeep = keepLife.results.filter((r) => r.error === undefined);
+    const firstViolator = okKeep.findIndex((r) => r.violates !== undefined);
+    assert(firstViolator === okKeep.length - lifeDown && okKeep.slice(firstViolator).every((r) => r.violates), 'violating rows follow all passing rows');
+    assert(keepLife.results.slice(okKeep.length).every((r) => r.error !== undefined), 'refused variants stay last');
+    const passingKeep = okKeep.slice(0, firstViolator).map((r) => r.index);
+    assert(JSON.stringify(passingKeep) === JSON.stringify(plain.results.filter((r) => r.error === undefined && r.delta!.Life! >= 0).map((r) => r.index)),
+      'passing rows keep their rankBy order');
+    for (const r of okKeep.slice(firstViolator)) {
+      const value = roundStat(lifeBase + r.delta!.Life!);
+      assert(r.violates!.length === 1 && r.violates![0] === `Life ${value} < ${lifeBase}`, `${r.label}: violates ${JSON.stringify(r.violates)}`);
+    }
+    log(`   e.g. ${okKeep[firstViolator].label}: ${okKeep[firstViolator].violates![0]}`);
+    // onlyPassing drops them but still counts them.
+    const only = await evaluateChanges(session, { variants, constraints: [{ stat: 'Life', min: lifeBase }], onlyPassing: true });
+    assert(only.violating === lifeDown && only.evaluated === okKeep.length, 'onlyPassing keeps the counters');
+    assert(only.results.every((r) => r.violates === undefined), 'onlyPassing leaves no violators');
+    assert(only.results.filter((r) => r.error === undefined).length === okKeep.length - lifeDown, 'onlyPassing drops the violators');
+    assert(only.results.filter((r) => r.error !== undefined).length === 4, 'refused variants stay listed with onlyPassing');
+    // A resistance floor nobody reaches; max, minDelta and several bounds on one stat.
+    const frBase = num(stats0.FireResist);
+    const fr = await evaluateChanges(session, { variants: good, constraints: [{ stat: 'FireResist', min: frBase + 1000 }] });
+    assert(fr.violating === good.length && fr.results.every((r) => r.violates!.length === 1 && /^FireResist -?[\d.]+ < /.test(r.violates![0])), 'FireResist floor');
+    const mix = await evaluateChanges(session, {
+      variants: good,
+      constraints: [{ stat: 'Life', max: lifeBase - 1, minDelta: 1 }],
+    });
+    // max = base - 1 is broken by every variant that does not lower Life; minDelta 1 by every one that does not raise it.
+    for (const r of mix.results) {
+      const d = r.delta!.Life!;
+      const hasMax = r.violates?.includes(`Life ${roundStat(lifeBase + d)} > ${lifeBase - 1}`) ?? false;
+      const hasMinDelta = r.violates?.includes(`Life change ${d} < 1`) ?? false;
+      assert(hasMax === (d >= 0), `${r.label}: max bound (${JSON.stringify(r.violates)})`);
+      assert(hasMinDelta === (d < 1), `${r.label}: minDelta bound (${JSON.stringify(r.violates)})`);
+    }
+    // Objective + constraints: passing rows by score first, then violators by score; constrained stats join `stats`.
+    const both = await evaluateChanges(session, {
+      variants: good,
+      stats: ['CombinedDPS'],
+      objective: { weights: { CombinedDPS: 1 } },
+      constraints: [{ stat: 'Life', min: lifeBase }],
+    });
+    assert(JSON.stringify(Object.keys(both.base)) === '["CombinedDPS","Life"]', `constraint stat added: ${Object.keys(both.base)}`);
+    const passScores = both.results.filter((r) => !r.violates).map((r) => r.score!);
+    const failScores = both.results.filter((r) => r.violates).map((r) => r.score!);
+    assert(both.results.findIndex((r) => r.violates) === passScores.length, 'objective: violators last');
+    for (const group of [passScores, failScores]) for (let i = 1; i < group.length; i++) assert(group[i - 1] >= group[i], 'objective order inside each group');
+    // A stat that is not a number breaks its constraint.
+    const nul = await evaluateChanges(session, { variants: good, constraints: [{ stat: 'NotARealStat', min: 0 }] });
+    assert(nul.violating === good.length && nul.results.every((r) => r.violates![0] === 'NotARealStat n/a (not a number) < 0'), 'null violates');
+    assert((await session.exportXML()) === xml0, 'export changed after the objective / constraint checks');
+    assert(undoDepth() === undo0, 'undo depth changed after the objective / constraint checks');
+    log('   PASS');
+
+    // ------------------------------------------------------------------
+    log('10. invalid objective / constraint input');
+    const base1 = { variants: [{ config: { usePowerCharges: true } }] };
+    const weights21 = Object.fromEntries(Array.from({ length: 21 }, (_v, i) => [`Stat${i}`, 1]));
+    const cons21 = Array.from({ length: 21 }, (_v, i) => ({ stat: `Stat${i}`, min: 0 }));
+    const cases: Array<[string, Partial<Parameters<typeof evaluateChanges>[1]>, RegExp]> = [
+      ['objective with rankBy', { objective: { weights: { Life: 1 } }, rankBy: 'Life' }, /either `objective` or `rankBy`/],
+      ['empty weights', { objective: { weights: {} } }, /at least one stat/],
+      ['all-zero weights', { objective: { weights: { Life: 0 } } }, /all 0/],
+      ['NaN weight', { objective: { weights: { Life: NaN } } }, /finite/],
+      ['Infinity weight', { objective: { weights: { Life: Infinity } } }, /finite/],
+      ['21 weights', { objective: { weights: weights21 } }, /at most 20/],
+      ['bad mode', { objective: { weights: { Life: 1 }, mode: 'nope' as 'relative' } }, /mode/],
+      ['constraint without bounds', { constraints: [{ stat: 'Life' }] }, /at least one of/],
+      ['NaN min', { constraints: [{ stat: 'Life', min: NaN }] }, /finite/],
+      ['Infinity max', { constraints: [{ stat: 'Life', max: Infinity }] }, /finite/],
+      ['min above max', { constraints: [{ stat: 'Life', min: 5, max: 1 }] }, /above max/],
+      ['minDelta above maxDelta', { constraints: [{ stat: 'Life', minDelta: 5, maxDelta: 1 }] }, /above maxDelta/],
+      ['empty stat', { constraints: [{ stat: '', min: 1 }] }, /stat is required/],
+      ['21 constraints', { constraints: cons21 }, /at most 20/],
+      ['onlyPassing without constraints', { onlyPassing: true }, /needs `constraints`/],
+    ];
+    for (const [name, extra, pattern] of cases) {
+      let err: unknown;
+      try {
+        await evaluateChanges(session, { ...base1, ...extra });
+      } catch (e) {
+        err = e;
+      }
+      assert(err instanceof Error && err.constructor.name === 'UserError' && pattern.test(err.message), `${name}: ${String(err)}`);
+    }
+    log(`   PASS: ${cases.length} invalid inputs refused with a UserError`);
+
     console.log('\nAll evaluate_changes tests passed.');
   } finally {
     await bridge.dispose();

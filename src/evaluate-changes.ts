@@ -8,12 +8,16 @@ import { MAX_NODE_NAMES, type BuildSession, type NamedProbeVariant } from './bui
 import type { Stats } from './lua-bridge.js';
 import { MAX_FALLBACK_VARIANTS, MAX_PROBE_VARIANTS, type ProbeVariantResult } from './probe.js';
 import type { ToolRegistrar } from './tool-registry.js';
+import { UserError } from './validation.js';
 
 export const DEFAULT_EVALUATE_STATS = [
   'CombinedDPS', 'TotalEHP', 'Life', 'EnergyShield', 'Mana',
   'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist',
 ];
 export const MAX_EVALUATE_STATS = 50;
+/** Most weighted stats in an objective / most constraints in one call. */
+export const MAX_OBJECTIVE_WEIGHTS = 20;
+export const MAX_CONSTRAINTS = 20;
 /** Per-variant input bounds. */
 export const MAX_VARIANT_NODES = 50;
 export const MAX_VARIANT_ITEMS = 10;
@@ -26,17 +30,40 @@ export interface EvaluateChangesVariant extends NamedProbeVariant {
   label?: string;
 }
 
+export interface EvaluateObjective {
+  weights: Record<string, number>;
+  mode?: 'relative' | 'absolute';
+}
+
+/** A hard limit on the variant's resulting stat value (min / max) or on its change from the base (minDelta / maxDelta). */
+export interface EvaluateConstraint {
+  stat: string;
+  min?: number;
+  max?: number;
+  minDelta?: number;
+  maxDelta?: number;
+}
+
 export interface EvaluateChangesInput {
   variants: EvaluateChangesVariant[];
   stats?: string[];
   rankBy?: string;
   order?: 'desc' | 'asc';
+  objective?: EvaluateObjective;
+  constraints?: EvaluateConstraint[];
+  onlyPassing?: boolean;
 }
 
 export interface EvaluateChangesRow {
   index: number;
   label?: string;
-  /** The variant's value of the rankBy stat. */
+  /** Weighted objective score (only with `objective`). */
+  score?: number;
+  /** Weighted stats this row's value is not a number for; they added nothing to `score`. */
+  unscored?: string[];
+  /** Constraints the variant breaks, e.g. "FireResist 72 < 75" (only when there are any). */
+  violates?: string[];
+  /** The variant's value of the rankBy stat (not with `objective`). */
   value?: number | string | boolean | null;
   /** Variant minus base for every requested stat; null when either side is not a number. */
   delta?: Record<string, number | null>;
@@ -48,12 +75,17 @@ export interface EvaluateChangesRow {
 }
 
 export interface EvaluateChangesResult {
-  rankBy: string;
+  /** The stat the rows are ranked by; absent when ranked by an `objective`. */
+  rankBy?: string;
   order: 'desc' | 'asc';
+  /** Present with `objective`: the mode, and the weighted stats ignored for every row (non-numeric base, or base 0 in relative mode). */
+  objective?: { mode: 'relative' | 'absolute'; ignored?: string[] };
   base: Stats;
   evaluated: number;
   failed: number;
   fallbacks: number;
+  /** Present with `constraints`: the evaluated variants that break one (dropped from `results` with onlyPassing). */
+  violating?: number;
   results: EvaluateChangesRow[];
 }
 
@@ -72,13 +104,111 @@ function statDelta(base: unknown, after: unknown): number | null {
   return typeof base === 'number' && typeof after === 'number' ? after - base : null;
 }
 
-function requestedStats(input: EvaluateChangesInput, rankBy: string): string[] {
+function requestedStats(input: EvaluateChangesInput, rankBy: string | undefined): string[] {
   const keys = [...new Set(input.stats && input.stats.length > 0 ? input.stats : DEFAULT_EVALUATE_STATS)];
-  if (!keys.includes(rankBy)) keys.unshift(rankBy);
+  if (rankBy !== undefined && !keys.includes(rankBy)) keys.unshift(rankBy);
+  const extra = [...Object.keys(input.objective?.weights ?? {}), ...(input.constraints ?? []).map((c) => c.stat)];
+  for (const key of extra) if (!keys.includes(key)) keys.push(key);
+  if ((input.objective || input.constraints) && keys.length > MAX_EVALUATE_STATS) {
+    throw new UserError(`Too many stats: ${keys.length} after adding the objective's and constraints' stats (at most ${MAX_EVALUATE_STATS}).`);
+  }
   return keys;
 }
 
-function toRow(index: number, label: string | undefined, r: ProbeVariantResult, base: Stats, keys: string[], rankBy: string): EvaluateChangesRow {
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** Reject bad objective / constraint input (the tool schema checks the same bounds; direct callers get them too). */
+export function validateObjectiveInput(input: EvaluateChangesInput): void {
+  const { objective, constraints } = input;
+  if (objective !== undefined) {
+    if (input.rankBy !== undefined) throw new UserError('Pass either `objective` or `rankBy`, not both: with an objective the rows are ranked by its score.');
+    const entries = Object.entries(objective.weights ?? {});
+    if (entries.length === 0) throw new UserError('objective.weights needs at least one stat.');
+    if (entries.length > MAX_OBJECTIVE_WEIGHTS) throw new UserError(`objective.weights has ${entries.length} stats (at most ${MAX_OBJECTIVE_WEIGHTS}).`);
+    for (const [stat, weight] of entries) {
+      if (stat.length === 0) throw new UserError('objective.weights has an empty stat key.');
+      if (!finite(weight)) throw new UserError(`objective.weights.${stat} must be a finite number.`);
+    }
+    if (entries.every(([, w]) => w === 0)) throw new UserError('objective.weights are all 0, so every variant would score 0.');
+    if (objective.mode !== undefined && objective.mode !== 'relative' && objective.mode !== 'absolute') {
+      throw new UserError('objective.mode must be "relative" or "absolute".');
+    }
+  }
+  if (constraints !== undefined) {
+    if (constraints.length > MAX_CONSTRAINTS) throw new UserError(`${constraints.length} constraints (at most ${MAX_CONSTRAINTS}).`);
+    constraints.forEach((c, i) => {
+      const where = `constraints[${i}]${c.stat ? ` (${c.stat})` : ''}`;
+      if (typeof c.stat !== 'string' || c.stat.length === 0) throw new UserError(`${where}: stat is required.`);
+      const bounds = [c.min, c.max, c.minDelta, c.maxDelta];
+      if (bounds.every((b) => b === undefined)) throw new UserError(`${where}: give at least one of min, max, minDelta, maxDelta.`);
+      if (bounds.some((b) => b !== undefined && !finite(b))) throw new UserError(`${where}: min / max / minDelta / maxDelta must be finite numbers.`);
+      if (c.min !== undefined && c.max !== undefined && c.min > c.max) throw new UserError(`${where}: min ${c.min} is above max ${c.max}.`);
+      if (c.minDelta !== undefined && c.maxDelta !== undefined && c.minDelta > c.maxDelta) {
+        throw new UserError(`${where}: minDelta ${c.minDelta} is above maxDelta ${c.maxDelta}.`);
+      }
+    });
+  }
+  if (input.onlyPassing && (constraints === undefined || constraints.length === 0)) {
+    throw new UserError('onlyPassing needs `constraints` to filter by.');
+  }
+}
+
+/** Why the variant breaks each constraint ("FireResist 72 < 75"); a stat that is not a number breaks every bound. */
+function violations(constraints: EvaluateConstraint[], base: Stats, after: Stats): string[] {
+  const out: string[] = [];
+  for (const c of constraints) {
+    const value = after[c.stat];
+    const delta = statDelta(base[c.stat], value);
+    const shown = finite(value) ? String(roundStat(value)) : 'n/a (not a number)';
+    const shownDelta = delta === null ? 'n/a (not a number)' : String(roundStat(delta));
+    if (c.min !== undefined && !(finite(value) && value >= c.min)) out.push(`${c.stat} ${shown} < ${c.min}`);
+    if (c.max !== undefined && !(finite(value) && value <= c.max)) out.push(`${c.stat} ${shown} > ${c.max}`);
+    if (c.minDelta !== undefined && !(delta !== null && delta >= c.minDelta)) out.push(`${c.stat} change ${shownDelta} < ${c.minDelta}`);
+    if (c.maxDelta !== undefined && !(delta !== null && delta <= c.maxDelta)) out.push(`${c.stat} change ${shownDelta} > ${c.maxDelta}`);
+  }
+  return out;
+}
+
+interface Scorer {
+  /** Weighted stats that add nothing for any row. */
+  ignored: string[];
+  score(after: Stats): { score: number; unscored: string[] };
+}
+
+/** score = sum of weight * change: delta / |base| (relative; a base that is 0 or not a number counts for nothing) or the raw delta (absolute). */
+function makeScorer(objective: EvaluateObjective, base: Stats): Scorer {
+  const mode = objective.mode ?? 'relative';
+  const entries = Object.entries(objective.weights);
+  const ignored = entries.filter(([stat]) => !finite(base[stat]) || (mode === 'relative' && base[stat] === 0)).map(([stat]) => stat);
+  return {
+    ignored,
+    score(after) {
+      let score = 0;
+      const unscored: string[] = [];
+      for (const [stat, weight] of entries) {
+        if (ignored.includes(stat)) continue;
+        const b = base[stat] as number;
+        const v = after[stat];
+        if (!finite(v)) {
+          unscored.push(stat);
+          continue;
+        }
+        score += weight * (mode === 'relative' ? (v - b) / Math.abs(b) : v - b);
+      }
+      return { score, unscored };
+    },
+  };
+}
+
+function toRow(
+  index: number,
+  label: string | undefined,
+  r: ProbeVariantResult,
+  base: Stats,
+  keys: string[],
+  rankBy: string | undefined,
+  extra: { score?: { score: number; unscored: string[] }; violates: string[] },
+): EvaluateChangesRow {
   const row: EvaluateChangesRow = { index, ...(label !== undefined ? { label } : {}) };
   if (r.error !== undefined) {
     return { ...row, error: r.error, userError: r.userError === true, ...(r.fallback ? { fallback: true as const } : {}) };
@@ -90,7 +220,10 @@ function toRow(index: number, label: string | undefined, r: ProbeVariantResult, 
   }
   return {
     ...row,
-    value: roundValue(r.stats[rankBy] ?? null),
+    ...(extra.score ? { score: roundStat(extra.score.score) } : {}),
+    ...(extra.score && extra.score.unscored.length > 0 ? { unscored: extra.score.unscored } : {}),
+    ...(extra.violates.length > 0 ? { violates: extra.violates } : {}),
+    ...(rankBy !== undefined ? { value: roundValue(r.stats[rankBy] ?? null) } : {}),
     delta,
     ...(r.pointsAdded ? { pointsAdded: r.pointsAdded } : {}),
     ...(r.pointsRemoved ? { pointsRemoved: r.pointsRemoved } : {}),
@@ -98,39 +231,61 @@ function toRow(index: number, label: string | undefined, r: ProbeVariantResult, 
   };
 }
 
-/** Run every variant through the probe engine and rank them by the rankBy stat's change. */
+/**
+ * Run every variant through the probe engine and rank them: by the rankBy stat's change, or by the objective's
+ * score. With constraints, variants that pass come first, then the violating ones (each group ranked the same
+ * way), then the refused ones.
+ */
 export async function evaluateChanges(session: BuildSession, input: EvaluateChangesInput): Promise<EvaluateChangesResult> {
-  const rankBy = input.rankBy ?? 'CombinedDPS';
+  validateObjectiveInput(input);
+  const rankBy = input.objective ? undefined : (input.rankBy ?? 'CombinedDPS');
   const order = input.order ?? 'desc';
   const keys = requestedStats(input, rankBy);
   const variants: NamedProbeVariant[] = input.variants.map(({ label: _label, ...variant }) => variant);
   const probed = await session.probeNamed({ stats: keys, variants });
+  const constraints = input.constraints ?? [];
+  const scorer = input.objective ? makeScorer(input.objective, probed.base) : undefined;
 
-  const rankDelta = (i: number): number | null => {
-    const r = probed.results[i];
-    return r.error === undefined ? statDelta(probed.base[rankBy], r.stats[rankBy]) : null;
-  };
   const ok: number[] = [];
   const failedRows: number[] = [];
   probed.results.forEach((r, i) => (r.error === undefined ? ok : failedRows).push(i));
+  const scores = new Map<number, { score: number; unscored: string[] }>();
+  const broken = new Map<number, string[]>();
+  for (const i of ok) {
+    if (scorer) scores.set(i, scorer.score(probed.results[i].stats));
+    broken.set(i, constraints.length > 0 ? violations(constraints, probed.base, probed.results[i].stats) : []);
+  }
+  const rankKey = (i: number): number | null => {
+    if (scorer) return scores.get(i)!.score;
+    return statDelta(probed.base[rankBy!], probed.results[i].stats[rankBy!]);
+  };
   const sign = order === 'desc' ? -1 : 1;
   ok.sort((a, b) => {
-    const da = rankDelta(a);
-    const db = rankDelta(b);
+    const va = broken.get(a)!.length > 0 ? 1 : 0;
+    const vb = broken.get(b)!.length > 0 ? 1 : 0;
+    if (va !== vb) return va - vb;
+    const da = rankKey(a);
+    const db = rankKey(b);
     if (da === null || db === null) return da === db ? a - b : da === null ? 1 : -1;
     return da === db ? a - b : sign * (da - db);
   });
+  const violating = ok.filter((i) => broken.get(i)!.length > 0).length;
+  const shown = input.onlyPassing ? ok.filter((i) => broken.get(i)!.length === 0) : ok;
 
   const base: Stats = {};
   for (const key of keys) base[key] = roundValue(probed.base[key] ?? null);
   return {
-    rankBy,
+    ...(rankBy !== undefined ? { rankBy } : {}),
     order,
+    ...(scorer ? { objective: { mode: input.objective!.mode ?? 'relative', ...(scorer.ignored.length > 0 ? { ignored: scorer.ignored } : {}) } } : {}),
     base,
     evaluated: ok.length,
     failed: failedRows.length,
     fallbacks: probed.results.filter((r) => r.fallback).length,
-    results: [...ok, ...failedRows].map((i) => toRow(i, input.variants[i].label, probed.results[i], probed.base, keys, rankBy)),
+    ...(constraints.length > 0 ? { violating } : {}),
+    results: [...shown, ...failedRows].map((i) =>
+      toRow(i, input.variants[i].label, probed.results[i], probed.base, keys, rankBy, { score: scores.get(i), violates: broken.get(i) ?? [] }),
+    ),
   };
 }
 
@@ -212,7 +367,9 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
         'each row has `index` (position in `variants`), `label`, `value` (the variant\'s rankBy stat), `delta` (change of every requested stat, null when not a number), ' +
         '`pointsAdded` / `pointsRemoved` for node changes, and `fallback`. A refused variant (unknown node or gem, item that does not fit, bad config) is listed after the others with its `error`; the call still succeeds. ' +
         'Numbers are rounded to 2 decimals (4 significant digits below 1). A node name resolves among the nodes the change can apply to (unallocated ones for allocate, allocated ones for deallocate); a name several of them share (e.g. "Strength") refuses that variant with the candidate ids, so pass ids for those. ' +
-        `Per variant: at most ${MAX_VARIANT_NODES} nodes in each of allocate / deallocate, ${MAX_VARIANT_ITEMS} items, ${MAX_VARIANT_GEMS} gem changes, ${MAX_VARIANT_CONFIG_KEYS} config keys; at most ${MAX_NODE_NAMES} different node names per call.`,
+        `Per variant: at most ${MAX_VARIANT_NODES} nodes in each of allocate / deallocate, ${MAX_VARIANT_ITEMS} items, ${MAX_VARIANT_GEMS} gem changes, ${MAX_VARIANT_CONFIG_KEYS} config keys; at most ${MAX_NODE_NAMES} different node names per call. ` +
+        'Optional `objective` {weights:{stat:weight}, mode:"relative"|"absolute"} ranks by `score` = sum of weight x change (relative: delta/|base|, a stat whose base is 0 or not a number counts for nothing and is listed in `objective.ignored`; absolute: raw delta; negative weights penalise) instead of `rankBy` (give one, not both). ' +
+        'Optional `constraints` [{stat, min?, max?, minDelta?, maxDelta?}] limit the variant\'s resulting value (or change): rows that break one list `violates` (e.g. "FireResist 72 < 75"; a non-number stat breaks it), come after the passing rows, and are counted in `violating`; `onlyPassing` drops them. Weighted and constrained stats are added to `stats`.',
       inputSchema: {
         variants: z.array(variantSchema).min(1).max(MAX_PROBE_VARIANTS).describe('The variants to evaluate, each on its own against the current build.'),
         stats: z
@@ -223,6 +380,30 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
           .describe(`PoB output stat keys to report (default ${DEFAULT_EVALUATE_STATS.join(', ')}); unknown keys come back as null.`),
         rankBy: z.string().min(1).optional().describe('Stat key to rank by (default "CombinedDPS"); added to `stats` if missing.'),
         order: z.enum(['desc', 'asc']).optional().describe('"desc" (default): largest gain first; "asc": smallest first.'),
+        objective: z
+          .object({
+            weights: z
+              .record(z.string().min(1), z.number().finite())
+              .refine((w) => Object.keys(w).length >= 1 && Object.keys(w).length <= MAX_OBJECTIVE_WEIGHTS, { message: `1 to ${MAX_OBJECTIVE_WEIGHTS} weighted stats` })
+              .describe('Stat key -> weight (negative penalises), e.g. {"CombinedDPS":1,"TotalEHP":0.5}.'),
+            mode: z.enum(['relative', 'absolute']).optional().describe('"relative" (default): weight x delta/|base|, so stats of different scale compare; "absolute": weight x raw delta.'),
+          })
+          .optional()
+          .describe('Rank by a weighted score instead of `rankBy`.'),
+        constraints: z
+          .array(
+            z.object({
+              stat: z.string().min(1),
+              min: z.number().finite().optional().describe('Smallest allowed resulting value.'),
+              max: z.number().finite().optional().describe('Largest allowed resulting value.'),
+              minDelta: z.number().finite().optional().describe('Smallest allowed change from the base.'),
+              maxDelta: z.number().finite().optional().describe('Largest allowed change from the base.'),
+            }),
+          )
+          .max(MAX_CONSTRAINTS)
+          .optional()
+          .describe('Hard limits (at least one of min / max / minDelta / maxDelta each); a variant that breaks one is ranked after those that pass.'),
+        onlyPassing: z.boolean().optional().describe('With `constraints`: leave the violating variants out of `results` (they are still counted in `violating`).'),
       },
     },
     (args, session) => evaluateChanges(session, args),
