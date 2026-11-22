@@ -202,6 +202,19 @@ The reply is one compact table, sorted by the CombinedDPS change (on the OccVort
 
 Nothing was changed. To keep a winner, pass that variant to `apply_changes` (one undoable step, the same numbers), or commit single changes with `swap_item` / `unequip_item`, `set_config` or `allocate_nodes` (each undoable). Rank by something else with `rankBy: "TotalEHP"` (`order: "asc"` puts the smallest first). A variant PoB refuses (unknown node or gem, a node name several nodes share, an item that does not fit the slot, a bad config key) comes back last with its `error` instead of failing the call.
 
+To rank by several stats at once and keep only variants that meet your requirements, add an `objective` and `constraints` (instead of `rankBy`):
+
+```
+evaluate_changes({
+  variants: [ ...same variants... ],
+  objective: { weights: { CombinedDPS: 1, TotalEHP: 0.5 } },   // score = Σ weight × (change / |base|)
+  constraints: [{ stat: "Life", min: 6728 }, { stat: "FireResist", min: 75 }],
+  onlyPassing: false
+})
+```
+
+Each row gets a `score`; variants that break a constraint carry `violates` (e.g. `"Life 6383 < 6728"`), come after every variant that passes (ranked by score among themselves), and are counted in `violating`. `onlyPassing: true` drops them from `results`. Use `mode: "absolute"` to weight raw deltas instead of relative change, and a negative weight to penalise a stat.
+
 To shop for an upgrade on the trade site:
 
 1. `generate_trade_search({ slot: "Helmet", league: "Standard" })` — returns `url` plus the weighted `filters` (`weight` ≈ stat-score gain per point of the mod) and `minWeightedSum` (half the current helmet's estimated value).
