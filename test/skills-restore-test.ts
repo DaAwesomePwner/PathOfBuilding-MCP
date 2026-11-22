@@ -22,15 +22,18 @@
 //      snapshot injected through a test-only wrapper around this process's
 //      LuaBridge.send, not reachable from MCP tool arguments) reaches the
 //      client as an internal error naming reset_build that keeps the probe's
-//      message and has the probe error as its cause; the same for
+//      message and has the probe error as its cause (swap_gem on the
+//      monster-explosion group: gem tools on a granted group keep the skills
+//      snapshot/restore path, the probe engine refuses those groups); the same for
 //      suggest_upgrades' restore (on a passive-tree jewel socket, which the
 //      probe engine measures through its full snapshot/restore fallback).
 //      Without the injection the probe error stays a user error, shown verbatim.
 //   6. The monster-explosion group (from OccVortex's items): a gem level
 //      changed through the engine survives skills probes (the gem is
 //      relinked to its source); a snapshot naming a source that no longer
-//      exists (injected by the same wrapper) is an internal error naming
-//      reset_build, not a silent difference.
+//      exists (injected by the same wrapper, around evaluate_gem_levels on
+//      that group) is an internal error naming reset_build, not a silent
+//      difference.
 //   7. Batch-command rollbacks, with failures injected inside the engine
 //      through POB_MCP_TEST_FAULTS (read by bridge.lua at start; set only by
 //      the LuaBridge `testFaults` option, for engine processes this test
@@ -327,12 +330,17 @@ async function main(): Promise<void> {
     log('Test 5: a probe user error plus a failing skills restore is an internal error naming reset_build');
     // New byte-exact baseline (the node order moved in test 4).
     const s5 = await state(bridge, session);
-    const plainErr = await rejection(session.findOptimalLinks('Vortex', 2, [BAD_GEM]));
-    assert(plainErr instanceof UserError && !/also failed/.test(plainErr.message), `plain probe error changed: ${plainErr.message}`);
+    const linksPlain = await rejection(session.findOptimalLinks('Vortex', 2, [BAD_GEM]));
+    assert(linksPlain instanceof UserError && linksPlain.message.includes(BAD_GEM), `find_optimal_links unknown gem: ${linksPlain.message}`);
+    const granted = (await session.listSkillGroups()).find((g) => g.source === 'Explode');
+    assert(granted, 'test build has no monster-explosion group');
+    const plainErr = await rejection(session.swapGemWithDiff(granted.index, 1, BAD_GEM));
+    assert(plainErr instanceof UserError && plainErr.message.includes(BAD_GEM) && !/also failed/.test(plainErr.message),
+      `plain probe error changed: ${plainErr.message}`);
     assert(errorResponse(plainErr).content[0].text === plainErr.message, 'plain probe user error is not shown verbatim');
 
     corruptSkillsSnapshot = true;
-    const bothErr = await rejection(session.findOptimalLinks('Vortex', 2, [BAD_GEM]));
+    const bothErr = await rejection(session.swapGemWithDiff(granted.index, 1, BAD_GEM));
     corruptSkillsSnapshot = false;
     assert(!(bothErr instanceof UserError), `probe + restore failure reported as a user error: ${bothErr.message}`);
     assert(bothErr.message.includes(BAD_GEM), `probe message lost: ${bothErr.message}`);
@@ -380,7 +388,7 @@ async function main(): Promise<void> {
     await session.evaluateGemLevels(explode.index, 1, [explodeLevel + 1]);
     assertSame('after skills probes with a changed explosion gem', await state(bridge, session), s6);
     unknownExplodeSource = true;
-    const explodeErr = await rejection(session.swapGemWithDiff(MAIN_GROUP, 1, 'Added Cold Damage', 20, 20));
+    const explodeErr = await rejection(session.evaluateGemLevels(explode.index, 1, [explodeLevel]));
     unknownExplodeSource = false;
     assertInternal(explodeErr, [/Skills restore was not exact/, /monster-explosion/, /no such source/], 'unrelinkable explosion gem');
     log('PASS: explosion gems are relinked; a lost one is an internal error naming reset_build');

@@ -1,7 +1,8 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
 import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
-import { runProbe, withoutNulls, type ProbeRequest, type ProbeResponse, type ProbeVariantResult } from './probe.js';
+import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
+import { runProbe, withoutNulls, type ProbeGemChange, type ProbeRequest, type ProbeResponse, type ProbeVariantResult } from './probe.js';
 import { toNumber } from './stat-values.js';
 import { DEFAULT_MAX_POINTS, findBestNextNodes, findWorstAllocatedNodes, type RankBy, type TreeSearchResult } from './tree-search.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
@@ -758,11 +759,6 @@ export class BuildSession {
     return probeThenRestore(fn, () => this.restoreSkillsUnlocked(snap));
   }
 
-  private async withConfigProbeUnlocked<T>(fn: () => Promise<T>): Promise<T> {
-    const snap = await this.snapshotConfigUnlocked();
-    return probeThenRestore(fn, () => this.restoreConfigUnlocked(snap));
-  }
-
   // ------------------------------------------------------------------
   // Labeled snapshots
   // ------------------------------------------------------------------
@@ -1346,6 +1342,61 @@ export class BuildSession {
     });
   }
 
+  /**
+   * Evaluate gem-change variants on one socket group (each list of changes is
+   * one variant), returning each variant's stats or its user error; any other
+   * failure fails the call. A normal group goes through the probe engine
+   * (PoB's calculator, nothing changes); a group granted by an item or the
+   * passive tree (the probe refuses those) keeps the old path: change the
+   * gems through the bridge, full recalc, exact skills restore.
+   */
+  private async gemVariantsUnlocked(
+    tool: string,
+    groupIndex: number,
+    variants: ProbeGemChange[][],
+  ): Promise<Array<{ stats: Stats | null; error: string | null }>> {
+    const groups = (await this.bridge.send<{ ok: true; groups: SkillGroupInfo[] }>({ cmd: 'getSocketGroups' })).groups ?? [];
+    if (!groups[groupIndex - 1]?.source) {
+      const probed = await this.probeUnlocked({ variants: variants.map((gems) => ({ gems })) });
+      return probed.results.map((r) => {
+        if (r.error === undefined) return { stats: withoutNulls(r.stats), error: null };
+        if (!r.userError) throw new Error(`${tool}: ${r.error}`);
+        return { stats: null, error: r.error.replace(/^gems\[\d+\]: /, '') };
+      });
+    }
+    const out: Array<{ stats: Stats | null; error: string | null }> = [];
+    for (const changes of variants) {
+      try {
+        const stats = await this.withSkillsProbeUnlocked(async () => {
+          for (const ch of changes) await this.sendGemChangeUnlocked(tool, ch);
+          return this.bridge.getStats();
+        });
+        out.push({ stats, error: null });
+      } catch (error) {
+        if (!(error instanceof UserError)) throw error;
+        out.push({ stats: null, error: error.message });
+      }
+    }
+    return out;
+  }
+
+  /** One gem change through the bridge's mutating gem commands (granted groups only, inside a skills probe). */
+  private async sendGemChangeUnlocked(tool: string, ch: ProbeGemChange): Promise<void> {
+    if (ch.op === 'remove') {
+      await this.bridge.send({ cmd: 'removeGem', groupIndex: ch.group, gemIndex: ch.index });
+    } else if (ch.op === 'set' && ch.name !== undefined) {
+      await this.bridge.send({ cmd: 'setGem', groupIndex: ch.group, gemIndex: ch.index, gemName: ch.name, level: ch.level, quality: ch.quality });
+    } else if (ch.op === 'set' && ch.enabled === undefined) {
+      await this.bridge.send({ cmd: 'setGemLevel', groupIndex: ch.group, gemIndex: ch.index, level: ch.level, quality: ch.quality });
+    } else {
+      throw new Error(`${tool}: gem change ${ch.op} is not supported on a granted skill group`);
+    }
+  }
+
+  /**
+   * Swap one gem (as setGem does) and return the stat diff, without changing
+   * the build (gemVariantsUnlocked). A refused change is a UserError.
+   */
   async swapGemWithDiff(
     skillGroupIndex: number,
     gemIndex: number,
@@ -1355,22 +1406,20 @@ export class BuildSession {
   ): Promise<StatDiffResult> {
     return this.withLock(async () => {
       const before = await this.bridge.getStats();
-      let after: Stats = before;
-      await this.withSkillsProbeUnlocked(async () => {
-        await this.bridge.send({
-          cmd: 'setGem',
-          groupIndex: skillGroupIndex,
-          gemIndex,
-          gemName: newGemName,
-          level,
-          quality,
-        });
-        after = await this.bridge.getStats();
-      });
-      return { before, after, diff: computeDiff(before, after) };
+      const [r] = await this.gemVariantsUnlocked('swap_gem', skillGroupIndex, [
+        [{ op: 'set', group: skillGroupIndex, index: gemIndex, name: newGemName, level, quality }],
+      ]);
+      if (!r.stats) throw new UserError(r.error ?? 'swap_gem: the change was refused');
+      return { before, after: r.stats, diff: computeDiff(before, r.stats) };
     });
   }
 
+  /**
+   * The weakest enabled support of a group (the smallest CombinedDPS loss when
+   * removed), then each candidate in its place at level 20 / quality 20. A
+   * candidate the engine refuses (unknown gem, ...) carries its error and
+   * null numbers; any other failure fails the call.
+   */
   async compareSupports(
     skillGroupIndex: number,
     candidates: string[],
@@ -1389,72 +1438,47 @@ export class BuildSession {
       const baselineStats = await this.bridge.getStats();
       const baselineDPS = toNumber(baselineStats.CombinedDPS);
 
-      // Phase 1: identify weakest support by simulating its removal.
-      let weakestIdx = supports[0].index;
-      let weakestName = supports[0].name;
-      let weakestLoss = Infinity;
-      for (const support of supports) {
-        let dpsWithout = baselineDPS;
-        await this.withSkillsProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({
-              cmd: 'removeGem',
-              groupIndex: skillGroupIndex,
-              gemIndex: support.index,
-            });
-            const stats = await this.bridge.getStats();
-            dpsWithout = toNumber(stats.CombinedDPS);
-          } catch {
-            // ignore — dpsWithout stays at baselineDPS
-          }
-        });
-        const loss = baselineDPS - dpsWithout;
-        if (loss < weakestLoss) {
-          weakestLoss = loss;
-          weakestIdx = support.index;
-          weakestName = support.name;
-        }
+      // Phase 1: the weakest support, by removing each in turn.
+      const removals = await this.gemVariantsUnlocked(
+        'compare_supports',
+        skillGroupIndex,
+        supports.map((s) => [{ op: 'remove', group: skillGroupIndex, index: s.index }]),
+      );
+      let weakest: { name: string; index: number; loss: number } | null = null;
+      for (const [i, support] of supports.entries()) {
+        const r = removals[i];
+        if (!r.stats) continue; // refused: cannot be ranked
+        const loss = baselineDPS - toNumber(r.stats.CombinedDPS);
+        if (weakest === null || loss < weakest.loss) weakest = { name: support.name, index: support.index, loss };
       }
+      if (weakest === null) {
+        throw new UserError(`No support of skill group ${skillGroupIndex} could be removed: ${removals[0]?.error ?? 'refused'}`);
+      }
+      const w = weakest;
 
-      // Phase 2: test each candidate as a replacement for the weakest support.
-      const results: SupportCandidate[] = [];
-      for (const candidateName of candidates) {
-        let candidateStats: Stats | null = null;
-        let error: string | null = null;
-        await this.withSkillsProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({
-              cmd: 'setGem',
-              groupIndex: skillGroupIndex,
-              gemIndex: weakestIdx,
-              gemName: candidateName,
-              level: 20,
-              quality: 20,
-            });
-            candidateStats = await this.bridge.getStats();
-          } catch (err) {
-            error = err instanceof Error ? err.message : String(err);
-          }
-        });
-        const cs = candidateStats as Stats | null;
-        results.push({
-          name: candidateName,
-          dps: cs ? toNumber(cs.CombinedDPS) : 0,
-          dpsDelta: cs ? toNumber(cs.CombinedDPS) - baselineDPS : 0,
-          error,
-        });
-      }
-      results.sort((a, b) => b.dps - a.dps);
+      // Phase 2: each candidate in the weakest support's place.
+      const swaps = await this.gemVariantsUnlocked(
+        'compare_supports',
+        skillGroupIndex,
+        candidates.map((name) => [{ op: 'set', group: skillGroupIndex, index: w.index, name, level: 20, quality: 20 }]),
+      );
+      const results: SupportCandidate[] = candidates.map((name, i) => {
+        const r = swaps[i];
+        const dps = r.stats ? toNumber(r.stats.CombinedDPS) : null;
+        return { name, dps, dpsDelta: dps === null ? null : dps - baselineDPS, error: r.error };
+      });
+      results.sort((a, b) => (b.dps ?? -Infinity) - (a.dps ?? -Infinity));
 
       return {
-        weakestCurrentSupport: { name: weakestName, gemIndex: weakestIdx, dpsContribution: weakestLoss },
-        slotTested: weakestIdx,
+        weakestCurrentSupport: { name: w.name, gemIndex: w.index, dpsContribution: w.loss },
+        slotTested: w.index,
         baselineDPS,
         candidates: results,
       };
     });
   }
 
+  /** CombinedDPS at each gem level (as setGemLevel would set it), without changing the build. */
   async evaluateGemLevels(
     skillGroupIndex: number,
     gemIndex: number,
@@ -1483,35 +1507,23 @@ export class BuildSession {
             return arr;
           })();
 
-      const results: GemLevelScaling[] = [];
-      for (const level of testLevels) {
-        let dps = baselineDPS;
-        let error: string | null = null;
-        await this.withSkillsProbeUnlocked(async () => {
-          try {
-            await this.bridge.send({
-              cmd: 'setGemLevel',
-              groupIndex: skillGroupIndex,
-              gemIndex,
-              level,
-            });
-            const stats = await this.bridge.getStats();
-            dps = toNumber(stats.CombinedDPS);
-          } catch (err) {
-            error = err instanceof Error ? err.message : String(err);
-          }
-        });
-        results.push({
-          level,
-          dps,
-          dpsDelta: dps - baselineDPS,
-          error,
-        });
-      }
-      return results;
+      const probed = await this.gemVariantsUnlocked(
+        'evaluate_gem_levels',
+        skillGroupIndex,
+        testLevels.map((level) => [{ op: 'set', group: skillGroupIndex, index: gemIndex, level }]),
+      );
+      return testLevels.map((level, i) => {
+        const r = probed[i];
+        const dps = r.stats ? toNumber(r.stats.CombinedDPS) : null;
+        return { level, dps, dpsDelta: dps === null ? null : dps - baselineDPS, error: r.error };
+      });
     });
   }
 
+  /**
+   * The best support combination for an active skill in the main socket
+   * group, searched on the probe engine (src/link-search.ts). Changes nothing.
+   */
   async findOptimalLinks(
     activeSkill: string,
     availableSlots: number,
@@ -1519,126 +1531,12 @@ export class BuildSession {
     options: { topN?: number; topAlternatives?: number } = {},
   ): Promise<OptimalLinksResult> {
     if (availableSlots < 1) throw new UserError('availableSlots must be >= 1');
-    return this.withLock(async () => {
-      const skillInfo = await this.bridge.send<{ ok: true; gem: GemDataInfo }>({
-        cmd: 'getGemByName',
-        name: activeSkill,
-      });
-      if (!skillInfo.gem) throw new UserError(`Active skill not found: "${activeSkill}"`);
-      if (skillInfo.gem.isSupport) throw new UserError(`"${activeSkill}" is a support gem, not an active skill`);
-
-      const supportsRes = await this.bridge.send<{ ok: true; supports: GemDataInfo[] }>({
-        cmd: 'getAvailableSupports',
-        activeSkillTags: skillInfo.gem.tags,
-        includeAwakened: false,
-      });
-      let supportPool = supportsRes.supports.filter((s) => !constraints.includes(s.name));
-
-      const topN = options.topN ?? 25;
-      if (supportPool.length > topN) supportPool = supportPool.slice(0, topN);
-
-      const freeSlots = Math.max(0, availableSlots - constraints.length);
-      if (freeSlots === 0) {
-        const dps = await this.testSupportCombinationLocked(activeSkill, constraints);
-        return {
-          activeSkill,
-          lockedSupports: constraints,
-          bestCombination: [],
-          bestDPS: dps,
-          singleSupportDPS: [],
-          topAlternatives: [],
-        };
-      }
-
-      // Phase A: single-support DPS
-      const singleResults: Array<{ name: string; dps: number }> = [];
-      for (const support of supportPool) {
-        const dps = await this.testSupportCombinationLocked(activeSkill, [...constraints, support.name]);
-        singleResults.push({ name: support.name, dps });
-      }
-      singleResults.sort((a, b) => b.dps - a.dps);
-
-      // Phase B: top-K combination
-      const initialCombo = singleResults.slice(0, freeSlots).map((s) => s.name);
-      let bestCombo = [...initialCombo];
-      let bestDPS = await this.testSupportCombinationLocked(activeSkill, [...constraints, ...bestCombo]);
-      const seen = new Map<string, number>();
-      seen.set(bestCombo.slice().sort().join('|'), bestDPS);
-
-      // Phase C: swap iteration — try replacing each slot with next-best candidates
-      const swapDepth = Math.min(8, singleResults.length - freeSlots);
-      for (let slot = 0; slot < freeSlots; slot++) {
-        for (let alt = freeSlots; alt < freeSlots + swapDepth; alt++) {
-          if (alt >= singleResults.length) break;
-          const candidate = singleResults[alt].name;
-          if (bestCombo.includes(candidate)) continue;
-          const testCombo = [...bestCombo];
-          testCombo[slot] = candidate;
-          const key = testCombo.slice().sort().join('|');
-          if (seen.has(key)) continue;
-          const dps = await this.testSupportCombinationLocked(activeSkill, [...constraints, ...testCombo]);
-          seen.set(key, dps);
-          if (dps > bestDPS) {
-            bestDPS = dps;
-            bestCombo = [...testCombo];
-          }
-        }
-      }
-
-      const topAltCount = options.topAlternatives ?? 5;
-      const sortedAlts = Array.from(seen.entries())
-        .map(([key, dps]) => ({ combo: key.split('|'), dps }))
-        .sort((a, b) => b.dps - a.dps)
-        .slice(0, topAltCount);
-
-      return {
-        activeSkill,
-        lockedSupports: constraints,
-        bestCombination: bestCombo,
-        bestDPS,
-        singleSupportDPS: singleResults,
-        topAlternatives: sortedAlts,
-      };
-    });
-  }
-
-  /**
-   * Test a single (active skill, supports) combination by atomically replacing
-   * the main skill group's gem list via `replaceSocketGroup` (one bridge
-   * round-trip, one OnFrame recalc), reading stats, then restoring.
-   *
-   * Previously this did N removeGem + M addGem calls, each triggering a full
-   * PoB OnFrame recalc (~55-65ms each). `replaceSocketGroup` wipes the
-   * gemList in Lua, inserts the new gems without per-gem recalcs, then calls
-   * ProcessSocketGroup + OnFrame once — same approach as restoreSkills.
-   * Profiling showed 91% of findOptimalLinks time was removeGem/addGem;
-   * this optimization yields ~64% wall-clock reduction.
-   *
-   * Caller MUST already hold the lock.
-   */
-  private async testSupportCombinationLocked(
-    activeSkill: string,
-    supports: string[],
-  ): Promise<number> {
-    const groupsRes = await this.bridge.send<{ ok: true; groups: SkillGroupInfo[] }>({
-      cmd: 'getSocketGroups',
-    });
-    let mainIndex = groupsRes.groups.findIndex((g) => g.isMainGroup);
-    if (mainIndex < 0) mainIndex = 0;
-    const groupNumber = mainIndex + 1;
-
-    // Replace the entire main group atomically: one Lua call, one OnFrame recalc.
-    // Avoids N removeGem + M addGem calls each triggering a full PoB recalculation.
-    // A probe error stays visible when the restore fails too (probeThenRestore).
-    return this.withSkillsProbeUnlocked(async () => {
-      const gems = [
-        { name: activeSkill, level: 20, quality: 20 },
-        ...supports.map((sup) => ({ name: sup, level: 20, quality: 20 })),
-      ];
-      await this.bridge.send({ cmd: 'replaceSocketGroup', groupIndex: groupNumber, gems });
-      const stats = await this.bridge.getStats();
-      return toNumber(stats.CombinedDPS);
-    });
+    return this.withLock(() =>
+      findOptimalLinks(
+        { send: (command) => this.bridge.send(command), probe: (request) => this.probeUnlocked(request) },
+        { activeSkill, supportSlots: availableSlots, constraints, topN: options.topN, topAlternatives: options.topAlternatives },
+      ),
+    );
   }
 
   // ------------------------------------------------------------------
@@ -1771,8 +1669,26 @@ export class BuildSession {
   }
 
   /**
-   * Apply config changes inside a snapshot/restore cycle; the build
-   * config is fully restored after the call.
+   * Evaluate config variants (each validated like set_config, which the
+   * caller has done) on the probe engine: each variant's stats, or its user
+   * error; any other failure fails the call. The build never changes.
+   */
+  private async configVariantsUnlocked(
+    tool: string,
+    variants: Array<Record<string, unknown>>,
+  ): Promise<Array<{ stats: Stats | null; error: string | null }>> {
+    const probed = await this.probeUnlocked({ variants: variants.map((config) => ({ config })) });
+    return probed.results.map((r) => {
+      if (r.error === undefined) return { stats: withoutNulls(r.stats), error: null };
+      if (!r.userError) throw new Error(`${tool}: ${r.error}`);
+      return { stats: null, error: r.error };
+    });
+  }
+
+  /**
+   * Stats with config changes applied (as set_config applies them), evaluated
+   * on the probe engine; the build never changes. An unknown key or a bad
+   * value is a UserError.
    */
   async simulateConfig(
     options: Record<string, unknown>,
@@ -1780,12 +1696,9 @@ export class BuildSession {
     return this.withLock(async () => {
       await this.validateConfigOptionsUnlocked(options);
       const before = await this.bridge.getStats();
-      let after: Stats = before;
-      await this.withConfigProbeUnlocked(async () => {
-        await this.bridge.setConfig(options);
-        after = await this.bridge.getStats();
-      });
-      return { before, after, diff: computeDiff(before, after) };
+      const [r] = await this.configVariantsUnlocked('simulate config', [options]);
+      if (!r.stats) throw new UserError(r.error ?? 'the config change was refused');
+      return { before, after: r.stats, diff: computeDiff(before, r.stats) };
     });
   }
 
@@ -1805,6 +1718,11 @@ export class BuildSession {
     };
   }
 
+  /**
+   * Every scenario as one probe variant. A preset key PoB does not have fails
+   * the whole call before anything runs; a scenario the engine refuses
+   * carries its error (null `after` / `diff`); any other failure fails the call.
+   */
   async compareScenarios(scenarios: string[]): Promise<ScenarioComparison> {
     if (scenarios.length === 0) throw new UserError('compareScenarios requires at least one scenario');
     for (const s of scenarios) {
@@ -1818,31 +1736,28 @@ export class BuildSession {
         await this.validateConfigOptionsUnlocked(SCENARIO_PRESETS[scenario].options, `scenario "${scenario}"`);
       }
       const baseline = await this.bridge.getStats();
-      const results: ScenarioResult[] = [];
-      for (const scenario of scenarios) {
+      const probed = await this.configVariantsUnlocked(
+        'compare_scenarios',
+        scenarios.map((s) => SCENARIO_PRESETS[s].options),
+      );
+      const results: ScenarioComparisonEntry[] = scenarios.map((scenario, i) => {
         const preset = SCENARIO_PRESETS[scenario];
-        let after: Stats = baseline;
-        await this.withConfigProbeUnlocked(async () => {
-          try {
-            await this.bridge.setConfig(preset.options);
-            after = await this.bridge.getStats();
-          } catch {
-            // ignore — after stays at baseline
-          }
-        });
-        results.push({
+        const after = probed[i].stats;
+        return {
           scenario,
           description: preset.description,
           options: preset.options,
           before: baseline,
           after,
-          diff: computeDiff(baseline, after),
-        });
-      }
+          diff: after ? computeDiff(baseline, after) : null,
+          ...(probed[i].error !== null ? { error: probed[i].error as string } : {}),
+        };
+      });
       return { baseline, scenarios: results };
     });
   }
 
+  /** Buffs / charges toggled as config options (BUFF_KEY_MAP aliases), through simulateConfig. */
   async toggleBuffs(buffs: Record<string, boolean | number | string>): Promise<StatDiffResult> {
     // Null-prototype so a "__proto__" key stays an own property (and gets rejected by validation).
     const options: Record<string, unknown> = Object.create(null);
@@ -2427,8 +2342,9 @@ export interface SkillsSnapshot {
 
 export interface SupportCandidate {
   name: string;
-  dps: number;
-  dpsDelta: number;
+  /** null when the candidate was refused (see error). */
+  dps: number | null;
+  dpsDelta: number | null;
   error: string | null;
 }
 
@@ -2441,19 +2357,13 @@ export interface SupportComparison {
 
 export interface GemLevelScaling {
   level: number;
-  dps: number;
-  dpsDelta: number;
+  /** null when the level was refused (see error). */
+  dps: number | null;
+  dpsDelta: number | null;
   error: string | null;
 }
 
-export interface OptimalLinksResult {
-  activeSkill: string;
-  lockedSupports: string[];
-  bestCombination: string[];
-  bestDPS: number;
-  singleSupportDPS: Array<{ name: string; dps: number }>;
-  topAlternatives: Array<{ combo: string[]; dps: number }>;
-}
+export type { OptimalLinksResult } from './link-search.js';
 
 // ---------------------------------------------------------------------------
 // Phase 6: Config / scenario types
@@ -2502,9 +2412,16 @@ export interface ScenarioResult {
   diff: StatDiff;
 }
 
+/** A compare_scenarios entry: `after` and `diff` are null when the engine refused the scenario (see error). */
+export interface ScenarioComparisonEntry extends Omit<ScenarioResult, 'after' | 'diff'> {
+  after: Stats | null;
+  diff: StatDiff | null;
+  error?: string;
+}
+
 export interface ScenarioComparison {
   baseline: Stats;
-  scenarios: ScenarioResult[];
+  scenarios: ScenarioComparisonEntry[];
 }
 
 // ---------------------------------------------------------------------------

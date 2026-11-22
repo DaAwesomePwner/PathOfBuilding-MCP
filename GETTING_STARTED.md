@@ -30,7 +30,7 @@ Three layers, three responsibilities:
 - **Never exits for a missing install.** If PoB or LuaJIT can't be found the server still starts; engine tools return an error asking for the PoB folder (`configure_pob_path`), or ask you directly via MCP elicitation when the client supports it.
 - **Version-aware.** If PoB updates itself on disk (new league), tools refuse to run on the stale in-memory engine and point at `reload_engine`.
 - **Serial execution.** A mutex guarantees only one operation runs at a time. PoB is fundamentally a single-threaded singleton with shared global state.
-- **Read-only probes and snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `suggest_upgrades` and a one-node `simulate_passive_change` evaluate each variant through PoB's own calculator (the one its tooltips use, a few ms per variant) without touching the build; the few variants it cannot reproduce exactly, and the other what-if tools, wrap the change in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
+- **Read-only probes and snapshot-and-restore for "what-if" queries.** `compare_items`, `find_best_next_nodes`, `find_worst_allocated_nodes`, `evaluate_keystone`, `suggest_upgrades`, a one-node `simulate_passive_change`, the gem tools (`swap_gem`, `compare_supports`, `evaluate_gem_levels`, `find_optimal_links`) and the scenario tools (`simulate_scenario`, `compare_scenarios`, `toggle_buffs`) evaluate each variant through PoB's own calculator (the one its tooltips use, a few ms per variant) without touching the build; the few variants it cannot reproduce exactly, and the other what-if tools, wrap the change in a snapshot/restore pair so the build state is always restored *exactly* (verified bit-exact across Life/CombinedDPS/TotalEHP).
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
@@ -59,7 +59,7 @@ Three layers, three responsibilities:
 - `get_passive_tree` — every allocated node with stats, plus point counts and class info.
 - `simulate_passive_change` — temporarily allocate/deallocate by node ID or name (allocating takes the node's path with it, deallocating its dependents). Validates connectivity. Always restored.
 - `find_best_next_nodes` — evaluates every unallocated node whose path from your tree costs at most `maxPoints` points (default 3, up to 10), so a notable two travel nodes away is found too, and ranks by gain per point (`rankBy: "perPoint"`, default) or total gain (`"total"`) of your chosen stat (Life, CombinedDPS, TotalEHP, etc.). Each result lists its `pointsCost` and `path`. ~2s on a typical end-game build (~0.4s with `maxPoints: 1`).
-- `find_worst_allocated_nodes` — finds your least valuable allocated nodes: normal, notable, keystone and empty jewel sockets, each removed together with the nodes that depend on it (so the tree stays connected), ranked by loss per refunded point (default) or total loss. Skips ascendancy nodes and masteries. ~1.5s.
+- `find_worst_allocated_nodes` — finds your least valuable allocated nodes: normal, notable, keystone and empty jewel sockets, each removed together with the nodes that depend on it (so the tree stays connected), ranked by loss per refunded point (default) or total loss. Skips ascendancy nodes and masteries. Nodes whose removal needs a full recalculation (cluster jewel nodes, skill-granting nodes, nodes whose dependents include a socketed jewel) are capped at the most promising few per call; the rest are listed in `skipped`. ~2-3s.
 - `evaluate_keystone` — toggle any keystone (adding it takes its path), return full stat diff.
 - `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
@@ -67,24 +67,24 @@ Three layers, three responsibilities:
 - `list_skill_groups` — every socket group with active gem, supports, slot, isMainSkill flag.
 - `lookup_gem` — gem metadata by name (tags, isSupport, awakened flag).
 - `list_available_supports` — every support gem in the data tables, optionally filtered by active-skill tags.
-- `swap_gem` — replace a gem in a group. **Mutates**, returns diff.
-- `compare_supports` — identifies the weakest support in a group, ranks 2-10 candidate replacements.
-- `evaluate_gem_levels` — DPS scaling from current ±1 through level 24.
-- `find_optimal_links` — three-phase heuristic: best single supports → top-K combinations → swap iteration. Honors locked-in supports as constraints. ~16s.
+- `swap_gem` — replace a gem in a group and return the diff, without changing the build (milliseconds).
+- `compare_supports` — identifies the weakest support in a group, ranks 1-10 candidate replacements; a candidate PoB refuses gets its own `error`.
+- `evaluate_gem_levels` — DPS scaling from current -1 through +4 (capped at 24), or the levels you pass.
+- `find_optimal_links` — scores every eligible support alone, then searches combinations of the best `topN` (exhaustive when they fit the budget, else the best few exhaustively plus pairwise swaps). Honors locked-in supports as constraints; reports `bestDPS`, `dpsDelta` vs the build as it is, and how many combinations were evaluated. ~1-3s for a 6-link.
 
 ### Configuration & scenarios (6)
 - `get_config` — every config var grouped into 8 sections (Combat, Enemy, Map, Skill Options, etc.) with type metadata.
 - `set_config` — permanently change config (with config-only undo).
 - `list_scenarios` — the 6 built-in presets: `mapping`, `map_boss`, `pinnacle_boss`, `uber_boss`, `no_buffs`, `delirium`.
-- `simulate_scenario` — apply a preset, return stats, restore.
-- `compare_scenarios` — DPS/EHP across 2+ scenarios.
+- `simulate_scenario` — a preset's stats and diff, without changing the build.
+- `compare_scenarios` — DPS/EHP across 2-6 scenarios in one call; a scenario PoB refuses gets its own `error`.
 - `toggle_buffs` — friendly-named on/off for buffs (`onslaught`, `fortify`, etc.).
 
 ### Optimization advisor (5)
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`.
 - `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only, well under a second), ranks by upgrade priority, suggests archetype-aware mods.
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
-- `undo_last_change` — pops the undo stack (works for swap/unequip/swap_gem/set_config/convert_tree_to_latest/etc.).
+- `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/convert_tree_to_latest; what-if tools push nothing).
 - `reset_build` — discard everything, return to the originally loaded state.
 
 ### Trade searches (2)

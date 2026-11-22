@@ -11,9 +11,13 @@
 // for real, full recalc, read) between a full build snapshot and its exact
 // restore — the same path the what-if tools used before (a passive-tree
 // snapshot and restore for a single node change touching no skill, as the
-// tree what-if tools used). Variants go to the engine in chunks (PROBE_CHUNK)
-// so no single bridge command nears its timeout. Nothing is pushed to the
-// undo stack or the crash-recovery journal: the build never changes.
+// tree what-if tools used). Around every fallback variant the committed state
+// is fingerprinted by value (`probe` with `fingerprint`) and compared after the
+// restore, so a restore that is not exact in any part (not only the part its
+// own check covers) is an internal error naming reset_build. Variants go to
+// the engine in chunks (PROBE_CHUNK) so no single bridge command nears its
+// timeout. Nothing is pushed to the undo stack or the crash-recovery journal:
+// the build never changes.
 
 import type { Stats } from './lua-bridge.js';
 import { UserError, validateItemText, validateSlot } from './validation.js';
@@ -25,7 +29,9 @@ export type ProbeGemChange =
   /** Remove gem `index` from group `group`. */
   | { op: 'remove'; group: number; index: number }
   /** Add a gem to group `group` (at `position`, default the end; level defaults to 20, quality to 0). */
-  | { op: 'add'; group: number; name: string; level?: number; quality?: number; enabled?: boolean; position?: number };
+  | { op: 'add'; group: number; name: string; level?: number; quality?: number; enabled?: boolean; position?: number }
+  /** Remove every gem from group `group` (adds after it build a new gem list, as replaceSocketGroup does). */
+  | { op: 'clear'; group: number };
 
 export type ProbeItemChange = { slot: string; itemText: string } | { slot: string; unequip: true };
 
@@ -197,11 +203,25 @@ function chunks<T>(list: T[], size: number): T[][] {
   return out;
 }
 
+async function committedFingerprint(deps: ProbeDeps): Promise<string[]> {
+  const res = await deps.send<{ fingerprint: unknown }>({ cmd: 'probe', fingerprint: true });
+  return Array.isArray(res.fingerprint) ? (res.fingerprint as string[]) : [];
+}
+
+/** The first line that differs between two fingerprints, or null. */
+function fingerprintDiff(a: string[], b: string[]): string | null {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return `${a[i] ?? '(none)'} -> ${b[i] ?? '(none)'}`;
+  }
+  return null;
+}
+
 /**
  * Run one fallback variant between a snapshot and its exact restore
  * (probeThenRestore): the passive tree's alone for a `treeOnly` variant, the
  * whole build's otherwise. A variant error with an exact restore is that
- * variant's error; a restore that fails ends the whole call (the build may differ).
+ * variant's error; a restore that fails, or leaves the committed fingerprint
+ * different, ends the whole call (the build may differ).
  */
 async function runFallback(
   deps: ProbeDeps,
@@ -209,11 +229,18 @@ async function runFallback(
   request: ProbeRequest,
   { reason, treeOnly }: PendingFallback,
 ): Promise<ProbeVariantResult> {
+  const before = await committedFingerprint(deps);
   const snapshot = treeOnly ? await deps.snapshotTree() : await deps.snapshot();
   let restoreFailed = false;
   const restore = async (): Promise<void> => {
     try {
       await (treeOnly ? deps.restoreTree(snapshot) : deps.restore(snapshot));
+      const diff = fingerprintDiff(before, await committedFingerprint(deps));
+      if (diff !== null) {
+        throw new Error(
+          `restoring the build after a full-recalculation probe variant was not exact (${diff}); call reset_build`,
+        );
+      }
     } catch (error) {
       restoreFailed = true;
       throw error;
