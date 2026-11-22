@@ -12,6 +12,8 @@
 --   * <lhs> starts at the beginning of its line, or after `;`, `then`, `do`,
 --     `else` or `repeat` on the same line. A statement continued from the
 --     previous line, or following `)`/`end` on the same line, is not handled.
+--     A lhs that itself contains a newline (a block comment inside it) is
+--     left alone, so line numbers never shift.
 --   * <rhs> ends at the end of the line, a trailing comment, a `;`, or an
 --     `end`/`else`/`elseif`/`until` that closes the enclosing block. It keeps
 --     going past a newline only while a bracket is still open, so a rhs that
@@ -67,11 +69,14 @@ local function rhsEnd(src, i)
 		local skipTo = skipLiteral(src, i)
 		local c = src:sub(i, i)
 		if skipTo then
-			if src:sub(i, i + 1) == "--" and depth == 0 and blocks == 0 then
-				return last + 1
+			if src:sub(i, i + 1) ~= "--" then
+				last = skipTo - 1 -- a string belongs to the rhs
+			elseif depth == 0 and blocks == 0 and not src:find("^%-%-%[=*%[", i) then
+				return last + 1 -- a trailing line comment ends the rhs
 			end
-			-- a string, or a comment inside brackets/function body
-			if src:sub(i, i + 1) ~= "--" then last = skipTo - 1 end
+			-- Comments are skipped without extending the rhs, so a block
+			-- comment after the rhs stays outside the parentheses while one in
+			-- the middle (`x -= 1 --[[c]] - 2`) does not cut the rhs short.
 			i = skipTo
 		elseif c == "\n" then
 			if depth <= 0 and blocks == 0 then return last + 1 end
@@ -110,6 +115,8 @@ function M.rewrite(src)
 		local skipTo = skipLiteral(src, i)
 		local c = src:sub(i, i)
 		if skipTo then
+			-- a comment before the lhs is not part of it (it may span lines)
+			if src:sub(i, i + 1) == "--" and not src:sub(stmt, i - 1):find("%S") then stmt = skipTo end
 			i = skipTo
 		elseif c == "\n" or c == ";" then
 			i = i + 1; stmt = i
@@ -122,7 +129,8 @@ function M.rewrite(src)
 				or (OPS[c] and src:sub(i + 1, i + 1) == "=" and src:sub(i + 2, i + 2) ~= "=" and c)
 				or nil
 			local lhs = op and src:sub(stmt, i - 1):match("^%s*(.-)%s*$")
-			if op and lhs ~= "" then
+			-- a lhs spanning lines would add a newline to the output
+			if op and lhs ~= "" and not lhs:find("\n", 1, true) then
 				local rhsStart = i + #op + 1
 				local stop = rhsEnd(src, rhsStart)
 				outN = outN + 1

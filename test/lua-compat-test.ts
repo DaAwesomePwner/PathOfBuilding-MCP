@@ -143,6 +143,33 @@ const cases: Case[] = [
     run: 'OK:3',
   },
   {
+    name: 'block-comment-inside-rhs',
+    src: 'local x = 10\nx -= 1 --[[c]] - 2\nreturn x',
+    out: 'local x = 10\nx = x - (1 --[[c]] - 2)\nreturn x',
+    count: 1,
+    run: 'OK:11',
+  },
+  {
+    name: 'block-comment-after-rhs',
+    src: 'local x = 10\nx -= 1 --[[ c\n]] -- d\nreturn x',
+    out: 'local x = 10\nx = x - (1) --[[ c\n]] -- d\nreturn x',
+    count: 1,
+    run: 'OK:9',
+  },
+  {
+    name: 'multi-line-comment-before-lhs',
+    src: 'local n = 1\n--[[ a\nb ]] n += 4\nreturn n',
+    out: 'local n = 1\n--[[ a\nb ]] n = n + (4)\nreturn n',
+    count: 1,
+    run: 'OK:5',
+  },
+  {
+    name: 'multi-line-comment-inside-lhs-left-alone',
+    src: 'local t = { 1 }\nt --[[ a\nb ]] [1] += 4\nreturn t[1]',
+    count: 0,
+    run: /multi-line-comment-inside-lhs-left-alone\.lua:3: '=' expected near '\+'$/,
+  },
+  {
     name: 'crlf',
     src: 'local x = 1\r\nx += 1\r\nreturn x\r\n',
     out: 'local x = 1\r\nx = x + (1)\r\nreturn x\r\n',

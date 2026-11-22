@@ -25,7 +25,7 @@ ls "$POB_PATH/src/Modules/Build.lua"
 
 If neither exists, your install is incomplete. Re-run the Path of Building Community installer, or clone <https://github.com/PathOfBuildingCommunity/PathOfBuilding>.
 
-A source clone is run read-only (the server switches PoB's dev-mode autosave off). Prefer a release tag (`git clone --branch v2.67.2 --depth 1 <repo>`): the default branch can use Lua syntax plain LuaJIT cannot parse. To check a clone, run `POB_SOURCE_PATH=<clone> npm run test:source-clone`.
+A source clone is run read-only (the server switches PoB's dev-mode autosave off). The default branch can use Lua syntax only PoB's patched LuaJIT parses (e.g. `count += 1`); the bridge rewrites it on load (`lua/compound-assign.lua`), but a release tag (`git clone --branch v2.67.2 --depth 1 <repo>`) is the safest choice. To check a clone, run `POB_SOURCE_PATH=<clone> npm run test:source-clone`.
 
 ## "… is Path of Building for Path of Exile 2"
 
