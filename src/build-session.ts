@@ -16,7 +16,9 @@ import {
 } from './probe.js';
 import { toNumber } from './stat-values.js';
 import { DEFAULT_MAX_POINTS, findBestNextNodes, findWorstAllocatedNodes, type RankBy, type TreeSearchResult } from './tree-search.js';
+import { topTradeMods, type ModLineCheck, type SuggestedMod } from './stat-weights.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
+import { tradeQueryCommand } from './trade-search-command.js';
 import { UserError, normalizeItemText } from './validation.js';
 
 /**
@@ -822,6 +824,24 @@ export class BuildSession {
     return this.withLock(() => this.probeUnlocked(request));
   }
 
+  /**
+   * stat_weights (src/stat-weights.ts), under one lock: which lines PoB's mod
+   * parser can use (`probe` with `parseModLines`), then one calculator variant
+   * per usable line (`modLines`: the line's mods appended to a copy of the
+   * config mod list, lua/probe.lua). `probe.results` has one entry per usable
+   * line, in order. Changes nothing and records nothing.
+   */
+  async probeModLines(lines: string[], stats: string[]): Promise<{ checks: ModLineCheck[]; probe: ProbeResponse }> {
+    return this.withLock(async () => {
+      const parsed = await this.bridge.send<{ ok: true; lines: ModLineCheck[] }>({ cmd: 'probe', parseModLines: lines });
+      const checks = lines.map((_, i) => parsed.lines?.[i] ?? { ok: false, reason: 'not checked' });
+      const variants: Array<ProbeVariant & { modLines: string[] }> = lines
+        .filter((_, i) => checks[i].ok)
+        .map((line) => ({ modLines: [line] }));
+      return { checks, probe: await this.probeUnlocked({ stats, variants }) };
+    });
+  }
+
   private probeUnlocked(request: ProbeRequest): Promise<ProbeResponse> {
     return runProbe(
       {
@@ -1503,7 +1523,9 @@ export class BuildSession {
       if (record && !record.started) throw err;
       try {
         await rollback();
-        const diff = fingerprintDiff(before, await committedFingerprint(deps));
+        // `rollbackCheck` marks the read for the bridge's buildEditRollbackInexact test fault.
+        const check = { send: <T>(c: object) => this.bridge.send<T>({ ...c, rollbackCheck: true }) };
+        const diff = fingerprintDiff(before, await committedFingerprint(check));
         if (diff !== null) {
           throw new Error(`rolling the build back after a failed build edit was not exact (${diff}); call reset_build`);
         }
@@ -2259,17 +2281,22 @@ export class BuildSession {
     });
   }
 
+  /**
+   * suggest_upgrades. Each equipped slot's DPS / EHP contribution is measured
+   * by emptying it as unequip_item would (one probe variant per slot); slots
+   * are sorted by upgrade priority. The first `modSlots` measured slots (the
+   * target slot when one is given) get `suggestedMods`: the mods Path of
+   * Building's own weighted trade query generator weighs highest for that
+   * slot (topTradeMods; ~0.4-1 s a slot on the OccVortex fixture, so not
+   * every slot by default). Highest priority first: measured slots (empty
+   * ones first), then slots that could not be measured. Changes nothing.
+   */
   async suggestUpgrades(
     targetSlot?: string,
-    budget?: 'low' | 'medium' | 'high',
+    options: { modSlots?: number; modsPerSlot?: number } = {},
   ): Promise<UpgradeSuggestion[]> {
     return this.withLock(async () => {
       const baseline = await this.bridge.getStats();
-      const groupsRes = await this.bridge.send<{ ok: true; groups: SkillGroupInfo[] }>({
-        cmd: 'getSocketGroups',
-      });
-      const archetype = identifyArchetype(groupsRes.groups);
-
       const focusSlots = targetSlot
         ? [targetSlot]
         : ['Weapon 1', 'Weapon 2', 'Helmet', 'Body Armour', 'Gloves', 'Boots', 'Amulet', 'Ring 1', 'Ring 2', 'Belt'];
@@ -2300,7 +2327,6 @@ export class BuildSession {
             dpsContribution: 0,
             ehpContribution: 0,
             priority: 100,
-            suggestedMods: getSuggestedMods(slot, archetype, budget),
           });
           continue;
         }
@@ -2317,7 +2343,6 @@ export class BuildSession {
           dpsContribution: dpsLoss,
           ehpContribution: ehpLoss,
           priority: without ? computeUpgradePriority(dpsLoss, ehpLoss, baseline) : 0,
-          suggestedMods: getSuggestedMods(slot, archetype, budget),
           ...(r.error !== undefined ? { error: r.error } : {}),
         });
       }
@@ -2329,6 +2354,20 @@ export class BuildSession {
         // Higher priority = the slot matters less relative to the build (upgrade it first).
         return b.priority - a.priority;
       });
+
+      // Suggested mods: PoB's weighted trade query for the highest-priority slots.
+      const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, focusSlots.length));
+      const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
+      for (const s of out.filter((x) => x.error === undefined).slice(0, modSlots)) {
+        try {
+          const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
+          const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
+          s.suggestedMods = topTradeMods(raw, modsPerSlot);
+        } catch (e) {
+          if (!(e instanceof UserError)) throw e;
+          s.modsError = e.message;
+        }
+      }
       return out;
     });
   }
@@ -2965,66 +3004,17 @@ export interface UpgradeSuggestion {
   dpsContribution: number;
   ehpContribution: number;
   priority: number;
-  suggestedMods: string[];
+  /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
+  suggestedMods?: SuggestedMod[];
+  /** PoB's trade query generator could not weigh mods for the slot. */
+  modsError?: string;
   /** The slot could not be measured (refused as input); its contributions are 0. */
   error?: string;
 }
 
-type BuildArchetype = 'archmage' | 'minion' | 'totem' | 'dot' | 'generic';
-
-function identifyArchetype(groups: SkillGroupInfo[]): BuildArchetype {
-  const main = groups.find((g) => g.isMainGroup) ?? groups[0];
-  if (!main) return 'generic';
-  const active = main.gems.find((g) => !g.isSupport);
-  const supports = main.gems.filter((g) => g.isSupport).map((g) => g.name);
-  const activeName = active?.name ?? '';
-
-  if (supports.some((s) => /Archmage/i.test(s))) return 'archmage';
-  if (
-    supports.some((s) => /Minion/i.test(s)) ||
-    /Summon|Raise|Animate/i.test(activeName)
-  ) {
-    return 'minion';
-  }
-  if (supports.some((s) => /Spell Totem|Ballista Totem/i.test(s))) return 'totem';
-  if (supports.some((s) => /Deadly Ailments|Swift Affliction|Void Manipulation/i.test(s))) return 'dot';
-  return 'generic';
-}
-
-function getSuggestedMods(
-  slot: string,
-  archetype: BuildArchetype,
-  budget?: 'low' | 'medium' | 'high',
-): string[] {
-  const mods: string[] = [];
-  if (['Helmet', 'Body Armour', 'Gloves', 'Boots', 'Belt'].includes(slot)) {
-    mods.push('Maximum Life', 'Elemental Resistances');
-  }
-  switch (archetype) {
-    case 'archmage':
-      mods.push('Maximum Mana', 'Mana Regeneration');
-      if (slot === 'Amulet') mods.push('-X to Total Mana Cost of Non-Channelling Skills');
-      break;
-    case 'minion':
-      mods.push('Minion Damage', 'Minion Attack/Cast Speed');
-      if (slot === 'Helmet') mods.push('+Level to Socketed Minion Gems');
-      break;
-    case 'dot':
-      mods.push('Damage over Time Multiplier', '+Level to Skill Gems');
-      break;
-    case 'totem':
-      mods.push('Totem Damage', '+1 Totem');
-      break;
-    default:
-      if (slot === 'Weapon 1') mods.push('Increased Damage', 'Critical Strike Chance', 'Attack/Cast Speed');
-      if (slot === 'Amulet') mods.push('Critical Strike Multiplier', '+Level to Skill Gems');
-      break;
-  }
-  if (slot === 'Boots') mods.push('Movement Speed');
-  if (slot === 'Gloves' && archetype !== 'minion') mods.push('Attack Speed', 'Accuracy');
-  if (slot === 'Body Armour' && budget === 'high') mods.push('Astramentis', 'Saviour, Mageblood, or Headhunter pairings');
-  return mods;
-}
+/** Slots that get suggested mods by default (PoB's trade query takes ~0.4-1 s a slot). */
+export const DEFAULT_MOD_SLOTS = 3;
+export const DEFAULT_MODS_PER_SLOT = 6;
 
 function computeUpgradePriority(dpsLoss: number, ehpLoss: number, baseline: Stats): number {
   const dpsBase = toNumber(baseline.CombinedDPS) || 1;

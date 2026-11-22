@@ -81,6 +81,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   compare_scenarios: READ_ONLY,
   toggle_buffs: READ_ONLY,
   suggest_upgrades: READ_ONLY,
+  stat_weights: READ_ONLY,
   // Trade (offline: builds a search link, never contacts the trade site)
   generate_trade_search: READ_ONLY,
   search_trade_mods: READ_ONLY,

@@ -9,7 +9,8 @@
 --      2.67 exports them in pairs() order),
 --      gem lists (changed gems are copies; the original gem objects are put
 --      back), items (each assigned to its slot under a free item id, or the
---      slot emptied for an `unequip` entry);
+--      slot emptied for an `unequip` entry), `modLines` (custom-modifier
+--      lines read from a copy of the config mod list; see applyModLines);
 --   2. calcFunc({ addNodes / removeNodes }, useFullDPS) runs on that data;
 --   3. every data change is undone, in reverse order.
 -- After the whole command the committed state is compared with a fingerprint
@@ -587,6 +588,90 @@ return function(ctx)
 	end
 
 	-- ------------------------------------------------------------------
+	-- Mod lines (stat_weights)
+	-- ------------------------------------------------------------------
+
+	-- `modLines`: item-style mod lines added to the config mod list as PoB's
+	-- Custom modifiers box adds them (ConfigTab:BuildModList: escapes
+	-- stripped, trimmed, modLib.parseMod; a line with unparsed text left over
+	-- is skipped there, so it is refused here). The committed config mod list
+	-- is never written: the calculator reads a copy with the lines' mods
+	-- appended, after every mod BuildModList adds (the order a line appended
+	-- to the custom modifier text would have), and the original list object
+	-- is put back afterwards. Only for calculator variants: the full-recalc
+	-- fallback and apply_changes have no way to apply them.
+	M.MAX_MOD_LINES = 20
+	M.MAX_PARSE_LINES = 500
+	M.MAX_MOD_LINE_LENGTH = 300
+
+	-- The mods of one line, or nil and why PoB cannot use it.
+	local function parseModLine(line)
+		local stripped = StripEscapes(line):match("^%s*(.-)%s*$")
+		if stripped == "" then return nil, "empty line" end
+		local mods, extra = modLib.parseMod(stripped)
+		if not mods then return nil, "not recognised by Path of Building's mod parser" end
+		if extra then return nil, "only partly recognised by Path of Building's mod parser (left over: \"" .. tostring(extra) .. "\")" end
+		local n = 0
+		for _, mod in pairs(mods) do
+			n = n + 1
+			if type(mod) == "table" and mod.name == "ExtraSkill" then return nil, "grants a skill (not supported)" end
+		end
+		if n == 0 then return nil, "parsed to no modifier" end
+		return mods
+	end
+
+	local function checkModLineText(line, label)
+		if type(line) ~= "string" or line:find("[\r\n]") or #line > M.MAX_MOD_LINE_LENGTH then
+			userError(label .. " must be one line of text of at most " .. M.MAX_MOD_LINE_LENGTH .. " characters")
+		end
+	end
+
+	-- A variant's modLines as one list of mods (copies, so the source can be set).
+	local function checkModLines(variant)
+		local lines = optArray(variant.modLines, "modLines", M.MAX_MOD_LINES)
+		local out = { }
+		for i, line in ipairs(lines) do
+			checkModLineText(line, "modLines[" .. i .. "]")
+			local mods, why = parseModLine(line)
+			if not mods then userError("mod line \"" .. line .. "\" cannot be used: " .. why) end
+			for _, mod in ipairs(mods) do out[#out + 1] = mod end
+		end
+		return out
+	end
+
+	local function applyModLines(mods)
+		local configTab = build.configTab
+		local orig = configTab.modList
+		local copy = ctx.construct("ModList")
+		copy:AddList(orig)
+		for _, mod in ipairs(mods) do copy:AddMod(modLib.setSource(mod, "Custom")) end
+		configTab.modList = copy
+		return function() configTab.modList = orig end
+	end
+
+	-- `probe` with `parseModLines`: whether PoB can use each line (nothing is
+	-- computed or changed).
+	function M.parseModLines(lines)
+		if not isArray(lines) then userError("parseModLines must be an array of mod lines") end
+		if #lines > M.MAX_PARSE_LINES then
+			userError("parseModLines has " .. #lines .. " entries; at most " .. M.MAX_PARSE_LINES .. " are allowed")
+		end
+		local out = { }
+		for i, line in ipairs(lines) do
+			checkModLineText(line, "parseModLines[" .. i .. "]")
+			local mods, why = parseModLine(line)
+			if mods then
+				local n = 0
+				for _ in pairs(mods) do n = n + 1 end
+				out[i] = { ok = true, mods = n }
+			else
+				out[i] = { ok = false, reason = why }
+			end
+		end
+		return { lines = out }
+	end
+
+	-- ------------------------------------------------------------------
 	-- Committed-state fingerprint
 	-- ------------------------------------------------------------------
 
@@ -775,9 +860,13 @@ return function(ctx)
 		if build.partyTab and build.partyTab.enableExportBuffs then
 			reason = reason or "the party tab's export-buffs option is on"
 		end
+		local modLines = checkModLines(variant)
+		if #modLines > 0 and reason then
+			userError("modLines cannot be combined with a change that needs a full recalculation (" .. reason .. ")")
+		end
 		return {
 			addList = addList, removeList = removeList, items = parsedItems, config = config, gems = gems,
-			nodeSet = nodeSet, adding = adding, fallbackReason = reason, treeOnly = treeOnly,
+			nodeSet = nodeSet, adding = adding, fallbackReason = reason, treeOnly = treeOnly, modLines = modLines,
 		}
 	end
 
@@ -846,6 +935,7 @@ return function(ctx)
 		local undos = { }
 		local ok, res = pcall(function()
 			if checked.config then undos[#undos + 1] = applyConfig(checked.config) end
+			if #checked.modLines > 0 then undos[#undos + 1] = applyModLines(checked.modLines) end
 			if #checked.gems > 0 then undos[#undos + 1] = applyGems(checked.gems) end
 			if #checked.items > 0 then undos[#undos + 1] = applyItems(checked.items) end
 			local override = { }
@@ -896,6 +986,7 @@ return function(ctx)
 		-- the caller compares before and after a fallback variant's restore.
 		if cmd.fingerprint then return { fingerprint = fingerprint(true) } end
 		if cmd.supportsFor ~= nil then return M.listSupports(cmd.supportsFor) end
+		if cmd.parseModLines ~= nil then return M.parseModLines(cmd.parseModLines) end
 		local keys = statKeyList(cmd.stats)
 		local variants = cmd.variants
 		if variants == nil then variants = { } end
@@ -1139,6 +1230,7 @@ return function(ctx)
 		local keys = statKeyList(cmd.stats)
 		if cmd.useFullDPS ~= nil and type(cmd.useFullDPS) ~= "boolean" then userError("useFullDPS must be a boolean") end
 		local checked = checkVariant(cmd.variant)
+		if #checked.modLines > 0 then userError("modLines are only evaluated through the calculator") end
 		local beforeIds = { }
 		for id in pairs(build.spec.allocNodes) do beforeIds[id] = true end
 		if checked.config then
@@ -1195,6 +1287,7 @@ return function(ctx)
 		local edit, nodeBatch = ctx.buildEdit, ctx.nodeBatch
 		local variant = cmd.variant
 		if type(variant) ~= "table" or (next(variant) ~= nil and isArray(variant)) then userError("variant must be an object") end
+		if variant.modLines ~= nil then userError("modLines are only available to read-only probes (stat_weights)") end
 		local items, config, gems, allocIds, deallocIds
 		if cmd.replay == true then
 			items = M.checkItems(variant)

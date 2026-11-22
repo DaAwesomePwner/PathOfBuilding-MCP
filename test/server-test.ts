@@ -164,7 +164,7 @@ async function main(): Promise<void> {
       const a = annotated.get(name);
       assert(a && typeof a.readOnlyHint === 'boolean' && typeof a.destructiveHint === 'boolean', `${name}: missing annotations`);
     }
-    for (const name of ['get_stats', 'evaluate_changes', 'simulate_passive_change', 'find_best_next_nodes', 'swap_gem', 'compare_items', 'get_passive_tree']) {
+    for (const name of ['get_stats', 'evaluate_changes', 'stat_weights', 'suggest_upgrades', 'simulate_passive_change', 'find_best_next_nodes', 'swap_gem', 'compare_items', 'get_passive_tree']) {
       assert(annotated.get(name)?.readOnlyHint === true && annotated.get(name)?.destructiveHint === false, `${name} should be read-only`);
     }
     for (const name of ['load_build', 'reset_build', 'configure_pob_path', 'reload_engine']) {

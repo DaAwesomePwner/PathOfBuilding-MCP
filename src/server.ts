@@ -5,6 +5,7 @@ import { z } from 'zod';
 import {
   BuildSession,
   ComparisonResult,
+  DEFAULT_MOD_SLOTS,
   computeDiff,
   EquippedItem,
   ItemModLine,
@@ -22,6 +23,7 @@ import { EngineManager } from './engine-manager.js';
 import type { Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
 import { registerTradeTools } from './trade-search.js';
+import { registerStatWeights } from './stat-weights.js';
 import { createToolRegistrar } from './tool-registry.js';
 import { DEFAULT_LINK_POOL, EXHAUSTIVE_BUDGET, MAX_COMBINATIONS } from './link-search.js';
 import { DEFAULT_MAX_POINTS, MAX_MAX_POINTS, MAX_SEARCH_FALLBACKS } from './tree-search.js';
@@ -131,6 +133,7 @@ const tools = createToolRegistrar(server, engine);
 
 registerEngineTools(tools, engine);
 registerTradeTools(tools);
+registerStatWeights(tools);
 registerEvaluateChanges(tools);
 
 tools.engine<{ source: string }>(
@@ -971,19 +974,29 @@ tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   },
 );
 
-tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
+tools.engine<{ slot?: string; modSlots?: number }>(
   'suggest_upgrades',
   {
     description:
-      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (highest priority first; empty slots come first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods; list_equipped_items / get_item_in_slot give the items themselves.",
+      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
+      `The first modSlots slots (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods Path of Building's own weighted trade query generator weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
+      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (highest priority first; empty slots come first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods / modsError; ' +
+      'list_equipped_items / get_item_in_slot give the items themselves, generate_trade_search the full weighted search, stat_weights the worth of any mod line.',
     inputSchema: {
       slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
-      budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),
+      modSlots: z.number().int().min(0).max(10).optional()
+        .describe(`How many of the highest-priority slots get suggestedMods (default ${DEFAULT_MOD_SLOTS}, 0 for none, 10 for all; each takes about 0.5-1 s).`),
     },
   },
-  async ({ slot, budget }, session) => {
-    const suggestions = await session.suggestUpgrades(slot, budget);
-    return { suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest) };
+  async ({ slot, modSlots }, session) => {
+    const suggestions = await session.suggestUpgrades(slot, { modSlots });
+    const withMods = suggestions.filter((s) => s.suggestedMods !== undefined || s.modsError !== undefined).length;
+    return {
+      suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest),
+      ...(withMods < suggestions.length
+        ? { modsNote: `suggestedMods computed for the first ${withMods} slot(s) only; pass slot, or a larger modSlots, for the others.` }
+        : {}),
+    };
   },
 );
 

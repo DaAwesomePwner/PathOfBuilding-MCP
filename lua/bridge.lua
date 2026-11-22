@@ -2550,10 +2550,12 @@ function buildEdit.applied(result, replay)
 end
 
 -- applyChangesFailsMidway raises part-way through the change (the caller
--- rolls it back); with buildEditRollbackInexact it also arms the next
--- committed-state fingerprint read to come back with one extra line, so the
--- caller's check after the rollback sees a difference (the build itself is
--- left as the rollback put it).
+-- rolls it back); with buildEditRollbackInexact it also arms the rollback's
+-- committed-state fingerprint read (`probe` with `fingerprint` and
+-- `rollbackCheck`) to come back with one extra line, so the caller's check
+-- after the rollback sees a difference (the build itself is left as the
+-- rollback put it). The next fingerprint read disarms it either way, so a
+-- rollback that fails before its check leaves nothing armed.
 function buildEdit.testFaultMidway(replay)
 	if TEST_FAULTS.applyChangesFailsMidway and not replay then
 		if TEST_FAULTS.buildEditRollbackInexact then buildEdit.rollbackInexact = true end
@@ -4567,6 +4569,7 @@ do
 		parseItemText = parseItemText,
 		assertItemFitsSlot = assertItemFitsSlot,
 		usableSlot = slotChecks.usableSlot,
+		construct = construct,
 		findGemByName = findGemByName,
 		getConfigMetadata = getConfigMetadata,
 		equipItemInSlot = equipItemInSlot,
@@ -4590,8 +4593,13 @@ do
 			local res = probe.probe(cmd)
 			if cmd.fingerprint and buildEdit.rollbackInexact then
 				-- Test fault (buildEditRollbackInexact): see buildEdit.testFaultMidway.
+				-- Only the read that checks a build edit's rollback
+				-- (`rollbackCheck`) gets the extra line; any other fingerprint
+				-- read disarms the fault (the rollback failed before its check).
 				buildEdit.rollbackInexact = nil
-				res.fingerprint[#res.fingerprint + 1] = "testFault|buildEditRollbackInexact"
+				if cmd.rollbackCheck == true then
+					res.fingerprint[#res.fingerprint + 1] = "testFault|buildEditRollbackInexact"
+				end
 			end
 			return res
 		end,
