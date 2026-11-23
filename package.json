@@ -56,7 +56,8 @@
     "test:stats": "tsx test/stats-diagnostics-test.ts",
     "test:stat-weights": "tsx test/stat-weights-test.ts",
     "test:compare": "tsx test/compare-builds-test.ts",
-    "test:tree-plan": "tsx test/tree-plan-test.ts"
+    "test:tree-plan": "tsx test/tree-plan-test.ts",
+    "test:item-data": "tsx test/item-data-test.ts"
   },
   "repository": {
     "type": "git",

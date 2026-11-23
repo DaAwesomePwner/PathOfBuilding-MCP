@@ -26,6 +26,7 @@ import {
   type RespecRaw,
 } from './tree-plan.js';
 import { topTradeMods, type ModLineCheck, type SuggestedMod } from './stat-weights.js';
+import type { ItemDataCommand } from './item-data.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
 import { tradeQueryCommand } from './trade-search-command.js';
 import { UserError, normalizeItemText } from './validation.js';
@@ -1116,6 +1117,22 @@ export class BuildSession {
     return this.withLock(async () => {
       const result = await this.bridge.send<{ ok: true } & TradeModsResult>({ cmd: 'searchTradeMods', slot, query, limit });
       return { itemCategory: result.itemCategory, total: result.total, mods: result.mods };
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Item data (read-only: PoB's unique list, item bases, affixes, bench crafts)
+  // ------------------------------------------------------------------
+
+  /**
+   * One of the bridge's item-data reads (search_items, get_item_text,
+   * list_item_mods, build_item). They build items with PoB's Item class and
+   * never add them to the build: nothing is undo-pushed or journaled.
+   */
+  async readItemData<T = Record<string, unknown>>(command: ItemDataCommand): Promise<T> {
+    return this.withLock(async () => {
+      const { ok: _ok, ...result } = await this.bridge.send<{ ok: true } & Record<string, unknown>>(command);
+      return result as T;
     });
   }
 

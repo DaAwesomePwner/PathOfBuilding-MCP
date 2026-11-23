@@ -297,6 +297,24 @@ async function main(): Promise<void> {
     assert(badCompare.isError === true && /^source: /.test(badText), `bad source: ${badText}`);
     log('PASS: compare_builds');
 
+    log('Test 14b: item data tools through MCP');
+    for (const name of ['search_items', 'get_item_text', 'list_item_mods', 'build_item']) {
+      assert(annotated.get(name)?.readOnlyHint === true && annotated.get(name)?.destructiveHint === false, `${name} should be read-only`);
+    }
+    const found = JSON.parse(await text('search_items', { query: 'Vaal Regalia', kind: 'base', limit: 1 })) as { results: Array<{ name: string }> };
+    assert(found.results[0]?.name === 'Vaal Regalia', `search_items: ${JSON.stringify(found)}`);
+    const listed = JSON.parse(await text('list_item_mods', { base: 'Vaal Regalia', query: 'maximum life', limit: 2 })) as { mods: Array<{ id: string }> };
+    assert(listed.mods.length === 2, `list_item_mods: ${JSON.stringify(listed)}`);
+    const built = JSON.parse(await text('build_item', { base: 'Vaal Regalia', mods: ['+110 to maximum Life'], crafted: ['+20% to Fire Resistance'] })) as { text: string };
+    const uniqueText = (JSON.parse(await text('get_item_text', { unique: "Kaom's Heart" })) as { text: string }).text;
+    const viaMcp = JSON.parse(await text('compare_items', { slot: 'Body Armour', items: [built.text, uniqueText] })) as { candidates: Array<{ error: string | null }> };
+    assert(viaMcp.candidates.every((c) => c.error === null), `compare_items took the item data texts: ${JSON.stringify(viaMcp.candidates)}`);
+    await refused('build_item', { base: 'Vaal Regalia', name: 'Two\nLines' }, 'a two-line item name');
+    await refused('build_item', { base: 'Vaal Regalia', mods: ['LocalIncreasedPhysicalDamagePercent1'] }, 'a mod that cannot roll');
+    await refused('get_item_text', { unique: "Kaom's Heart", base: 'Vaal Regalia' }, 'unique and base together');
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'item data tools changed the build');
+    log('PASS: item data tools');
+
     log('Test 15: masteries and mainSkill through MCP (ConvertTreeMasteries.xml)');
     await text('load_build', { source: readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8') });
     const mBefore = await text('export_build', { format: 'xml' });

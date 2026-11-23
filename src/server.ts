@@ -19,6 +19,7 @@ import {
 import { registerBuildEditTools } from './build-edit-tools.js';
 import { registerCompareBuilds } from './compare-builds.js';
 import { masteriesSchema, registerEvaluateChanges } from './evaluate-changes.js';
+import { registerItemDataTools } from './item-data.js';
 import { registerTreePlanTools } from './tree-plan.js';
 import type { ProbeMasteryChoice } from './probe.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
@@ -138,6 +139,7 @@ registerEngineTools(tools, engine);
 registerTradeTools(tools);
 registerStatWeights(tools);
 registerEvaluateChanges(tools);
+registerItemDataTools(tools);
 registerTreePlanTools(tools);
 registerCompareBuilds(tools, engine);
 

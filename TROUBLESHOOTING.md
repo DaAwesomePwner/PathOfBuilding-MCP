@@ -101,6 +101,24 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 `swap_item`, `compare_items` and item variants in `evaluate_changes` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`. The one exception is a Viscera (Wickerman) item copied from the game, whose first line is `Item Class: Viscera` and which has no `Rarity:` line; it is accepted as is.
 
+## `build_item` / `list_item_mods` refusals
+
+- **"… cannot roll on <base>"** — Path of Building's spawn weights give that mod weight 0 on the base's tags (e.g. a local weapon mod on armour). Influenced mods need `influences` (e.g. `["Shaper"]`). `list_item_mods` lists what can roll.
+- **"… needs item level N"** / **"needs a higher item level"** — the tier is above `itemLevel` (default 86): raise it or pick a lower tier.
+- **"… is outside every tier that can roll"** — a rolled line's number is not inside any tier's range; the message lists the tiers. Give the mod's range text or id instead.
+- **"N prefixes (crafted ones included) but a rare … can have 3"** — magic items take 1 prefix and 1 suffix, rare items 3 and 3 (jewels 2 and 2), crafted mods included.
+- **"X and Y are both in mod group …"** — an item has at most one mod of each group (a bench craft too).
+- **"Unknown item base" / "Unknown unique"** — use `search_items` (`kind: "base"` for bases); a unique name several items share (e.g. Grand Spectrum) needs its full `"Name, Base"`.
+- **"implicit … is an influence line" / "is read as the item header …" / "name … is an item flag line"** — Path of Building reads that line as part of the item's header (influence, corruption, quality, sockets, item level, …), not as a modifier. Use `influences`, `corrupted` or `quality` instead, and plain modifier lines for implicits and names.
+- **"implicit … changes the prefix or suffix limits" / "gives the item a crucible passive tree" / "restricts the mods the item can roll"** — PoB keeps such a line as a mod but reads it as a crafting rule that `build_item` does not model; leave it out.
+- **"name … is a unique …" / "starts with \"Foulborn \""** — PoB treats a rare with that name as the unique (its own affix pool or extra mod tags); pick another name.
+- **A cluster notable "cannot roll"** — give the jewel's enchant as implicits (`"Added Small Passive Skills grant: …"`, plus `"Adds N Passive Skills"`); PoB takes the cluster skill from it, and only that skill's notables roll.
+- **"Path of Building reads the item differently from the request"** — PoB's parse of the built text came out different (a line moved between implicits and mods, an influence or flag appeared). Rephrase the named line.
+- **"No crafting bench prefix or suffix … matches"** — bench mods are named by their text (`list_item_mods` with `includeCrafted`), not by an id.
+- **"Path of Building does not model this line"** (a warning) — the item is built, but PoB's mod parser ignores that line in its calculations.
+
+Not covered: essences, eldritch implicits (pass them as `implicits` lines), fossils, harvest and veiled mods.
+
 ## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
 
 The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
