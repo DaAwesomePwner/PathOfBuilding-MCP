@@ -3035,6 +3035,181 @@ local function deallocNodesBatch(nodeIds, strict)
 	return result
 end
 
+-- plan_respec (BuildSession.planRespec, which runs it between a passive-tree
+-- snapshot and its exact restore): change the tree so that exactly the
+-- `target` nodes (ids or unique names) are allocated, plus class starts, the
+-- allocated ascendancy nodes when `keepAscendancy` is not false, the `keep`
+-- ids, and the nodes connecting them. The whole target is checked first
+-- (unknown ids or names, names several nodes share, nodes no path reaches,
+-- unallocated masteries, two options of one choice): a refusal changes
+-- nothing. Then, on the tree as it is:
+--   1. removals: while an allocated node can go without taking a kept node
+--      with it (its PoB `depends`), the one taking the most nodes (lowest id
+--      on ties) is deallocated as PoB does (with its dependents). Kept nodes
+--      stay connected without every removed node, so deallocating `deallocate`
+--      in order on the original tree removes the same nodes;
+--   2. additions: the unallocated target node with the shortest PoB path
+--      (lowest id on ties) is allocated with that path, until none is left.
+--      `allocate` lists the nodes added in the order they joined the tree
+--      (allocating them in that order reproduces the change exactly).
+-- `readded`: nodes of `allocate` that were allocated before (a removal took
+-- them, a path needed them again); the caller restores the tree and runs the
+-- command again with them in `keep`. `removed` / `added`: the net change.
+function nodeBatch.respec(cmd)
+	local spec = build.spec
+	local refs = cmd.target
+	if type(refs) ~= "table" then userError("target must be an array of node ids or names") end
+	local problems = { unknown = { }, ambiguous = { }, unreachable = { }, masteries = { } }
+	local byName
+	local target, targetIds = { }, { }
+	local choiceOf = { }
+	for _, ref in ipairs(refs) do
+		local node
+		if type(ref) == "number" then
+			node = spec.nodes[ref]
+			if not node then table.insert(problems.unknown, tostring(ref)) end
+		elseif type(ref) == "string" and ref ~= "" then
+			if not byName then
+				byName = { }
+				for _, n in pairs(spec.nodes) do
+					if n.dn then
+						local key = n.dn:lower()
+						byName[key] = byName[key] or { }
+						table.insert(byName[key], n)
+					end
+				end
+			end
+			local all = byName[ref:lower()] or { }
+			if #all == 1 then
+				node = all[1]
+			elseif #all == 0 then
+				table.insert(problems.unknown, "\"" .. ref .. "\"")
+			else
+				table.sort(all, function(a, b) return a.id < b.id end)
+				local ids = { }
+				for i = 1, math.min(#all, 8) do ids[i] = tostring(all[i].id) end
+				table.insert(problems.ambiguous, "\"" .. ref .. "\" (" .. #all .. " nodes: " .. table.concat(ids, ", ")
+					.. (#all > 8 and ", ..." or "") .. ")")
+			end
+		else
+			userError("target entries must be node ids or non-empty names")
+		end
+		if node and not target[node.id] and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+			if node.type == "Mastery" and not node.alloc then
+				table.insert(problems.masteries, nodeLabel(node))
+			elseif not node.alloc and not (node.path and #node.path > 0) then
+				table.insert(problems.unreachable, nodeLabel(node))
+			else
+				if node.isMultipleChoiceOption and node.linked and node.linked[1] then
+					local other = choiceOf[node.linked[1]]
+					if other then
+						userError("target: nodes " .. nodeLabel(other) .. " and " .. nodeLabel(node) .. " are options of the same choice; only one can be allocated")
+					end
+					choiceOf[node.linked[1]] = node
+				end
+				target[node.id] = true
+				targetIds[#targetIds + 1] = node.id
+			end
+		end
+	end
+	local parts = { }
+	if #problems.unknown > 0 then parts[#parts + 1] = "unknown nodes: " .. table.concat(problems.unknown, ", ") end
+	if #problems.ambiguous > 0 then parts[#parts + 1] = "names several nodes share (pass the id): " .. table.concat(problems.ambiguous, "; ") end
+	if #problems.unreachable > 0 then parts[#parts + 1] = "no path from the class start reaches: " .. table.concat(problems.unreachable, ", ") end
+	if #problems.masteries > 0 then
+		parts[#parts + 1] = "unallocated masteries need an effect (leave them out, then allocate them with allocate_nodes `masteries`): "
+			.. table.concat(problems.masteries, ", ")
+	end
+	if #parts > 0 then userError("target: " .. table.concat(parts, "; ")) end
+	table.sort(targetIds)
+
+	local required = { }
+	for id in pairs(target) do required[id] = true end
+	for _, id in ipairs(type(cmd.keep) == "table" and cmd.keep or { }) do
+		if spec.allocNodes[id] then required[id] = true end
+	end
+	if cmd.keepAscendancy ~= false then
+		for id, node in pairs(spec.allocNodes) do
+			if node.ascendancyName then required[id] = true end
+		end
+	end
+	local before = nodeBatch.captureAllocated()
+
+	-- 1. Removals.
+	local roots = { }
+	for _ = 1, 10000 do
+		local best, bestSize = nil, 0
+		for id, node in pairs(spec.allocNodes) do
+			if not required[id] and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+				local size, ok = 0, true
+				for _, dep in ipairs(node.depends or { node }) do
+					if required[dep.id] or dep.type == "ClassStart" or dep.type == "AscendClassStart" then
+						ok = false
+						break
+					end
+					size = size + 1
+				end
+				if ok and (best == nil or size > bestSize or (size == bestSize and id < best.id)) then best, bestSize = node, size end
+			end
+		end
+		if not best then break end
+		roots[#roots + 1] = best.id
+		spec:DeallocNode(best)
+	end
+
+	-- 2. Additions.
+	local order, listed = { }, { }
+	for _ = 1, 10000 do
+		local pick, pickLen = nil, 0
+		for _, id in ipairs(targetIds) do
+			local node = spec.nodes[id]
+			if not node then error("target node " .. id .. " no longer exists after the removals rebuilt the cluster jewel graphs", 0) end
+			if not node.alloc then
+				if not (node.path and #node.path > 0) then error("no path reaches target node " .. nodeLabel(node) .. " after the removals", 0) end
+				if pick == nil or #node.path < pickLen or (#node.path == pickLen and id < pick.id) then pick, pickLen = node, #node.path end
+			end
+		end
+		if not pick then break end
+		local path = pick.path
+		if #(pick.intuitiveLeapLikesAffecting or { }) > 0 then path = { pick } end
+		for j = #path, 1, -1 do
+			local pathNode = path[j]
+			if not pathNode.alloc and not listed[pathNode.id] then
+				listed[pathNode.id] = true
+				order[#order + 1] = pathNode.id
+			end
+		end
+		spec:AllocNode(pick)
+		if not spec.allocNodes[pick.id] then error("target node " .. nodeLabel(pick) .. " could not be allocated", 0) end
+	end
+	for id in pairs(required) do
+		if not spec.allocNodes[id] then error("node " .. id .. " was to be kept but is no longer allocated", 0) end
+	end
+
+	-- `added` in join order; anything else that became allocated (not expected) follows, by id.
+	local added, readded, inAdded = { }, { }, { }
+	for _, id in ipairs(order) do
+		if before[id] then
+			readded[#readded + 1] = id
+		elseif spec.allocNodes[id] then
+			added[#added + 1] = nodeBatch.describe(spec.allocNodes[id])
+			inAdded[id] = true
+		end
+	end
+	local extra = { }
+	for id in pairs(spec.allocNodes) do
+		if not before[id] and not inAdded[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(spec.allocNodes[id]) end
+	build.buildFlag = true
+	runCallback("OnFrame")
+	return {
+		removed = nodeBatch.lostSince(before), added = added, deallocate = roots, allocate = order,
+		readded = readded, target = targetIds,
+	}
+end
+
 local function isTreeConnected()
 	-- All allocated non-start nodes must reach a class/ascend start through other allocated nodes.
 	if not (build and build.spec and build.spec.allocNodes) then
@@ -4656,6 +4831,11 @@ local DISPATCH = {
 	},
 	masteryOptions = {
 		handler = function(cmd) return { masteries = nodeBatch.masteryOptions(cmd.nodes) } end,
+	},
+	respecTree = {
+		-- plan_respec only, between a tree snapshot and its exact restore.
+		handler = function(cmd) return nodeBatch.respec(cmd) end,
+		mutating = true,
 	},
 	deallocNodes = {
 		handler = function(cmd) return deallocNodesBatch(cmd.nodeIds or { }, cmd.strict == true) end,
