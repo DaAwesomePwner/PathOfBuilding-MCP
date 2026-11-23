@@ -1552,8 +1552,10 @@ export class BuildSession {
             }
           : { cmd: 'deallocNodes', nodeIds: ids };
       return this.commitAfterUnlocked(entry, journal, command, async () => {
-        if (failure !== undefined) throw await this.recalcAfterAppliedFailureUnlocked(failure);
+        // A granted skill group added or removed can move the main group: the cached main skill is re-read.
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
         const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
         const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
         return {
           added,

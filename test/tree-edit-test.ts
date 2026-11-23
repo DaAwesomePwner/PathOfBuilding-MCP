@@ -695,6 +695,14 @@ async function test10GrantedSkill(): Promise<void> {
   await session.setMainSkill(granted);
   const base = await state(session);
   assert(mainSocketGroup(base.xml) === String(granted), `main group ${mainSocketGroup(base.xml)}`);
+  const baseMain = (await session.getBuildInfo()).mainSkill;
+  assert(baseMain && /Sentinel of Radiance/.test(baseMain), `main skill ${String(baseMain)}`);
+  // The cached build info (export_build summary, get_engine_info) against PoB's own.
+  const mainSkills = async (): Promise<{ cached: string | null | undefined; pob: string | null | undefined; summary: string }> => ({
+    cached: (await session.getBuildInfo()).mainSkill,
+    pob: (await bridge.send<{ info: { mainSkill?: string | null } }>({ cmd: 'getBuildInfo' })).info.mainSkill,
+    summary: await session.exportBuild('summary'),
+  });
 
   const exact = async (label: string): Promise<void> => {
     const now = await state(session);
@@ -714,8 +722,13 @@ async function test10GrantedSkill(): Promise<void> {
     const after = (await bridge.send<{ groups: unknown[] }>({ cmd: 'getSocketGroups' })).groups;
     assert(after.length === groups.length - 1, `${label}: the granted group goes with the node`);
     assert(mainSocketGroup(await session.exportXML()) !== String(granted), `${label}: the main group moved off the removed group`);
+    const moved = await mainSkills();
+    assert(moved.pob && moved.pob !== baseMain, `${label}: PoB's main skill ${String(moved.pob)}`);
+    assert(moved.cached === moved.pob, `${label}: cached main skill ${String(moved.cached)} != PoB's ${String(moved.pob)}`);
+    assert(moved.summary.includes(`Main Skill: ${moved.pob}`), `${label}: summary export: ${moved.summary.slice(0, 300)}`);
     await session.undoLastChange();
     await exact(`undo deallocate_nodes (${label})`);
+    assert((await mainSkills()).cached === baseMain, `${label}: undo puts the main skill back`);
   }
 
   // Allocating it: from the tree without it, add it back, then undo.
