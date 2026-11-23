@@ -180,7 +180,7 @@ const variantSchema = z.object({
     )
     .max(MAX_VARIANT_ITEMS)
     .optional()
-    .describe('{ slot, itemText } (PoB "Copy item" text) equips as swap_item would; { slot, unequip: true } empties the slot.'),
+    .describe('{ slot, itemText } (PoB "Copy item" text; Viscera items copied from the game, first line "Item Class: Viscera", need no Rarity line) equips as swap_item would; { slot, unequip: true } empties the slot.'),
   gems: z
     .array(gemChange)
     .max(MAX_VARIANT_GEMS)

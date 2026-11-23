@@ -296,8 +296,9 @@ return function(ctx)
 			if type(entry) ~= "table" or type(entry.slot) ~= "string" or not (unequip or type(entry.itemText) == "string") then
 				userError("items[" .. i .. "] must be { slot, itemText } or { slot, unequip = true }")
 			end
-			local slot = tab.slots[entry.slot]
-			if not slot then userError("Unknown slot: " .. entry.slot) end
+			-- Unknown slots and (for an item) slots PoB hides on this tree are
+			-- refused as swap_item refuses them.
+			local slot = ctx.usableSlot(entry.slot, not unequip)
 			if bySlot[entry.slot] then userError("Slot " .. entry.slot .. " is listed twice") end
 			local item = nil
 			if not unequip then item = ctx.parseItemText(entry.itemText, entry.slot) end

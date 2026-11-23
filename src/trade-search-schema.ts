@@ -1,8 +1,9 @@
 /** generate_trade_search / search_trade_mods: argument and bridge result types, option lists, Zod schema. */
 import { z } from 'zod';
 
-/** What the bridge's `tradeQuery` command returns (PoB's TradeQueryGenerator, 36-filter cap lifted). */
+/** What the bridge's `tradeQuery` command returns (PoB's TradeQueryGenerator, its filter cap lifted: 2.67's MAX_FILTERS, 2.68's complexity budget). */
 export interface TradeQueryRaw {
+  /** The full request JSON: {query: {filters, status, stats}, sort, engine}; stats[0] is the weight group, no empty groups. */
   queryJson: string;
   pobMessage: string | null;
   capLifted: boolean;
@@ -29,7 +30,7 @@ export interface TradeModsResult {
   }[];
 }
 
-export const MAX_FILTERS = 36; // PoB's MAX_FILTERS (TradeQueryGenerator.lua)
+export const MAX_FILTERS = 36; // PoB 2.67's MAX_FILTERS (TradeQueryGenerator.lua); the server's cap on every PoB version
 export const DEFAULT_STAT_WEIGHTS = [{ stat: 'FullDPS', weight: 1 }, { stat: 'TotalEHP', weight: 0.5 }];
 export const TRADE_TYPES = ['securable', 'available', 'onlineleague', 'online', 'any'] as const;
 export const ELDRITCH = ['copyCurrent', 'keepRegular', 'keepRegularPresence', 'remove'] as const;

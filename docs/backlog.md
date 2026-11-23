@@ -19,18 +19,6 @@ it plausible.
 Raised by reviewers of the 2026-11-12 fix set (merged as `a4b9218e`) and left
 for later.
 
-- ~~**PoB `dev` branch does not parse under plain LuaJIT.**~~ **Fixed.** PoB 2.68
-  uses compound assignments (`count += 1` in `Modules/Main.lua`, `url ..= ...` in
-  `Classes/CompareBuySimilar.lua`) that only PoB's patched LuaJIT parses. Every PoB
-  file the bridge loads (`LoadModule`, `PLoadModule`, `require`, `Launch.lua`) now
-  goes through `lua/compound-assign.lua`: the file is loaded as-is first, and only
-  if that fails to parse are its compound assignments rewritten in memory to
-  `x = x + (...)` (line numbers preserved; the original error is raised if the
-  retry fails too; nothing is written to the PoB install). Limitations of the
-  rewrite are listed at the top of that file. `test:lua-compat` covers it without
-  PoB. The same change adapts the bridge to 2.68's split constructors
-  (`new("Item"):Item(raw)`), so 2.68.1 boots and passes `test:bridge`/`test:session`.
-  CI still pins `v2.67.2`; moving the pin to a 2.68 tag is separate work.
 - **Trade search on PoB 2.68: known gaps.** `generate_trade_search` works on 2.67
   and 2.68 (the bridge lifts 2.68's complexity budget through a scoped line hook,
   turns its query table into the 2.67 JSON shape and drops its empty `and`/`not`

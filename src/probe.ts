@@ -20,7 +20,7 @@
 // the build never changes.
 
 import type { Stats } from './lua-bridge.js';
-import { UserError, validateItemText, validateSlot } from './validation.js';
+import { UserError, normalizeItemText, validateItemText, validateSlot } from './validation.js';
 
 /** One gem change; group and gem indices are 1-based, as in get_skill_breakdown. */
 export type ProbeGemChange =
@@ -151,18 +151,26 @@ export function validateProbeRequest(request: unknown): ProbeRequest {
  * Checks done here rather than in the engine, with the rules the mutating
  * tools use: swap_item's slot and item-text checks, set_config's config
  * validation (set_config's schema takes booleans, numbers and strings only,
- * so a null value is refused here too).
+ * so a null value is refused here too). Returns the variant to send to the
+ * engine: item text normalized as swap_item sends it (a leading BOM removed).
  */
-async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<void> {
+async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<ProbeVariant> {
   if (!isPlainObject(variant)) throw new UserError('each variant must be an object');
+  let toEngine = variant;
   if (Array.isArray(variant.items)) {
+    const items: unknown[] = [];
     for (const entry of variant.items) {
       if (!isPlainObject(entry)) throw new UserError('each item must be { slot, itemText } or { slot, unequip: true }');
       validateSlot(entry.slot);
-      if (entry.unequip === true && entry.itemText === undefined) continue;
+      if (entry.unequip === true && entry.itemText === undefined) {
+        items.push(entry);
+        continue;
+      }
       if (entry.unequip !== undefined) throw new UserError('an item entry takes either itemText or unequip: true');
       validateItemText(entry.itemText);
+      items.push({ ...entry, itemText: normalizeItemText(entry.itemText as string) });
     }
+    toEngine = { ...variant, items };
   }
   if (variant.config !== undefined) {
     if (!isPlainObject(variant.config)) throw new UserError('config must be an object of config keys');
@@ -173,6 +181,7 @@ async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<void> {
     }
     await deps.validateConfig(variant.config);
   }
+  return toEngine as unknown as ProbeVariant;
 }
 
 function checkFallbackCap(count: number): void {
@@ -268,10 +277,12 @@ async function runFallback(
 export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeResponse> {
   const request = validateProbeRequest(input);
   const results: Array<ProbeVariantResult | undefined> = new Array(request.variants.length);
+  // What each variant sends to the engine (checked, item text normalized).
+  const variants: ProbeVariant[] = request.variants.slice();
   const toEngine: number[] = [];
   for (let i = 0; i < request.variants.length; i++) {
     try {
-      await checkVariant(deps, request.variants[i]);
+      variants[i] = await checkVariant(deps, request.variants[i]);
       toEngine.push(i);
     } catch (error) {
       if (!(error instanceof UserError)) throw error;
@@ -288,7 +299,7 @@ export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeRe
       cmd: 'probe',
       classifyOnly: true,
       stats: request.stats,
-      variants: chunk.map((i) => request.variants[i]),
+      variants: chunk.map((i) => variants[i]),
     });
     base ??= res.base;
     chunk.forEach((i, j) => {
@@ -309,7 +320,7 @@ export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeRe
       cmd: 'probe',
       stats: request.stats,
       useFullDPS: request.useFullDPS,
-      variants: chunk.map((i) => request.variants[i]),
+      variants: chunk.map((i) => variants[i]),
     });
     chunk.forEach((i, j) => {
       const raw = res.results?.[j] ?? {};
@@ -327,7 +338,7 @@ export async function runProbe(deps: ProbeDeps, input: unknown): Promise<ProbeRe
   // Defensive: the run pass may report a fallback the classify pass did not.
   checkFallbackCap(fallbacks.length);
   for (const fallback of fallbacks) {
-    results[fallback.index] = await runFallback(deps, request.variants[fallback.index], request, fallback);
+    results[fallback.index] = await runFallback(deps, variants[fallback.index], request, fallback);
   }
 
   return {

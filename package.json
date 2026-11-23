@@ -44,6 +44,7 @@
     "test:convert-tree": "tsx test/convert-tree-test.ts",
     "test:tree-restore": "tsx test/tree-restore-test.ts",
     "test:item-restore": "tsx test/item-restore-test.ts",
+    "test:wickerman": "tsx test/wickerman-test.ts",
     "test:skills-restore": "tsx test/skills-restore-test.ts",
     "test:crash-recovery": "tsx test/crash-recovery-test.ts",
     "test:trade": "tsx test/trade-search-test.ts",
