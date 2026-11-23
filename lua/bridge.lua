@@ -2343,6 +2343,10 @@ local function describeTreeNode(node, includeStats)
 		ascendancyName = node.ascendancyName,
 		alloc = node.alloc and true or false,
 	}
+	if node.type == "Mastery" and node.alloc and build.spec.masterySelections then
+		-- The chosen effect's id (get_passive_tree's `masteries` lists the options).
+		desc.effect = build.spec.masterySelections[node.id]
+	end
 	if includeStats then
 		desc.stats = copyStats(node.sd)
 	end
@@ -2483,8 +2487,9 @@ end
 local nodeBatch = { }
 
 -- `strict` (allocate_nodes / deallocate_nodes) also refuses a repeated id
--- and, when allocating, a mastery (choosing mastery effects is not supported)
--- or a node that is already allocated.
+-- and, when allocating, a mastery given without an effect (masteries are
+-- allocated through `masteries`, nodeBatch.resolveMasteries) or a node that
+-- is already allocated.
 function nodeBatch.strictChecks(nodes, allocating)
 	local seen = { }
 	for _, node in ipairs(nodes) do
@@ -2493,7 +2498,7 @@ function nodeBatch.strictChecks(nodes, allocating)
 		end
 		seen[node.id] = true
 		if allocating and node.type == "Mastery" then
-			userError("Node " .. nodeLabel(node) .. " is a mastery; allocating masteries (choosing a mastery effect) is not supported yet")
+			userError(nodeBatch.masteryInNodes(node))
 		end
 		if allocating and node.alloc then
 			userError("Node " .. nodeLabel(node) .. " is already allocated")
@@ -2533,6 +2538,282 @@ function nodeBatch.lostSince(before)
 	local lost = { }
 	for i, id in ipairs(ids) do lost[i] = before[id] end
 	return lost
+end
+
+-- ---------------------------------------------------------------------------
+-- Masteries. A mastery is allocated together with the effect chosen on it
+-- (PoB's TreeTab:SaveMasteryPopup: spec.masterySelections[id] = effect, then
+-- AllocNode); PassiveSpec:BuildAllDependsAndPaths gives an allocated mastery
+-- its effect's stats and drops a selection on a mastery that is not
+-- allocated, so a selection is set right before its node is allocated
+-- (allocNodesBatch). An allocated mastery changes effect by a new selection
+-- and a rebuild. Each effect can be chosen on one mastery only (PoB's mastery
+-- popup leaves out effects chosen elsewhere).
+-- ---------------------------------------------------------------------------
+
+nodeBatch.MAX_MASTERIES = 20
+nodeBatch.MAX_LISTED = 12
+
+function nodeBatch.masteryInNodes(node)
+	return "Node " .. nodeLabel(node) .. " is a mastery; pass it in `masteries` as { node, effect } "
+		.. "(get_passive_tree with `masteries` lists its effects)"
+end
+
+-- Passive points of the path that allocating `node` would add.
+function nodeBatch.pathPoints(node)
+	local n = 0
+	for _, pathNode in ipairs(node.path or { }) do
+		if not pathNode.ascendancyName and pathNode.type ~= "ClassStart" and pathNode.type ~= "AscendClassStart" then n = n + 1 end
+	end
+	return n
+end
+
+-- The mastery nodes named `name` (case-insensitive), allocated ones first,
+-- then by path points, then by id.
+function nodeBatch.masteriesNamed(name)
+	local target, out = name:lower(), { }
+	for _, node in pairs(build.spec.nodes) do
+		if node.type == "Mastery" and node.dn and node.dn:lower() == target then out[#out + 1] = node end
+	end
+	table.sort(out, function(a, b)
+		if (a.alloc and true or false) ~= (b.alloc and true or false) then return a.alloc and true or false end
+		local pa, pb = nodeBatch.pathPoints(a), nodeBatch.pathPoints(b)
+		if pa ~= pb then return pa < pb end
+		return a.id < b.id
+	end)
+	return out
+end
+
+function nodeBatch.reachable(node)
+	return node.alloc or (node.path ~= nil and #node.path > 0)
+end
+
+function nodeBatch.describeMasteryCandidate(node)
+	if node.alloc then
+		return tostring(node.id) .. " (allocated, effect " .. tostring(build.spec.masterySelections[node.id]) .. ")"
+	end
+	if not nodeBatch.reachable(node) then return tostring(node.id) .. " (unallocated, no path)" end
+	local points = nodeBatch.pathPoints(node)
+	return tostring(node.id) .. " (unallocated, " .. points .. " point" .. (points == 1 and "" or "s") .. " away)"
+end
+
+-- A mastery node by id or name. Masteries share names ("Life Mastery"), so a
+-- name resolves in steps: among the allocated masteries of that name, the one
+-- that has `effectRef` chosen already, else the only allocated one (an effect
+-- switch); with none allocated, the only unallocated one a path reaches.
+-- Anything else (several allocated ones, none with that effect; several
+-- reachable unallocated ones) is refused with their ids. To allocate another
+-- mastery of a name that is allocated already, pass its id.
+function nodeBatch.masteryNode(ref, label, effectRef)
+	local spec = build.spec
+	if type(ref) == "number" then
+		local node = spec.nodes[ref]
+		if not node then userError(label .. ": unknown node id " .. tostring(ref)) end
+		if node.type ~= "Mastery" then userError(label .. ": node " .. nodeLabel(node) .. " is not a mastery") end
+		return node
+	end
+	if type(ref) ~= "string" or ref == "" then userError(label .. ": node must be a node id or a mastery name") end
+	local all = nodeBatch.masteriesNamed(ref)
+	if #all == 0 then userError(label .. ": no mastery named \"" .. ref .. "\"") end
+	local allocated, usable = { }, { }
+	for _, node in ipairs(all) do
+		if node.alloc then allocated[#allocated + 1] = node end
+		if nodeBatch.reachable(node) then usable[#usable + 1] = node end
+	end
+	if #allocated > 0 then
+		if effectRef ~= nil then
+			-- The effect, as the masteries of this name offer it (they share their options).
+			local ok, effect = pcall(nodeBatch.masteryEffect, allocated[1], effectRef, label)
+			for _, node in ipairs(ok and allocated or { }) do
+				if spec.masterySelections[node.id] == effect then return node end
+			end
+		end
+		if #allocated == 1 then return allocated[1] end
+		usable = allocated
+	end
+	local pick = #usable > 0 and usable or all
+	if #pick == 1 then return pick[1] end
+	local listed = { }
+	for i = 1, math.min(#pick, nodeBatch.MAX_LISTED) do listed[i] = nodeBatch.describeMasteryCandidate(pick[i]) end
+	userError(label .. ": mastery name \"" .. ref .. "\" matches " .. #pick .. " nodes: " .. table.concat(listed, ", ")
+		.. (#pick > #listed and (" and " .. (#pick - #listed) .. " more") or "") .. ". Pass the node id instead.")
+end
+
+-- The effects a mastery node offers, as { effect = id, stats = text }.
+function nodeBatch.masteryEffectList(node)
+	local out = { }
+	for _, effect in ipairs(node.masteryEffects or { }) do
+		out[#out + 1] = { effect = effect.effect, stats = masteryEffectText(build.spec, effect.effect)
+			or table.concat(effect.stats or { }, " / ") }
+	end
+	return out
+end
+
+-- An effect of `node` by id or by text: the whole effect text or one of its
+-- lines (case-insensitive), else a part of its text that only one effect has.
+function nodeBatch.masteryEffect(node, ref, label)
+	local effects = nodeBatch.masteryEffectList(node)
+	local function options()
+		local shown = { }
+		for i, e in ipairs(effects) do shown[i] = tostring(e.effect) .. ": " .. e.stats end
+		return " Its effects: " .. table.concat(shown, "; ")
+	end
+	if type(ref) == "number" then
+		if not nodeOffersMasteryEffect(node, ref) then
+			userError(label .. ": mastery " .. nodeLabel(node) .. " does not offer effect " .. tostring(ref) .. "." .. options())
+		end
+		return ref
+	end
+	if type(ref) ~= "string" or ref:match("^%s*$") then userError(label .. ": effect must be an effect id or its text") end
+	local want = ref:lower():match("^%s*(.-)%s*$")
+	local partial = { }
+	for _, e in ipairs(effects) do
+		local text = e.stats:lower()
+		if text == want then return e.effect end
+		for line in (text .. " / "):gmatch("(.-) / ") do
+			if line == want then return e.effect end
+		end
+		if text:find(want, 1, true) then partial[#partial + 1] = e.effect end
+	end
+	if #partial == 1 then return partial[1] end
+	userError(label .. ": " .. (#partial > 1 and ("effect text \"" .. ref .. "\" matches " .. #partial .. " effects of mastery ")
+		or ("no effect of mastery ")) .. nodeLabel(node) .. (#partial > 1 and "; pass the effect id." or (" matches \"" .. ref .. "\".")) .. options())
+end
+
+-- Resolve and check a list of { node, effect } entries (user errors before
+-- any change). Returns { { node, id, effect } ... } in order. `opts.replay`
+-- (a crash replay of a committed change: node and effect are ids that were
+-- checked when the change was made) only resolves the ids. `opts.skip` (ids)
+-- are nodes the same change lists elsewhere, refused as listed twice;
+-- `opts.removed` (ids) are allocated nodes the same change deallocates (a
+-- deallocated node's dependents among them): a mastery among them is
+-- refused, since the change would remove it and re-allocate it with a path.
+-- Each entry carries `noop` when the mastery is allocated with that effect.
+function nodeBatch.resolveMasteries(entries, opts)
+	opts = opts or { }
+	if entries == nil then return { } end
+	if type(entries) ~= "table" then userError("masteries must be an array of { node, effect }") end
+	if #entries > nodeBatch.MAX_MASTERIES then
+		userError("masteries has " .. #entries .. " entries; at most " .. nodeBatch.MAX_MASTERIES .. " are allowed")
+	end
+	local spec = build.spec
+	local out, seen, byEffect = { }, { }, { }
+	for i, entry in ipairs(entries) do
+		local label = "masteries[" .. i .. "]"
+		if type(entry) ~= "table" or entry.node == nil or entry.effect == nil then
+			userError(label .. " must be { node, effect }")
+		end
+		local node = nodeBatch.masteryNode(entry.node, label, not opts.replay and entry.effect or nil)
+		local effect = opts.replay and tonumber(entry.effect) or nodeBatch.masteryEffect(node, entry.effect, label)
+		if not opts.replay then
+			if seen[node.id] or (opts.skip and opts.skip[node.id]) then userError("Node " .. nodeLabel(node) .. " is listed twice") end
+			if opts.removed and opts.removed[node.id] then
+				userError(label .. ": mastery " .. nodeLabel(node) .. " is removed by this change's deallocation (it depends on a "
+					.. "deallocated node); deallocate it too, or keep the node it depends on")
+			end
+			if spec.hashOverrides and spec.hashOverrides[node.id] then
+				userError(label .. ": mastery " .. nodeLabel(node) .. " carries a tattoo or runegraft; its effect cannot be chosen")
+			end
+			if not nodeBatch.reachable(node) then
+				userError("Node " .. nodeLabel(node) .. " cannot be allocated: no path from the allocated tree reaches it")
+			end
+			if byEffect[effect] then
+				userError(label .. ": effect " .. effect .. " is also chosen for mastery " .. nodeLabel(byEffect[effect])
+					.. " in this change; each mastery effect can be chosen on one mastery only")
+			end
+		end
+		seen[node.id] = true
+		byEffect[effect] = node
+		out[#out + 1] = { node = node, id = node.id, effect = effect,
+			noop = (node.alloc and spec.masterySelections[node.id] == effect) and true or nil }
+	end
+	if not opts.replay then
+		-- Taken on a mastery this change leaves alone (PoB's mastery popup
+		-- does not offer an effect chosen on another mastery).
+		for otherId, effect in pairs(spec.masterySelections or { }) do
+			local mine = byEffect[effect]
+			if mine and mine.id ~= otherId and not seen[otherId] then
+				local other = spec.nodes[otherId]
+				userError("Effect " .. effect .. " (" .. tostring(masteryEffectText(spec, effect)) .. ") is already chosen on mastery "
+					.. (other and nodeLabel(other) or tostring(otherId)) .. "; each mastery effect can be chosen on one mastery only")
+			end
+		end
+	end
+	return out
+end
+
+-- What a committed mastery change reports: { id, name, effect, stats, previousEffect? }.
+function nodeBatch.describeMastery(id, previous)
+	local spec = build.spec
+	local node = spec.nodes[id]
+	local effect = spec.masterySelections[id]
+	return { id = id, name = node and node.dn, effect = effect, stats = effect and masteryEffectText(spec, effect),
+		previousEffect = previous }
+end
+
+-- True when every mastery entry is a no-op (allocated with that effect already).
+function nodeBatch.allNoop(masteries)
+	for _, m in ipairs(masteries) do
+		if not m.noop then return false end
+	end
+	return true
+end
+
+-- A change that changes nothing (only no-op mastery entries): no rebuild, no
+-- recalculation, and the caller pushes no undo entry or journal record.
+function nodeBatch.unchanged(masteries)
+	local out = { }
+	for i, m in ipairs(masteries) do out[i] = nodeBatch.describeMastery(m.id, m.effect) end
+	return { added = { }, removed = { }, masteries = out, unchanged = true }
+end
+
+-- get_passive_tree's `masteries`: each referenced mastery (a name lists
+-- every mastery of that name, allocated ones first, at most MAX_LISTED) with
+-- its effects; `takenBy` names another mastery that has an effect chosen.
+function nodeBatch.masteryOptions(refs)
+	if type(refs) ~= "table" then userError("masteries must be an array of node ids or mastery names") end
+	if #refs > nodeBatch.MAX_MASTERIES then
+		userError("masteries has " .. #refs .. " entries; at most " .. nodeBatch.MAX_MASTERIES .. " are allowed")
+	end
+	local spec = build.spec
+	local takenBy = { }
+	for id, effect in pairs(spec.masterySelections or { }) do takenBy[effect] = id end
+	local out, listed = { }, { }
+	for i, ref in ipairs(refs) do
+		local label = "masteries[" .. i .. "]"
+		local nodes, more = { }, 0
+		if type(ref) == "number" then
+			nodes[1] = nodeBatch.masteryNode(ref, label)
+		elseif type(ref) == "string" and ref ~= "" then
+			local all = nodeBatch.masteriesNamed(ref)
+			if #all == 0 then userError(label .. ": no mastery named \"" .. ref .. "\"") end
+			for j = 1, math.min(#all, nodeBatch.MAX_LISTED) do nodes[j] = all[j] end
+			more = #all - #nodes
+		else
+			userError(label .. " must be a node id or a mastery name")
+		end
+		for _, node in ipairs(nodes) do
+			if not listed[node.id] then
+				listed[node.id] = true
+				local options = { }
+				for j, e in ipairs(nodeBatch.masteryEffectList(node)) do
+					local owner = takenBy[e.effect]
+					options[j] = { effect = e.effect, stats = e.stats, takenBy = owner ~= node.id and owner or nil }
+				end
+				local entry = { id = node.id, name = node.dn, allocated = node.alloc and true or false, options = options }
+				if node.alloc then
+					entry.effect = spec.masterySelections[node.id]
+				elseif nodeBatch.reachable(node) then
+					entry.points = nodeBatch.pathPoints(node)
+				else
+					entry.reachable = false
+				end
+				out[#out + 1] = entry
+			end
+		end
+		if more > 0 then out[#out + 1] = { name = ref, more = more } end
+	end
+	return out
 end
 
 -- A strict batch (allocate_nodes / deallocate_nodes) records what it changed
@@ -2609,10 +2890,37 @@ buildEdit.COMMANDS = { applyChanges = true, createSocketGroup = true, deleteSock
 -- between processes): what a crash replay needs. Nodes are looked up by id
 -- at every step: an earlier node of the batch may have rebuilt the cluster
 -- jewel graphs.
-local function allocNodesBatch(nodeIds, strict)
+-- `masteries` (resolved by nodeBatch.resolveMasteries: { id, effect } each)
+-- are masteries to allocate with that effect, or allocated ones to give that
+-- effect. Unallocated ones not in nodeIds are allocated after nodeIds (a
+-- crash replay lists them in nodeIds, in join order); each selection is set
+-- right before its node is allocated, those of allocated masteries first.
+-- `masteries` in the result: { id, name, effect, stats, previousEffect? } each.
+local function allocNodesBatch(nodeIds, strict, masteries)
 	if strict then nodeBatch.record = { } end
+	masteries = masteries or { }
 	local nodes = batchNodes(nodeIds)
 	if strict then nodeBatch.strictChecks(nodes, true) end
+	local effectOf, previous = { }, { }
+	do
+		local requested = { }
+		for _, id in ipairs(nodeIds) do requested[id] = true end
+		local extended = { }
+		for i, id in ipairs(nodeIds) do extended[i] = id end
+		for _, m in ipairs(masteries) do
+			effectOf[m.id] = m.effect
+			previous[m.id] = build.spec.masterySelections[m.id]
+			local node = build.spec.nodes[m.id]
+			if node and not node.alloc and not requested[m.id] then
+				extended[#extended + 1] = m.id
+				nodes[#nodes + 1] = node
+			end
+		end
+		nodeIds = extended
+	end
+	for _, node in ipairs(nodes) do
+		if node.type == "Mastery" and not node.alloc and not effectOf[node.id] then userError(nodeBatch.masteryInNodes(node)) end
+	end
 	local choiceParent = { }
 	for _, node in ipairs(nodes) do
 		-- PassiveSpec:AllocNode silently does nothing for a node no path
@@ -2635,8 +2943,12 @@ local function allocNodesBatch(nodeIds, strict)
 	local before = nodeBatch.captureAllocated()
 	local order, listed = { }, { }
 	withTreeRollback(function()
+		local spec = build.spec
+		for _, m in ipairs(masteries) do
+			if spec.allocNodes[m.id] then spec.masterySelections[m.id] = m.effect end
+		end
 		for i, id in ipairs(nodeIds) do
-			local node = build.spec.nodes[id]
+			local node = spec.nodes[id]
 			if not node then
 				userError("Node " .. nodeLabel(nodes[i]) .. " no longer exists after an earlier node of the batch rebuilt the cluster jewel graphs")
 			end
@@ -2649,11 +2961,19 @@ local function allocNodesBatch(nodeIds, strict)
 					order[#order + 1] = pathNode.id
 				end
 			end
-			build.spec:AllocNode(node)
+			if effectOf[id] then spec.masterySelections[id] = effectOf[id] end
+			spec:AllocNode(node)
 		end
+		-- Allocated masteries whose effect changed get it from the rebuild.
+		if #masteries > 0 then spec:BuildAllDependsAndPaths() end
 		for i, id in ipairs(nodeIds) do
-			if not build.spec.allocNodes[id] then
+			if not spec.allocNodes[id] then
 				userError("Node " .. nodeLabel(nodes[i]) .. " could not be allocated")
+			end
+		end
+		for _, m in ipairs(masteries) do
+			if spec.masterySelections[m.id] ~= m.effect then
+				userError("Mastery " .. nodeLabel(spec.nodes[m.id]) .. " could not be given effect " .. tostring(m.effect))
 			end
 		end
 	end)
@@ -2670,6 +2990,10 @@ local function allocNodesBatch(nodeIds, strict)
 	table.sort(extra)
 	for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
 	local result = { added = added, removed = nodeBatch.lostSince(before) }
+	if #masteries > 0 then
+		result.masteries = { }
+		for i, m in ipairs(masteries) do result.masteries[i] = nodeBatch.describeMastery(m.id, previous[m.id]) end
+	end
 	build.buildFlag = true
 	nodeBatch.recordApplied(strict, result)
 	runCallback("OnFrame")
@@ -4315,8 +4639,23 @@ local DISPATCH = {
 		mutating = true,
 	},
 	allocNodes = {
-		handler = function(cmd) return allocNodesBatch(cmd.nodeIds or { }, cmd.strict == true) end,
+		-- `masteries`: [{ node, effect }] (allocate_nodes: ids or names; a
+		-- crash replay: the ids recorded, its nodeIds listing the masteries it
+		-- allocated in join order).
+		handler = function(cmd)
+			local strict = cmd.strict == true
+			local skip = { }
+			for _, id in ipairs(type(cmd.nodeIds) == "table" and cmd.nodeIds or { }) do skip[id] = true end
+			local masteries = nodeBatch.resolveMasteries(cmd.masteries, { replay = not strict, skip = strict and skip or nil })
+			if strict and #masteries > 0 and #(cmd.nodeIds or { }) == 0 and nodeBatch.allNoop(masteries) then
+				return nodeBatch.unchanged(masteries)
+			end
+			return allocNodesBatch(cmd.nodeIds or { }, strict, masteries)
+		end,
 		mutating = true,
+	},
+	masteryOptions = {
+		handler = function(cmd) return { masteries = nodeBatch.masteryOptions(cmd.nodes) } end,
 	},
 	deallocNodes = {
 		handler = function(cmd) return deallocNodesBatch(cmd.nodeIds or { }, cmd.strict == true) end,

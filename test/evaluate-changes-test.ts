@@ -15,6 +15,11 @@
 //      unchanged afterwards.
 //   5. rankBy "Life" with order "asc", a custom stats list with an unknown key
 //      (null base and delta), and a node name nobody has.
+//  12. Masteries and mainSkill (ConvertTreeMasteries.xml, a 3.24 tree): two
+//      effects of one mastery (by id and by text) and a `mainSkill` row run
+//      through the calculator; each row's deltas equal the change committed
+//      (allocate_nodes `masteries` / set_main_skill) + get_stats; the export
+//      stays byte-identical and the undo depth unchanged.
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -55,6 +60,12 @@ function log(msg: string): void {
 }
 
 const num = (v: unknown): number => (typeof v === 'number' ? v : NaN);
+
+/** The export is byte-identical to `xml0` (masteries / mainSkill section). */
+async function assertExportUnchanged2(session: BuildSession, xml0: string, after: string): Promise<void> {
+  const xml = await session.exportXML();
+  assert(xml === xml0, `export changed after ${after}`);
+}
 const sameNumber = (a: unknown, b: unknown): boolean => a === b || (Number.isNaN(a) && Number.isNaN(b));
 
 async function main(): Promise<void> {
@@ -513,6 +524,55 @@ async function main(): Promise<void> {
     assert(tooMany instanceof Error && tooMany.constructor.name === 'UserError' && /50 requested plus 1 more/.test(tooMany.message) && /ExtraStat51/.test(tooMany.message) && !/Life/.test(tooMany.message),
       `too many stats: ${String(tooMany)}`);
     log('   PASS');
+
+    log('12. Masteries and mainSkill (ConvertTreeMasteries.xml, a 3.24 tree)');
+    {
+      await session.loadBuild(readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8'));
+      const mXml = await session.exportXML();
+      const mUndo = undoDepth();
+      const mStats = await session.getStats();
+      const life = (await session.getPassiveTree([2841])).masteryOptions![0];
+      const free = (life.options ?? []).filter((o) => o.takenBy === undefined && o.effect !== life.effect);
+      assert(free.length >= 2, 'two free effects on Life Mastery 2841');
+      const effectA = free[0];
+      const effectB = free[1];
+      const ranked = await evaluateChanges(session, {
+        variants: [
+          { label: 'A', masteries: [{ node: 2841, effect: effectA.effect }] },
+          { label: 'B', masteries: [{ node: 2841, effect: effectB.stats }] },
+          { label: 'other skill', mainSkill: { group: 2, activeSkill: 2 } },
+        ],
+        rankBy: 'Life',
+        stats: ['Life', 'CombinedDPS', 'TotalEHP'],
+      });
+      assert(ranked.failed === 0 && ranked.fallbacks === 0, `no failure, no fallback: ${JSON.stringify(ranked.results)}`);
+      await assertExportUnchanged2(session, mXml, 'evaluate_changes with masteries / mainSkill');
+      assert(undoDepth() === mUndo, 'undo depth unchanged');
+      const lifeRows = ranked.results.filter((r) => r.label === 'A' || r.label === 'B');
+      assert(lifeRows.length === 2 && (lifeRows[0].delta!.Life ?? 0) >= (lifeRows[1].delta!.Life ?? 0), `ranked by Life: ${JSON.stringify(lifeRows)}`);
+      // Each row equals the change committed (allocate_nodes / set_main_skill) + get_stats, then undone.
+      const committed = async (commit: () => Promise<unknown>): Promise<Stats> => {
+        await commit();
+        const stats = await session.getStats();
+        await session.undoLastChange();
+        return stats;
+      };
+      const expected: Record<string, Stats> = {
+        A: await committed(() => session.allocateNodes([], [{ node: 2841, effect: effectA.effect }])),
+        B: await committed(() => session.allocateNodes([], [{ node: 2841, effect: effectB.effect }])),
+        'other skill': await committed(() => session.setMainSkill(2, 2)),
+      };
+      for (const row of ranked.results) {
+        const after = expected[row.label!];
+        for (const key of ['Life', 'CombinedDPS', 'TotalEHP']) {
+          const want = roundStat(num(after[key]) - num(mStats[key]));
+          assert(sameNumber(row.delta![key], want), `${row.label} ${key}: evaluate_changes delta ${row.delta![key]} != committed ${want}`);
+        }
+      }
+      assert(ranked.results.find((r) => r.label === 'other skill')!.delta!.CombinedDPS !== 0, 'the other main skill changes CombinedDPS');
+      await assertExportUnchanged2(session, mXml, 'the commits and undos');
+      log('   PASS: two mastery effects ranked, mainSkill row, each equal to the committed change; build unchanged');
+    }
 
     console.log('\nAll evaluate_changes tests passed.');
   } finally {

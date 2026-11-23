@@ -18,7 +18,8 @@ import {
 } from './build-session.js';
 import { registerBuildEditTools } from './build-edit-tools.js';
 import { registerCompareBuilds } from './compare-builds.js';
-import { registerEvaluateChanges } from './evaluate-changes.js';
+import { masteriesSchema, registerEvaluateChanges } from './evaluate-changes.js';
+import type { ProbeMasteryChoice } from './probe.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
 import type { Stats } from './lua-bridge.js';
@@ -430,23 +431,32 @@ function compactTree(tree: PassiveTreeInfo): unknown {
       name: n.name,
       type: n.type,
       ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
-      ...(n.isMastery || n.type === 'Mastery' ? { stats: n.stats ?? [] } : {}),
+      ...(n.isMastery || n.type === 'Mastery' ? { effect: n.effect, stats: n.stats ?? [] } : {}),
     })),
+    ...(tree.masteryOptions ? { masteryOptions: tree.masteryOptions } : {}),
   };
 }
 
-tools.engine<{ detail?: 'summary' | 'full' }>(
+tools.engine<{ detail?: 'summary' | 'full'; masteries?: Array<string | number> }>(
   'get_passive_tree',
   {
     description:
-      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type; allocated masteries also carry `stats`, their chosen effect). ' +
-      '`detail: "full"` returns every allocated node with all its fields and stats.',
+      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type; allocated masteries also carry `effect`, the chosen effect id, and `stats`, its text). ' +
+      '`detail: "full"` returns every allocated node with all its fields and stats. ' +
+      '`masteries` (node ids or mastery names, e.g. "Life Mastery") adds `masteryOptions`: per mastery node its id, name, `allocated`, the chosen `effect`, `points` (path cost when unallocated) or `reachable: false`, and `options` [{effect, stats, takenBy?}] (takenBy: another mastery that has that effect chosen; each effect can be chosen once). ' +
+      `A name lists every mastery of that name (allocated ones first, then the cheapest; at most 12, then {name, more}). Choose effects with allocate_nodes / evaluate_changes / apply_changes \`masteries\`.`,
     inputSchema: {
       detail: detailSchema.optional().describe('"summary" (default) or "full" (every allocated node with its stats and flags).'),
+      masteries: z
+        .array(z.union([z.number().int(), z.string().min(1)]))
+        .min(1)
+        .max(20)
+        .optional()
+        .describe('Mastery node ids or names whose effect options to list.'),
     },
   },
-  async ({ detail }, session) => {
-    const tree = await session.getPassiveTree();
+  async ({ detail, masteries }, session) => {
+    const tree = await session.getPassiveTree(masteries);
     return detail === 'full' ? tree : compactTree(tree);
   },
 );
@@ -524,10 +534,14 @@ function treeEditResponse(result: TreeEditResult, verb: 'allocated' | 'deallocat
   const s = result.summary;
   const changed = verb === 'allocated' ? result.added : result.removed;
   const cost = pointCounts(changed);
+  if (result.unchanged) {
+    return { status: 'unchanged', masteries: result.masteries ?? [], message: 'Every mastery already has that effect; nothing was changed or pushed to undo.' };
+  }
   return {
     status: verb,
     ...(verb === 'allocated' ? { added: result.added.map(node) } : {}),
     ...(result.removed.length > 0 ? { removed: result.removed.map(node) } : {}),
+    ...(result.masteries && result.masteries.length > 0 ? { masteries: result.masteries } : {}),
     ...(verb === 'allocated'
       ? { pointsUsed: cost.points, ascendancyPointsUsed: cost.ascendancyPoints }
       : { pointsRefunded: cost.points, ascendancyPointsRefunded: cost.ascendancyPoints }),
@@ -543,18 +557,24 @@ function treeEditResponse(result: TreeEditResult, verb: 'allocated' | 'deallocat
   };
 }
 
-tools.engine<{ nodes: Array<string | number> }>(
+tools.engine<{ nodes?: Array<string | number>; masteries?: ProbeMasteryChoice[] }>(
   'allocate_nodes',
   {
     description:
       "Allocate passive nodes in the build, each together with its shortest path from the allocated tree (as clicking it in PoB, simulate_passive_change and find_best_next_nodes do), and return the nodes added, the points used, the tree's point totals and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes the change). " +
-      'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, already allocated, a mastery (choosing mastery effects is not supported yet), listed twice, cannot be allocated because no path from the allocated tree reaches it, or is a second option of the same choice node. ' +
-      'A node name resolves among the unallocated nodes a path reaches; a name several of them share (e.g. "Strength") is refused with the candidate ids, so pass ids for those. `removed` lists any node the change deallocated (another option of a choice node). At most 50 nodes.',
+      '`masteries` [{node, effect}] allocates masteries (with their path, after `nodes`) with the chosen effect, or switches an allocated mastery to another effect (to clear a mastery, deallocate it with deallocate_nodes); get_passive_tree `masteries` lists the effect ids. ' +
+      'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, already allocated, a mastery listed in `nodes`, listed twice, cannot be allocated because no path from the allocated tree reaches it, or is a second option of the same choice node, or a mastery effect is not offered by that mastery or already chosen on another one. ' +
+      'A node name resolves among the unallocated nodes a path reaches; a name several of them share (e.g. "Strength") is refused with the candidate ids, so pass ids for those (a mastery name, e.g. "Life Mastery", picks the allocated mastery that has the effect, else the only allocated one of that name, else the only reachable one; pass an id to allocate a second one); masteries that already have their effect alone return `status: "unchanged"` and push nothing. `removed` lists any node the change deallocated (another option of a choice node); `masteries` the masteries given an effect (with `previousEffect` when switched). At most 50 nodes and 20 masteries.',
     inputSchema: {
-      nodes: nodeRefsSchema.describe('Node names (e.g. "Resolute Technique") or numeric node IDs to allocate.'),
+      nodes: z
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .max(50)
+        .optional()
+        .describe('Node names (e.g. "Resolute Technique") or numeric node IDs to allocate.'),
+      masteries: masteriesSchema.optional(),
     },
   },
-  async ({ nodes }, session) => treeEditResponse(await session.allocateNodes(nodes), 'allocated'),
+  async ({ nodes, masteries }, session) => treeEditResponse(await session.allocateNodes(nodes ?? [], masteries ?? []), 'allocated'),
 );
 
 tools.engine<{ nodes: Array<string | number> }>(

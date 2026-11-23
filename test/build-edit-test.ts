@@ -34,6 +34,21 @@
 //      restores the pre-call build.
 //   6. Through the MCP server: the four tools are listed as undoable,
 //      apply_changes echoes the label and reports points, undo reverts.
+//   7. Masteries and the main skill (ConvertTreeMasteries.xml, a 3.24 tree):
+//      (a) a `mainSkill` variant (group 2, its second active skill) equals
+//      the probe, evaluate_changes and set_main_skill + get_stats; (b) a
+//      variant switching an allocated mastery's effect, allocating another
+//      mastery with its path (a fallback: two mastery changes) and setting
+//      the main skill equals the probe, the export holds both effects and
+//      the result lists them; undo restores exactly; (c) a crash replays it;
+//      (d) refusals (an effect the mastery does not offer, a mastery in
+//      `allocate`, an out-of-range main skill group / active skill) change
+//      nothing; (e) a deallocation that removes a listed mastery is refused
+//      alike by evaluate_changes and apply_changes, a deallocation plus a
+//      switch on another mastery equals evaluate_changes, `mainSkill` with an
+//      item granting a skill is refused by both, and a variant of only
+//      masteries that already have their effect is `unchanged` (nothing
+//      pushed or journaled).
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
@@ -156,9 +171,9 @@ function assertSame(label: string, actual: State, expected: State): void {
 }
 
 /** A session on a build already in PoB's re-read form (loading a fresh XML is not byte-idempotent once). */
-async function primedSession(bridge: LuaBridge): Promise<BuildSession> {
+async function primedSession(bridge: LuaBridge, xml = occXml): Promise<BuildSession> {
   const session = new BuildSession(bridge);
-  await session.loadBuild(occXml);
+  await session.loadBuild(xml);
   await session.loadBuild(await session.exportXML());
   return session;
 }
@@ -658,6 +673,140 @@ async function test6Mcp(): Promise<void> {
   log('PASS 6');
 }
 
+const MASTERY_FIXTURE = path.resolve(testDir, 'fixtures', 'ConvertTreeMasteries.xml');
+const LIFE_MASTERY = 2841; // allocated, effect 64381; 34242 and 47642 are chosen on 12125 / 12382
+
+function specMasteries(xml: string): string[] {
+  const m = /<Spec\b[^>]*\bmasteryEffects="([^"]*)"/.exec(xml);
+  assert(m, 'export has no masteryEffects attribute');
+  return (m[1].match(/\{\d+,\d+\}/g) ?? []).sort();
+}
+
+async function test7MasteriesAndMainSkill(): Promise<void> {
+  const masteryXml = readFileSync(MASTERY_FIXTURE, 'utf8');
+  const bridge = newBridge();
+  const session = await primedSession(bridge, masteryXml);
+  const base = await state(session);
+
+  log('Test 7a: a mainSkill variant equals set_main_skill + get_stats');
+  const mainOnly: NamedProbeVariant = { mainSkill: { group: TWO_ACTIVES_GROUP, activeSkill: 2 } };
+  let applied: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+  await assertParity('mainSkill', session, mainOnly, async () => {
+    applied = await session.applyChanges(mainOnly);
+    return applied.after;
+  });
+  assert(applied, 'applied');
+  assert(applied.mainSkill === 'Cold Snap', `main skill after: ${applied.mainSkill}`);
+  assert(toNumber(applied.after.CombinedDPS) !== toNumber(base.stats.CombinedDPS), 'another main skill changes DPS');
+  assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'one undo entry, one journal record');
+  await session.undoLastChange();
+  assertSame('undo of the mainSkill variant', await state(session), base);
+  const viaTool = await session.setMainSkill(TWO_ACTIVES_GROUP, 2);
+  assertSameStats('apply_changes mainSkill = set_main_skill', viaTool.after, applied.after);
+  await session.undoLastChange();
+  assertSame('undo of set_main_skill', await state(session), base);
+  log('PASS 7a');
+
+  log('Test 7b: masteries + mainSkill in one variant (fallback), undo exact');
+  const life = (await session.getPassiveTree([LIFE_MASTERY])).masteryOptions![0];
+  const free = (life.options ?? []).filter((o) => o.takenBy === undefined && o.effect !== life.effect);
+  const other = ((await session.getPassiveTree(['Life Mastery'])).masteryOptions ?? [])
+    .filter((m) => !m.allocated && m.points !== undefined)
+    .sort((a, b) => a.points! - b.points!)[0];
+  assert(free.length >= 2 && other, 'two free Life Mastery effects and a reachable unallocated Life Mastery');
+  const mixed: NamedProbeVariant = {
+    masteries: [{ node: LIFE_MASTERY, effect: free[0].effect }, { node: other.id!, effect: free[1].stats }],
+    mainSkill: { group: TWO_ACTIVES_GROUP },
+  };
+  const probed = await session.probeNamed({ variants: [mixed] });
+  assert(probed.results[0].fallback === true, `two mastery changes take the fallback: ${JSON.stringify(probed.results[0])}`);
+  let result: Awaited<ReturnType<BuildSession['applyChanges']>> | undefined;
+  await assertParity('masteries + mainSkill', session, mixed, async () => {
+    result = await session.applyChanges(mixed);
+    return result.after;
+  });
+  assert(result, 'applied');
+  const masteries = result.masteries ?? [];
+  assert(masteries.length === 2 && masteries[0].id === LIFE_MASTERY && masteries[0].effect === free[0].effect && masteries[0].previousEffect === 64381
+    && masteries[1].id === other.id && masteries[1].effect === free[1].effect, `masteries: ${JSON.stringify(masteries)}`);
+  assert(result.added.length === other.points && result.added[result.added.length - 1].id === other.id, `added: ${JSON.stringify(result.added)}`);
+  const mixedState = await state(session);
+  const effects = specMasteries(mixedState.xml);
+  assert(effects.includes(`{${LIFE_MASTERY},${free[0].effect}}`) && effects.includes(`{${other.id},${free[1].effect}}`), `export effects: ${effects}`);
+  assert(session.undoStackDepth() === 1 && bridge.committedCount() === 1, 'one undo entry, one journal record');
+  await session.undoLastChange();
+  assertSame('undo of masteries + mainSkill', await state(session), base);
+  log('PASS 7b');
+
+  log('Test 7c: a crash replays it');
+  await session.applyChanges(mixed);
+  const again = await state(session);
+  assertSame('the same variant applied again', again, mixedState);
+  await crash(bridge);
+  await expectRestart('after apply_changes with masteries', session.getStats());
+  assertSame('respawned after apply_changes with masteries', await state(session), again);
+  log('PASS 7c');
+
+  log('Test 7d: refusals change nothing');
+  const now = await state(session);
+  const depth = session.undoStackDepth();
+  const journal = bridge.committedCount();
+  const refusals: Array<[string, NamedProbeVariant, RegExp]> = [
+    ['effect not offered', { masteries: [{ node: 12125, effect: 41322 }] }, /does not offer effect 41322/],
+    ['mastery in allocate', { allocate: [other.id!] }, /is a mastery; pass it in `masteries`/],
+    ['main skill group out of range', { mainSkill: { group: 99 } }, /Skill group not found at index 99/],
+    ['active skill out of range', { mainSkill: { group: TWO_ACTIVES_GROUP, activeSkill: 3 } }, /out of range/],
+    ['mixed with a bad effect', { config: { usePowerCharges: true }, masteries: [{ node: 12125, effect: 'no such effect text' }] }, /no effect of mastery/],
+  ];
+  for (const [label, variant, pattern] of refusals) {
+    const e = await rejection(session.applyChanges(variant));
+    assert(e instanceof UserError && pattern.test(e.message), `${label}: ${e.constructor.name}: ${e.message}`);
+    assertSame(`${label}: unchanged`, await state(session), now);
+    assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, `${label}: undo/journal changed`);
+  }
+  log('PASS 7d');
+
+  log('Test 7e: a deallocation that removes a listed mastery; mainSkill with a skill-granting item; a no-op');
+  // A node whose deallocation removes an allocated mastery (one of its dependents).
+  const masteryIds = new Set((await session.getPassiveTree()).allocatedNodes.filter((n) => n.type === 'Mastery').map((n) => n.id));
+  const deallocs = (await bridge.send<{ nodes: Array<{ id: number; type: string; nodes: number[]; fallback?: string }> }>({ cmd: 'probe', candidates: 'deallocate' })).nodes;
+  const carrier = deallocs.find((c) => !c.fallback && c.nodes.slice(1).some((id) => masteryIds.has(id)));
+  assert(carrier, 'an allocated node with a mastery among its dependents');
+  const dependent = carrier.nodes.slice(1).find((id) => masteryIds.has(id))!;
+  const dependentEffect = ((await session.getPassiveTree([dependent])).masteryOptions![0]).effect!;
+  // Refused the same way by evaluate_changes and apply_changes (the calculator
+  // would drop the mastery with its node, apply_changes re-allocate it).
+  const removedShape: NamedProbeVariant = { deallocate: [carrier.id], masteries: [{ node: dependent, effect: dependentEffect }] };
+  const evalRemoved = await evaluateChanges(session, { variants: [removedShape] });
+  assert(evalRemoved.results[0].userError === true && /removed by this change's deallocation/.test(evalRemoved.results[0].error ?? ''), `evaluate: ${JSON.stringify(evalRemoved.results[0])}`);
+  const applyRemoved = await rejection(session.applyChanges(removedShape));
+  assert(applyRemoved instanceof UserError && /removed by this change's deallocation/.test(applyRemoved.message), `apply: ${applyRemoved.message}`);
+  assertSame('refused deallocation + mastery: unchanged', await state(session), now);
+  // A deallocation plus a switch on a mastery it leaves alone: evaluate_changes (fallback) = apply_changes.
+  const alone = [...masteryIds].find((id) => !carrier.nodes.includes(id))!;
+  const aloneOpt = (await session.getPassiveTree([alone])).masteryOptions![0];
+  const aloneEffect = (aloneOpt.options ?? []).find((o) => o.takenBy === undefined && o.effect !== aloneOpt.effect)!;
+  const deallocAndSwitch: NamedProbeVariant = { deallocate: [carrier.id], masteries: [{ node: alone, effect: aloneEffect.effect }] };
+  await assertParity('deallocate + mastery switch', session, deallocAndSwitch, async () => (await session.applyChanges(deallocAndSwitch)).after);
+  await session.undoLastChange();
+  assertSame('undo of deallocate + mastery switch', await state(session), now);
+
+  const skillRing = 'Rarity: RARE\nSkill Ring\nCoral Ring\n+30 to maximum Life\nGrants Level 20 Summon Skitterbots Skill';
+  const withSkillItem: NamedProbeVariant = { items: [{ slot: 'Ring 1', itemText: skillRing }], mainSkill: { group: TWO_ACTIVES_GROUP } };
+  const evalSkill = await evaluateChanges(session, { variants: [withSkillItem, { items: [{ slot: 'Ring 1', itemText: skillRing }] }] });
+  const skillRow = evalSkill.results.find((r) => r.index === 0)!;
+  assert(skillRow.userError === true && /mainSkill cannot be combined/.test(skillRow.error ?? ''), `evaluate mainSkill + skill item: ${JSON.stringify(skillRow)}`);
+  assert(evalSkill.results.find((r) => r.index === 1)!.error === undefined, 'the item alone is evaluated');
+  const applySkill = await rejection(session.applyChanges(withSkillItem));
+  assert(applySkill instanceof UserError && /mainSkill cannot be combined/.test(applySkill.message), `apply mainSkill + skill item: ${applySkill.message}`);
+
+  const noop = await session.applyChanges({ masteries: [{ node: 12125, effect: 34242 }] });
+  assert(noop.unchanged === true && Object.keys(noop.diff).length === 0, `no-op apply_changes: ${JSON.stringify(noop.masteries)}`);
+  assertSame('after the refusals and the no-op', await state(session), now);
+  assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, 'nothing pushed or journaled');
+  log('PASS 7e');
+}
+
 async function main(): Promise<void> {
   try {
     await test1Parity();
@@ -666,6 +815,7 @@ async function main(): Promise<void> {
     await test4CrashReplay();
     await test5Faults();
     await test6Mcp();
+    await test7MasteriesAndMainSkill();
     log('ALL PASS');
   } finally {
     for (const b of bridges) await b.shutdown().catch(() => undefined);

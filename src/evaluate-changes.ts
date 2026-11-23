@@ -24,6 +24,7 @@ export const MAX_VARIANT_NODES = 50;
 export const MAX_VARIANT_ITEMS = 10;
 export const MAX_VARIANT_GEMS = 20;
 export const MAX_VARIANT_CONFIG_KEYS = 50;
+export const MAX_VARIANT_MASTERIES = 20;
 export const MAX_ITEM_TEXT = 10_000;
 export const MAX_LABEL = 100;
 
@@ -337,6 +338,33 @@ const gemChange = z.discriminatedUnion('op', [
   z.object({ op: z.literal('clear'), group: groupIndex }),
 ]);
 
+/** A mastery and the effect to choose on it (variants, allocate_nodes). */
+export const masteryChoiceSchema = z.object({
+  node: nodeRef.describe(
+    'Mastery node id, or its name: a name picks the allocated mastery of that name that has `effect` already, else the only allocated one (an effect switch), else the only one a path reaches; anything else is refused with the ids (pass an id to allocate a second mastery of a name).',
+  ),
+  effect: z
+    .union([z.number().int(), z.string().min(1).max(MAX_LABEL * 3)])
+    .describe('Effect id (get_passive_tree `masteries` lists them), or its text: the whole effect, one of its lines, or a part only one of its effects has.'),
+});
+
+export const masteriesSchema = z
+  .array(masteryChoiceSchema)
+  .max(MAX_VARIANT_MASTERIES)
+  .describe(
+    'Masteries to allocate (with their path from the allocated tree) with the given effect, or allocated masteries to switch to another effect. ' +
+      'Each effect can be chosen on one mastery only; a mastery the same change removes (it depends on a deallocated node) is refused. List effect ids with get_passive_tree `masteries`.',
+  );
+
+export const mainSkillSchema = z
+  .object({
+    group: groupIndex.describe('1-based socket group index from list_skill_groups.'),
+    activeSkill: groupIndex.optional().describe("1-based active skill within the group (default: the group's current choice)."),
+  })
+  .describe(
+    'The main skill to use, as set_main_skill sets it (applied after every other change of the variant; group indices as list_skill_groups shows them now). Refused with an item or node change that may add or remove item- or passive-granted skill groups: make that change first.',
+  );
+
 export const variantSchema = z.object({
   label: z.string().max(MAX_LABEL).optional().describe('Your name for the variant, echoed back.'),
   allocate: z.array(nodeRef).max(MAX_VARIANT_NODES).optional().describe('Passive nodes to allocate (names or ids), each with its path from the allocated tree.'),
@@ -367,6 +395,8 @@ export const variantSchema = z.object({
     })
     .optional()
     .describe('Config options as set_config takes them (e.g. {"enemyIsBoss":"Pinnacle"}).'),
+  masteries: masteriesSchema.optional(),
+  mainSkill: mainSkillSchema.optional(),
 });
 
 export function registerEvaluateChanges(tools: ToolRegistrar): void {
@@ -375,15 +405,15 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
     {
       description:
         `Try up to ${MAX_PROBE_VARIANTS} what-if variants of the build in one call and get a compact table ranked by one stat. ` +
-        'Each variant may combine passive nodes to allocate/deallocate (names or ids), items to equip or unequip, gem changes and config options; ' +
-        "they apply in the order config, gems, items, nodes. Every variant is evaluated through Path of Building's own calculator (a few ms each); " +
-        `variants it cannot reproduce exactly (several node changes in one variant, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored instead (~0.3-0.5 s each, at most ${MAX_FALLBACK_VARIANTS} per call) and marked \`fallback\`. ` +
+        'Each variant may combine passive nodes to allocate/deallocate (names or ids), mastery effects (`masteries` [{node, effect}]: allocate a mastery with that effect, or switch an allocated mastery to it), items to equip or unequip, gem changes, config options, and `mainSkill` {group, activeSkill?} (the stats are computed with that socket group as the main skill, e.g. "what does this tree do for my other skill?"); ' +
+        "they apply in the order config, gems, items, nodes and masteries, main skill. Every variant is evaluated through Path of Building's own calculator (a few ms each); " +
+        `variants it cannot reproduce exactly (several node or mastery changes in one variant, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored instead (~0.3-0.5 s each, at most ${MAX_FALLBACK_VARIANTS} per call) and marked \`fallback\`. ` +
         'NOTHING IS APPLIED TO THE BUILD and nothing is pushed to undo. To keep a winner, pass the same variant to apply_changes (one undoable step). ' +
         'Returns `base` (the requested stats now), then `results` sorted by the change of `rankBy` (default CombinedDPS, `order` desc): ' +
         'each row has `index` (position in `variants`), `label`, `value` (the variant\'s rankBy stat), `delta` (change of every requested stat, null when not a number), ' +
         '`pointsAdded` / `pointsRemoved` for node changes, and `fallback`. A refused variant (unknown node or gem, item that does not fit, bad config) is listed after the others with its `error`; the call still succeeds. ' +
         'Numbers are rounded to 2 decimals (4 significant digits below 1). A node name resolves among the nodes the change can apply to (unallocated ones for allocate, allocated ones for deallocate); a name several of them share (e.g. "Strength") refuses that variant with the candidate ids, so pass ids for those. ' +
-        `Per variant: at most ${MAX_VARIANT_NODES} nodes in each of allocate / deallocate, ${MAX_VARIANT_ITEMS} items, ${MAX_VARIANT_GEMS} gem changes, ${MAX_VARIANT_CONFIG_KEYS} config keys; at most ${MAX_NODE_NAMES} different node names per call. ` +
+        `Per variant: at most ${MAX_VARIANT_NODES} nodes in each of allocate / deallocate, ${MAX_VARIANT_MASTERIES} masteries, ${MAX_VARIANT_ITEMS} items, ${MAX_VARIANT_GEMS} gem changes, ${MAX_VARIANT_CONFIG_KEYS} config keys; at most ${MAX_NODE_NAMES} different node names per call. ` +
         'Optional `objective` {weights:{stat:weight}, mode:"relative"|"absolute"} ranks by `score` = sum of weight x change instead of `rankBy` (give one, not both; rows then have `score` and no `value`). ' +
         'Relative (default): delta/|base|, so a tiny base dominates the score; prefer "absolute" (raw delta) or small weights for those. A stat whose base is 0 or not a number counts for nothing and is listed in `objective.ignored`; a row whose own value is not a number lists it in `unscored`. Negative weights penalise. ' +
         'Optional `constraints` [{stat, min?, max?, minDelta?, maxDelta?}] limit the variant\'s resulting value (or change): rows that break one list `violates` (e.g. "FireResist 72 < 75"; a non-number stat breaks it), come after the passing rows, and are counted in `violating`; `onlyPassing` drops them. Weighted and constrained stats are added to `stats`.',

@@ -27,6 +27,19 @@
 //      (batchFailsAfterChange) is a UserError that pushes nothing; a rollback
 //      that is not exact (treeRollbackInexact) is an internal error with an
 //      undo entry but no journal record, and undo restores the tree.
+//   9. Masteries (ConvertTreeMasteries.xml, a 3.24 tree): get_passive_tree
+//      `masteries` lists a mastery's effects (chosen one, `takenBy` for
+//      effects chosen elsewhere; a name lists allocated ones first);
+//      allocate_nodes `masteries` switches an allocated mastery's effect
+//      (by id) and allocates an unallocated one with its path (effect by
+//      text), each with the probe's stats, the export holding the effect, one
+//      undo entry and journal record; undo is exact; a call with `nodes` and
+//      `masteries` together equals the probe's fallback, and a crash replays
+//      every call; a name resolves to the mastery that has the effect (a
+//      no-op: `unchanged`, nothing pushed or journaled) or the only allocated
+//      one of that name (a switch); refusals (effect not offered, chosen on another mastery, text matching
+//      nothing, not a mastery, ambiguous name, listed twice, one effect twice,
+//      a mastery in `nodes`, nothing given) change nothing.
 //   Points: every result's passive `pointCost` count equals the change in
 //   PoB's own point total.
 //   (No fixture has an ascendancy choice node, so `removed` for one option
@@ -506,6 +519,144 @@ async function test8Faults(): Promise<void> {
   log('PASS 8');
 }
 
+/** The active spec's mastery selections in the export, sorted ("{node,effect}" each). */
+function specMasteries(xml: string): string[] {
+  const m = /<Spec\b[^>]*\bmasteryEffects="([^"]*)"/.exec(xml);
+  assert(m, 'export has no masteryEffects attribute');
+  return (m[1].match(/\{\d+,\d+\}/g) ?? []).sort();
+}
+
+async function test9Masteries(): Promise<void> {
+  log('Test 9: masteries through allocate_nodes (ConvertTreeMasteries.xml, a 3.24 tree)');
+  const bridge = newBridge();
+  const session = await primedSession(bridge, readFileSync(MASTERY_FIXTURE, 'utf8'));
+  const base = await state(session);
+  const depth0 = session.undoStackDepth();
+  const journal0 = bridge.committedCount();
+
+  // Listing: Life Mastery 2841 has 64381 chosen; 34242 / 47642 are chosen on 12125 / 12382.
+  const listed = (await session.getPassiveTree([MASTERY_NODE])).masteryOptions;
+  assert(listed && listed.length === 1, `one listed mastery: ${JSON.stringify(listed)}`);
+  const life = listed[0];
+  assert(life.id === MASTERY_NODE && life.allocated === true && life.effect === 64381, `2841 chosen effect: ${JSON.stringify(life)}`);
+  const takenBy = new Map((life.options ?? []).map((o) => [o.effect, o.takenBy]));
+  assert(takenBy.get(34242) === 12125 && takenBy.get(47642) === 12382 && takenBy.get(64381) === undefined, `takenBy: ${JSON.stringify(life.options)}`);
+  const free = (life.options ?? []).filter((o) => o.takenBy === undefined && o.effect !== life.effect);
+  assert(free.length >= 2, 'at least two free Life Mastery effects');
+  const byName = (await session.getPassiveTree(['Life Mastery'])).masteryOptions ?? [];
+  assert(byName.filter((m) => m.allocated).length === 3 && byName[0].allocated, `a name lists the allocated ones first: ${JSON.stringify(byName.map((m) => m.id))}`);
+  const reachable = byName.filter((m) => !m.allocated && m.points !== undefined).sort((a, b) => a.points! - b.points!);
+  assert(reachable.length > 0, 'an unallocated Life Mastery a path reaches');
+
+  log('  9a. switch an allocated mastery to another effect (by id), equal to the probe; undo exact');
+  const switchTo = free[0];
+  const probed = await session.probe({ variants: [{ masteries: [{ node: MASTERY_NODE, effect: switchTo.effect }] }] });
+  assert(!probed.results[0].error && !probed.results[0].fallback, `probe: ${JSON.stringify(probed.results[0])}`);
+  const switched = await session.allocateNodes([], [{ node: MASTERY_NODE, effect: switchTo.effect }]);
+  assert(switched.added.length === 0 && switched.removed.length === 0, 'a switch allocates nothing');
+  assert(switched.masteries?.length === 1 && switched.masteries[0].id === MASTERY_NODE && switched.masteries[0].effect === switchTo.effect
+    && switched.masteries[0].previousEffect === 64381 && switched.masteries[0].stats === switchTo.stats, `masteries: ${JSON.stringify(switched.masteries)}`);
+  for (const [k, v] of Object.entries(probed.results[0].stats)) {
+    if (v !== null) assert(Object.is(switched.after[k], v), `switch ${k}: committed ${String(switched.after[k])} != probe ${String(v)}`);
+  }
+  const switchedState = await state(session);
+  assert(specMasteries(switchedState.xml).includes(`{${MASTERY_NODE},${switchTo.effect}}`), 'export holds the new effect');
+  assert(session.undoStackDepth() === depth0 + 1 && bridge.committedCount() === journal0 + 1, 'one undo entry, one journal record');
+  await session.undoLastChange();
+  assertSame('undo of the switch', await state(session), base);
+
+  log('  9b. allocate an unallocated mastery with its path, effect by text');
+  const target = reachable[0];
+  // (Not the effect 9a used: 2841 takes it again below.)
+  const targetEffect = (target.options ?? []).find((o) => o.takenBy === undefined && o.effect !== switchTo.effect);
+  assert(targetEffect, 'a free effect on the target');
+  const effectText = targetEffect.stats.split(' / ')[0].toUpperCase();
+  const probedAlloc = await session.probe({ variants: [{ masteries: [{ node: target.id!, effect: effectText }] }] });
+  assert(!probedAlloc.results[0].error, `probe allocate: ${probedAlloc.results[0].error}`);
+  const alloc = await session.allocateNodes([], [{ node: target.id!, effect: effectText }]);
+  assert(alloc.added.length === target.points && alloc.added[alloc.added.length - 1].id === target.id, `added path, mastery last: ${JSON.stringify(alloc.added)}`);
+  assert(probedAlloc.results[0].pointsAdded === target.points, `probe pointsAdded ${probedAlloc.results[0].pointsAdded}`);
+  assert(alloc.masteries?.[0].effect === targetEffect.effect && alloc.masteries[0].previousEffect === undefined, `chosen: ${JSON.stringify(alloc.masteries)}`);
+  for (const [k, v] of Object.entries(probedAlloc.results[0].stats)) {
+    if (v !== null) assert(Object.is(alloc.after[k], v), `allocate ${k}: committed ${String(alloc.after[k])} != probe ${String(v)}`);
+  }
+  const allocState = await state(session);
+  assert(specNodes(allocState.xml).includes(target.id!), 'export holds the mastery node');
+  assert(specMasteries(allocState.xml).includes(`{${target.id},${targetEffect.effect}}`), 'export holds its effect');
+  // A regular node and a mastery switch in one call (two tree changes: the
+  // probe's full-recalculation fallback gives the same stats); then a crash
+  // replays both calls.
+  const notable = (await candidates(bridge)).find((c) => c.type === 'Notable' && c.points === 2);
+  assert(notable, 'a 2-point notable');
+  const comboMasteries = [{ node: MASTERY_NODE, effect: switchTo.effect }];
+  const probedCombo = (await session.probe({ variants: [{ allocate: [notable.id], masteries: comboMasteries }] })).results[0];
+  assert(!probedCombo.error && probedCombo.fallback, `combo probe: ${JSON.stringify(probedCombo)}`);
+  const combo = await session.allocateNodes([notable.id], comboMasteries);
+  assert(combo.added.length === 2 && combo.added[1].id === notable.id && combo.masteries?.[0].effect === switchTo.effect, `combo: ${JSON.stringify(combo)}`);
+  for (const [k, v] of Object.entries(probedCombo.stats)) {
+    if (v !== null) assert(Object.is(combo.after[k], v), `combo ${k}: committed ${String(combo.after[k])} != probe ${String(v)}`);
+  }
+  const both = await state(session);
+  assert(specNodes(both.xml).includes(notable.id) && specMasteries(both.xml).includes(`{${MASTERY_NODE},${switchTo.effect}}`), 'export holds both');
+  await crash(bridge);
+  await expectRestart('after the mastery edits', session.getStats());
+  assertSame('respawned after the mastery edits', await state(session), both);
+
+  log('  9c. mastery names: the one with the effect, the only allocated one; a no-op pushes nothing');
+  {
+    const xml = (await state(session)).xml;
+    const depth = session.undoStackDepth();
+    const journal = bridge.committedCount();
+    // Four Life Masteries are allocated; the name resolves to 12382, which has 47642 already.
+    const noop = await session.allocateNodes([], [{ node: 'Life Mastery', effect: 47642 }]);
+    assert(noop.unchanged === true && noop.masteries?.[0].id === 12382 && Object.keys(noop.diff).length === 0, `no-op: ${JSON.stringify(noop.masteries)}`);
+    assert((await state(session)).xml === xml && session.undoStackDepth() === depth && bridge.committedCount() === journal, 'a no-op pushes and journals nothing');
+    // One Block Mastery is allocated (38921): its name switches it.
+    const block = (await session.getPassiveTree([38921])).masteryOptions![0];
+    const blockOther = (block.options ?? []).find((o) => o.takenBy === undefined && o.effect !== block.effect)!;
+    const switchedBlock = await session.allocateNodes([], [{ node: 'block mastery', effect: blockOther.effect }]);
+    assert(switchedBlock.masteries?.[0].id === 38921 && switchedBlock.masteries[0].previousEffect === block.effect && !switchedBlock.unchanged, `by name: ${JSON.stringify(switchedBlock.masteries)}`);
+    await session.undoLastChange();
+    assert((await state(session)).xml === xml && session.undoStackDepth() === depth, 'undo of the switch by name');
+  }
+
+  log('  9d. refusals change nothing');
+  const blockEffect = 41322; // chosen on Block Mastery 38921
+  const notableId = await firstNotable(session);
+  const lifeNow = (await session.getPassiveTree([MASTERY_NODE])).masteryOptions![0];
+  const unused = (lifeNow.options ?? []).find((o) => o.takenBy === undefined && o.effect !== lifeNow.effect);
+  assert(unused, 'a Life Mastery effect no Life Mastery has');
+  const now = await state(session);
+  const depth = session.undoStackDepth();
+  const journal = bridge.committedCount();
+  const refusals: Array<[string, () => Promise<unknown>, RegExp]> = [
+    ['effect not offered', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: blockEffect }]), /does not offer effect/],
+    ['effect taken elsewhere', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: 47642 }]), /already chosen on mastery 12382/],
+    ['effect text matching nothing', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: 'no such effect text' }]), /no effect of mastery/],
+    ['not a mastery', () => session.allocateNodes([], [{ node: notableId, effect: 1 }]), /is not a mastery/],
+    ['ambiguous mastery name', () => session.allocateNodes([], [{ node: 'Life Mastery', effect: unused.effect }]), /matches 4 nodes/],
+    ['listed twice', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: unused.effect }, { node: MASTERY_NODE, effect: unused.effect }]), /listed twice/],
+    ['one effect twice', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: unused.effect }, { node: 12125, effect: unused.effect }]), /also chosen/],
+    ['mastery in nodes', () => session.allocateNodes([reachable[reachable.length - 1].id!]), /is a mastery; pass it in `masteries`/],
+    ['nothing given', () => session.allocateNodes([], []), /at least one node or mastery/],
+  ];
+  for (const [label, call, pattern] of refusals) {
+    const e = await rejection(call());
+    assert(e instanceof UserError, `${label}: expected a UserError, got ${e.constructor.name}: ${e.message}`);
+    assert(pattern.test(e.message), `${label}: "${e.message}" does not match ${pattern}`);
+    const after = await state(session);
+    assert(after.xml === now.xml, `${label}: export changed`);
+    assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, `${label}: undo/journal changed`);
+  }
+  log('PASS 9');
+}
+
+async function firstNotable(session: BuildSession): Promise<number> {
+  const n = (await session.getPassiveTree()).notables[0];
+  assert(n, 'an allocated notable');
+  return n.id;
+}
+
 async function main(): Promise<void> {
   try {
     await test1To4();
@@ -513,6 +664,7 @@ async function main(): Promise<void> {
     await test6Mcp();
     await test7Cluster();
     await test8Faults();
+    await test9Masteries();
     log('ALL PASS');
   } finally {
     for (const b of bridges) await b.shutdown().catch(() => undefined);

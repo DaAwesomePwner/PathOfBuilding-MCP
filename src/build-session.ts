@@ -9,6 +9,7 @@ import {
   runProbe,
   withoutNulls,
   type ProbeGemChange,
+  type ProbeMasteryChoice,
   type ProbeRequest,
   type ProbeResponse,
   type ProbeVariant,
@@ -1321,8 +1322,8 @@ export class BuildSession {
    * added node ids in the order they joined the tree (so the replay does not
    * depend on which of several equally short paths PoB picks).
    */
-  async allocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
-    return this.treeEdit(refs, 'allocate');
+  async allocateNodes(refs: Array<string | number>, masteries: ProbeMasteryChoice[] = []): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'allocate', masteries);
   }
 
   /**
@@ -1335,9 +1336,15 @@ export class BuildSession {
     return this.treeEdit(refs, 'deallocate');
   }
 
-  private async treeEdit(refs: Array<string | number>, mode: 'allocate' | 'deallocate'): Promise<TreeEditResult> {
+  private async treeEdit(
+    refs: Array<string | number>,
+    mode: 'allocate' | 'deallocate',
+    masteries: ProbeMasteryChoice[] = [],
+  ): Promise<TreeEditResult> {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
-    if (refs.length === 0) throw new UserError('Pass at least one node');
+    if (refs.length === 0 && masteries.length === 0) {
+      throw new UserError(mode === 'allocate' ? 'Pass at least one node or mastery' : 'Pass at least one node');
+    }
     return this.withLock(async () => {
       const resolver = new NodeNameResolver((command) => this.bridge.send(command));
       const ids = await resolver.resolveAll(refs, mode);
@@ -1347,7 +1354,12 @@ export class BuildSession {
       let res: TreeEditApplied;
       let failure: unknown;
       try {
-        res = await this.bridge.send({ cmd: mode === 'allocate' ? 'allocNodes' : 'deallocNodes', nodeIds: ids, strict: true });
+        res = await this.bridge.send({
+          cmd: mode === 'allocate' ? 'allocNodes' : 'deallocNodes',
+          nodeIds: ids,
+          strict: true,
+          ...(masteries.length > 0 ? { masteries } : {}),
+        });
       } catch (err) {
         // The batch records what it changed once the tree has changed; a failure
         // after that (PoB's recalculation, the stats, an error popup) leaves the
@@ -1368,15 +1380,35 @@ export class BuildSession {
       }
       const added = treeEditNodes(res.added);
       const removed = treeEditNodes(res.removed);
+      const chosen = masteryChoices(res.masteries);
+      if (res.unchanged === true && failure === undefined) {
+        // Only masteries that already had their effect: no undo entry, no journal record.
+        const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
+        return { added, removed, masteries: chosen, unchanged: true, summary: summary.summary, before, after: before, diff: {} };
+      }
+      // The replay: added ids in join order (masteries among them) and the
+      // masteries by node id and effect id.
       const command =
         mode === 'allocate'
-          ? { cmd: 'allocNodes', nodeIds: added.map((n) => n.id) }
+          ? {
+              cmd: 'allocNodes',
+              nodeIds: added.map((n) => n.id),
+              ...(chosen.length > 0 ? { masteries: chosen.map((m) => ({ node: m.id, effect: m.effect })) } : {}),
+            }
           : { cmd: 'deallocNodes', nodeIds: ids };
       return this.commitAfterUnlocked(entry, journal, command, async () => {
         if (failure !== undefined) throw await this.recalcAfterAppliedFailureUnlocked(failure);
         const after = await this.bridge.getStats();
         const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
-        return { added, removed, summary: summary.summary, before, after, diff: computeDiff(before, after) };
+        return {
+          added,
+          removed,
+          ...(chosen.length > 0 ? { masteries: chosen } : {}),
+          summary: summary.summary,
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
       });
     });
   }
@@ -1436,9 +1468,9 @@ export class BuildSession {
   async applyChanges(variant: NamedProbeVariant): Promise<ApplyChangesResult> {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
     const hasConfig = variant.config !== undefined && Object.keys(variant.config).length > 0;
-    const lists = [variant.allocate, variant.deallocate, variant.items, variant.gems];
-    if (!hasConfig && lists.every((list) => list === undefined || list.length === 0)) {
-      throw new UserError('The variant changes nothing: give at least one of allocate, deallocate, items, gems or config');
+    const lists = [variant.allocate, variant.deallocate, variant.items, variant.gems, variant.masteries];
+    if (!hasConfig && variant.mainSkill === undefined && lists.every((list) => list === undefined || list.length === 0)) {
+      throw new UserError('The variant changes nothing: give at least one of allocate, deallocate, masteries, items, gems, config or mainSkill');
     }
     return this.withLock(async () => {
       const resolver = new NodeNameResolver((command) => this.bridge.send(command));
@@ -1461,6 +1493,10 @@ export class BuildSession {
       );
       const added = treeEditNodes(res.added);
       const removed = treeEditNodes(res.removed);
+      if (res.unchanged === true && failure === undefined) {
+        // Only masteries that already had their effect: no undo entry, no journal record.
+        return { added, removed, masteries: masteryChoices(res.masteries), unchanged: true, before, after: before, diff: {} };
+      }
       // The replay: gem names as PoB names them, allocations in join order.
       const gemNames = Array.isArray(res.gemNames) ? res.gemNames : [];
       const replay: ProbeVariant = { ...toEngine };
@@ -1472,15 +1508,28 @@ export class BuildSession {
       }
       delete replay.allocate;
       if (Array.isArray(res.allocOrder) && res.allocOrder.length > 0) replay.allocate = res.allocOrder;
+      // Masteries by node id and effect id (a name or effect text may resolve differently later).
+      const masteries = masteryChoices(res.masteries);
+      delete replay.masteries;
+      if (masteries.length > 0) replay.masteries = masteries.map((m) => ({ node: m.id, effect: m.effect }));
       return this.commitAfterUnlocked(entry, journal, { cmd: 'applyChanges', replay: true, variant: replay }, async () => {
         if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
         const after = await this.bridge.getStats();
         let summary: PassiveTreeSummary | undefined;
-        if (added.length + removed.length > 0) {
+        if (added.length + removed.length + masteries.length > 0) {
           summary = (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
         }
         await this.refreshBuildInfoUnlocked();
-        return { added, removed, ...(summary ? { summary } : {}), before, after, diff: computeDiff(before, after) };
+        return {
+          added,
+          removed,
+          ...(masteries.length > 0 ? { masteries } : {}),
+          ...(toEngine.mainSkill ? { mainSkill: this.buildInfo?.mainSkill ?? null } : {}),
+          ...(summary ? { summary } : {}),
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
       });
     });
   }
@@ -1601,7 +1650,12 @@ export class BuildSession {
     }
   }
 
-  async getPassiveTree(): Promise<PassiveTreeInfo> {
+  /**
+   * The passive tree; with `masteries` (node ids or mastery names; a name
+   * lists every mastery of that name, allocated ones first) also each
+   * mastery's effect options (`masteryOptions`).
+   */
+  async getPassiveTree(masteries?: Array<string | number>): Promise<PassiveTreeInfo> {
     return this.withLock(async () => {
       const allocatedRes = await this.bridge.send<{ ok: true; nodes: TreeNodeInfo[] }>({
         cmd: 'getAllocatedNodesDetailed',
@@ -1609,12 +1663,18 @@ export class BuildSession {
       const summaryRes = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({
         cmd: 'getPassiveTreeSummary',
       });
+      let masteryOptions: MasteryOptions[] | undefined;
+      if (masteries && masteries.length > 0) {
+        const res = await this.bridge.send<{ ok: true; masteries: MasteryOptions[] }>({ cmd: 'masteryOptions', nodes: masteries });
+        masteryOptions = (res.masteries ?? []).map((m) => ({ ...m, options: Array.isArray(m.options) ? m.options : undefined }));
+      }
       const allocated = allocatedRes.nodes ?? [];
       return {
         allocatedNodes: allocated,
         keystones: allocated.filter((n) => n.isKeystone),
         notables: allocated.filter((n) => n.isNotable),
         summary: summaryRes.summary,
+        ...(masteryOptions ? { masteryOptions } : {}),
       };
     });
   }
@@ -2719,6 +2779,8 @@ export interface TreeNodeInfo {
   isAscendancy: boolean;
   ascendancyName?: string | null;
   alloc: boolean;
+  /** An allocated mastery's chosen effect id. */
+  effect?: number;
   stats?: string[];
   linked?: number[];
 }
@@ -2737,6 +2799,9 @@ export interface TreeEditNode {
 interface TreeEditApplied {
   added?: unknown;
   removed?: unknown;
+  masteries?: unknown;
+  /** Nothing changed (only masteries that already had their effect). */
+  unchanged?: boolean;
 }
 
 export interface TreeEditResult extends StatDiffResult {
@@ -2744,6 +2809,10 @@ export interface TreeEditResult extends StatDiffResult {
   added: TreeEditNode[];
   /** Deallocated by the change (dependents; another option of a choice node), by id. */
   removed: TreeEditNode[];
+  /** Masteries given an effect (allocate_nodes `masteries`). */
+  masteries?: MasteryChoice[];
+  /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
+  unchanged?: boolean;
   /** The tree after the change (point counts). */
   summary: PassiveTreeSummary;
 }
@@ -2767,6 +2836,50 @@ interface RawApplyChanges {
   allocOrder?: number[];
   /** Each gem change's gem as PoB names it, or null. */
   gemNames?: Array<string | null>;
+  /** The masteries given an effect, by id. */
+  masteries?: unknown;
+  /** Nothing changed (only masteries that already had their effect). */
+  unchanged?: boolean;
+}
+
+/** A mastery a committed change gave an effect (allocate_nodes, apply_changes). */
+export interface MasteryChoice {
+  id: number;
+  name?: string;
+  /** The chosen effect's id and text. */
+  effect: number;
+  stats?: string;
+  /** The effect it had before, when it was allocated already. */
+  previousEffect?: number;
+}
+
+function masteryChoices(value: unknown): MasteryChoice[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((m): m is MasteryChoice => typeof m === 'object' && m !== null && typeof m.id === 'number' && typeof m.effect === 'number')
+    .map((m) => ({
+      id: m.id,
+      ...(typeof m.name === 'string' ? { name: m.name } : {}),
+      effect: m.effect,
+      ...(typeof m.stats === 'string' ? { stats: m.stats } : {}),
+      ...(typeof m.previousEffect === 'number' ? { previousEffect: m.previousEffect } : {}),
+    }));
+}
+
+/** A mastery node's effect options (get_passive_tree `masteries`). */
+export interface MasteryOptions {
+  id?: number;
+  name?: string;
+  allocated?: boolean;
+  /** The chosen effect, when allocated. */
+  effect?: number;
+  /** Passive points of its path, when unallocated and reachable. */
+  points?: number;
+  /** False when no path from the allocated tree reaches it. */
+  reachable?: boolean;
+  options?: Array<{ effect: number; stats: string; takenBy?: number }>;
+  /** For a name with more masteries than listed: how many were left out. */
+  more?: number;
 }
 
 export interface ApplyChangesResult extends StatDiffResult {
@@ -2774,6 +2887,12 @@ export interface ApplyChangesResult extends StatDiffResult {
   added: TreeEditNode[];
   /** Deallocated by the change, by id. */
   removed: TreeEditNode[];
+  /** Masteries given an effect. */
+  masteries?: MasteryChoice[];
+  /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
+  unchanged?: boolean;
+  /** The build's main skill after the change, when the variant set one. */
+  mainSkill?: string | null;
   /** The tree after the change (point counts), when nodes changed. */
   summary?: PassiveTreeSummary;
 }
@@ -2879,6 +2998,8 @@ export interface PassiveTreeInfo {
   keystones: TreeNodeInfo[];
   notables: TreeNodeInfo[];
   summary: PassiveTreeSummary;
+  /** With get_passive_tree `masteries`: each mastery's effect options. */
+  masteryOptions?: MasteryOptions[];
 }
 
 export type { NodeRanking, RankBy, TreeSearchResult } from './tree-search.js';

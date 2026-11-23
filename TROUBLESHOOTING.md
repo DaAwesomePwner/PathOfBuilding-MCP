@@ -119,6 +119,18 @@ An item already in a hidden slot is still listed by `list_equipped_items` (with 
 2. Use `reset_build` to return to original loaded state and try again.
 3. If the drift is reproducible, file an issue with: build XML + sequence of tool calls + observed vs expected values.
 
+## "Node … is a mastery; pass it in `masteries` as { node, effect }" / mastery effect errors
+
+A mastery is always allocated together with the effect chosen on it, so it cannot go in `allocate` (evaluate_changes / apply_changes) or `nodes` (allocate_nodes). Pass `masteries: [{ node, effect }]` instead; `get_passive_tree({ masteries: [<id or name>] })` lists each mastery's effects with their ids.
+
+- **"does not offer effect N"** / **"no effect of mastery … matches"** — the effect id or text is not one of that mastery's options (each mastery type has its own list). Use an id from `masteryOptions`, or a text that only one of its effects contains.
+- **"Effect N … is already chosen on mastery M"** — Path of Exile allows each mastery effect on one mastery only (`takenBy` in `masteryOptions`). Switch mastery M to another effect, or deallocate it, first.
+- **"mastery name … matches N nodes"** — masteries share names ("Life Mastery"). A name picks the allocated mastery that has the effect already, else the only allocated one of that name, else the only one a path reaches; otherwise pass the node id from the list in the error (also to allocate a second mastery of a name you already have).
+- **"mastery … is removed by this change's deallocation"** — the same variant deallocates a node the mastery depends on. Deallocate the mastery too, or keep that node.
+- **"mainSkill cannot be combined with a change that may add or remove skill groups"** — an item or passive in the same variant grants (or replaced one that grants) a skill, so socket group indices may shift. Apply that change first, re-read `list_skill_groups`, then set the main skill.
+- **`status: "unchanged"`** — every mastery listed already had that effect; nothing changed and nothing was pushed to undo.
+- A mastery has no "allocated without an effect" state: to clear one, deallocate it with `deallocate_nodes`.
+
 ## "Nothing to undo"
 
 The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only `swap_item`, `unequip_item`, `set_config` and `convert_tree_to_latest` push an entry, and only when the change succeeded; the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
