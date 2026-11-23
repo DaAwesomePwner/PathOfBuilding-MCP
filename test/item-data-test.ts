@@ -4,7 +4,7 @@
 //   2. get_item_text for a unique and for a base: the text swap_item accepts, and
 //      compare_items (probe) stats for it equal swap_item's.
 //   3. list_item_mods for a body armour base: life / resistance mods with tiers,
-//      itemLevel respected, bench crafts on request.
+//      itemLevel respected, bench crafts (by text) on request.
 //   4. build_item: a rare (life + 2 resists + a crafted resist) that swap_item
 //      accepts with the expected stat change; refusals for a mod that cannot roll,
 //      too many prefixes, two mods of one group, unknown base, item level.
@@ -39,7 +39,7 @@ function approxEq(a: unknown, b: unknown, tol = 1e-6): boolean {
 interface SearchResult { kind: string; name: string; base?: string; type: string; slot: string; variants?: string[]; mods?: string[] }
 interface TextResult { text: string; name: string; base: string; rarity: string; mods: string[]; implicits: string[]; variant?: string; warnings?: string[] }
 interface ModRow { id: string; type: string; tier: number; tiers: number; level: number; group: string; text: string; weight: number }
-interface ModsResult { mods: ModRow[]; total: number; more: number; prefixLimit: number; suffixLimit: number; crafted?: Array<{ id: string; type: string; text: string }> }
+interface ModsResult { mods: ModRow[]; total: number; more: number; prefixLimit: number; suffixLimit: number; crafted?: Array<{ type: string; text: string; group: string }> }
 interface BuildResult extends TextResult { affixes: Array<{ id: string; type: string; tier?: number; crafted?: boolean; text: string }> }
 
 const SLOT = 'Body Armour';
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
     for (const group of ['FireResistance', 'ColdResistance', 'LightningResistance']) {
       assert(res.mods.some((m) => m.group === group && m.type === 'suffix' && m.tier === 1), `${group} suffixes listed`);
     }
-    assert(res.crafted?.some((c) => c.id.startsWith('bench:') && /Lightning Resistance/.test(c.text)), 'bench lightning resistance listed');
+    assert(res.crafted?.some((c) => c.text === '+(16-20)% to Lightning Resistance' && c.type === 'suffix'), `bench lightning resistance listed by text: ${JSON.stringify(res.crafted)}`);
     const weaponMod = (await mods({ base: 'Vaal Regalia', query: 'increased physical damage', limit: 200 })).mods;
     assert(!weaponMod.some((m) => m.id.startsWith('LocalIncreasedPhysicalDamagePercent')), 'local weapon physical damage does not roll on body armour');
     const limited = await mods({ base: 'Vaal Regalia', limit: 3 });
@@ -161,7 +161,7 @@ async function main(): Promise<void> {
     for (const line of ['+110 to maximum Life', '+45% to Fire Resistance', '+45% to Cold Resistance', '+20% to Lightning Resistance (crafted)']) {
       assert(rare.mods.includes(line), `rare has "${line}": ${JSON.stringify(rare.mods)}`);
     }
-    assert(rare.affixes.find((a) => a.id === 'FireResist7')?.tier === 2 && rare.affixes.some((a) => a.crafted && a.id.startsWith('bench:')), `affixes: ${JSON.stringify(rare.affixes)}`);
+    assert(rare.affixes.find((a) => a.id === 'FireResist7')?.tier === 2 && rare.affixes.some((a) => a.crafted && a.id === '+(16-20)% to Lightning Resistance'), `affixes: ${JSON.stringify(rare.affixes)}`);
     await unchanged('build_item');
     const rareStats = await parity('built rare', rare.text);
     assert(Number(rareStats.Life) > Number(robeStats.Life), `the rare adds life: ${rareStats.Life} vs ${robeStats.Life}`);
@@ -190,20 +190,55 @@ async function main(): Promise<void> {
     await refused('too many prefixes', () => build({ base: 'Vaal Regalia', mods: fourPrefixes }), /4 prefixes .* can have 3/);
     await refused('magic: two prefixes', () => build({ base: 'Vaal Regalia', rarity: 'magic', mods: fourPrefixes.slice(0, 2) }), /2 prefixes .* can have 1/);
     const threeNonLife = [...byGroup.entries()].filter(([g]) => g !== 'IncreasedLife').slice(0, 3).map(([, id]) => id);
-    await refused('crafted prefix over the limit', () => build({ base: 'Vaal Regalia', mods: threeNonLife, crafted: ['bench:1'] }), /4 prefixes \(crafted ones included\)/);
+    await refused('crafted prefix over the limit', () => build({ base: 'Vaal Regalia', mods: threeNonLife, crafted: ['+(15-25) to maximum Life'] }), /4 prefixes \(crafted ones included\)/);
     await refused('two mods of one group', () => build({ base: 'Vaal Regalia', mods: ['IncreasedLife7', 'IncreasedLife8'] }), /both in mod group IncreasedLife/);
-    await refused('crafted mod in a used group', () => build({ base: 'Vaal Regalia', mods: ['IncreasedLife7'], crafted: ['bench:1'] }), /both in mod group IncreasedLife/);
+    await refused('crafted mod in a used group', () => build({ base: 'Vaal Regalia', mods: ['IncreasedLife7'], crafted: ['+20 to maximum Life'] }), /both in mod group IncreasedLife/);
     await refused('unknown base', () => build({ base: 'Nope Robe' }), /Unknown item base "Nope Robe"/);
     await refused('item level', () => build({ base: 'Vaal Regalia', mods: ['IncreasedLife12'], itemLevel: 80 }), /needs item level 86/);
     await refused('value out of every tier', () => build({ base: 'Vaal Regalia', mods: ['+500 to maximum Life'] }), /outside every tier/);
     await refused('unknown mod', () => build({ base: 'Vaal Regalia', mods: ['+3 to Level of all Minion Skill Gems and a pony'] }), /No prefix or suffix matches/);
     await refused('normal item with mods', () => build({ base: 'Vaal Regalia', rarity: 'normal', mods: ['IncreasedLife7'] }), /normal item has no prefixes/);
-    await refused('bench id for another class', () => build({ base: 'Vaal Regalia', crafted: ['bench:99999'] }), /not a crafting bench/);
+    await refused('not a bench craft', () => build({ base: 'Vaal Regalia', crafted: ['bench:1'] }), /No crafting bench prefix or suffix/);
+    await refused('bench value out of range', () => build({ base: 'Vaal Regalia', crafted: ['+99% to Lightning Resistance'] }), /outside every crafting bench tier/);
+    // A "-" is kept when matching: a negative line is not a "+(..)" mod.
+    await refused('negative line', () => build({ base: 'Vaal Regalia', mods: ['-10% to Fire Resistance'] }), /No prefix or suffix matches/);
     await refused('rare flask', () => build({ base: 'Divine Life Flask', rarity: 'rare' }), /cannot be rare/);
     await refused('duplicate mods', () => build({ base: 'Vaal Regalia', mods: ['IncreasedLife7', 'increasedlife7'] }), /twice/);
     assert(!z.object(buildItemSchema).safeParse({ base: 'Vaal Regalia', name: 'Two\nLines' }).success, 'a name with a newline is refused by the schema');
     assert(!z.object(buildItemSchema).safeParse({ base: 'Vaal Regalia', mods: Array.from({ length: 13 }, () => 'IncreasedLife7') }).success, '13 mods are refused by the schema');
     await unchanged('build_item refusals');
+    log('PASS');
+
+    log('Test 5: lines PoB reads as headers or flags are refused, the parse-back must match the request');
+    // Reviewed scenario 1: an influence line in implicits added influences behind the influences check.
+    await refused('influence line as implicit', () => build({ base: 'Vaal Regalia', influences: ['Shaper'], implicits: ['Crusader Item'] }), /influence line/);
+    await refused('four influences via implicits', () => build({ base: 'Vaal Regalia', implicits: ['Shaper Item', 'Elder Item', 'Hunter Item', 'Warlord Item'] }), /influence line/);
+    // Reviewed scenario 2: an "Implicits: N" line shifted explicit mods into the implicit section.
+    await refused('Implicits header as implicit', () => build({ base: 'Vaal Regalia', implicits: ['Implicits: 3'], mods: ['IncreasedLife7'] }), /item header "Implicits"/);
+    for (const line of ['Corrupted', 'Item Level: 1', 'Quality: 30', 'Sockets: R-R-R', 'Prefix: IncreasedLife12', 'Unidentified', '--------', '{crafted}+10 to Strength']) {
+      await refused(`implicit "${line}"`, () => build({ base: 'Vaal Regalia', implicits: [line] }), /in Path of Building item text/);
+    }
+    for (const name of ['--------', 'Unidentified', 'Corrupted', 'Rarity: Unique']) {
+      await refused(`name "${name}"`, () => build({ base: 'Vaal Regalia', name }), /^name ".*in Path of Building item text/);
+    }
+    const withImplicits = await build({ base: 'Vaal Regalia', implicits: ['+1 to Level of all Vaal Skill Gems', 'Added Small Passive Skills grant: 12% increased Fire Damage'], mods: ['IncreasedLife7'], corrupted: true });
+    assert(withImplicits.implicits.length === 2 && withImplicits.mods.length === 1 && /\nCorrupted$/.test(withImplicits.text), `implicits kept apart from mods: ${JSON.stringify(withImplicits)}`.slice(0, 600));
+    await unchanged('header refusals');
+    log('PASS');
+
+    log('Test 6: per-range rolls, corrupted limits');
+    // One line, two ranges: each value gets its own roll.
+    const flat = await build({ base: 'Jewelled Foil', mods: ['Adds 22 to 52 Physical Damage'] });
+    assert(flat.mods.includes('Adds 22 to 52 Physical Damage') && flat.affixes[0].id === 'LocalAddedPhysicalDamage9', `flat damage at 22 / 52: ${JSON.stringify(flat.mods)}`);
+    const flatMin = await build({ base: 'Jewelled Foil', mods: ['LocalAddedPhysicalDamage9'], roll: 'min' });
+    const flatAvg = await build({ base: 'Jewelled Foil', mods: ['Adds (22-29) to (45-52) Physical Damage'], roll: 'avg' });
+    assert(flatMin.mods.includes('Adds 22 to 45 Physical Damage') && flatAvg.mods.includes('Adds 26 to 49 Physical Damage'), `min / avg: ${flatMin.mods} / ${flatAvg.mods}`);
+    // A corrupted abyss jewel allows PoB's 3 + 3; an uncorrupted rare jewel 2 + 2.
+    const abyss = ['AbyssFlatArmourJewel1', 'AbyssFlatEvasionJewel1', '+40 to maximum Energy Shield'];
+    await refused('three prefixes on an abyss jewel', () => build({ base: 'Murderous Eye Jewel', mods: abyss }), /3 prefixes .* can have 2/);
+    const corruptedAbyss = await build({ base: 'Murderous Eye Jewel', mods: abyss, corrupted: true });
+    assert(corruptedAbyss.mods.length === 3 && /\nCorrupted$/.test(corruptedAbyss.text), `corrupted abyss jewel: ${JSON.stringify(corruptedAbyss.mods)}`);
+    await unchanged('rolls and limits');
     log('PASS');
 
     log('ALL PASS');

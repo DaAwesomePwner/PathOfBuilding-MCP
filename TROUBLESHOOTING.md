@@ -109,6 +109,9 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 - **"N prefixes (crafted ones included) but a rare … can have 3"** — magic items take 1 prefix and 1 suffix, rare items 3 and 3 (jewels 2 and 2), crafted mods included.
 - **"X and Y are both in mod group …"** — an item has at most one mod of each group (a bench craft too).
 - **"Unknown item base" / "Unknown unique"** — use `search_items` (`kind: "base"` for bases); a unique name several items share (e.g. Grand Spectrum) needs its full `"Name, Base"`.
+- **"implicit … is an influence line" / "is read as the item header …" / "name … is an item flag line"** — Path of Building reads that line as part of the item's header (influence, corruption, quality, sockets, item level, …), not as a modifier. Use `influences`, `corrupted` or `quality` instead, and plain modifier lines for implicits and names.
+- **"Path of Building reads the item differently from the request"** — PoB's parse of the built text came out different (a line moved between implicits and mods, an influence or flag appeared). Rephrase the named line.
+- **"No crafting bench prefix or suffix … matches"** — bench mods are named by their text (`list_item_mods` with `includeCrafted`), not by an id.
 - **"Path of Building does not model this line"** (a warning) — the item is built, but PoB's mod parser ignores that line in its calculations.
 
 Not covered: essences, eldritch implicits (pass them as `implicits` lines), fossils, harvest and veiled mods.

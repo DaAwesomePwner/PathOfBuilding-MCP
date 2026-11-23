@@ -90,7 +90,7 @@ export const listItemModsSchema = {
   query: z.string().trim().max(100).optional().describe('Only mods whose text, id or affix name contains this, e.g. "maximum life".'),
   itemLevel: itemLevelSchema,
   influences: influencesSchema,
-  includeCrafted: z.boolean().optional().describe('Also list crafting bench mods for this item class (ids "bench:<n>").'),
+  includeCrafted: z.boolean().optional().describe('Also list crafting bench mods for this item class. PoB\'s bench data has no ids: a bench mod is named by its `text` (with ranges), which build_item `crafted` takes.'),
   limit: z.number().int().min(1).max(MAX_MODS_LIMIT).optional().describe(`Maximum mods listed (default ${DEFAULT_MODS_LIMIT}; the same cap applies to bench mods).`),
 };
 
@@ -118,9 +118,9 @@ export const buildItemSchema = {
   mods: z.array(modSpec).max(MAX_ITEM_MODS).optional()
     .describe('Prefixes and suffixes: mod ids from list_item_mods ("IncreasedLife7"), their text ("+(100-114) to maximum Life", takes `roll`) or a rolled line ("+110 to maximum Life": the tier whose range holds the value, at that value).'),
   crafted: z.array(modSpec).max(MAX_CRAFTED_MODS).optional()
-    .describe('Crafting bench mods: ids from list_item_mods with includeCrafted ("bench:4") or their text / a rolled line. They count as prefixes or suffixes.'),
+    .describe('Crafting bench mods by their text from list_item_mods with includeCrafted ("+(16-20)% to Lightning Resistance", takes `roll`) or a rolled line ("+20% to Lightning Resistance"). They count as prefixes or suffixes.'),
   implicits: z.array(oneLine(200)).max(MAX_IMPLICITS).optional()
-    .describe('Replace the base implicits with these lines (e.g. eldritch or corruption implicits); not validated against the base.'),
+    .describe('Replace the base implicits with these modifier lines (e.g. eldritch or corruption implicits); not validated against the base. Lines PoB reads as item headers or flags ("Corrupted", "Shaper Item", "Quality: 30", ...) are refused: use corrupted / influences / quality.'),
   influences: influencesSchema,
   corrupted: z.boolean().optional().describe('Mark the item corrupted.'),
   roll: rollSchema,
@@ -239,7 +239,8 @@ export function registerItemDataTools(tools: ToolRegistrar): void {
       description:
         'Build a normal, magic or rare item on a base with Path of Building\'s crafting (Item:Craft / BuildRaw), checking that every mod can roll on the ' +
         'base at the item level with its influences (or is a bench craft for the item class), the prefix/suffix limits of the rarity (crafted mods count) ' +
-        'and one mod per mod group; anything else is refused. Returns `text`, the rolled lines, each affix with its tier, and warnings (e.g. a line PoB ' +
+        'and one mod per mod group (each mod checked with the tags the other chosen mods add, as PoB\'s crafting dropdowns do); anything else is refused, ' +
+        'and PoB\'s parse of the result must match the request (name, implicits, mods, influences, corruption, item level, quality). Returns `text`, the rolled lines, each affix with its tier, and warnings (e.g. a line PoB ' +
         `does not model). ${TEXT_USE} Read-only: the build is unchanged until you equip the item.`,
       inputSchema: buildItemSchema,
     },

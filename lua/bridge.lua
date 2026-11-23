@@ -5597,13 +5597,76 @@ do
 		return out
 	end
 
-	-- Text from BuildRaw, checked to parse back as swap_item parses item text.
-	function itemData.textResult(item)
+	-- Spec names PoB's ParseRaw reads from "Name: value" lines (Item:ParseRaw),
+	-- plus the header lines it reads before them.
+	itemData.HEADER_SPECS = { }
+	for name in ([[Allow Duplicate Variants|Armour|Attacks per Second|Block chance|Catalyst|CatalystQuality|Chance to Block|Chaos Damage|Cluster Jewel Node Count|Cluster Jewel Skill|Crafted|Critical Strike Chance|Critical Strike Range|Crucible|Dex|Dexterity|Elemental Damage|Energy Shield|Evasion Rating|Evasion|Has Alt Variant Five|Has Alt Variant Four|Has Alt Variant Three|Has Alt Variant Two|Has Alt Variant|Has Variants|Implicit|Implicits|Int|Intangibility|Intelligence|Item Level|League|Level|LevelReq|Limited to|Memory Strands|Note|Physical Damage|Prefix|Quality|Radius|Requires Class|Requires Level|Scourge|Selected Alt Variant Five|Selected Alt Variant Four|Selected Alt Variant Three|Selected Alt Variant Two|Selected Alt Variant|Selected Variant Group|Selected Variant|Selected Variants|Selected Version|Sockets|Source|Str|Strength|Suffix|Talisman Tier|Unique ID|Unreleased|Upgrade|Variant|Version|Ward|Weapon Range|Rarity|Item Class|Class:]]):gmatch("[^|]+") do
+		itemData.HEADER_SPECS[name] = true
+	end
+	itemData.FLAG_LINES = { ["--------"] = true, Split = true, Mirrored = true, Corrupted = true, ["Fractured Item"] = true,
+		["Synthesised Item"] = true, Unidentified = true, ["Requirements:"] = true, ["Prefixes:"] = true,
+		["Veiled Prefix"] = true, ["Veiled Suffix"] = true }
+
+	-- Why PoB's ParseRaw would read `line` as an item header or flag instead
+	-- of a modifier ("Corrupted", "Shaper Item", "Quality: 30", "--------"),
+	-- or nil. In a name or an implicit such a line would change the item
+	-- behind build_item's checks.
+	function itemData.headerReason(line)
+		if itemData.FLAG_LINES[line] or line:find("Foil Unique", 1, true) then return "is an item flag line" end
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			if line == info.display .. " Item" then return "is an influence line (use influences)" end
+		end
+		if line:match("^{") then return "starts with a { } tag" end
+		if line:match("^%(%a") or line:match("^%(%d+%%? of ") then return "is read as reminder text" end
+		local spec = line:match("^([%a %(%)]+:?): .+$")
+		if spec and (itemData.HEADER_SPECS[spec] or spec:match("BasePercentile") or spec:match("^Quality %(")) then
+			return "is read as the item header \"" .. spec .. "\""
+		end
+		if line:match("^Requires %a+ ") then return "is read as an item requirement" end
+		return nil
+	end
+
+	-- What build_item asked for, checked on PoB's parse of the item: nothing
+	-- may come out different (a line read as a header or flag, an implicit
+	-- read as an explicit or the other way round).
+	function itemData.verifyParsed(item, expect)
+		local function refuse(what)
+			userError("Path of Building reads the item differently from the request (" .. what ..
+				"): a name or implicit line is probably read as an item header or flag; use plain modifier lines")
+		end
+		if item.baseName ~= expect.baseName then refuse("base " .. tostring(item.baseName)) end
+		if item.rarity ~= expect.rarity then refuse("rarity " .. tostring(item.rarity)) end
+		if expect.title and item.title ~= expect.title then refuse("name " .. tostring(item.title)) end
+		if (item.corrupted == true) ~= expect.corrupted then refuse(item.corrupted and "corrupted" or "not corrupted") end
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			if (item[info.key] == true) ~= (expect.influences[info.key] == true) then
+				refuse(info.display .. " influence " .. (item[info.key] and "added" or "lost"))
+			end
+		end
+		if tonumber(item.itemLevel) ~= expect.itemLevel then refuse("item level " .. tostring(item.itemLevel)) end
+		if item.quality ~= expect.quality then refuse("quality " .. tostring(item.quality)) end
+		for _, part in ipairs({ { "implicits", "implicitModLines", "implicit" }, { "explicits", "explicitModLines", "mod" } }) do
+			local wanted, lines = expect[part[1]], item[part[2]] or { }
+			if wanted then
+				if #lines ~= #wanted then refuse(#lines .. " " .. part[3] .. " lines instead of " .. #wanted) end
+				for i, line in ipairs(wanted) do
+					if lines[i].line ~= line then refuse(part[3] .. " line " .. i .. " is \"" .. itemData.clip(lines[i].line) .. "\"") end
+				end
+			end
+		end
+	end
+
+	-- Text from BuildRaw, checked to parse back as swap_item parses item text
+	-- (and, for build_item, to be the item that was asked for).
+	function itemData.textResult(item, expect)
 		local text = item:BuildRaw()
 		local ok, check = pcall(construct, "Item", text)
 		if not ok or not (check and check.base) then
-			error("Path of Building could not parse the item text it built: " .. stripColorCodes(tostring(check)), 0)
+			local message = "Path of Building could not parse the item text it built: " .. stripColorCodes(tostring(check))
+			if expect then userError(message .. " (check the name and implicit lines)") end
+			error(message, 0)
 		end
+		if expect then itemData.verifyParsed(check, expect) end
 		local variants, variantsMore = itemData.variantNames(check)
 		local warnings = { }
 		for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do
@@ -5690,8 +5753,10 @@ do
 		return keys
 	end
 
-	-- The item list_item_mods and build_item work on: a magic or rare item of
-	-- `base` with its influences, item level and implicits, parsed by PoB.
+	-- The item list_item_mods and build_item work on: a normal, magic or rare
+	-- item of `base` with its influences, item level, corruption and
+	-- implicits, parsed by PoB and checked to be exactly that. Returns the
+	-- item and what it must stay (for build_item's final check).
 	function itemData.craftItem(cmd)
 		local baseName, base = itemData.findBase(cmd.base)
 		local onlyMagic = base.flask or base.type == "Tincture" or (base.type == "Jewel" and base.subType == "Charm")
@@ -5699,25 +5764,48 @@ do
 		if rarity == "RARE" and onlyMagic then
 			userError(baseName .. " cannot be rare in Path of Building (flasks, tinctures and charms are at most magic): use rarity \"magic\"")
 		end
-		local title = cmd.name ~= nil and cmd.name ~= dkjson.null and itemData.trim(cmd.name) or nil
+		local title = nil
+		if cmd.name ~= nil and cmd.name ~= dkjson.null then
+			title = itemData.trim(cmd.name)
+			local reason = itemData.headerReason(title)
+			if reason then userError("name \"" .. title .. "\" " .. reason .. " in Path of Building item text") end
+		end
 		local item = itemData.newItem(baseName, base, rarity, title)
 		local influences = itemData.influenceKeys(cmd.influences)
 		if #influences > 0 and not base.influenceTags then
 			userError(baseName .. " (" .. base.type .. ") cannot have influences")
 		end
-		for _, key in ipairs(influences) do item[key] = true end
+		local wanted = { }
+		for _, key in ipairs(influences) do
+			item[key] = true
+			wanted[key] = true
+		end
 		item.itemLevel = tonumber(cmd.itemLevel) or 86
+		-- Before the parse: PoB's prefix/suffix limits depend on it (a corrupted abyss jewel).
+		if cmd.corrupted == true then item.corrupted = true end
+		local implicits = nil
 		if cmd.implicits ~= nil and cmd.implicits ~= dkjson.null then
+			implicits = { }
 			item.implicitModLines = { }
-			for _, line in ipairs(cmd.implicits) do
-				item.implicitModLines[#item.implicitModLines + 1] = { line = itemData.trim(line), modTags = { } }
+			for _, raw in ipairs(cmd.implicits) do
+				local line = itemData.trim(raw)
+				local reason = itemData.headerReason(line)
+				if reason then userError("implicit \"" .. line .. "\" " .. reason .. " in Path of Building item text, not a modifier") end
+				implicits[#implicits + 1] = line
+				item.implicitModLines[#item.implicitModLines + 1] = { line = line, modTags = { } }
 			end
 		end
+		local expect = {
+			baseName = baseName, rarity = rarity, title = rarity == "RARE" and (title or "New Item") or nil,
+			corrupted = cmd.corrupted == true, influences = wanted, itemLevel = item.itemLevel, quality = item.quality,
+			implicits = implicits, explicits = { },
+		}
 		item:BuildAndParseRaw()
+		itemData.verifyParsed(item, expect)
 		if rarity ~= "NORMAL" and not item.crafted then
 			userError(baseName .. " (" .. base.type .. ") has no prefixes or suffixes Path of Building can craft")
 		end
-		return item, baseName, base
+		return item, baseName, base, expect
 	end
 
 	function itemData.limits(item)
@@ -5725,20 +5813,54 @@ do
 		return item.prefixes.limit or half, item.suffixes.limit or half
 	end
 
-	-- Prefixes and suffixes that can roll on `item` (PoB's spawn weights, delve
-	-- mods left out as the crafting dropdowns do), with tiers: within one
-	-- family (type, group, stats) the highest-level mod is tier 1. Item level
-	-- is not applied here.
+	-- Tags every affix check gets, as the items tab's crafting dropdowns add
+	-- them: the cluster jewel skill's tag.
+	function itemData.baseTags(item)
+		local tags = { }
+		if item.clusterJewel and item.clusterJewelSkill then
+			local skill = item.clusterJewel.skills and item.clusterJewel.skills[item.clusterJewelSkill]
+			if skill and skill.tag then tags[skill.tag] = true end
+		end
+		return tags
+	end
+
+	-- PoB's check that `mod` can roll (Item:CanHaveMod with `tags`), on
+	-- prefixes and suffixes only, delve mods left out as the dropdowns do.
+	function itemData.canRoll(item, mod, tags)
+		if not (mod.type == "Prefix" or mod.type == "Suffix") or not mod.weightKey or item:CheckIfModIsDelve(mod) then return false end
+		local copy = { }
+		for k, v in pairs(tags or { }) do copy[k] = v end
+		return item:CanHaveMod(mod, copy) and true or false
+	end
+
+	-- Affix ids that can roll with `tags` (cached per tag set).
+	function itemData.rollableWith(item, tags)
+		local keys = { }
+		for tag in pairs(tags) do keys[#keys + 1] = tag end
+		table.sort(keys)
+		local key = table.concat(keys, ",")
+		item.rollableByTags = item.rollableByTags or { }
+		if item.rollableByTags[key] then return item.rollableByTags[key] end
+		local ok = { }
+		for modId, mod in pairs(item.affixes or { }) do
+			if itemData.canRoll(item, mod, tags) then ok[modId] = true end
+		end
+		item.rollableByTags[key] = ok
+		return ok
+	end
+
+	-- Prefixes and suffixes that can roll on `item` with its base tags, with
+	-- tiers: within one family (type, group, stats) the highest-level mod is
+	-- tier 1. Item level is not applied here.
 	function itemData.rollable(item)
 		if item.rollableCache then return item.rollableCache.ok, item.rollableCache.tiers end
-		local ok, families = { }, { }
-		for modId, mod in pairs(item.affixes or { }) do
-			if (mod.type == "Prefix" or mod.type == "Suffix") and mod.weightKey and not item:CheckIfModIsDelve(mod) and item:CanHaveMod(mod, { }) then
-				ok[modId] = true
-				local key = mod.type .. "|" .. tostring(mod.group) .. "|" .. table.concat(mod.statOrder or { }, ",")
-				families[key] = families[key] or { }
-				table.insert(families[key], modId)
-			end
+		local ok = itemData.rollableWith(item, itemData.baseTags(item))
+		local families = { }
+		for modId in pairs(ok) do
+			local mod = item.affixes[modId]
+			local key = mod.type .. "|" .. tostring(mod.group) .. "|" .. table.concat(mod.statOrder or { }, ",")
+			families[key] = families[key] or { }
+			table.insert(families[key], modId)
 		end
 		local tiers = { }
 		for _, ids in pairs(families) do
@@ -5767,11 +5889,14 @@ do
 		return a < b
 	end
 
+	-- Crafting bench prefixes and suffixes for the item class. PoB's bench
+	-- data has no ids (and group + level is not unique), so a bench mod is
+	-- named by its text with ranges, which stays valid as long as the mod.
 	function itemData.benchMods(item)
 		local list = { }
-		for i, craft in ipairs(data.masterMods or { }) do
+		for _, craft in ipairs(data.masterMods or { }) do
 			if craft.types and craft.types[item.type] and (craft.type == "Prefix" or craft.type == "Suffix") then
-				list[#list + 1] = { id = "bench:" .. i, mod = craft }
+				list[#list + 1] = { id = table.concat(craft, " / "), mod = craft }
 			end
 		end
 		return list
@@ -5806,9 +5931,10 @@ do
 				weight = item:GetModSpawnWeight(mod), text = itemData.clip(table.concat(mod, " / ")),
 			}
 		end
+		local prefixLimit, suffixLimit = itemData.limits(item)
 		local result = {
 			base = baseName, type = item.base.type, itemLevel = ilvl,
-			prefixLimit = select(1, itemData.limits(item)), suffixLimit = select(2, itemData.limits(item)),
+			prefixLimit = prefixLimit, suffixLimit = suffixLimit,
 			total = #ids, more = math.max(0, #ids - #mods), mods = mods,
 		}
 		if cmd.includeCrafted then
@@ -5819,8 +5945,8 @@ do
 					craftedTotal = craftedTotal + 1
 					if #crafted < limit then
 						crafted[#crafted + 1] = {
-							id = entry.id, type = entry.mod.type:lower(), level = entry.mod.level, group = entry.mod.group,
-							text = itemData.clip(table.concat(entry.mod, " / ")),
+							type = entry.mod.type:lower(), level = entry.mod.level, group = entry.mod.group,
+							text = itemData.clip(entry.id),
 						}
 					end
 				end
@@ -5834,9 +5960,10 @@ do
 		return (itemData.lower(text):gsub("%s*\n%s*", " / "):gsub("%s*/%s*", " / "):gsub("%s+", " "))
 	end
 
-	-- Ranges and numbers become "#", signs before them are dropped.
+	-- Ranges and numbers become "#"; a "+" before them is dropped (optional),
+	-- a "-" is kept, so "-10%" never matches a "+(..)%" mod.
 	function itemData.template(normText)
-		return (normText:gsub("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", "#"):gsub("%d+%.?%d*", "#"):gsub("[%+%-]#", "#"))
+		return (normText:gsub("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", "#"):gsub("%d+%.?%d*", "#"):gsub("%+#", "#"))
 	end
 
 	-- A mod's numbers in order: ranges { min, max } and fixed values.
@@ -5867,7 +5994,7 @@ do
 	end
 
 	-- nil: the text is not this mod; false: same mod text, numbers outside its
-	-- ranges; else { ranges } giving those numbers (empty: the mod's own text,
+	-- ranges; else { ranges } giving those numbers (exact: the mod's own text,
 	-- ranges included, which takes the requested roll).
 	function itemData.matchMod(spec, mod)
 		local t = itemData.modTemplate(mod)
@@ -5889,20 +6016,32 @@ do
 		return { ranges = ranges }
 	end
 
-	-- One roll for the mod: the requested roll for its own text, else the
-	-- roll that gives the numbers asked for (a mod with several ranges that
-	-- need different rolls gets the average, with a warning).
-	function itemData.rangeFor(match, roll, label, warnings)
+	-- The roll for a matched mod: the requested roll for its own text (every
+	-- range at that roll), else the rolls that give the numbers asked for.
+	-- A one-line mod keeps one roll per range (itemLib.applyRange takes a
+	-- list); several lines that need different rolls, or a bench craft
+	-- (PoB keeps one roll per crafted line), get the average, with a warning.
+	function itemData.rangeFor(match, mod, roll, label, warnings, scalarOnly)
 		if match.exact or #match.ranges == 0 then return roll end
+		local function up(r)
+			-- BuildRaw keeps 3 decimals of an affix roll: round up so the value is reached.
+			local v = math.ceil(r * 1000 - 1e-6) / 1000
+			if v <= 0 then return 0 end
+			return math.min(1, v)
+		end
 		local sum, same = 0, true
 		for _, r in ipairs(match.ranges) do
 			sum = sum + r
 			if math.abs(r - match.ranges[1]) > 1e-9 then same = false end
 		end
-		local r = same and match.ranges[1] or sum / #match.ranges
-		if not same then warnings[#warnings + 1] = label .. ": its values need different rolls; one average roll is used" end
-		-- BuildRaw keeps 3 decimals of an affix roll: round up so the value is reached.
-		return math.min(1, math.ceil(r * 1000 - 1e-6) / 1000)
+		if same then return up(match.ranges[1]) end
+		if #mod == 1 and not scalarOnly then
+			local list = { }
+			for i, r in ipairs(match.ranges) do list[i] = up(r) end
+			return list
+		end
+		warnings[#warnings + 1] = label .. ": its values need different rolls; one average roll is used"
+		return up(sum / #match.ranges)
 	end
 
 	function itemData.parseSpec(text)
@@ -5922,9 +6061,9 @@ do
 	end
 
 	-- A prefix or suffix by mod id or text, checked against the base, its
-	-- influences and the item level.
-	function itemData.resolveAffix(item, baseName, specText, roll, warnings)
-		local ok = itemData.rollable(item)
+	-- influences, the item level and `ok` (what can roll with the other
+	-- mods' tags). Returns the choice, or nil and why not.
+	function itemData.resolveAffix(item, baseName, specText, roll, warnings, ok)
 		local ilvl = item.itemLevel
 		local where = baseName .. " at item level " .. ilvl
 		local id = nil
@@ -5939,10 +6078,12 @@ do
 		if id then
 			local mod = item.affixes[id]
 			if not (mod.type == "Prefix" or mod.type == "Suffix") then
-				userError(id .. " is a " .. tostring(mod.type) .. " modifier, not a prefix or suffix")
+				return nil, id .. " is a " .. tostring(mod.type) .. " modifier, not a prefix or suffix"
 			end
-			if not ok[id] then userError(id .. " (" .. itemData.clip(table.concat(mod, " / ")) .. ") cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them)") end
-			if (mod.level or 0) > ilvl then userError(id .. " needs item level " .. mod.level .. " (itemLevel is " .. ilvl .. ")") end
+			if not ok[id] then
+				return nil, id .. " (" .. itemData.clip(table.concat(mod, " / ")) .. ") cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them)"
+			end
+			if (mod.level or 0) > ilvl then return nil, id .. " needs item level " .. mod.level .. " (itemLevel is " .. ilvl .. ")" end
 			return { id = id, mod = mod, range = roll }
 		end
 		local spec = itemData.parseSpec(specText)
@@ -5964,45 +6105,39 @@ do
 			end
 		end
 		if best then
-			return { id = best, mod = item.affixes[best], range = itemData.rangeFor(bestMatch, roll, best, warnings) }
+			local mod = item.affixes[best]
+			return { id = best, mod = mod, range = itemData.rangeFor(bestMatch, mod, roll, best, warnings) }
 		end
 		local function sorted(list)
 			table.sort(list, function(a, b) return (item.affixes[a].level or 0) > (item.affixes[b].level or 0) end)
 			return list
 		end
 		if #tooHigh > 0 then
-			userError("\"" .. spec.text .. "\" needs a higher item level than " .. ilvl .. ": " .. itemData.describeCandidates(item, sorted(tooHigh)))
+			return nil, "\"" .. spec.text .. "\" needs a higher item level than " .. ilvl .. ": " .. itemData.describeCandidates(item, sorted(tooHigh))
 		end
 		if #outOfRange > 0 then
-			userError("\"" .. spec.text .. "\" is outside every tier that can roll on " .. where .. ": " .. itemData.describeCandidates(item, sorted(outOfRange)))
+			return nil, "\"" .. spec.text .. "\" is outside every tier that can roll on " .. where .. ": " .. itemData.describeCandidates(item, sorted(outOfRange))
 		end
 		if #notRollable > 0 then
-			userError("\"" .. spec.text .. "\" cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them): " .. itemData.describeCandidates(item, sorted(notRollable)))
+			return nil, "\"" .. spec.text .. "\" cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them): " .. itemData.describeCandidates(item, sorted(notRollable))
 		end
-		userError("No prefix or suffix matches \"" .. spec.text .. "\" (give a mod id or its text, e.g. \"+(100-114) to maximum Life\" or \"+110 to maximum Life\"; use list_item_mods)")
+		return nil, "No prefix or suffix matches \"" .. spec.text .. "\" (give a mod id or its text, e.g. \"+(100-114) to maximum Life\" or \"+110 to maximum Life\"; use list_item_mods)"
 	end
 
 	function itemData.resolveCraft(item, baseName, specText, roll, warnings)
 		local bench = itemData.benchMods(item)
-		local trimmed = itemData.trim(specText)
-		for _, entry in ipairs(bench) do
-			if entry.id == trimmed:lower() then return { id = entry.id, mod = entry.mod, range = roll, crafted = true } end
-		end
-		if trimmed:lower():match("^bench:%d+$") then
-			userError(trimmed .. " is not a crafting bench prefix or suffix for " .. baseName .. " (use list_item_mods with includeCrafted)")
-		end
 		local spec = itemData.parseSpec(specText)
 		local best, bestMatch, outOfRange = nil, nil, { }
 		for _, entry in ipairs(bench) do
 			local m = itemData.matchMod(spec, entry.mod)
 			if m == false then
-				outOfRange[#outOfRange + 1] = entry.id .. ": " .. itemData.clip(table.concat(entry.mod, " / "))
+				outOfRange[#outOfRange + 1] = itemData.clip(entry.id)
 			elseif m and (not best or (entry.mod.level or 0) > (best.mod.level or 0)) then
 				best, bestMatch = entry, m
 			end
 		end
 		if best then
-			return { id = best.id, mod = best.mod, range = itemData.rangeFor(bestMatch, roll, best.id, warnings), crafted = true }
+			return { id = best.id, mod = best.mod, range = itemData.rangeFor(bestMatch, best.mod, roll, best.id, warnings, true), crafted = true }
 		end
 		if #outOfRange > 0 then
 			while #outOfRange > 5 do table.remove(outOfRange) end
@@ -6011,12 +6146,56 @@ do
 		userError("No crafting bench prefix or suffix for " .. baseName .. " matches \"" .. spec.text .. "\" (use list_item_mods with includeCrafted)")
 	end
 
+	-- Every `mods` entry resolved; each is checked with the tags the other
+	-- chosen mods add (PoB's UpdateAffixControl passes them to CanHaveMod),
+	-- so a mod that needs another one's tag is found once that one is.
+	function itemData.resolveAffixes(item, baseName, specs, roll, warnings)
+		local resolved = { }
+		local function tagsExcept(i)
+			local tags = itemData.baseTags(item)
+			for j, r in pairs(resolved) do
+				if j ~= i then
+					for _, tag in ipairs(r.mod.tags or { }) do tags[tag] = true end
+				end
+			end
+			return tags
+		end
+		local progress = true
+		while progress do
+			progress = false
+			for i, spec in ipairs(specs) do
+				if not resolved[i] then
+					local r = itemData.resolveAffix(item, baseName, spec, roll, warnings, itemData.rollableWith(item, tagsExcept(i)))
+					if r then
+						resolved[i] = r
+						progress = true
+					end
+				end
+			end
+		end
+		local list = { }
+		for i, spec in ipairs(specs) do
+			if not resolved[i] then
+				local _, message = itemData.resolveAffix(item, baseName, spec, roll, { }, itemData.rollableWith(item, tagsExcept(i)))
+				userError(message)
+			end
+		end
+		for i = 1, #specs do
+			-- Tags only ever add weight keys, but a key can carry weight 0: check each with all the others.
+			if not itemData.canRoll(item, resolved[i].mod, tagsExcept(i)) then
+				userError(resolved[i].id .. " cannot roll on " .. baseName .. " together with the other mods")
+			end
+			list[i] = resolved[i]
+		end
+		return list
+	end
+
 	function itemData.buildCommand(cmd)
 		local roll = itemData.roll(cmd.roll)
-		local item, baseName, base = itemData.craftItem(cmd)
+		local item, baseName, base, expect = itemData.craftItem(cmd)
 		local warnings = { }
-		local affixes, crafts = { }, { }
-		for _, spec in ipairs(cmd.mods or { }) do affixes[#affixes + 1] = itemData.resolveAffix(item, baseName, spec, roll, warnings) end
+		local affixes = itemData.resolveAffixes(item, baseName, cmd.mods or { }, roll, warnings)
+		local crafts = { }
 		for _, spec in ipairs(cmd.crafted or { }) do crafts[#crafts + 1] = itemData.resolveCraft(item, baseName, spec, roll, warnings) end
 		local total = #affixes + #crafts
 		if item.rarity == "NORMAL" and total > 0 then
@@ -6040,11 +6219,12 @@ do
 			for _, r in ipairs(list) do counts[r.mod.type] = counts[r.mod.type] + 1 end
 		end
 		local rarityName = item.rarity:lower()
+		local what = rarityName .. (item.corrupted and " corrupted " or " ") .. base.type
 		if counts.Prefix > prefixLimit then
-			userError(counts.Prefix .. " prefixes (crafted ones included) but a " .. rarityName .. " " .. base.type .. " can have " .. prefixLimit)
+			userError(counts.Prefix .. " prefixes (crafted ones included) but a " .. what .. " can have " .. prefixLimit)
 		end
 		if counts.Suffix > suffixLimit then
-			userError(counts.Suffix .. " suffixes (crafted ones included) but a " .. rarityName .. " " .. base.type .. " can have " .. suffixLimit)
+			userError(counts.Suffix .. " suffixes (crafted ones included) but a " .. what .. " can have " .. suffixLimit)
 		end
 		if #crafts > 1 then
 			warnings[#warnings + 1] = "more than one crafted modifier needs the bench's \"Can have up to 3 Crafted Modifiers\" craft"
@@ -6055,8 +6235,8 @@ do
 		if cmd.quality ~= nil and cmd.quality ~= dkjson.null then
 			if item.quality == nil then userError(base.type .. " items have no quality") end
 			item.quality = tonumber(cmd.quality)
+			expect.quality = item.quality
 		end
-		if cmd.corrupted == true then item.corrupted = true end
 		local p, s = 0, 0
 		for _, r in ipairs(affixes) do
 			if r.mod.type == "Prefix" then
@@ -6079,7 +6259,9 @@ do
 		else
 			item:BuildAndParseRaw()
 		end
-		local result = itemData.textResult(item)
+		expect.explicits = { }
+		for i, ml in ipairs(item.explicitModLines) do expect.explicits[i] = ml.line end
+		local result = itemData.textResult(item, expect)
 		local _, tiers = itemData.rollable(item)
 		local chosen = { }
 		for _, list in ipairs({ affixes, crafts }) do
@@ -6087,7 +6269,7 @@ do
 				chosen[#chosen + 1] = {
 					id = r.id, type = r.mod.type:lower(), crafted = r.crafted,
 					tier = tiers[r.id] and tiers[r.id].tier or nil, tiers = tiers[r.id] and tiers[r.id].of or nil,
-					text = itemData.clip(itemLib.applyRange(table.concat(r.mod, "\n"), type(r.range) == "number" and r.range or 0.5)),
+					text = itemData.clip(itemLib.applyRange(table.concat(r.mod, "\n"), r.range)),
 				}
 			end
 		end
