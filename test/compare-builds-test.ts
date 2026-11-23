@@ -3,6 +3,10 @@
 //
 //   0. Output bounds (no engine): long names and mod lines are clipped, long
 //      gem lists capped with `...More` counts, mastery changes with a count.
+//   0b. Active gems (no engine): groups paired by a shared active skill whose
+//      other active gems differ (Fireball + Flame Wall vs Fireball +
+//      Frostblink, same supports) are a changed group with `activesAdded` /
+//      `activesRemoved`, not a same group.
 //   1. B = the fixture with a 2-point notable allocated, a ring swapped, a
 //      support gem replaced (apply_changes) and a config option set, exported
 //      as a build code and undone. The comparison reports exactly those
@@ -141,8 +145,36 @@ function testBounds(): void {
   log(`PASS (${text.length} bytes)`);
 }
 
+function testActiveGems(): void {
+  log('Test 0b: an active gem added / removed in a matched group');
+  const gem = (name: string, support = false) => ({ name, level: 20, quality: 0, enabled: true, support });
+  const side = (second: string): BuildSnapshot => ({
+    info: { class: 'Witch', mainSkill: 'Fireball' },
+    stats: {},
+    tree: { points: 0, ascendancyPoints: 0, nodes: [] },
+    items: [],
+    groups: [
+      { enabled: true, gems: [gem('Fireball'), gem(second), gem('Spell Echo Support', true)] },
+      { enabled: true, gems: [gem('Vortex'), gem('Controlled Destruction Support', true)] },
+    ],
+    config: {},
+  });
+  const out = diffBuilds(side('Flame Wall'), side('Frostblink')) as {
+    gems: { sameGroups: number; changed: Array<Record<string, unknown>>; onlyA: unknown[]; onlyB: unknown[] };
+  };
+  const g = out.gems;
+  assert(g.sameGroups === 1 && g.changed.length === 1 && g.onlyA.length === 0 && g.onlyB.length === 0, `groups: ${JSON.stringify(g)}`);
+  const c = g.changed[0];
+  assert(JSON.stringify(c.activesAdded) === '["Frostblink"]' && JSON.stringify(c.activesRemoved) === '["Flame Wall"]', `actives: ${JSON.stringify(c)}`);
+  assert(c.supportsAdded === undefined && c.supportsRemoved === undefined && c.gemChanges === undefined, `nothing else changed: ${JSON.stringify(c)}`);
+  const same = diffBuilds(side('Flame Wall'), side('Flame Wall')) as { gems: { sameGroups: number; changed: unknown[] } };
+  assert(same.gems.sameGroups === 2 && same.gems.changed.length === 0, `identical sides: ${JSON.stringify(same.gems)}`);
+  log('PASS');
+}
+
 async function main(): Promise<void> {
   testBounds();
+  testActiveGems();
   const { paths, fixturePath } = setupTestEnv();
   const fixtureXml = readFileSync(fixturePath, 'utf8');
 

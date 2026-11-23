@@ -328,6 +328,9 @@ function groupChange(a: SnapshotGroup, b: SnapshotGroup): Record<string, unknown
   const supB = b.gems.filter((x) => x.support).map((x) => x.name);
   const supportsRemoved = multisetMinus(supA, supB);
   const supportsAdded = multisetMinus(supB, supA);
+  // Groups paired by one shared active skill can differ in their other actives.
+  const activesRemoved = multisetMinus(activeNames(a), activeNames(b));
+  const activesAdded = multisetMinus(activeNames(b), activeNames(a));
   const gemChanges: string[] = [];
   const used = new Set<SnapshotGem>();
   for (const ga of a.gems) {
@@ -341,12 +344,15 @@ function groupChange(a: SnapshotGroup, b: SnapshotGroup): Record<string, unknown
     fields.slot = { a: a.slot !== undefined ? clip(a.slot, MAX_NAME_CHARS) : null, b: b.slot !== undefined ? clip(b.slot, MAX_NAME_CHARS) : null };
   }
   if (a.enabled !== b.enabled) fields.enabled = { a: a.enabled, b: b.enabled };
-  if (!supportsRemoved.length && !supportsAdded.length && !gemChanges.length && !Object.keys(fields).length) return null;
+  const gemDiffs = [supportsRemoved, supportsAdded, activesRemoved, activesAdded, gemChanges];
+  if (gemDiffs.every((list) => !list.length) && !Object.keys(fields).length) return null;
   const changes = capped(gemChanges, MAX_GEMS);
   return {
     skills: groupLabel(a),
     ...gemList('supportsAdded', supportsAdded),
     ...gemList('supportsRemoved', supportsRemoved),
+    ...gemList('activesAdded', activesAdded),
+    ...gemList('activesRemoved', activesRemoved),
     ...(changes.list.length ? { gemChanges: changes.list } : {}),
     ...(changes.more ? { gemChangesMore: changes.more } : {}),
     ...fields,
@@ -620,7 +626,7 @@ export function registerCompareBuilds(tools: ToolRegistrar, engine: EngineManage
         `\`stats\` (a, b, delta = b - a, pct = delta in % of a: ${KEY_STATS.join(', ')} always, other stats only when they differ, largest change first), ` +
         '`tree` (points; nodes only in a / only in b: keystones, notables, masteries with their effect and ascendancy nodes named with ids, normal nodes and jewel sockets counted; mastery effect changes), ' +
         '`items` (slots holding the same item; changed slots with the mod lines only in a / only in b; slots filled on one side only), ' +
-        '`gems` (socket groups matched by their active skills: supports added / removed, level / quality / enabled changes; groups on one side only) and `config` (options that differ). ' +
+        '`gems` (socket groups matched by their active skills: supports and other active gems added / removed, level / quality / enabled changes; groups on one side only) and `config` (options that differ). ' +
         'Long lists are cut; `more` says how many entries were left out.',
       inputSchema: {
         source: sourceSchema,

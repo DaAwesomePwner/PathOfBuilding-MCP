@@ -286,11 +286,12 @@ export type UndoEntry = (
   | { kind: 'config'; snapshot: ConfigSnapshot }
   /** Tree-version change: restores the whole spec, version included. */
   | { kind: 'spec'; state: SpecState }
-  /** Committed node allocation / deallocation: restores the tree exactly (items are untouched). */
-  | { kind: 'tree'; snapshot: TreeSnapshot }
   /** Committed socket group edit (create / delete / main skill): restores every skill set exactly. */
   | { kind: 'skills'; snapshot: SkillsSnapshot }
-  /** set_ascendancy: the tree and every skill set (a removed node may have granted a socket group). */
+  /**
+   * allocate_nodes / deallocate_nodes / set_ascendancy: the tree exactly and every
+   * skill set (a node added or removed may grant a socket group); items are untouched.
+   */
   | { kind: 'treeSkills'; tree: TreeSnapshot; skills: SkillsSnapshot }
   /** set_character_level: the level and PoB's auto level mode before the change. */
   | { kind: 'level'; level: number; autoMode: boolean }
@@ -1058,15 +1059,12 @@ export class BuildSession {
       } else if (entry.kind === 'spec') {
         await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
         await this.refreshBuildInfoUnlocked();
-      } else if (entry.kind === 'tree') {
-        await this.restoreTreeUnlocked(entry.snapshot);
-        // set_ascendancy pushes tree entries: the class / ascendancy may change back.
-        await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'skills') {
         await this.restoreSkillsUnlocked(entry.snapshot);
         await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'treeSkills') {
         await this.restoreTreeAndSkillsUnlocked(entry.tree, entry.skills);
+        // The class / ascendancy and the main skill may change back.
         await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'level') {
         await this.bridge.send({ cmd: 'setCharacterLevel', level: entry.level, autoMode: entry.autoMode });
@@ -1467,7 +1465,7 @@ export class BuildSession {
    * Names resolve as in simulate_passive_change. The bridge checks the whole
    * batch first (unknown, unreachable, already allocated, mastery, repeated,
    * two options of one choice node), so a refusal changes nothing and pushes
-   * nothing. Pushes one tree undo entry and records, for crash replay, the
+   * nothing. Pushes one tree + skills undo entry and records, for crash replay, the
    * added node ids in the order they joined the tree (so the replay does not
    * depend on which of several equally short paths PoB picks).
    */
@@ -1477,8 +1475,8 @@ export class BuildSession {
 
   /**
    * Commit a deallocation (deallocate_nodes): each node together with every
-   * node that depends on it. Checked first like allocateNodes; one tree undo
-   * entry; the requested ids are recorded for replay (what depends on a node
+   * node that depends on it. Checked first like allocateNodes; one tree +
+   * skills undo entry; the requested ids are recorded for replay (what depends on a node
    * is a property of the tree, not of table order).
    */
   async deallocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
@@ -1497,7 +1495,15 @@ export class BuildSession {
     return this.withLock(async () => {
       const resolver = new NodeNameResolver((command) => this.bridge.send(command));
       const ids = await resolver.resolveAll(refs, mode);
-      const entry: UndoEntry = { kind: 'tree', snapshot: await this.snapshotTreeUnlocked() };
+      // Skills too, as for set_ascendancy: a node that grants a skill (Radiant
+      // Crusade, or one depending on it) adds or drops a socket group when PoB
+      // recalculates, and a tree restore alone brings the group back with
+      // default fields and loses a main socket group pointing at it.
+      const entry: UndoEntry = {
+        kind: 'treeSkills',
+        tree: await this.snapshotTreeUnlocked(),
+        skills: await this.snapshotSkillsUnlocked(),
+      };
       const journal = this.bridge.committedCount();
       const before = await this.bridge.getStats();
       let res: TreeEditApplied;
