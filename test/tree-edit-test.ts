@@ -40,6 +40,14 @@
 //      one of that name (a switch); refusals (effect not offered, chosen on another mastery, text matching
 //      nothing, not a mastery, ambiguous name, listed twice, one effect twice,
 //      a mastery in `nodes`, nothing given) change nothing.
+//  10. A skill-granting node (Guardian, Radiant Crusade, whose granted group
+//      is the main group after the fixture's groups): deallocate_nodes on it
+//      (alone, and taking a dependent ascendancy node with it) drops the
+//      group and moves the main group; undo brings the group back with its
+//      fields and the main group (export byte-identical, CombinedDPS and
+//      mainSocketGroup exact). allocate_nodes adding it, then undo, is exact
+//      too. (Radiant Crusade is next to the Guardian start, so no node can sit
+//      between it and the start.)
 //   Points: every result's passive `pointCost` count equals the change in
 //   PoB's own point total.
 //   (No fixture has an ascendancy choice node, so `removed` for one option
@@ -657,6 +665,85 @@ async function firstNotable(session: BuildSession): Promise<number> {
   return n.id;
 }
 
+/** The fixture as a Guardian with only the given (ascendancy) nodes allocated. */
+function guardianXml(nodes: string): string {
+  return readFileSync(MASTERY_FIXTURE, 'utf8')
+    .replace(
+      /<Spec nodes="[^"]*" treeVersion="3_24"([^>]*?)masteryEffects="[^"]*" classId="3" ascendClassId="1"/,
+      `<Spec nodes="${nodes}" treeVersion="3_24"$1masteryEffects="" classId="5" ascendClassId="3"`,
+    )
+    .replace('ascendClassName="Occultist"', 'ascendClassName="Guardian"')
+    .replace('className="Witch"', 'className="Templar"');
+}
+
+const RADIANT_CRUSADE = 4494;
+const RADIANT_CRUSADE_NEXT = 16745; // the Guardian node past Radiant Crusade: depends on it
+
+function mainSocketGroup(xml: string): string {
+  const m = /<Build\b[^>]*\bmainSocketGroup="(\d+)"/.exec(xml);
+  assert(m, 'export has no mainSocketGroup');
+  return m[1];
+}
+
+async function test10GrantedSkill(): Promise<void> {
+  log('Test 10: tree edits removing / adding a skill-granting node: undo restores the skills');
+  const bridge = newBridge();
+  const session = await primedSession(bridge, guardianXml(`40010,${RADIANT_CRUSADE},${RADIANT_CRUSADE_NEXT}`));
+  const groups = (await bridge.send<{ groups: Array<{ source?: string }> }>({ cmd: 'getSocketGroups' })).groups;
+  const granted = groups.findIndex((g) => g.source === `Tree:${RADIANT_CRUSADE}`) + 1;
+  assert(granted > 1, `the granted group follows the fixture's groups: ${JSON.stringify(groups)}`);
+  await session.setMainSkill(granted);
+  const base = await state(session);
+  assert(mainSocketGroup(base.xml) === String(granted), `main group ${mainSocketGroup(base.xml)}`);
+  const baseMain = (await session.getBuildInfo()).mainSkill;
+  assert(baseMain && /Sentinel of Radiance/.test(baseMain), `main skill ${String(baseMain)}`);
+  // The cached build info (export_build summary, get_engine_info) against PoB's own.
+  const mainSkills = async (): Promise<{ cached: string | null | undefined; pob: string | null | undefined; summary: string }> => ({
+    cached: (await session.getBuildInfo()).mainSkill,
+    pob: (await bridge.send<{ info: { mainSkill?: string | null } }>({ cmd: 'getBuildInfo' })).info.mainSkill,
+    summary: await session.exportBuild('summary'),
+  });
+
+  const exact = async (label: string): Promise<void> => {
+    const now = await state(session);
+    assert(mainSocketGroup(now.xml) === mainSocketGroup(base.xml), `${label}: mainSocketGroup ${mainSocketGroup(now.xml)} != ${mainSocketGroup(base.xml)}`);
+    assert(Object.is(now.stats.CombinedDPS, base.stats.CombinedDPS), `${label}: CombinedDPS ${now.stats.CombinedDPS} != ${base.stats.CombinedDPS}`);
+    assertSame(label, now, base);
+    assert(now.xml === base.xml, `${label}: export not byte-identical`);
+  };
+
+  for (const [label, refs] of [
+    ['Radiant Crusade with its dependent', [RADIANT_CRUSADE]],
+    ['Radiant Crusade by name with its dependent listed', ['Radiant Crusade', RADIANT_CRUSADE_NEXT]],
+  ] as Array<[string, Array<string | number>]>) {
+    const res = await session.deallocateNodes(refs);
+    const removed = res.removed.map((n) => n.id).sort((a, b) => a - b);
+    assert(JSON.stringify(removed) === JSON.stringify([RADIANT_CRUSADE, RADIANT_CRUSADE_NEXT].sort((a, b) => a - b)), `${label}: removed ${JSON.stringify(removed)}`);
+    const after = (await bridge.send<{ groups: unknown[] }>({ cmd: 'getSocketGroups' })).groups;
+    assert(after.length === groups.length - 1, `${label}: the granted group goes with the node`);
+    assert(mainSocketGroup(await session.exportXML()) !== String(granted), `${label}: the main group moved off the removed group`);
+    const moved = await mainSkills();
+    assert(moved.pob && moved.pob !== baseMain, `${label}: PoB's main skill ${String(moved.pob)}`);
+    assert(moved.cached === moved.pob, `${label}: cached main skill ${String(moved.cached)} != PoB's ${String(moved.pob)}`);
+    assert(moved.summary.includes(`Main Skill: ${moved.pob}`), `${label}: summary export: ${moved.summary.slice(0, 300)}`);
+    await session.undoLastChange();
+    await exact(`undo deallocate_nodes (${label})`);
+    assert((await mainSkills()).cached === baseMain, `${label}: undo puts the main skill back`);
+  }
+
+  // Allocating it: from the tree without it, add it back, then undo.
+  await session.deallocateNodes([RADIANT_CRUSADE]);
+  const without = await state(session);
+  const added = await session.allocateNodes([RADIANT_CRUSADE_NEXT]);
+  assert(added.added.some((n) => n.id === RADIANT_CRUSADE), `allocated with its path: ${JSON.stringify(added.added)}`);
+  await session.undoLastChange();
+  assertSame('undo allocate_nodes adding Radiant Crusade', await state(session), without);
+  assert((await state(session)).xml === without.xml, 'undo allocate_nodes: export not byte-identical');
+  await session.undoLastChange();
+  await exact('undo the deallocation after the allocation round trip');
+  log('PASS 10');
+}
+
 async function main(): Promise<void> {
   try {
     await test1To4();
@@ -665,6 +752,7 @@ async function main(): Promise<void> {
     await test7Cluster();
     await test8Faults();
     await test9Masteries();
+    await test10GrantedSkill();
     log('ALL PASS');
   } finally {
     for (const b of bridges) await b.shutdown().catch(() => undefined);
