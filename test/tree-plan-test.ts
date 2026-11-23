@@ -18,6 +18,14 @@
 //      are refused with every problem listed.
 //   6. includeMasteries (ConvertTreeMasteries.xml): mastery candidates are offered and the
 //      plan's variant (with its masteries) reproduces its `after` through apply_changes.
+//   4b. Input checks and truncation: unknown excludeNodes / optimizeFor / objective stats
+//      refused; pointsRemaining reported; a fake clock forces the time budget part-way
+//      (greedy and beamWidth 2): the plan returned is one that was applied, its totals equal
+//      its last step and its variant reproduces `after`.
+//   7. Skills in the scope: a Guardian with Radiant Crusade (grants a skill) whose granted
+//      group is the main skill; plan_respec removing the ascendancy and a plan restore the
+//      build exactly (the group and the main socket group come back), and apply_changes of
+//      the respec variant gives its `after`.
 //   After every tool: export_build byte-identical, undo depth, journal length and the
 //   committed fingerprint unchanged.
 import { mkdtempSync, readFileSync } from 'fs';
@@ -163,6 +171,47 @@ async function main(): Promise<void> {
     await assertUnchanged(s0, 'section 4');
     log(`PASS: constrained +${manaCap.gain} (Mana kept), beam +${beam.gain} vs greedy 4 +${p4.gain}`);
 
+    log('4b. Input checks, pointsRemaining, truncation');
+    await refused(() => session.planPassivePoints({ points: 2, excludeNodes: [999999, 'No Such Node Name', p1.steps[0].node.id] }),
+      ['999999', '"No Such Node Name"'], 'unknown excludeNodes');
+    await refused(() => session.planPassivePoints({ points: 2, optimizeFor: 'NotARealStat' }), ['NotARealStat'], 'unknown optimizeFor');
+    await refused(() => session.planPassivePoints({ points: 2, objective: { weights: { NotARealStat: 1 } } }), ['NotARealStat'], 'objective of unknown stats');
+    const tree0 = (await session.getPassiveTree()).summary;
+    assert(p10.pointsRemaining.before === tree0.maxNormalPoints - tree0.totalPoints && p10.pointsRemaining.after === p10.pointsRemaining.before - p10.pointsUsed,
+      `pointsRemaining: ${JSON.stringify(p10.pointsRemaining)}`);
+    /** Totals consistent with the steps, and the variant reproduces `after`. */
+    const assertConsistent = async (p: PlanPointsResult, what: string): Promise<void> => {
+      const last = p.steps[p.steps.length - 1];
+      if (!last) {
+        assert(p.pointsUsed === 0 && p.gain === 0 && p.nodeIds.length === 0, `${what}: empty plan with totals`);
+        sameStats(p.after, p.before, KEYS, `${what} empty`);
+        return;
+      }
+      assert(p.pointsUsed === last.pointsUsed, `${what}: pointsUsed ${p.pointsUsed} vs last step ${last.pointsUsed}`);
+      close(p.after.CombinedDPS, last.after.CombinedDPS, `${what}: after = last step`);
+      close(p.gain, (p.after.CombinedDPS as number) - (p.before.CombinedDPS as number), `${what}: gain`);
+      close(p.delta.CombinedDPS, p.gain, `${what}: delta`);
+      assert(p.nodeIds.length === p.steps.reduce((n, st) => n + st.path.length, 0), `${what}: nodeIds = step paths`);
+      const ev = await session.probeNamed({ stats: KEYS, variants: [p.applyChanges] });
+      assert(ev.results[0].error === undefined, `${what}: ${ev.results[0].error}`);
+      sameStats(ev.results[0].stats, p.after, KEYS, `${what} variant`);
+    };
+    const fakeClock = (): (() => number) => {
+      let ticks = 0;
+      return () => ticks++ * 1000;
+    };
+    for (const [beamWidth, ticks] of [[1, 12], [1, 20], [2, 20], [2, 40]] as const) {
+      const cut = await session.planPassivePoints({ points: 10, beamWidth, clock: fakeClock(), timeBudgetMs: ticks * 1000 });
+      await assertUnchanged(s0, `truncated plan (beam ${beamWidth}, ${ticks} ticks)`);
+      assert(cut.truncated?.some((t) => t.includes('stopped after')), `beam ${beamWidth}, ${ticks} ticks: not truncated`);
+      assert(cut.steps.length < p10.steps.length || beamWidth > 1, `beam ${beamWidth}, ${ticks} ticks: ${cut.steps.length} steps`);
+      await assertConsistent(cut, `truncated plan (beam ${beamWidth}, ${ticks} ticks)`);
+      log(`  beam ${beamWidth}, ${ticks} ticks: ${cut.steps.length} steps, ${cut.pointsUsed} points, +${cut.gain}`);
+    }
+    await assertConsistent(p10, 'plan 10');
+    await assertUnchanged(s0, 'section 4b');
+    log('PASS');
+
     log('5. plan_respec');
     const tree = await session.getPassiveTree();
     const allocated = tree.allocatedNodes.map((n) => n.id);
@@ -235,6 +284,32 @@ async function main(): Promise<void> {
     await session.undoLastChange();
     await assertUnchanged(m0, 'mastery apply + undo');
     log('PASS: mastery steps reproduced');
+
+    log('7. Skills in the scope (Guardian, Radiant Crusade as the main skill)');
+    const guardianXml = readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8')
+      .replace(/<Spec nodes="[^"]*" treeVersion="3_24"([^>]*?)masteryEffects="[^"]*" classId="3" ascendClassId="1"/, '<Spec nodes="40010,4494" treeVersion="3_24"$1masteryEffects="" classId="5" ascendClassId="3"')
+      .replace('ascendClassName="Occultist"', 'ascendClassName="Guardian"')
+      .replace('className="Witch"', 'className="Templar"');
+    await session.loadBuild(guardianXml);
+    const gTree = await session.getPassiveTree();
+    assert(gTree.allocatedNodes.some((n) => n.id === 4494), 'Radiant Crusade allocated');
+    const groups = (await bridge.send<{ groups: Array<{ source?: string }> }>({ cmd: 'getSocketGroups' })).groups;
+    const granted = groups.findIndex((g) => g.source === 'Tree:4494') + 1;
+    assert(granted > 0, `no group granted by Radiant Crusade: ${JSON.stringify(groups)}`);
+    await session.setMainSkill(granted);
+    const g0 = await state();
+    const normal = gTree.allocatedNodes.filter((n) => !(n as { ascendancyName?: string }).ascendancyName).map((n) => n.id);
+    const gRespec = await session.planRespec(normal, false, KEYS);
+    await assertUnchanged(g0, 'respec dropping a skill-granting node');
+    assert(gRespec.removed.some((n) => n.id === 4494), 'Radiant Crusade removed');
+    const gApplied = await session.applyChanges({ deallocate: gRespec.deallocate });
+    sameStats(gApplied.after, gRespec.after, KEYS, 'Guardian respec apply_changes');
+    await session.undoLastChange();
+    await assertUnchanged(g0, 'Guardian respec apply + undo');
+    const gPlan = await session.planPassivePoints({ points: 3, optimizeFor: 'Life', beamWidth: 2 });
+    await assertUnchanged(g0, 'plan on the Guardian build');
+    assert(gPlan.steps.length > 0, 'Guardian plan has steps');
+    log(`PASS: respec -${gRespec.removed.length} nodes, plan +${gPlan.gain} Life`);
 
     log('ALL TESTS PASSED');
   } finally {

@@ -17,10 +17,12 @@
 // gain wins. Every step's numbers are read from the real tree after the step
 // (not the calculator's prediction), so the final stats are what applying the
 // returned variant gives. Candidates needing a full recalculation (cluster
-// jewel nodes, skill-granting nodes) are capped per expansion
-// (MAX_SEARCH_FALLBACKS, fewest points first) and per plan
-// (MAX_PLAN_FALLBACKS); a time budget (PLAN_TIME_BUDGET_MS) stops the search
-// early. Both are reported. Callers hold the session lock.
+// jewel nodes, skill-granting nodes, masteries in a timeless jewel's radius:
+// the engine classifies every candidate first, as the probe does) are capped
+// per expansion (MAX_SEARCH_FALLBACKS, fewest points first) and per plan
+// (MAX_PLAN_FALLBACKS); a time budget (PLAN_TIME_BUDGET_MS, checked between
+// probe chunks too) stops the search, and the best plan already applied is
+// returned. Both are reported. Callers hold the session lock.
 
 import { z } from 'zod';
 import {
@@ -46,7 +48,7 @@ export const MAX_BEAM_WIDTH = 3;
 /** Candidates needing a full recalculation evaluated per plan (each ~0.1-0.3 s). */
 export const MAX_PLAN_FALLBACKS = 24;
 /** The search stops expanding after this long and returns the best plan found so far. */
-export const PLAN_TIME_BUDGET_MS = 45_000;
+export const PLAN_TIME_BUDGET_MS = 40_000;
 export const MAX_RESPEC_TARGET = 300;
 
 export interface PlanDeps {
@@ -54,7 +56,6 @@ export interface PlanDeps {
   probe(request: ProbeRequest): Promise<ProbeResponse>;
   /** Put the tree back exactly as the plan found it (beam search switches states). */
   resetTree(): Promise<void>;
-  now?: () => number;
 }
 
 export interface PlanPointsOptions {
@@ -66,6 +67,9 @@ export interface PlanPointsOptions {
   beamWidth?: number;
   includeMasteries?: boolean;
   excludeNodes?: Array<number | string>;
+  /** Tests: the time budget (default PLAN_TIME_BUDGET_MS) and the clock it is measured with. Not tool arguments. */
+  timeBudgetMs?: number;
+  clock?: () => number;
 }
 
 interface NodeRef {
@@ -112,6 +116,8 @@ export interface PlanPointsResult {
   objective?: { mode: 'relative' | 'absolute'; ignored?: string[] };
   points: number;
   pointsUsed: number;
+  /** Unspent passive points of the build before the plan and after it (negative: over budget). */
+  pointsRemaining: { before: number; after: number };
   maxPathCost: number;
   beamWidth: number;
   steps: PlanStep[];
@@ -129,6 +135,7 @@ export interface PlanPointsResult {
   evaluated: number;
   skippedSlow?: number;
   truncated?: string[];
+  warnings?: string[];
   timeMs: number;
 }
 
@@ -178,10 +185,22 @@ interface Ranked {
   violates: string[];
 }
 
+/** Thrown inside the search when the time budget runs out; caught by planPassivePoints. */
+class TimeUp extends Error {}
+
+/** Candidates probed per call between time-budget checks. */
+const PLAN_PROBE_CHUNK = 100;
+/** Variants per classify-only call (the engine's limit per command). */
+const CLASSIFY_CHUNK = MAX_PROBE_VARIANTS;
+
 export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions): Promise<PlanPointsResult> {
   validatePlanOptions(opts);
-  const now = deps.now ?? Date.now;
+  const now = opts.clock ?? Date.now;
   const started = now();
+  const budget = opts.timeBudgetMs ?? PLAN_TIME_BUDGET_MS;
+  const checkTime = (): void => {
+    if (now() - started > budget) throw new TimeUp();
+  };
   const maxPathCost = opts.maxPathCost ?? DEFAULT_PLAN_PATH_COST;
   const beamWidth = opts.beamWidth ?? 1;
   const constraints = opts.constraints ?? [];
@@ -191,16 +210,38 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
     ...constraints.map((c) => c.stat),
   ]);
   const keys = unique([...focus, ...DEFAULT_EVALUATE_STATS]);
+
+  // excludeNodes: every id and name must name a node.
   const excludedIds = new Set<number>();
   const excludedNames = new Set<string>();
+  const unknownExcluded: string[] = [];
   for (const ref of opts.excludeNodes ?? []) {
-    if (typeof ref === 'number') excludedIds.add(ref);
+    const res = await deps.send<{ node: unknown }>(typeof ref === 'number' ? { cmd: 'getNodeInfo', nodeId: ref } : { cmd: 'getNodeInfo', name: ref });
+    if (!res.node || typeof res.node !== 'object') unknownExcluded.push(typeof ref === 'number' ? String(ref) : `"${ref}"`);
+    else if (typeof ref === 'number') excludedIds.add(ref);
     else excludedNames.add(ref.toLowerCase());
   }
+  if (unknownExcluded.length > 0) throw new UserError(`excludeNodes: unknown nodes: ${unknownExcluded.join(', ')}`);
 
   const readBase = async (): Promise<Stats> => (await deps.probe({ stats: keys, variants: [] })).base;
   const startStats = await readBase();
+  if (optimizeFor !== undefined && typeof startStats[optimizeFor] !== 'number') {
+    throw new UserError(
+      `optimizeFor "${optimizeFor}" is not a numeric stat of this build (an unknown key? use the keys get_stats / evaluate_changes report, e.g. CombinedDPS, Life, TotalEHP)`,
+    );
+  }
   const scorer = opts.objective ? makeScorer(opts.objective, startStats) : undefined;
+  if (scorer && scorer.ignored.length === Object.keys(opts.objective!.weights).length) {
+    throw new UserError(`objective: no weighted stat is a non-zero number for this build (${scorer.ignored.join(', ')}); unknown keys?`);
+  }
+  const warnings: string[] = [];
+  for (const c of constraints) {
+    if (typeof startStats[c.stat] !== 'number') warnings.push(`constraint stat ${c.stat} is not a number for this build (an unknown key?); every step breaks it`);
+  }
+  const summary = (await deps.send<{ summary?: { totalPoints?: number; maxNormalPoints?: number } }>({ cmd: 'getPassiveTreeSummary' })).summary ?? {};
+  const remainingBefore = toNumber(summary.maxNormalPoints) - toNumber(summary.totalPoints);
+  if (opts.points > remainingBefore) warnings.push(`the build has ${remainingBefore} unspent passive points; the plan may spend up to ${opts.points}`);
+
   const value = (s: Stats): number => (scorer ? scorer.score(s).score : toNumber(s[optimizeFor!]));
   const startValue = value(startStats);
   const noise = (v: number): number => (scorer ? 1e-12 : 1e-9 * Math.max(1, Math.abs(v)));
@@ -284,7 +325,7 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
     for (const c of array<Candidate>(res.nodes)) {
       const nodes = array<number>(c.nodes);
       if (c.type === 'Socket' || isExcluded(nodes)) continue;
-      out.push({ id: c.id, name: c.name, type: c.type, nodes, points: c.points, ...(c.fallback ? { fallback: c.fallback } : {}) });
+      out.push({ id: c.id, name: c.name, type: c.type, nodes, points: c.points });
     }
     for (const m of array<Candidate & { effects: unknown }>(res.masteries)) {
       const nodes = array<number>(m.nodes);
@@ -298,32 +339,60 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
 
   const variantOf = (c: Candidate): ProbeVariant => (c.mastery ? { masteries: [{ node: c.id, effect: c.mastery.effect }] } : { allocate: [c.id] });
 
-  /** Every candidate from the state on the tree, ranked (improving ones only). */
+  /**
+   * Every candidate from the state on the tree, ranked (improving ones only).
+   * The engine classifies each first (as the probe does): those that would
+   * need a full recalculation (cluster jewel and skill-granting nodes, a
+   * mastery in a timeless jewel's radius, every variant while the party's
+   * export-buffs option is on, ...) are the slow ones, capped.
+   */
   const rankFrom = async (s: State, maxPoints: number): Promise<Ranked[]> => {
     const all = await listCandidates(maxPoints);
-    const slow = all.filter((c) => c.fallback !== undefined).sort((a, b) => a.points - b.points || a.id - b.id);
+    const fast: Candidate[] = [];
+    const slow: Candidate[] = [];
+    for (let i = 0; i < all.length; i += CLASSIFY_CHUNK) {
+      checkTime();
+      const chunk = all.slice(i, i + CLASSIFY_CHUNK);
+      const res = await deps.send<{ results?: unknown }>({ cmd: 'probe', classifyOnly: true, variants: chunk.map(variantOf) });
+      const results = array<{ error?: string; userError?: boolean; fallback?: boolean; reason?: string }>(res.results);
+      chunk.forEach((c, j) => {
+        const r = results[j] ?? {};
+        if (r.error !== undefined) {
+          if (r.userError) return; // refused as input (an effect taken meanwhile, ...): not a candidate
+          throw new Error(`plan_passive_points: checking node ${c.id} (${c.name}) failed: ${r.error}`);
+        }
+        if (r.fallback) {
+          c.fallback = r.reason ?? 'needs a full recalculation';
+          slow.push(c);
+        } else {
+          fast.push(c);
+        }
+      });
+    }
+    slow.sort((a, b) => a.points - b.points || a.id - b.id || (a.mastery?.effect ?? 0) - (b.mastery?.effect ?? 0));
     const slowCap = Math.max(0, Math.min(MAX_SEARCH_FALLBACKS, fallbackBudget));
-    const keptSlow = new Set(slow.slice(0, slowCap));
     if (slow.length > slowCap) {
       skippedSlow += slow.length - slowCap;
       truncated.add(
-        `candidates needing a full recalculation (cluster jewel or skill-granting nodes) were capped at ${MAX_SEARCH_FALLBACKS} per step and ${MAX_PLAN_FALLBACKS} per plan, fewest points first; ${'`skippedSlow`'} counts the others`,
+        `candidates needing a full recalculation (cluster jewel or skill-granting nodes, masteries in a timeless jewel's radius, ...) were capped at ${MAX_SEARCH_FALLBACKS} per step and ${MAX_PLAN_FALLBACKS} per plan, fewest points first; skippedSlow counts the others`,
       );
     }
-    const kept = all.filter((c) => c.fallback === undefined || keptSlow.has(c));
+    const keptSlow = slow.slice(0, slowCap);
+    fallbackBudget -= keptSlow.length;
+    const kept = [...fast, ...keptSlow];
     const results: ProbeVariantResult[] = [];
-    for (let i = 0; i < kept.length; i += MAX_PROBE_VARIANTS) {
-      const res = await deps.probe({ stats: keys, variants: kept.slice(i, i + MAX_PROBE_VARIANTS).map(variantOf) });
+    for (let i = 0; i < kept.length; i += PLAN_PROBE_CHUNK) {
+      checkTime();
+      const res = await deps.probe({ stats: keys, variants: kept.slice(i, i + PLAN_PROBE_CHUNK).map(variantOf) });
       results.push(...res.results);
     }
     evaluated += kept.length;
-    fallbackBudget -= results.filter((r) => r.fallback).length;
     const current = value(s.stats!);
     const ranked: Ranked[] = [];
     kept.forEach((cand, i) => {
       const r = results[i];
       if (r.error !== undefined) {
-        if (r.userError) return; // refused as input (e.g. an effect taken meanwhile): not a candidate
+        if (r.userError) return;
         throw new Error(`plan_passive_points: evaluating node ${cand.id} (${cand.name}) failed: ${r.error}`);
       }
       const gain = value(r.stats) - current;
@@ -359,36 +428,48 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
   let beams: State[] = [root];
   const finished: State[] = [];
   while (beams.length > 0) {
-    if (now() - started > PLAN_TIME_BUDGET_MS) {
-      truncated.add(`the search stopped after ${PLAN_TIME_BUDGET_MS / 1000} s; the plan holds the steps found by then`);
-      for (const s of beams) s.done ??= 'time budget';
-      finished.push(...beams);
-      break;
-    }
     const children: State[] = [];
-    for (const s of beams) {
-      await materialize(s);
-      const left = opts.points - s.points;
-      if (left <= 0) {
-        finished.push(s);
-        continue;
+    try {
+      for (const s of beams) {
+        checkTime();
+        await materialize(s);
+        const left = opts.points - s.points;
+        if (left <= 0) {
+          finished.push(s);
+          continue;
+        }
+        const ranked = await rankFrom(s, Math.min(maxPathCost, left));
+        const currentBroken = constraints.length > 0 ? violations(constraints, startStats, s.stats!).length : 0;
+        // A step keeps the constraints satisfied when one can; once broken, the fewest violations first.
+        const usable = currentBroken === 0 ? ranked.filter((r) => r.violates.length === 0) : ranked;
+        if (usable.length === 0) {
+          s.done =
+            ranked.length === 0
+              ? `no candidate of at most ${Math.min(maxPathCost, left)} points improves ${optimizeFor ?? 'the objective'}`
+              : 'every improving candidate breaks a constraint';
+          finished.push(s);
+          continue;
+        }
+        for (const r of usable.slice(0, beamWidth)) {
+          const predicted = value(r.result.stats);
+          children.push({ key: stateKey(s, r.cand), parent: s, cand: r.cand, ids: s.ids, masteries: s.masteries, points: s.points + r.points, steps: s.steps, predicted });
+        }
       }
-      const ranked = await rankFrom(s, Math.min(maxPathCost, left));
-      const currentBroken = constraints.length > 0 ? violations(constraints, startStats, s.stats!).length : 0;
-      // A step keeps the constraints satisfied when one can; once broken, the fewest violations first.
-      const usable = currentBroken === 0 ? ranked.filter((r) => r.violates.length === 0) : ranked;
-      if (usable.length === 0) {
-        s.done =
-          ranked.length === 0
-            ? `no candidate of at most ${Math.min(maxPathCost, left)} points improves ${optimizeFor ?? 'the objective'}`
-            : 'every improving candidate breaks a constraint';
-        finished.push(s);
-        continue;
+    } catch (e) {
+      if (!(e instanceof TimeUp)) throw e;
+      // Out of time: every plan of this round that is applied ends here, one
+      // not applied yet ends at its (applied) parent; unapplied children are dropped.
+      truncated.add(`the search stopped after ${Math.round(budget / 1000)} s; the plan holds the steps applied by then`);
+      const ends = new Set<State>(finished);
+      for (const s of beams) {
+        const end = s.stats !== undefined ? s : s.parent!;
+        end.done ??= 'time budget';
+        if (!ends.has(end)) {
+          ends.add(end);
+          finished.push(end);
+        }
       }
-      for (const r of usable.slice(0, beamWidth)) {
-        const predicted = value(r.result.stats);
-        children.push({ key: stateKey(s, r.cand), parent: s, cand: r.cand, ids: s.ids, masteries: s.masteries, points: s.points + r.points, steps: s.steps, predicted });
-      }
+      break;
     }
     // Keep the beamWidth best distinct partial plans by predicted gain per point spent.
     const perPoint = (c: State): number => (c.predicted - startValue) / Math.max(1, c.points);
@@ -399,14 +480,15 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
       .slice(0, beamWidth);
   }
 
-  // The plan with the largest total gain (fewest points, then the earliest found, on ties).
-  let best = finished[0] ?? root;
-  for (const s of finished) {
-    const gs = value(s.stats ?? startStats);
-    const gb = value(best.stats ?? startStats);
+  // The applied plan with the largest total gain (fewest points, then the earliest found, on ties).
+  const ends = finished.filter((s) => s.stats !== undefined);
+  let best = ends[0] ?? root;
+  for (const s of ends) {
+    const gs = value(s.stats!);
+    const gb = value(best.stats!);
     if (gs > gb + noise(gb) || (Math.abs(gs - gb) <= noise(gb) && s.points < best.points)) best = s;
   }
-  const endStats = best.stats ?? startStats;
+  const endStats = best.stats!;
   const delta: Record<string, number | null> = {};
   for (const k of keys) {
     const a = startStats[k];
@@ -424,6 +506,7 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
     ...(scorer ? { objective: { mode: opts.objective!.mode ?? 'relative', ...(scorer.ignored.length > 0 ? { ignored: scorer.ignored } : {}) } } : {}),
     points: opts.points,
     pointsUsed: best.points,
+    pointsRemaining: { before: remainingBefore, after: remainingBefore - best.points },
     maxPathCost,
     beamWidth,
     steps: best.steps,
@@ -439,6 +522,7 @@ export async function planPassivePoints(deps: PlanDeps, opts: PlanPointsOptions)
     evaluated,
     ...(skippedSlow > 0 ? { skippedSlow } : {}),
     ...(truncated.size > 0 ? { truncated: [...truncated] } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
     timeMs: now() - started,
   };
 }
@@ -586,7 +670,9 @@ export function registerTreePlanTools(tools: ToolRegistrar): void {
         "Every candidate is evaluated through Path of Building's own calculator (as find_best_next_nodes), and each step's numbers are read from the recalculated tree, so `after` is what applying the plan gives. NOTHING IS APPLIED and nothing is pushed to undo. " +
         'Returns `steps` in order (node, `path` = the nodes the step allocates in join order, `points`, cumulative `pointsUsed`, `gain`, `gainPerPoint`, the focus stats `after` the step), `gain` (total), `before` / `after` / `delta` of the key stats, `nodeIds` (join order), and ready-to-use arguments: `applyChanges` (one undoable apply_changes variant) and `allocateNodes` (allocate_nodes). ' +
         '`constraints` (as evaluate_changes) are kept by every step when possible (`violates` lists any broken); `beamWidth` 2-3 keeps several partial plans (slower, sometimes better than greedy); `includeMasteries` also considers each free effect of reachable masteries; `excludeNodes` (ids or names) are never allocated, nor paths through them. Jewel sockets, ascendancy nodes and class starts are skipped. ' +
-        `Nodes needing a full recalculation are capped (\`skippedSlow\`), and the search stops after ${PLAN_TIME_BUDGET_MS / 1000} s (\`truncated\`); \`stoppedEarly\` says why fewer points were used.`,
+        `Nodes needing a full recalculation are capped (\`skippedSlow\`), and the search stops after ${PLAN_TIME_BUDGET_MS / 1000} s with the steps applied by then (\`truncated\`); \`stoppedEarly\` says why fewer points were used, \`pointsRemaining\` the unspent points before and after, \`warnings\` anything doubtful (a constraint stat that is not a number, more points than the build has left). ` +
+        `The call holds the engine for its whole duration (about 1 s per step greedy, up to ${PLAN_TIME_BUDGET_MS / 1000} s): other tool calls wait for it. ` +
+        'An unknown `optimizeFor`, an objective with no usable weighted stat, or an unknown `excludeNodes` entry is refused.',
       inputSchema: {
         points: z.number().int().min(1).max(MAX_PLAN_POINTS).describe('Passive points to spend.'),
         optimizeFor: z.string().min(1).optional().describe('Stat key to maximize (default "CombinedDPS"); not with `objective`.'),

@@ -1869,16 +1869,25 @@ export class BuildSession {
   }
 
   /**
-   * Run `fn` on a temporary passive tree: the tree is snapshotted once and
-   * restored exactly once at the end (`resetTree` restores it mid-way), and
-   * the committed state is compared by value (`probe` with `fingerprint`)
-   * before and after; a difference is an internal error naming reset_build.
+   * Run `fn` on a temporary passive tree: the tree and the skills are
+   * snapshotted once and restored exactly once at the end (`resetTree`
+   * restores them mid-way), and the committed state is compared by value
+   * (`probe` with `fingerprint`) before and after; a difference is an
+   * internal error naming reset_build. The skills are part of the scope
+   * because a node that grants a skill (Radiant Crusade) adds or drops a
+   * socket group when it changes: a tree restore alone brings the group back
+   * with default fields and loses a main socket group pointing at it.
    */
   private async withPlanTreeScopeUnlocked<T>(tool: string, fn: (resetTree: () => Promise<void>) => Promise<T>): Promise<T> {
     const deps = { send: <R>(c: object) => this.bridge.send<R>(c) };
     const before = await committedFingerprint(deps);
-    const snap = await this.snapshotTreeUnlocked();
-    const restore = (): Promise<void> => this.restoreTreeUnlocked(snap);
+    const tree = await this.snapshotTreeUnlocked();
+    const skills = await this.snapshotSkillsUnlocked();
+    // Skills last: the tree restore re-adds a granted group, the skills restore gives it its fields back.
+    const restore = async (): Promise<void> => {
+      await this.restoreTreeUnlocked(tree);
+      await this.restoreSkillsUnlocked(skills);
+    };
     const result = await probeThenRestore(() => fn(restore), restore);
     const diff = fingerprintDiff(before, await committedFingerprint(deps));
     if (diff !== null) throw new Error(`${tool}: restoring the build afterwards was not exact (${diff}); call reset_build`);
