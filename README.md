@@ -4,7 +4,7 @@
 
 An MCP server that exposes [Path of Building Community](https://pathofbuilding.community/)'s build-planning and calculation engine to LLM clients (Claude Desktop, Claude Code, and other [MCP](https://modelcontextprotocol.io/) hosts).
 
-The server runs PoB's real Lua calculation engine in headless mode and surfaces 46 tools for inspecting builds, swapping items and gems, manipulating the passive tree, simulating "what-ifs," comparing alternatives, and generating weighted trade searches.
+The server runs PoB's real Lua calculation engine in headless mode and surfaces 57 tools for creating and inspecting builds, committing passive tree, gem and item changes, simulating and ranking "what-ifs," planning passive points, comparing builds, building items from PoB's data, and generating weighted trade searches.
 
 ## Prerequisites
 

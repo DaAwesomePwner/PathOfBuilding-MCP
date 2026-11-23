@@ -168,3 +168,37 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
 - **No tests** for stdin-EOF shutdown, or that all tools are registered.
   `test/` is not type-checked.
 - **Nightly run against PoB's `dev` branch** to catch internal API changes early.
+
+## Found during the build-comparison and theorycrafting work
+
+Raised by reviewers on 2026-11-22 (merged up to `d4f168ca`) and left for later.
+None gives wrong numbers today.
+
+- **Probe fingerprint ignores character level** and its auto-level mode
+  (`lua/probe.lua`). Nothing changes the level inside a probe; an auto-level
+  build could drift during a full recalc.
+- **`set_config` undo can reorder the config tables** (about 1 in 6; values
+  exact; visible only in PoB 2.67's export, 2.68 sorts keys). `apply_changes`
+  avoids it with token-bound table copies; `set_config` could do the same.
+- **`simulate_passive_change` snapshots only the tree** (pre-existing): a
+  skill-granting node change can come back with the granted group re-added at
+  the end of the list. `plan_passive_points` / `plan_respec` / `set_ascendancy`
+  snapshot skills too.
+- **Masteries.** A mastery cut off only by two deallocations in one variant is
+  not refused (both paths re-allocate it, so they agree); moving a mastery by
+  name gives "listed twice" instead of the ambiguity list; `mainSkill` is
+  refused with any tree-jewel item change, even one adding no skill; masteries
+  in a timeless jewel's radius (always fallback) are untested.
+- **Tree planning speed.** `plan_passive_points` restores skills on every
+  state switch and classifies each candidate chunk twice; the 40 s budget can
+  overrun by one 100-candidate chunk.
+- **`compare_builds`.** An item inactive on both sides is not marked; the
+  "PoB applying an update" check before the temporary engine starts is
+  untested; an engine-swap carry that fails can return a `buildCode` wrapping
+  `<MCPNewBuild/>` (only this server can load it).
+- **`build_item`.** Essences, fossils, veiled and eldritch-specific crafting
+  are not modelled (eldritch implicits can be passed as lines); more than one
+  bench craft is a warning, not a refusal; uniques with variant-group mod
+  selection only take PoB's default; crucible unique names are refused in any
+  letter case although PoB matches exact case.
+- **`suggest_upgrades`** has no test for error rows sorting last.
