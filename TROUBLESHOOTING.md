@@ -149,9 +149,16 @@ A mastery is always allocated together with the effect chosen on it, so it canno
 - **`status: "unchanged"`** — every mastery listed already had that effect; nothing changed and nothing was pushed to undo.
 - A mastery has no "allocated without an effect" state: to clear one, deallocate it with `deallocate_nodes`.
 
+## `new_build` / `set_ascendancy` refusals
+
+- *"Unknown class / ascendancy / secondary ascendancy …"* — the error lists every class with its ascendancies (or the bloodlines) of that passive tree; names ignore case. Nothing was changed.
+- *"… is a Marauder ascendancy and this build is a Witch"* — `set_ascendancy` changes class only when `className` is given too.
+- *"Changing class from X to Y would reset the passive tree"* — no allocated passive connects to the new class's start, so PoB would ask before removing them. Pass `allowTreeReset: true` to do it anyway (undoable), connect the tree to that start first, or start over with `new_build`.
+- *"Passive tree 3_20 has no secondary ascendancies"* — bloodlines exist on 3.25+ trees only.
+
 ## "Nothing to undo"
 
-The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only `swap_item`, `unequip_item`, `set_config` and `convert_tree_to_latest` push an entry, and only when the change succeeded; the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
+The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only the committed edits (`swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, `create_socket_group`, `delete_socket_group`, `set_main_skill`, `set_character_level`, `set_ascendancy`, `convert_tree_to_latest`) push an entry, and only when the change succeeded (a `new_build` clears the stack, like `load_build`); the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
 
 ## "The Path of Building engine was restarted … Retry the call"
 

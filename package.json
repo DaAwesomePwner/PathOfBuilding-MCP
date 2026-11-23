@@ -45,6 +45,7 @@
     "test:tree-restore": "tsx test/tree-restore-test.ts",
     "test:tree-edit": "tsx test/tree-edit-test.ts",
     "test:build-edit": "tsx test/build-edit-test.ts",
+    "test:new-build": "tsx test/new-build-test.ts",
     "test:item-restore": "tsx test/item-restore-test.ts",
     "test:wickerman": "tsx test/wickerman-test.ts",
     "test:skills-restore": "tsx test/skills-restore-test.ts",

@@ -24,7 +24,7 @@ import { registerTreePlanTools } from './tree-plan.js';
 import type { ProbeMasteryChoice } from './probe.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
-import type { Stats } from './lua-bridge.js';
+import type { BuildInfo, Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
 import { registerTradeTools } from './trade-search.js';
 import { registerStatWeights } from './stat-weights.js';
@@ -173,6 +173,47 @@ tools.engine<{ source: string }>(
     } finally {
       stop();
     }
+  },
+);
+
+tools.engine<{ className?: string; ascendancy?: string; secondaryAscendancy?: string; level?: number; treeVersion?: string }>(
+  'new_build',
+  {
+    description:
+      "Start a new, blank build (what Path of Building's New gives: no passives beyond the class start, no items, no skills, default configuration) with the class, ascendancy, secondary ascendancy (bloodline, 3.25+ trees), level and passive tree chosen. " +
+      'It REPLACES the loaded build exactly as load_build does: undo history and stat snapshots are cleared, and reset_build returns to this blank build. ' +
+      'Build it up with allocate_nodes / plan_passive_points (passives), create_socket_group (skills), build_item + swap_item (gear) and set_config, then export_build. ' +
+      'The level defaults to 1, as in PoB, and is in manual mode (pass the level you plan for, e.g. 90 for an endgame build, or change it later with set_character_level). ' +
+      'Unknown class, ascendancy, bloodline or tree names are refused without changing the loaded build, with the choices listed (names ignore case).',
+    inputSchema: {
+      className: z.string().min(1).max(30).optional().describe('Class, e.g. "Witch" (may be left out when an ascendancy is given).'),
+      ascendancy: z.string().min(1).max(60).optional().describe('Ascendancy, e.g. "Elementalist" (default none).'),
+      secondaryAscendancy: z
+        .string()
+        .min(1)
+        .max(60)
+        .optional()
+        .describe('Secondary ascendancy (bloodline), e.g. "Aul Bloodline" (default none).'),
+      level: z.number().int().min(1).max(100).optional().describe('Character level, 1-100 (default 1).'),
+      treeVersion: z
+        .string()
+        .min(1)
+        .max(40)
+        .optional()
+        .describe('Passive tree version as PoB names it, e.g. "3_30" or "3_30_ruthless" (default: the latest).'),
+    },
+  },
+  async (args, session) => {
+    const info = (await session.newBuild(args)) as BuildInfo & { secondaryAscendancy?: string };
+    return {
+      status: 'created',
+      class: info.class,
+      ascendancy: info.ascendancy,
+      ...(info.secondaryAscendancy ? { secondaryAscendancy: info.secondaryAscendancy } : {}),
+      level: info.level,
+      treeVersion: info.treeVersion,
+      ...(info.engineRestart ? { engineRestart: info.engineRestart } : {}),
+    };
   },
 );
 
@@ -410,7 +451,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill or convert_tree_to_latest). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill, set_character_level, set_ascendancy or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -1090,7 +1131,7 @@ tools.engine<Record<string, never>>(
   'reset_build',
   {
     description:
-      'Reset the build to its original state (as it was when first loaded). All session mutations (item swaps, tree changes, gem swaps, config changes) are reverted.',
+      'Reset the build to its original state (as it was when first loaded, or as new_build created it). All session mutations (item swaps, tree changes, gem swaps, config changes) are reverted.',
     inputSchema: {},
   },
   async (_args, session) => {
