@@ -6463,8 +6463,7 @@ do
 
 	-- new_build: the XML of a blank build (what PoB's "New" gives, with the
 	-- class, ascendancies, level and tree chosen; the level in manual mode),
-	-- checked against the tree first. Nothing is loaded: the caller loads it
-	-- like any build (loadXML), so a refusal leaves the current build as it is.
+	-- checked against the tree first, so a refusal changes nothing.
 	function basics.blankBuild(cmd)
 		local version = basics.version(cmd.treeVersion)
 		local tree = basics.tree(version)
@@ -6632,9 +6631,43 @@ do
 		return result
 	end
 
+	-- A new_build request: an XML document whose only element under
+	-- <PathOfBuilding> is <MCPNewBuild className=... ascendancy=...
+	-- secondaryAscendancy=... level=... treeVersion=.../> (BuildSession.newBuild).
+	-- Returns its attributes, or nil for any other XML.
+	function basics.newBuildRequest(xmlText)
+		if type(xmlText) ~= "string" or not xmlText:find("<MCPNewBuild", 1, true) then return nil end
+		local parsed = common.xml.ParseXML(xmlText)
+		local root = type(parsed) == "table" and parsed[1]
+		if not (type(root) == "table" and root.elem == "PathOfBuilding") then return nil end
+		local request = nil
+		for _, child in ipairs(root) do
+			if type(child) == "table" then
+				if child.elem ~= "MCPNewBuild" or request then return nil end
+				request = child.attrib or { }
+			end
+		end
+		return request
+	end
+
+	-- new_build goes through loadXML like any build (BuildSession.newBuild
+	-- sends the request as the build's XML), so it shares load_build's path in
+	-- the bridge and in LuaBridge: a respawn for it skips the replay, a refusal
+	-- (raised here before anything changes) puts the last committed build
+	-- back, and the request is the recovery build and reset_build's target,
+	-- which give the same blank build again. `info.newBuild` is what the build
+	-- should load as (BuildSession checks it).
+	local plainLoad = DISPATCH.loadXML.handler
+	DISPATCH.loadXML.handler = function(cmd)
+		local request = basics.newBuildRequest(cmd.xml)
+		if not request then return plainLoad(cmd) end
+		local blank = basics.blankBuild(request)
+		local body = plainLoad({ xml = blank.xml, name = cmd.name })
+		body.info.newBuild = blank.build
+		return body
+	end
+
 	buildEdit.COMMANDS.setAscendancy = true
-	DISPATCH.blankBuildXML = { handler = basics.blankBuild }
-	NO_BUILD_REQUIRED.blankBuildXML = true
 	DISPATCH.getCharacterLevel = { handler = function(_cmd) return basics.levelState() end }
 	DISPATCH.setCharacterLevel = { handler = basics.setLevel }
 	DISPATCH.setAscendancy = { handler = basics.setAscendancy }

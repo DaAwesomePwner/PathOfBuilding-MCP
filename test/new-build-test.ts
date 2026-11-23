@@ -221,6 +221,19 @@ async function test4Level(bridge: LuaBridge, session: BuildSession): Promise<voi
   await session.newBuild({ className: 'Duelist', ascendancy: 'Slayer', level: 1 });
   await session.setCharacterLevel(90);
   assert((await session.getStats()).Life === at90, `Life at 90: ${(await session.getStats()).Life} != ${at90} (new_build at 90)`);
+
+  // A build in PoB's auto level mode: the edit switches to manual, undo puts auto mode (and its level) back.
+  const autoXml = occXml.replace('<Build level="99"', '<Build characterLevelAutoMode="true" level="99"');
+  assert(autoXml !== occXml, 'fixture has the expected Build tag');
+  await session.loadBuild(autoXml);
+  await session.loadBuild(await session.exportXML()); // PoB's re-read form
+  const auto = await state(session);
+  assert(/characterLevelAutoMode="true"/.test(auto.xml), 'the build is in auto level mode');
+  const manual = await session.setCharacterLevel(50);
+  assert(manual.previous.autoMode && manual.previous.level === auto.info.level, `previous: ${JSON.stringify(manual.previous)}`);
+  assert(/characterLevelAutoMode="false"/.test(await session.exportXML()), 'set_character_level turns auto mode off');
+  await session.undoLastChange();
+  assertSame('undo set_character_level from auto mode', await state(session), auto);
   log('PASS 4');
 }
 
@@ -266,12 +279,84 @@ async function test5Ascendancy(bridge: LuaBridge, session: BuildSession): Promis
   assert(reset.summary.totalPoints === 0 && reset.removed.length > 0, `class change removed: ${JSON.stringify(reset.removed)}`);
   await session.undoLastChange();
   assertSame('undo the class change', await state(session), committed);
+  await session.setAscendancy({ className: 'Marauder', ascendancy: 'Berserker', allowTreeReset: true });
+  const changedClass = await state(session);
+  await crashAndRestart(bridge, session, 'class change');
+  assertSame('replayed class change', await state(session), changedClass);
 
   // A class change on an empty tree needs no reset (PoB does not ask).
   await session.newBuild({ className: 'Shadow' });
   const empty = await session.setAscendancy({ className: 'Ranger', ascendancy: 'Pathfinder' });
   assert(empty.to.className === 'Ranger' && empty.to.ascendancy === 'Pathfinder', `empty tree: ${JSON.stringify(empty.to)}`);
   log('PASS 5');
+}
+
+async function test5bGrantedSkill(session: BuildSession): Promise<void> {
+  log('Test 5b: set_ascendancy removing a skill-granting node: undo brings the socket group back as it was');
+  await session.newBuild({ className: 'Templar', ascendancy: 'Guardian', level: 90 });
+  // A group before the granted one: removing the granted (main) group moves the main group to 1.
+  await session.createSocketGroup({ gems: [{ name: 'Fireball' }] });
+  await session.allocateNodes(['Radiant Crusade']);
+  const groups = await session.listSkillGroups();
+  const granted = groups.findIndex((g) => /^Tree:/.test(String((g as { source?: string }).source ?? ''))) + 1;
+  assert(granted > 0, `no group granted by Radiant Crusade: ${JSON.stringify(groups).slice(0, 400)}`);
+  await session.setMainSkill(granted);
+  const base = await state(session);
+  const res = await session.setAscendancy({ ascendancy: 'Inquisitor' });
+  assert(res.removed.some((n) => n.name === 'Radiant Crusade'), `removed: ${JSON.stringify(res.removed)}`);
+  assert((await session.listSkillGroups()).length === groups.length - 1, 'the granted group goes with the node');
+  assert(granted === 2 && (await session.getBuildInfo()).mainSkill !== base.info.mainSkill, 'the main skill moved off the removed group');
+  await session.undoLastChange();
+  assertSame('undo set_ascendancy with a granted skill', await state(session), base);
+  log('PASS 5b');
+}
+
+/** Bridge command names sent from now on (crash-recovery-test's helper). */
+function recordCommands(bridge: LuaBridge): string[] {
+  const sent: string[] = [];
+  const b = bridge as unknown as { send: (cmd: { cmd?: string }, t?: number) => Promise<unknown> };
+  const real = b.send.bind(bridge);
+  b.send = (cmd, t) => {
+    sent.push(String(cmd?.cmd));
+    return real(cmd, t);
+  };
+  return sent;
+}
+
+async function test7NewBuildAfterCrash(bridge: LuaBridge, session: BuildSession): Promise<void> {
+  log('Test 7: new_build after a crash skips the replay; a refused one puts the committed build back');
+  await session.newBuild({ className: 'Witch', ascendancy: 'Elementalist', level: 90 });
+  await session.swapItemWithDiff('Ring 1', RING);
+  await session.setCharacterLevel(80);
+  const committed = await state(session);
+  const sent = recordCommands(bridge);
+  const kill = async (): Promise<void> => {
+    const pid = bridge.getPid()!;
+    process.kill(pid, 'SIGKILL');
+    while (bridge.isRunning()) await new Promise((r) => setTimeout(r, 25));
+  };
+
+  // Refused: blank respawn, the refused load, then the committed build put back (the next call gives the notice).
+  await kill();
+  await refusedWith('refused after a crash', session.newBuild({ className: 'Wizard' }), /Unknown class/);
+  assert(JSON.stringify(sent) === JSON.stringify(['loadXML', 'loadXML', 'equipItem', 'setCharacterLevel', 'getBuildInfo']),
+    `commands after a crash + refused new_build: ${sent}`);
+  const notice = await rejection(session.getStats());
+  assert(notice instanceof EngineRestartedError && /build was restored/.test(notice.message), `notice: ${notice.message}`);
+  assertSame('refused new_build after a crash', await state(session), committed);
+
+  // Accepted: only the load is sent (a replay would now kill the engine), with the note.
+  await kill();
+  bridge.setTestFaults('exitOn_equipItem');
+  const spawns = bridge.getSpawnCount();
+  sent.length = 0;
+  const info = await session.newBuild({ className: 'Shadow', ascendancy: 'Trickster', level: 60 });
+  assert(JSON.stringify(sent) === JSON.stringify(['loadXML']), `new_build after a crash sends only the load: ${sent}`);
+  assert(/stopped unexpectedly/.test(info.engineRestart ?? ''), `new_build note: ${info.engineRestart}`);
+  assert(bridge.getSpawnCount() === spawns + 1 && info.class === 'Shadow' && info.ascendancy === 'Trickster', `new build: ${JSON.stringify(info)}`);
+  assert((await session.getBuildInfo()).engineRestart === undefined, 'the note is not cached');
+  bridge.setTestFaults(undefined);
+  log('PASS 7');
 }
 
 // ---------------------------------------------------------------------------
@@ -363,9 +448,15 @@ async function main(): Promise<void> {
     await test2Refusals(session);
     await test3RoundTripAndReset(session);
     await test4Level(bridge, session);
-    await test5Ascendancy(bridge, session);
+    // Its own engine: three crashes on one would open the crash breaker.
+    const ascBridge = newBridge();
+    const ascSession = new BuildSession(ascBridge);
+    await test5Ascendancy(ascBridge, ascSession);
+    await test5bGrantedSkill(ascSession);
     await session.newBuild({ className: 'Witch', ascendancy: 'Elementalist', level: 90 });
     reachableWitch = (await session.getReachableNodes()).filter((n) => !n.isJewelSocket).map((n) => n.id);
+    const crashBridge = newBridge();
+    await test7NewBuildAfterCrash(crashBridge, new BuildSession(crashBridge));
   } finally {
     for (const b of bridges) await b.dispose().catch(() => undefined);
   }

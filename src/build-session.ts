@@ -290,6 +290,8 @@ export type UndoEntry = (
   | { kind: 'tree'; snapshot: TreeSnapshot }
   /** Committed socket group edit (create / delete / main skill): restores every skill set exactly. */
   | { kind: 'skills'; snapshot: SkillsSnapshot }
+  /** set_ascendancy: the tree and every skill set (a removed node may have granted a socket group). */
+  | { kind: 'treeSkills'; tree: TreeSnapshot; skills: SkillsSnapshot }
   /** set_character_level: the level and PoB's auto level mode before the change. */
   | { kind: 'level'; level: number; autoMode: boolean }
 ) & {
@@ -500,7 +502,7 @@ export class BuildSession {
     // order, not call order (a slow URL load started first can land after, and
     // replace, a build code loaded later).
     const xml = await resolveBuildSource(source);
-    return this.withLoadLock(() => this.replaceBuildUnlocked(xml));
+    return this.withLoadLock(async () => (await this.replaceBuildUnlocked(xml)).info);
   }
 
   /**
@@ -508,35 +510,39 @@ export class BuildSession {
    * bridge records it for crash recovery only once it is accepted; it becomes
    * reset_build's target, and undo history and stat snapshots are cleared.
    */
-  private async replaceBuildUnlocked(xml: string): Promise<BuildInfo> {
-    const info = await this.bridge.loadBuildXML(xml);
+  private async replaceBuildUnlocked(xml: string): Promise<{ info: BuildInfo; newBuild?: NewBuildExpected }> {
+    // `newBuild`: a new_build request's expected result (the bridge adds it to the load's info).
+    const { newBuild, ...info } = (await this.bridge.loadBuildXML(xml)) as BuildInfo & { newBuild?: NewBuildExpected };
     this.originalXML = xml;
     this.buildInfo = withoutRestartNote(info);
     this.configMetaCache = null;
     this.undoStack.length = 0;
     this.undoClearedByRestart = false;
     this.snapshots.clear();
-    return info;
+    return { info, newBuild };
   }
 
   /**
-   * Start a blank build (new_build): the bridge checks the class, ascendancy,
-   * secondary ascendancy, level and tree version against PoB's tree data and
-   * writes the XML of a blank build (refusals change nothing), which is then
-   * loaded exactly as load_build loads XML: same recovery baseline, undo
-   * reset, reset_build target and engineRestart note.
+   * Start a blank build (new_build). The request goes to the bridge as the
+   * build's XML (newBuildRequestXML), loaded exactly as load_build loads
+   * XML: the bridge's loadXML checks the class, ascendancy, secondary
+   * ascendancy, level and tree version against PoB's tree data and loads
+   * the blank build it writes; a refusal changes nothing. So the recovery
+   * baseline, the undo reset, the reset_build target (the request, which
+   * gives the same blank build again) and the engineRestart note are
+   * load_build's, and a respawn for it never replays the old build.
    */
   async newBuild(spec: NewBuildSpec): Promise<BuildInfo> {
+    const xml = newBuildRequestXML(spec);
     return this.withLoadLock(async () => {
-      const blank = await this.bridge.send<{ ok: true; xml: string; build: NewBuildExpected }>({ cmd: 'blankBuildXML', ...spec });
-      const info = await this.replaceBuildUnlocked(blank.xml);
-      const want = blank.build;
+      const { info, newBuild: want } = await this.replaceBuildUnlocked(xml);
       const ext = info as BuildInfo & { secondaryAscendancy?: string };
       const got = { class: info.class, ascendancy: info.ascendancy, secondaryAscendancy: ext.secondaryAscendancy, level: info.level, treeVersion: info.treeVersion };
-      const wrong = (Object.keys(want) as Array<keyof NewBuildExpected>).filter((k) => (want[k] ?? null) !== (got[k] ?? null));
+      const wrong = want ? (Object.keys(want) as Array<keyof NewBuildExpected>).filter((k) => (want[k] ?? null) !== (got[k] ?? null)) : ['build'];
       if (wrong.length > 0) {
         throw new Error(
-          `Path of Building loaded the new build with a different ${wrong.join(', ')} (${JSON.stringify(got)}, expected ${JSON.stringify(want)})`,
+          `new_build replaced the loaded build (undo history cleared), but Path of Building loaded it with a different ${wrong.join(', ')} ` +
+            `(${JSON.stringify(got)}, expected ${JSON.stringify(want ?? null)})`,
         );
       }
       return info;
@@ -546,15 +552,8 @@ export class BuildSession {
   async resetBuild(): Promise<BuildInfo> {
     if (!this.originalXML) throw new UserError('No build loaded — call load_build first');
     const xml = this.originalXML;
-    return this.withLoadLock(async () => {
-      const info = await this.bridge.loadBuildXML(xml);
-      this.buildInfo = withoutRestartNote(info);
-      this.configMetaCache = null;
-      this.undoStack.length = 0;
-      this.undoClearedByRestart = false;
-      this.snapshots.clear();
-      return info;
-    });
+    // Same XML, so originalXML is unchanged (a new_build request gives the same blank build).
+    return this.withLoadLock(async () => (await this.replaceBuildUnlocked(xml)).info);
   }
 
   /** True once a build has been loaded into this session. */
@@ -1066,6 +1065,9 @@ export class BuildSession {
       } else if (entry.kind === 'skills') {
         await this.restoreSkillsUnlocked(entry.snapshot);
         await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'treeSkills') {
+        await this.restoreTreeAndSkillsUnlocked(entry.tree, entry.skills);
+        await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'level') {
         await this.bridge.send({ cmd: 'setCharacterLevel', level: entry.level, autoMode: entry.autoMode });
         await this.refreshBuildInfoUnlocked();
@@ -1413,18 +1415,21 @@ export class BuildSession {
    * PoB's dropdowns do: passives that no longer connect are removed. The
    * bridge checks the names first (and refuses a class change that would
    * reset the tree unless `allowTreeReset`), so a refusal changes nothing.
-   * Pushes one tree undo entry (class and ascendancies are part of the tree
-   * state) and records the chosen ids for crash replay.
+   * Pushes one undo entry with the tree (class and ascendancies are part of
+   * it) and the skills, and records the chosen ids for crash replay.
    */
   async setAscendancy(spec: AscendancySpec): Promise<AscendancyChangeResult> {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build or new_build first');
     return this.withLock(async () => {
-      const snapshot = await this.snapshotTreeUnlocked();
-      const entry: UndoEntry = { kind: 'tree', snapshot };
+      // Skills too: a removed node may have granted a socket group (Radiant
+      // Crusade), which a tree restore alone brings back with default fields.
+      const tree = await this.snapshotTreeUnlocked();
+      const skills = await this.snapshotSkillsUnlocked();
+      const entry: UndoEntry = { kind: 'treeSkills', tree, skills };
       const journal = this.bridge.committedCount();
       const before = await this.bridge.getStats();
       const { res, failure } = await this.sendBuildEditUnlocked<RawAscendancyChange>({ cmd: 'setAscendancy', ...spec }, entry, journal, () =>
-        this.restoreTreeUnlocked(snapshot),
+        this.restoreTreeAndSkillsUnlocked(tree, skills),
       );
       const summaryOf = async () =>
         (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
@@ -2014,16 +2019,19 @@ export class BuildSession {
    * socket group when it changes: a tree restore alone brings the group back
    * with default fields and loses a main socket group pointing at it.
    */
+  /** Skills last: the tree restore re-adds a granted group, the skills restore gives it its fields back. */
+  private async restoreTreeAndSkillsUnlocked(tree: TreeSnapshot, skills: SkillsSnapshot): Promise<void> {
+    await this.restoreTreeUnlocked(tree);
+    await this.restoreSkillsUnlocked(skills);
+  }
+
   private async withPlanTreeScopeUnlocked<T>(tool: string, fn: (resetTree: () => Promise<void>) => Promise<T>): Promise<T> {
     const deps = { send: <R>(c: object) => this.bridge.send<R>(c) };
     const before = await committedFingerprint(deps);
     const tree = await this.snapshotTreeUnlocked();
     const skills = await this.snapshotSkillsUnlocked();
     // Skills last: the tree restore re-adds a granted group, the skills restore gives it its fields back.
-    const restore = async (): Promise<void> => {
-      await this.restoreTreeUnlocked(tree);
-      await this.restoreSkillsUnlocked(skills);
-    };
+    const restore = (): Promise<void> => this.restoreTreeAndSkillsUnlocked(tree, skills);
     const result = await probeThenRestore(() => fn(restore), restore);
     const diff = fingerprintDiff(before, await committedFingerprint(deps));
     if (diff !== null) throw new Error(`${tool}: restoring the build afterwards was not exact (${diff}); call reset_build`);
@@ -3042,6 +3050,27 @@ export interface TreeEditResult extends StatDiffResult {
   unchanged?: boolean;
   /** The tree after the change (point counts). */
   summary: PassiveTreeSummary;
+}
+
+function xmlAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * new_build's request, sent as the build XML (see BuildSession.newBuild and
+ * basics.newBuildRequest in lua/bridge.lua): <PathOfBuilding> with one
+ * <MCPNewBuild/> carrying the arguments given.
+ */
+export function newBuildRequestXML(spec: NewBuildSpec): string {
+  const attrs = (['className', 'ascendancy', 'secondaryAscendancy', 'level', 'treeVersion'] as const)
+    .filter((k) => spec[k] !== undefined)
+    .map((k) => ` ${k}="${xmlAttr(String(spec[k]))}"`)
+    .join('');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<PathOfBuilding>
+	<MCPNewBuild${attrs}/>
+</PathOfBuilding>
+`;
 }
 
 function treeEditNodes(value: unknown): TreeEditNode[] {
