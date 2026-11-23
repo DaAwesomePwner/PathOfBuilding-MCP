@@ -110,6 +110,9 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 - **"X and Y are both in mod group …"** — an item has at most one mod of each group (a bench craft too).
 - **"Unknown item base" / "Unknown unique"** — use `search_items` (`kind: "base"` for bases); a unique name several items share (e.g. Grand Spectrum) needs its full `"Name, Base"`.
 - **"implicit … is an influence line" / "is read as the item header …" / "name … is an item flag line"** — Path of Building reads that line as part of the item's header (influence, corruption, quality, sockets, item level, …), not as a modifier. Use `influences`, `corrupted` or `quality` instead, and plain modifier lines for implicits and names.
+- **"implicit … changes the prefix or suffix limits" / "gives the item a crucible passive tree" / "restricts the mods the item can roll"** — PoB keeps such a line as a mod but reads it as a crafting rule that `build_item` does not model; leave it out.
+- **"name … is a unique …" / "starts with \"Foulborn \""** — PoB treats a rare with that name as the unique (its own affix pool or extra mod tags); pick another name.
+- **A cluster notable "cannot roll"** — give the jewel's enchant as implicits (`"Added Small Passive Skills grant: …"`, plus `"Adds N Passive Skills"`); PoB takes the cluster skill from it, and only that skill's notables roll.
 - **"Path of Building reads the item differently from the request"** — PoB's parse of the built text came out different (a line moved between implicits and mods, an influence or flag appeared). Rephrase the named line.
 - **"No crafting bench prefix or suffix … matches"** — bench mods are named by their text (`list_item_mods` with `includeCrafted`), not by an id.
 - **"Path of Building does not model this line"** (a warning) — the item is built, but PoB's mod parser ignores that line in its calculations.

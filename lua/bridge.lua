@@ -5626,6 +5626,39 @@ do
 		return nil
 	end
 
+	-- Why an implicit line PoB keeps as a modifier but reads as a crafting rule
+	-- (Item:ParseRaw / CanHaveMod: prefix or suffix limits, a crucible tree,
+	-- "Cannot roll" restrictions, extra influences) is refused, or nil.
+	function itemData.ruleReason(line)
+		local low = line:lower()
+		if low:match(" prefix modifiers? allowed") or low:match(" suffix modifiers? allowed") then
+			return "changes the prefix or suffix limits"
+		end
+		if low:find("crucible passive skill tree", 1, true) then return "gives the item a crucible passive tree" end
+		if low:match("^cannot roll ") then return "restricts the mods the item can roll" end
+		if low == "has elder, shaper and all conqueror influences" or low:find("if the eater of worlds is dominant", 1, true) then
+			return "adds influences (use influences)"
+		end
+		return nil
+	end
+
+	-- Why PoB would treat a rare named `title` as something else, or nil: a
+	-- rare-like unique (its own affix pool and limits), a crucible unique
+	-- (extra mod tags) or a Foulborn name (PoB renames it).
+	function itemData.nameReason(title)
+		local low = title:lower()
+		if data.rareLikeUniques and data.rareLikeUniques[low] then
+			return "is a unique Path of Building crafts with its own affix pool; pick another name"
+		end
+		for _, list in ipairs({ data.casterTagCrucibleUniques or { }, data.minionTagCrucibleUniques or { } }) do
+			for name in pairs(list) do
+				if tostring(name):lower() == low then return "is a unique whose name changes the mods Path of Building lets it roll; pick another name" end
+			end
+		end
+		if low:match("^foulborn ") then return "starts with \"Foulborn \", which Path of Building reads as a Foulborn unique; pick another name" end
+		return nil
+	end
+
 	-- What build_item asked for, checked on PoB's parse of the item: nothing
 	-- may come out different (a line read as a header or flag, an implicit
 	-- read as an explicit or the other way round).
@@ -5663,7 +5696,7 @@ do
 		local ok, check = pcall(construct, "Item", text)
 		if not ok or not (check and check.base) then
 			local message = "Path of Building could not parse the item text it built: " .. stripColorCodes(tostring(check))
-			if expect then userError(message .. " (check the name and implicit lines)") end
+			-- The name and implicits already parsed once (craftItem): a failure here is the engine's.
 			error(message, 0)
 		end
 		if expect then itemData.verifyParsed(check, expect) end
@@ -5769,6 +5802,8 @@ do
 			title = itemData.trim(cmd.name)
 			local reason = itemData.headerReason(title)
 			if reason then userError("name \"" .. title .. "\" " .. reason .. " in Path of Building item text") end
+			reason = itemData.nameReason(title)
+			if reason then userError("name \"" .. title .. "\" " .. reason) end
 		end
 		local item = itemData.newItem(baseName, base, rarity, title)
 		local influences = itemData.influenceKeys(cmd.influences)
@@ -5791,6 +5826,8 @@ do
 				local line = itemData.trim(raw)
 				local reason = itemData.headerReason(line)
 				if reason then userError("implicit \"" .. line .. "\" " .. reason .. " in Path of Building item text, not a modifier") end
+				reason = itemData.ruleReason(line)
+				if reason then userError("implicit \"" .. line .. "\" " .. reason .. ", which build_item does not model") end
 				implicits[#implicits + 1] = line
 				item.implicitModLines[#item.implicitModLines + 1] = { line = line, modTags = { } }
 			end
@@ -5800,7 +5837,13 @@ do
 			corrupted = cmd.corrupted == true, influences = wanted, itemLevel = item.itemLevel, quality = item.quality,
 			implicits = implicits, explicits = { },
 		}
-		item:BuildAndParseRaw()
+		local parsed, parseError = pcall(item.BuildAndParseRaw, item)
+		if not parsed then
+			local message = "Path of Building could not parse the item: " .. stripColorCodes(tostring(parseError))
+			-- Only the name and implicit lines come from the caller here.
+			if title or implicits then userError(message .. " (check the name and implicit lines)") end
+			error(message, 0)
+		end
 		itemData.verifyParsed(item, expect)
 		if rarity ~= "NORMAL" and not item.crafted then
 			userError(baseName .. " (" .. base.type .. ") has no prefixes or suffixes Path of Building can craft")

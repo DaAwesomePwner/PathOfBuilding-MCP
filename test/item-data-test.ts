@@ -221,6 +221,16 @@ async function main(): Promise<void> {
     for (const name of ['--------', 'Unidentified', 'Corrupted', 'Rarity: Unique']) {
       await refused(`name "${name}"`, () => build({ base: 'Vaal Regalia', name }), /^name ".*in Path of Building item text/);
     }
+    // Implicit lines PoB keeps as mods but reads as crafting rules.
+    await refused('+3 Prefix Modifiers allowed', () => build({ base: 'Vaal Regalia', implicits: ['+3 Prefix Modifiers allowed'], mods: ['IncreasedLife7'] }),
+      /"\+3 Prefix Modifiers allowed" changes the prefix or suffix limits/);
+    await refused('-1 Suffix Modifier allowed', () => build({ base: 'Vaal Regalia', implicits: ['-1 Suffix Modifier allowed'] }), /prefix or suffix limits/);
+    await refused('crucible tree line', () => build({ base: 'Vaal Regalia', implicits: ['Has a Crucible Passive Skill Tree'] }), /crucible passive tree/);
+    await refused('cannot roll line', () => build({ base: 'Vaal Regalia', implicits: ['Cannot roll Caster Modifiers'] }), /restricts the mods/);
+    // Names PoB reads as rare-like / crucible / Foulborn uniques.
+    await refused('rare-like unique name', () => build({ base: 'Cutlass', name: "Dread Captain's Cutlass" }), /own affix pool/);
+    await refused('crucible unique name', () => build({ base: 'Vaal Regalia', name: "atziri's rule" }), /changes the mods/);
+    await refused('Foulborn name', () => build({ base: 'Vaal Regalia', name: 'Foulborn Robe' }), /Foulborn/);
     const withImplicits = await build({ base: 'Vaal Regalia', implicits: ['+1 to Level of all Vaal Skill Gems', 'Added Small Passive Skills grant: 12% increased Fire Damage'], mods: ['IncreasedLife7'], corrupted: true });
     assert(withImplicits.implicits.length === 2 && withImplicits.mods.length === 1 && /\nCorrupted$/.test(withImplicits.text), `implicits kept apart from mods: ${JSON.stringify(withImplicits)}`.slice(0, 600));
     await unchanged('header refusals');
@@ -238,6 +248,14 @@ async function main(): Promise<void> {
     await refused('three prefixes on an abyss jewel', () => build({ base: 'Murderous Eye Jewel', mods: abyss }), /3 prefixes .* can have 2/);
     const corruptedAbyss = await build({ base: 'Murderous Eye Jewel', mods: abyss, corrupted: true });
     assert(corruptedAbyss.mods.length === 3 && /\nCorrupted$/.test(corruptedAbyss.text), `corrupted abyss jewel: ${JSON.stringify(corruptedAbyss.mods)}`);
+    // Cluster jewels: the "Added Small Passive Skills grant" implicit sets PoB's cluster skill, whose tag lets its notables roll.
+    await refused('cluster notable without a skill', () => build({ base: 'Large Cluster Jewel', mods: ['AfflictionNotableSadist_'] }), /cannot roll on Large Cluster Jewel/);
+    const cluster = await build({
+      base: 'Large Cluster Jewel',
+      implicits: ['Adds 8 Passive Skills', 'Added Small Passive Skills grant: 12% increased Fire Damage'],
+      mods: ['AfflictionNotableSadist_'],
+    });
+    assert(/\nCluster Jewel Skill: affliction_fire_damage\n/.test(cluster.text) && cluster.mods.includes('1 Added Passive Skill is Sadist'), `cluster jewel: ${cluster.text}`);
     await unchanged('rolls and limits');
     log('PASS');
 
