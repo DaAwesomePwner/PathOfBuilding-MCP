@@ -43,7 +43,12 @@
 //      the result lists them; undo restores exactly; (c) a crash replays it;
 //      (d) refusals (an effect the mastery does not offer, a mastery in
 //      `allocate`, an out-of-range main skill group / active skill) change
-//      nothing.
+//      nothing; (e) a deallocation that removes a listed mastery is refused
+//      alike by evaluate_changes and apply_changes, a deallocation plus a
+//      switch on another mastery equals evaluate_changes, `mainSkill` with an
+//      item granting a skill is refused by both, and a variant of only
+//      masteries that already have their effect is `unchanged` (nothing
+//      pushed or journaled).
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
@@ -760,6 +765,46 @@ async function test7MasteriesAndMainSkill(): Promise<void> {
     assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, `${label}: undo/journal changed`);
   }
   log('PASS 7d');
+
+  log('Test 7e: a deallocation that removes a listed mastery; mainSkill with a skill-granting item; a no-op');
+  // A node whose deallocation removes an allocated mastery (one of its dependents).
+  const masteryIds = new Set((await session.getPassiveTree()).allocatedNodes.filter((n) => n.type === 'Mastery').map((n) => n.id));
+  const deallocs = (await bridge.send<{ nodes: Array<{ id: number; type: string; nodes: number[]; fallback?: string }> }>({ cmd: 'probe', candidates: 'deallocate' })).nodes;
+  const carrier = deallocs.find((c) => !c.fallback && c.nodes.slice(1).some((id) => masteryIds.has(id)));
+  assert(carrier, 'an allocated node with a mastery among its dependents');
+  const dependent = carrier.nodes.slice(1).find((id) => masteryIds.has(id))!;
+  const dependentEffect = ((await session.getPassiveTree([dependent])).masteryOptions![0]).effect!;
+  // Refused the same way by evaluate_changes and apply_changes (the calculator
+  // would drop the mastery with its node, apply_changes re-allocate it).
+  const removedShape: NamedProbeVariant = { deallocate: [carrier.id], masteries: [{ node: dependent, effect: dependentEffect }] };
+  const evalRemoved = await evaluateChanges(session, { variants: [removedShape] });
+  assert(evalRemoved.results[0].userError === true && /removed by this change's deallocation/.test(evalRemoved.results[0].error ?? ''), `evaluate: ${JSON.stringify(evalRemoved.results[0])}`);
+  const applyRemoved = await rejection(session.applyChanges(removedShape));
+  assert(applyRemoved instanceof UserError && /removed by this change's deallocation/.test(applyRemoved.message), `apply: ${applyRemoved.message}`);
+  assertSame('refused deallocation + mastery: unchanged', await state(session), now);
+  // A deallocation plus a switch on a mastery it leaves alone: evaluate_changes (fallback) = apply_changes.
+  const alone = [...masteryIds].find((id) => !carrier.nodes.includes(id))!;
+  const aloneOpt = (await session.getPassiveTree([alone])).masteryOptions![0];
+  const aloneEffect = (aloneOpt.options ?? []).find((o) => o.takenBy === undefined && o.effect !== aloneOpt.effect)!;
+  const deallocAndSwitch: NamedProbeVariant = { deallocate: [carrier.id], masteries: [{ node: alone, effect: aloneEffect.effect }] };
+  await assertParity('deallocate + mastery switch', session, deallocAndSwitch, async () => (await session.applyChanges(deallocAndSwitch)).after);
+  await session.undoLastChange();
+  assertSame('undo of deallocate + mastery switch', await state(session), now);
+
+  const skillRing = 'Rarity: RARE\nSkill Ring\nCoral Ring\n+30 to maximum Life\nGrants Level 20 Summon Skitterbots Skill';
+  const withSkillItem: NamedProbeVariant = { items: [{ slot: 'Ring 1', itemText: skillRing }], mainSkill: { group: TWO_ACTIVES_GROUP } };
+  const evalSkill = await evaluateChanges(session, { variants: [withSkillItem, { items: [{ slot: 'Ring 1', itemText: skillRing }] }] });
+  const skillRow = evalSkill.results.find((r) => r.index === 0)!;
+  assert(skillRow.userError === true && /mainSkill cannot be combined/.test(skillRow.error ?? ''), `evaluate mainSkill + skill item: ${JSON.stringify(skillRow)}`);
+  assert(evalSkill.results.find((r) => r.index === 1)!.error === undefined, 'the item alone is evaluated');
+  const applySkill = await rejection(session.applyChanges(withSkillItem));
+  assert(applySkill instanceof UserError && /mainSkill cannot be combined/.test(applySkill.message), `apply mainSkill + skill item: ${applySkill.message}`);
+
+  const noop = await session.applyChanges({ masteries: [{ node: 12125, effect: 34242 }] });
+  assert(noop.unchanged === true && Object.keys(noop.diff).length === 0, `no-op apply_changes: ${JSON.stringify(noop.masteries)}`);
+  assertSame('after the refusals and the no-op', await state(session), now);
+  assert(session.undoStackDepth() === depth && bridge.committedCount() === journal, 'nothing pushed or journaled');
+  log('PASS 7e');
 }
 
 async function main(): Promise<void> {

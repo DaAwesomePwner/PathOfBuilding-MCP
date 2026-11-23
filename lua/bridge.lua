@@ -2597,10 +2597,14 @@ function nodeBatch.describeMasteryCandidate(node)
 	return tostring(node.id) .. " (unallocated, " .. points .. " point" .. (points == 1 and "" or "s") .. " away)"
 end
 
--- A mastery node by id or name. A name resolves among the masteries the
--- change can apply to (allocated ones, and unallocated ones a path reaches):
--- exactly one is used, several are refused with their ids.
-function nodeBatch.masteryNode(ref, label)
+-- A mastery node by id or name. Masteries share names ("Life Mastery"), so a
+-- name resolves in steps: among the allocated masteries of that name, the one
+-- that has `effectRef` chosen already, else the only allocated one (an effect
+-- switch); with none allocated, the only unallocated one a path reaches.
+-- Anything else (several allocated ones, none with that effect; several
+-- reachable unallocated ones) is refused with their ids. To allocate another
+-- mastery of a name that is allocated already, pass its id.
+function nodeBatch.masteryNode(ref, label, effectRef)
 	local spec = build.spec
 	if type(ref) == "number" then
 		local node = spec.nodes[ref]
@@ -2611,9 +2615,21 @@ function nodeBatch.masteryNode(ref, label)
 	if type(ref) ~= "string" or ref == "" then userError(label .. ": node must be a node id or a mastery name") end
 	local all = nodeBatch.masteriesNamed(ref)
 	if #all == 0 then userError(label .. ": no mastery named \"" .. ref .. "\"") end
-	local usable = { }
+	local allocated, usable = { }, { }
 	for _, node in ipairs(all) do
+		if node.alloc then allocated[#allocated + 1] = node end
 		if nodeBatch.reachable(node) then usable[#usable + 1] = node end
+	end
+	if #allocated > 0 then
+		if effectRef ~= nil then
+			-- The effect, as the masteries of this name offer it (they share their options).
+			local ok, effect = pcall(nodeBatch.masteryEffect, allocated[1], effectRef, label)
+			for _, node in ipairs(ok and allocated or { }) do
+				if spec.masterySelections[node.id] == effect then return node end
+			end
+		end
+		if #allocated == 1 then return allocated[1] end
+		usable = allocated
 	end
 	local pick = #usable > 0 and usable or all
 	if #pick == 1 then return pick[1] end
@@ -2668,7 +2684,11 @@ end
 -- any change). Returns { { node, id, effect } ... } in order. `opts.replay`
 -- (a crash replay of a committed change: node and effect are ids that were
 -- checked when the change was made) only resolves the ids. `opts.skip` (ids)
--- are nodes the same change lists elsewhere, refused as listed twice.
+-- are nodes the same change lists elsewhere, refused as listed twice;
+-- `opts.removed` (ids) are allocated nodes the same change deallocates (a
+-- deallocated node's dependents among them): a mastery among them is
+-- refused, since the change would remove it and re-allocate it with a path.
+-- Each entry carries `noop` when the mastery is allocated with that effect.
 function nodeBatch.resolveMasteries(entries, opts)
 	opts = opts or { }
 	if entries == nil then return { } end
@@ -2683,10 +2703,14 @@ function nodeBatch.resolveMasteries(entries, opts)
 		if type(entry) ~= "table" or entry.node == nil or entry.effect == nil then
 			userError(label .. " must be { node, effect }")
 		end
-		local node = nodeBatch.masteryNode(entry.node, label)
+		local node = nodeBatch.masteryNode(entry.node, label, not opts.replay and entry.effect or nil)
 		local effect = opts.replay and tonumber(entry.effect) or nodeBatch.masteryEffect(node, entry.effect, label)
 		if not opts.replay then
 			if seen[node.id] or (opts.skip and opts.skip[node.id]) then userError("Node " .. nodeLabel(node) .. " is listed twice") end
+			if opts.removed and opts.removed[node.id] then
+				userError(label .. ": mastery " .. nodeLabel(node) .. " is removed by this change's deallocation (it depends on a "
+					.. "deallocated node); deallocate it too, or keep the node it depends on")
+			end
 			if spec.hashOverrides and spec.hashOverrides[node.id] then
 				userError(label .. ": mastery " .. nodeLabel(node) .. " carries a tattoo or runegraft; its effect cannot be chosen")
 			end
@@ -2700,7 +2724,8 @@ function nodeBatch.resolveMasteries(entries, opts)
 		end
 		seen[node.id] = true
 		byEffect[effect] = node
-		out[#out + 1] = { node = node, id = node.id, effect = effect }
+		out[#out + 1] = { node = node, id = node.id, effect = effect,
+			noop = (node.alloc and spec.masterySelections[node.id] == effect) and true or nil }
 	end
 	if not opts.replay then
 		-- Taken on a mastery this change leaves alone (PoB's mastery popup
@@ -2724,6 +2749,22 @@ function nodeBatch.describeMastery(id, previous)
 	local effect = spec.masterySelections[id]
 	return { id = id, name = node and node.dn, effect = effect, stats = effect and masteryEffectText(spec, effect),
 		previousEffect = previous }
+end
+
+-- True when every mastery entry is a no-op (allocated with that effect already).
+function nodeBatch.allNoop(masteries)
+	for _, m in ipairs(masteries) do
+		if not m.noop then return false end
+	end
+	return true
+end
+
+-- A change that changes nothing (only no-op mastery entries): no rebuild, no
+-- recalculation, and the caller pushes no undo entry or journal record.
+function nodeBatch.unchanged(masteries)
+	local out = { }
+	for i, m in ipairs(masteries) do out[i] = nodeBatch.describeMastery(m.id, m.effect) end
+	return { added = { }, removed = { }, masteries = out, unchanged = true }
 end
 
 -- get_passive_tree's `masteries`: each referenced mastery (a name lists
@@ -4606,6 +4647,9 @@ local DISPATCH = {
 			local skip = { }
 			for _, id in ipairs(type(cmd.nodeIds) == "table" and cmd.nodeIds or { }) do skip[id] = true end
 			local masteries = nodeBatch.resolveMasteries(cmd.masteries, { replay = not strict, skip = strict and skip or nil })
+			if strict and #masteries > 0 and #(cmd.nodeIds or { }) == 0 and nodeBatch.allNoop(masteries) then
+				return nodeBatch.unchanged(masteries)
+			end
 			return allocNodesBatch(cmd.nodeIds or { }, strict, masteries)
 		end,
 		mutating = true,

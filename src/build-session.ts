@@ -1381,6 +1381,11 @@ export class BuildSession {
       const added = treeEditNodes(res.added);
       const removed = treeEditNodes(res.removed);
       const chosen = masteryChoices(res.masteries);
+      if (res.unchanged === true && failure === undefined) {
+        // Only masteries that already had their effect: no undo entry, no journal record.
+        const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
+        return { added, removed, masteries: chosen, unchanged: true, summary: summary.summary, before, after: before, diff: {} };
+      }
       // The replay: added ids in join order (masteries among them) and the
       // masteries by node id and effect id.
       const command =
@@ -1488,6 +1493,10 @@ export class BuildSession {
       );
       const added = treeEditNodes(res.added);
       const removed = treeEditNodes(res.removed);
+      if (res.unchanged === true && failure === undefined) {
+        // Only masteries that already had their effect: no undo entry, no journal record.
+        return { added, removed, masteries: masteryChoices(res.masteries), unchanged: true, before, after: before, diff: {} };
+      }
       // The replay: gem names as PoB names them, allocations in join order.
       const gemNames = Array.isArray(res.gemNames) ? res.gemNames : [];
       const replay: ProbeVariant = { ...toEngine };
@@ -2791,6 +2800,8 @@ interface TreeEditApplied {
   added?: unknown;
   removed?: unknown;
   masteries?: unknown;
+  /** Nothing changed (only masteries that already had their effect). */
+  unchanged?: boolean;
 }
 
 export interface TreeEditResult extends StatDiffResult {
@@ -2800,6 +2811,8 @@ export interface TreeEditResult extends StatDiffResult {
   removed: TreeEditNode[];
   /** Masteries given an effect (allocate_nodes `masteries`). */
   masteries?: MasteryChoice[];
+  /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
+  unchanged?: boolean;
   /** The tree after the change (point counts). */
   summary: PassiveTreeSummary;
 }
@@ -2825,6 +2838,8 @@ interface RawApplyChanges {
   gemNames?: Array<string | null>;
   /** The masteries given an effect, by id. */
   masteries?: unknown;
+  /** Nothing changed (only masteries that already had their effect). */
+  unchanged?: boolean;
 }
 
 /** A mastery a committed change gave an effect (allocate_nodes, apply_changes). */
@@ -2874,6 +2889,8 @@ export interface ApplyChangesResult extends StatDiffResult {
   removed: TreeEditNode[];
   /** Masteries given an effect. */
   masteries?: MasteryChoice[];
+  /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
+  unchanged?: boolean;
   /** The build's main skill after the change, when the variant set one. */
   mainSkill?: string | null;
   /** The tree after the change (point counts), when nodes changed. */

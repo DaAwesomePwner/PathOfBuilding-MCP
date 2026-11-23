@@ -223,9 +223,16 @@ return function(ctx)
 			if not node.alloc then userError("Node " .. nodeLabel(node) .. " is not allocated") end
 			removeList[#removeList + 1] = node
 		end
-		local skip = { }
+		local skip, removed = { }, { }
 		for node in pairs(seen) do skip[node.id] = true end
-		local masteries = ctx.nodeBatch.resolveMasteries(variant.masteries, { skip = skip })
+		-- What the deallocations remove (each node with its dependents): a
+		-- mastery among them is refused, so the calculator path (which drops
+		-- it with its node) and a fallback / apply_changes (which would
+		-- deallocate it and allocate it again with a path) never disagree.
+		for _, node in ipairs(removeList) do
+			for _, dep in ipairs(node.depends or { }) do removed[dep.id] = true end
+		end
+		local masteries = ctx.nodeBatch.resolveMasteries(variant.masteries, { skip = skip, removed = removed })
 		return addList, removeList, masteries
 	end
 
@@ -918,6 +925,7 @@ return function(ctx)
 		end
 		local addList, removeList, masteries = M.checkNodes(variant)
 		local parsedItems, reason = M.checkItems(variant)
+		local itemReason = reason
 		local config = checkConfig(variant)
 		local gems = optArray(variant.gems, "gems", M.MAX_GEM_CHANGES)
 		for i, ch in ipairs(gems) do checkGemChange(ch, i) end
@@ -926,7 +934,7 @@ return function(ctx)
 		-- new effect on an allocated one (its current effect again is a no-op).
 		local masteryChanges = { }
 		for _, m in ipairs(masteries) do
-			if not m.node.alloc or build.spec.masterySelections[m.id] ~= m.effect then masteryChanges[#masteryChanges + 1] = m end
+			if not m.noop then masteryChanges[#masteryChanges + 1] = m end
 		end
 		local nodeSet, adding, swap = nil, false, nil
 		if #addList + #removeList + #masteryChanges > 1 then
@@ -944,6 +952,8 @@ return function(ctx)
 				swap = { add = effectNode, remove = m.node }
 				if m.node.conqueredBy then reason = reason or ("mastery " .. nodeLabel(m.node) .. " is in a timeless jewel's radius") end
 				if grantsSkill(effectNode) then reason = reason or ("mastery effect " .. m.effect .. " grants a skill") end
+				-- The effect it loses is checked as a deallocation is.
+				reason = reason or nodeFallbackReason(build.spec, { [m.node] = true }, false)
 			else
 				nodeSet, adding = allocSet(m.node), true
 				if nodeSet[m.node] then
@@ -955,6 +965,27 @@ return function(ctx)
 		end
 		if nodeSet and not reason then
 			reason = nodeFallbackReason(build.spec, nodeSet, adding)
+		end
+		if mainSkill then
+			-- Socket groups granted by items or passives exist only after a
+			-- full recalculation, so a change that may add or remove one could
+			-- shift the group the index names: refused rather than guessed.
+			local changed = { }
+			for _, node in ipairs(addList) do
+				for n in pairs(allocSet(node)) do changed[n] = true end
+			end
+			for _, node in ipairs(removeList) do
+				for n in pairs(deallocSet(node)) do changed[n] = true end
+			end
+			for _, m in ipairs(masteryChanges) do
+				changed[m.node] = true
+				changed[masteryEffectNode(m.node, m.effect)] = true
+			end
+			local why = itemReason or (touchesSkills(build.spec, changed) and "a passive node change adds or removes a skill") or nil
+			if why then
+				userError("mainSkill cannot be combined with a change that may add or remove skill groups (" .. why
+					.. "); make that change first, then pick the main skill by its new group index")
+			end
 		end
 		-- A fallback that only changes the passive tree and no skill: the
 		-- caller may snapshot and restore just the passive tree around it.
@@ -1420,6 +1451,11 @@ return function(ctx)
 			allocIds, deallocIds = { }, { }
 			for i, node in ipairs(checked.addList) do allocIds[i] = node.id end
 			for i, node in ipairs(checked.removeList) do deallocIds[i] = node.id end
+			if #masteries > 0 and nodeBatch.allNoop(masteries) and #allocIds + #deallocIds + #items + #gems == 0
+				and config == nil and mainSkill == nil then
+				-- Only masteries that already have their effect: nothing changes.
+				return nodeBatch.unchanged(masteries)
+			end
 		end
 		local gemNames = { }
 		if #gems > 0 or mainSkill then

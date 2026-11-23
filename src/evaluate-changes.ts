@@ -340,7 +340,9 @@ const gemChange = z.discriminatedUnion('op', [
 
 /** A mastery and the effect to choose on it (variants, allocate_nodes). */
 export const masteryChoiceSchema = z.object({
-  node: nodeRef.describe('Mastery node id, or its name (a name several reachable masteries share is refused with their ids).'),
+  node: nodeRef.describe(
+    'Mastery node id, or its name: a name picks the allocated mastery of that name that has `effect` already, else the only allocated one (an effect switch), else the only one a path reaches; anything else is refused with the ids (pass an id to allocate a second mastery of a name).',
+  ),
   effect: z
     .union([z.number().int(), z.string().min(1).max(MAX_LABEL * 3)])
     .describe('Effect id (get_passive_tree `masteries` lists them), or its text: the whole effect, one of its lines, or a part only one of its effects has.'),
@@ -351,7 +353,7 @@ export const masteriesSchema = z
   .max(MAX_VARIANT_MASTERIES)
   .describe(
     'Masteries to allocate (with their path from the allocated tree) with the given effect, or allocated masteries to switch to another effect. ' +
-      'Each effect can be chosen on one mastery only. List effect ids with get_passive_tree `masteries`.',
+      'Each effect can be chosen on one mastery only; a mastery the same change removes (it depends on a deallocated node) is refused. List effect ids with get_passive_tree `masteries`.',
   );
 
 export const mainSkillSchema = z
@@ -359,7 +361,9 @@ export const mainSkillSchema = z
     group: groupIndex.describe('1-based socket group index from list_skill_groups.'),
     activeSkill: groupIndex.optional().describe("1-based active skill within the group (default: the group's current choice)."),
   })
-  .describe('The main skill to use, as set_main_skill sets it (applied after every other change of the variant).');
+  .describe(
+    'The main skill to use, as set_main_skill sets it (applied after every other change of the variant; group indices as list_skill_groups shows them now). Refused with an item or node change that may add or remove item- or passive-granted skill groups: make that change first.',
+  );
 
 export const variantSchema = z.object({
   label: z.string().max(MAX_LABEL).optional().describe('Your name for the variant, echoed back.'),

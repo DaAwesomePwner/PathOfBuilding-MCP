@@ -30,6 +30,14 @@ function points(nodes: TreeEditNode[], cost: 'passive' | 'ascendancy'): number {
 
 function applyResponse(result: ApplyChangesResult, label: string | undefined, summarize: SummarizeStatDiff): unknown {
   const s = result.summary;
+  if (result.unchanged) {
+    return {
+      status: 'unchanged',
+      ...(label !== undefined ? { label } : {}),
+      masteries: result.masteries ?? [],
+      message: 'Every mastery already has that effect; nothing was changed or pushed to undo.',
+    };
+  }
   return {
     status: 'applied',
     ...(label !== undefined ? { label } : {}),

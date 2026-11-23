@@ -125,7 +125,10 @@ A mastery is always allocated together with the effect chosen on it, so it canno
 
 - **"does not offer effect N"** / **"no effect of mastery … matches"** — the effect id or text is not one of that mastery's options (each mastery type has its own list). Use an id from `masteryOptions`, or a text that only one of its effects contains.
 - **"Effect N … is already chosen on mastery M"** — Path of Exile allows each mastery effect on one mastery only (`takenBy` in `masteryOptions`). Switch mastery M to another effect, or deallocate it, first.
-- **"mastery name … matches N nodes"** — masteries share names ("Life Mastery"); pass the node id from the list in the error.
+- **"mastery name … matches N nodes"** — masteries share names ("Life Mastery"). A name picks the allocated mastery that has the effect already, else the only allocated one of that name, else the only one a path reaches; otherwise pass the node id from the list in the error (also to allocate a second mastery of a name you already have).
+- **"mastery … is removed by this change's deallocation"** — the same variant deallocates a node the mastery depends on. Deallocate the mastery too, or keep that node.
+- **"mainSkill cannot be combined with a change that may add or remove skill groups"** — an item or passive in the same variant grants (or replaced one that grants) a skill, so socket group indices may shift. Apply that change first, re-read `list_skill_groups`, then set the main skill.
+- **`status: "unchanged"`** — every mastery listed already had that effect; nothing changed and nothing was pushed to undo.
 - A mastery has no "allocated without an effect" state: to clear one, deallocate it with `deallocate_nodes`.
 
 ## "Nothing to undo"

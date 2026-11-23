@@ -33,8 +33,11 @@
 //      allocate_nodes `masteries` switches an allocated mastery's effect
 //      (by id) and allocates an unallocated one with its path (effect by
 //      text), each with the probe's stats, the export holding the effect, one
-//      undo entry and journal record; undo is exact and a crash replays both;
-//      refusals (effect not offered, chosen on another mastery, text matching
+//      undo entry and journal record; undo is exact; a call with `nodes` and
+//      `masteries` together equals the probe's fallback, and a crash replays
+//      every call; a name resolves to the mastery that has the effect (a
+//      no-op: `unchanged`, nothing pushed or journaled) or the only allocated
+//      one of that name (a switch); refusals (effect not offered, chosen on another mastery, text matching
 //      nothing, not a mastery, ambiguous name, listed twice, one effect twice,
 //      a mastery in `nodes`, nothing given) change nothing.
 //   Points: every result's passive `pointCost` count equals the change in
@@ -580,16 +583,49 @@ async function test9Masteries(): Promise<void> {
   const allocState = await state(session);
   assert(specNodes(allocState.xml).includes(target.id!), 'export holds the mastery node');
   assert(specMasteries(allocState.xml).includes(`{${target.id},${targetEffect.effect}}`), 'export holds its effect');
-  // A regular node and a mastery switch in one call; then a crash replays both calls.
-  await session.allocateNodes([], [{ node: MASTERY_NODE, effect: switchTo.effect }]);
+  // A regular node and a mastery switch in one call (two tree changes: the
+  // probe's full-recalculation fallback gives the same stats); then a crash
+  // replays both calls.
+  const notable = (await candidates(bridge)).find((c) => c.type === 'Notable' && c.points === 2);
+  assert(notable, 'a 2-point notable');
+  const comboMasteries = [{ node: MASTERY_NODE, effect: switchTo.effect }];
+  const probedCombo = (await session.probe({ variants: [{ allocate: [notable.id], masteries: comboMasteries }] })).results[0];
+  assert(!probedCombo.error && probedCombo.fallback, `combo probe: ${JSON.stringify(probedCombo)}`);
+  const combo = await session.allocateNodes([notable.id], comboMasteries);
+  assert(combo.added.length === 2 && combo.added[1].id === notable.id && combo.masteries?.[0].effect === switchTo.effect, `combo: ${JSON.stringify(combo)}`);
+  for (const [k, v] of Object.entries(probedCombo.stats)) {
+    if (v !== null) assert(Object.is(combo.after[k], v), `combo ${k}: committed ${String(combo.after[k])} != probe ${String(v)}`);
+  }
   const both = await state(session);
+  assert(specNodes(both.xml).includes(notable.id) && specMasteries(both.xml).includes(`{${MASTERY_NODE},${switchTo.effect}}`), 'export holds both');
   await crash(bridge);
   await expectRestart('after the mastery edits', session.getStats());
   assertSame('respawned after the mastery edits', await state(session), both);
 
-  log('  9c. refusals change nothing');
+  log('  9c. mastery names: the one with the effect, the only allocated one; a no-op pushes nothing');
+  {
+    const xml = (await state(session)).xml;
+    const depth = session.undoStackDepth();
+    const journal = bridge.committedCount();
+    // Four Life Masteries are allocated; the name resolves to 12382, which has 47642 already.
+    const noop = await session.allocateNodes([], [{ node: 'Life Mastery', effect: 47642 }]);
+    assert(noop.unchanged === true && noop.masteries?.[0].id === 12382 && Object.keys(noop.diff).length === 0, `no-op: ${JSON.stringify(noop.masteries)}`);
+    assert((await state(session)).xml === xml && session.undoStackDepth() === depth && bridge.committedCount() === journal, 'a no-op pushes and journals nothing');
+    // One Block Mastery is allocated (38921): its name switches it.
+    const block = (await session.getPassiveTree([38921])).masteryOptions![0];
+    const blockOther = (block.options ?? []).find((o) => o.takenBy === undefined && o.effect !== block.effect)!;
+    const switchedBlock = await session.allocateNodes([], [{ node: 'block mastery', effect: blockOther.effect }]);
+    assert(switchedBlock.masteries?.[0].id === 38921 && switchedBlock.masteries[0].previousEffect === block.effect && !switchedBlock.unchanged, `by name: ${JSON.stringify(switchedBlock.masteries)}`);
+    await session.undoLastChange();
+    assert((await state(session)).xml === xml && session.undoStackDepth() === depth, 'undo of the switch by name');
+  }
+
+  log('  9d. refusals change nothing');
   const blockEffect = 41322; // chosen on Block Mastery 38921
   const notableId = await firstNotable(session);
+  const lifeNow = (await session.getPassiveTree([MASTERY_NODE])).masteryOptions![0];
+  const unused = (lifeNow.options ?? []).find((o) => o.takenBy === undefined && o.effect !== lifeNow.effect);
+  assert(unused, 'a Life Mastery effect no Life Mastery has');
   const now = await state(session);
   const depth = session.undoStackDepth();
   const journal = bridge.committedCount();
@@ -598,9 +634,9 @@ async function test9Masteries(): Promise<void> {
     ['effect taken elsewhere', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: 47642 }]), /already chosen on mastery 12382/],
     ['effect text matching nothing', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: 'no such effect text' }]), /no effect of mastery/],
     ['not a mastery', () => session.allocateNodes([], [{ node: notableId, effect: 1 }]), /is not a mastery/],
-    ['ambiguous mastery name', () => session.allocateNodes([], [{ node: 'Life Mastery', effect: switchTo.effect }]), /matches \d+ nodes/],
-    ['listed twice', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: free[1].effect }, { node: MASTERY_NODE, effect: free[1].effect }]), /listed twice/],
-    ['one effect twice', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: free[1].effect }, { node: 12125, effect: free[1].effect }]), /also chosen/],
+    ['ambiguous mastery name', () => session.allocateNodes([], [{ node: 'Life Mastery', effect: unused.effect }]), /matches 4 nodes/],
+    ['listed twice', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: unused.effect }, { node: MASTERY_NODE, effect: unused.effect }]), /listed twice/],
+    ['one effect twice', () => session.allocateNodes([], [{ node: MASTERY_NODE, effect: unused.effect }, { node: 12125, effect: unused.effect }]), /also chosen/],
     ['mastery in nodes', () => session.allocateNodes([reachable[reachable.length - 1].id!]), /is a mastery; pass it in `masteries`/],
     ['nothing given', () => session.allocateNodes([], []), /at least one node or mastery/],
   ];

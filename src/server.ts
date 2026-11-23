@@ -534,6 +534,9 @@ function treeEditResponse(result: TreeEditResult, verb: 'allocated' | 'deallocat
   const s = result.summary;
   const changed = verb === 'allocated' ? result.added : result.removed;
   const cost = pointCounts(changed);
+  if (result.unchanged) {
+    return { status: 'unchanged', masteries: result.masteries ?? [], message: 'Every mastery already has that effect; nothing was changed or pushed to undo.' };
+  }
   return {
     status: verb,
     ...(verb === 'allocated' ? { added: result.added.map(node) } : {}),
@@ -561,7 +564,7 @@ tools.engine<{ nodes?: Array<string | number>; masteries?: ProbeMasteryChoice[] 
       "Allocate passive nodes in the build, each together with its shortest path from the allocated tree (as clicking it in PoB, simulate_passive_change and find_best_next_nodes do), and return the nodes added, the points used, the tree's point totals and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes the change). " +
       '`masteries` [{node, effect}] allocates masteries (with their path, after `nodes`) with the chosen effect, or switches an allocated mastery to another effect (to clear a mastery, deallocate it with deallocate_nodes); get_passive_tree `masteries` lists the effect ids. ' +
       'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, already allocated, a mastery listed in `nodes`, listed twice, cannot be allocated because no path from the allocated tree reaches it, or is a second option of the same choice node, or a mastery effect is not offered by that mastery or already chosen on another one. ' +
-      'A node name resolves among the unallocated nodes a path reaches; a name several of them share (e.g. "Strength") is refused with the candidate ids, so pass ids for those (mastery names, e.g. "Life Mastery", resolve among allocated and reachable masteries the same way). `removed` lists any node the change deallocated (another option of a choice node); `masteries` the masteries given an effect (with `previousEffect` when switched). At most 50 nodes and 20 masteries.',
+      'A node name resolves among the unallocated nodes a path reaches; a name several of them share (e.g. "Strength") is refused with the candidate ids, so pass ids for those (a mastery name, e.g. "Life Mastery", picks the allocated mastery that has the effect, else the only allocated one of that name, else the only reachable one; pass an id to allocate a second one); masteries that already have their effect alone return `status: "unchanged"` and push nothing. `removed` lists any node the change deallocated (another option of a choice node); `masteries` the masteries given an effect (with `previousEffect` when switched). At most 50 nodes and 20 masteries.',
     inputSchema: {
       nodes: z
         .array(z.union([z.string().min(1), z.number().int()]))
