@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   50 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   54 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -23,7 +23,7 @@ Three layers, three responsibilities:
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
 | **Probe engine** | `lua/probe.lua`, `src/probe.ts` | Evaluates what-if variants through PoB's own calculator (the one its tooltips use) without changing or recalculating the build; `src/tree-search.ts`, `src/link-search.ts` and `src/evaluate-changes.ts` build the node searches, the link search and `evaluate_changes` on it. |
-| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 50 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
+| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 54 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -36,7 +36,7 @@ Three layers, three responsibilities:
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 50 tools
+## The 54 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -56,6 +56,12 @@ Three layers, three responsibilities:
 - `swap_item` — equip an item from PoB-format text, **mutates** the build, returns before/after diff.
 - `unequip_item` — remove an item from a slot, **mutates**, returns diff.
 - `compare_items` — test 2-5 candidate items in a slot non-destructively (tens of milliseconds). Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`; a candidate that does not fit or parse gets its own `error`.
+
+### Item data (4)
+- `search_items` — `{ query?, kind?: "unique" | "base" | "any", slot?, modQuery?, limit? }`: PoB's uniques and item bases by name, base or item type (case-insensitive, exact names first), optionally only those for a slot (`"Body Armour"`, `"Ring 1"`, `"Weapon 2"`) or with a mod text (`modQuery: "maximum power charges"`). Each result has its base, type, slot, level requirement, variant names (uniques) and first mod lines.
+- `get_item_text` — `{ unique, variant?, roll? }` or `{ base }`: the full PoB item text for a unique (variant by name or index; ranged mods at `roll` `"max"` (default), `"min"` or `"avg"`) or a plain normal base, with the rolled lines. Pass `text` to `swap_item`, `compare_items`, `evaluate_changes` or `apply_changes`.
+- `list_item_mods` — `{ base, affix?, query?, itemLevel? (86), influences?, includeCrafted?, limit? }`: the prefixes and suffixes that can roll on the base according to PoB's spawn weights: id, tier (1 = best), level, mod group, weight and text with ranges; `includeCrafted` adds crafting bench mods (`bench:<n>`). Essences, eldritch implicits, fossils and veiled mods are not covered.
+- `build_item` — `{ base, rarity? ("rare"), name?, itemLevel?, quality?, mods: [ids or texts], crafted?, implicits?, influences?, corrupted?, roll? }`: builds the item with PoB's crafting code after checking each mod can roll on the base at that item level, the prefix / suffix limits (crafted mods count) and one mod per group. A mod can be its id (`"IncreasedLife7"`), its text (`"+(100-114) to maximum Life"`, at `roll`) or a rolled line (`"+110 to maximum Life"`, the tier and roll that give exactly that). Read-only.
 
 ### Passive tree (8)
 - `get_passive_tree` — point counts and class info, keystones and notables with their stats, and every allocated node (id, name, type; masteries with their chosen effect id and text); `detail: "full"` adds every node's stats and flags. `masteries: [ids or names]` lists those masteries' effect options (`effect` id, `stats`, `takenBy` when another mastery has it).
@@ -237,6 +243,20 @@ evaluate_changes({
 ```
 
 An effect is given by id or by text (a whole effect, one of its lines, or a part only one effect has); each effect can be chosen on one mastery only, so one another mastery has (`takenBy`) is refused. Keep a choice with `apply_changes` or `allocate_nodes({ masteries: [{ node: 2841, effect: 31822 }] })`; `mainSkill` in `apply_changes` sets the main skill as `set_main_skill` does.
+
+To try an item that does not exist yet, let PoB write it instead of typing item text:
+
+```
+list_item_mods({ base: "Vaal Regalia", query: "resistance", affix: "suffix", includeCrafted: true })
+build_item({ base: "Vaal Regalia", name: "Test Robe", mods: ["+110 to maximum Life", "FireResist7", "+(42-45)% to Cold Resistance"],
+             crafted: ["+20% to Lightning Resistance"] })
+// -> { text: "Rarity: RARE\nTest Robe\nVaal Regalia\n...", mods: ["+110 to maximum Life", "+45% to Fire Resistance", ...],
+//      affixes: [{ id: "IncreasedLife7", tier: 6, tiers: 13, ... }, ...] }
+get_item_text({ unique: "Kaom's Heart" })   // -> { text: "Rarity: UNIQUE\nKaom's Heart\nGlorious Plate\n..." }
+compare_items({ slot: "Body Armour", items: [<build_item text>, <get_item_text text>] })
+```
+
+A mod that cannot roll on the base (`LocalIncreasedPhysicalDamagePercent1` on body armour), a fourth prefix, two mods of one group or a tier above the item level is refused with the reason.
 
 To shop for an upgrade on the trade site:
 

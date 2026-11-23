@@ -87,6 +87,11 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   stat_weights: READ_ONLY,
   // Reads another build (may fetch a pastebin / pobb.in link) in a short-lived second engine.
   compare_builds: { ...READ_ONLY, openWorldHint: true },
+  // PoB's item data: items are built in the engine, never added to the build.
+  search_items: READ_ONLY,
+  get_item_text: READ_ONLY,
+  list_item_mods: READ_ONLY,
+  build_item: READ_ONLY,
   // Trade (offline: builds a search link, never contacts the trade site)
   generate_trade_search: READ_ONLY,
   search_trade_mods: READ_ONLY,

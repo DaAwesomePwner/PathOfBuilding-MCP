@@ -5295,6 +5295,823 @@ do
 	}
 end
 
+-- Item data (search_items, get_item_text, list_item_mods, build_item): PoB's
+-- own unique list (main.uniqueDB), item bases, affixes with their spawn
+-- weights (Item:CanHaveMod, as the items tab's crafting dropdowns filter them)
+-- and crafting bench mods (data.masterMods). Items are made with PoB's Item
+-- class (BuildAndParseRaw, Craft, BuildRaw) and never added to the build:
+-- these commands change nothing. (A `do` block: the main chunk is at Lua's
+-- limit of 200 locals.)
+do
+	local itemData = {
+		ROLLS = { max = 1, min = 0, avg = 0.5 },
+		LINE_CAP = 160,
+		SUMMARY_LINES = 6,
+		VARIANT_CAP = 20,
+		templates = { },
+	}
+
+	function itemData.trim(s)
+		return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+
+	function itemData.lower(s)
+		return itemData.trim(s):lower()
+	end
+
+	function itemData.clip(s)
+		local text = stripColorCodes(tostring(s or "")):gsub("\n", " / ")
+		if #text > itemData.LINE_CAP then text = text:sub(1, itemData.LINE_CAP - 3) .. "..." end
+		return text
+	end
+
+	function itemData.roll(name)
+		if name == nil or name == dkjson.null then return itemData.ROLLS.max end
+		local roll = itemData.ROLLS[name]
+		if not roll then userError("roll must be max, min or avg") end
+		return roll
+	end
+
+	-- PoB fills main.uniqueDB in an OnFrame coroutine after startup; finish it
+	-- here (its own loader) if a command comes first.
+	function itemData.uniques()
+		if itemData.uniqueArray then return itemData.uniqueArray end
+		local m = mainObject.main
+		local db = m and m.uniqueDB
+		if not db then error("Path of Building's unique item list is not available", 0) end
+		local guard = 0
+		while db.loading and m.onFrameFuncs and m.onFrameFuncs["LoadItems"] and guard < 100000 do
+			m.onFrameFuncs["LoadItems"]()
+			guard = guard + 1
+		end
+		if db.loading then error("Path of Building's unique item list did not finish loading", 0) end
+		local list = { }
+		for _, item in pairs(db.list) do list[#list + 1] = item end
+		table.sort(list, function(a, b) return a.name < b.name end)
+		itemData.uniqueArray = list
+		return list
+	end
+
+	function itemData.primarySlot(base)
+		if base.weapon then return "Weapon 1" end
+		local t = base.type
+		if t == "Quiver" or t == "Shield" then return "Weapon 2" end
+		if t == "Ring" then return "Ring 1" end
+		if t == "Flask" or t == "Tincture" then return "Flask 1" end
+		if t == "Graft" then return "Graft 1" end
+		return t
+	end
+
+	-- `slot` as list_valid_slots names it ("Ring 1", "Weapon 2 Swap") or an item
+	-- type ("Body Armour", "Two Handed Sword", "Flask", "Jewel: Abyss").
+	function itemData.slotFilter(slot)
+		if slot == nil or slot == dkjson.null then return nil end
+		local s = itemData.lower(slot):gsub(" swap$", "")
+		local key = s:match("^(.-) %d+$") or s
+		local function matches(base)
+			local t = base.type:lower()
+			if key == "weapon" then
+				if s == "weapon 2" then
+					local info = data.weaponTypeInfo and data.weaponTypeInfo[base.type]
+					return t == "shield" or t == "quiver" or (base.weapon ~= nil and info ~= nil and info.oneHand == true)
+				end
+				return base.weapon ~= nil
+			end
+			if key == "flask" then return t == "flask" or t == "tincture" end
+			if t == key then return true end
+			if base.subType and (base.subType:lower() == key or (t .. ": " .. base.subType:lower()) == key) then return true end
+			return false
+		end
+		for _, base in pairs(data.itemBases) do
+			if matches(base) then return matches end
+		end
+		userError("No item base fits slot or item type \"" .. itemData.trim(slot) .. "\" (use a slot name such as \"Body Armour\", \"Ring 1\", \"Weapon 1\" or an item type such as \"Two Handed Sword\")")
+	end
+
+	-- 0 exact, 1 prefix, 2 contains, 3 found only in `extra` (base, type), nil no match.
+	function itemData.rank(needle, name, extra)
+		if needle == "" then return 3 end
+		local n = name:lower()
+		if n == needle then return 0 end
+		if n:sub(1, #needle) == needle then return 1 end
+		if n:find(needle, 1, true) then return 2 end
+		for _, e in ipairs(extra) do
+			if e and e:lower():find(needle, 1, true) then return 3 end
+		end
+		return nil
+	end
+
+	function itemData.activeLines(item, lines, cap)
+		local out, more = { }, 0
+		for _, ml in ipairs(lines or { }) do
+			if item:CheckModLineVariant(ml) then
+				if #out < cap then out[#out + 1] = itemData.clip(ml.line) else more = more + 1 end
+			end
+		end
+		return out, more
+	end
+
+	function itemData.hasModText(item, needle)
+		for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do
+			for _, ml in ipairs(item[key] or { }) do
+				if tostring(ml.line):lower():find(needle, 1, true) then return true end
+			end
+		end
+		return false
+	end
+
+	function itemData.variantNames(item)
+		if not item.variantList then return nil, nil end
+		local names = { }
+		for i = 1, math.min(#item.variantList, itemData.VARIANT_CAP) do names[i] = item.variantList[i] end
+		local more = #item.variantList - #names
+		return names, more > 0 and more or nil
+	end
+
+	function itemData.describeUnique(item)
+		local implicits = itemData.activeLines(item, item.implicitModLines, 4)
+		local mods, more = itemData.activeLines(item, item.explicitModLines, itemData.SUMMARY_LINES)
+		local variants, variantsMore = itemData.variantNames(item)
+		return {
+			kind = "unique",
+			name = item.title,
+			base = item.baseName,
+			type = item.base.type,
+			subType = item.base.subType,
+			slot = itemData.primarySlot(item.base),
+			levelReq = item.requirements and item.requirements.level or nil,
+			variants = variants,
+			variantsMore = variantsMore,
+			variant = item.variantList and item.variantList[item.variant] or nil,
+			implicits = #implicits > 0 and implicits or nil,
+			mods = mods,
+			modsMore = more > 0 and more or nil,
+		}
+	end
+
+	function itemData.describeBase(name, base)
+		local implicits = { }
+		for line in tostring(base.implicit or ""):gmatch("[^\n]+") do implicits[#implicits + 1] = itemData.clip(line) end
+		local req = base.req or { }
+		return {
+			kind = "base",
+			name = name,
+			type = base.type,
+			subType = base.subType,
+			slot = itemData.primarySlot(base),
+			levelReq = req.level,
+			str = req.str, dex = req.dex, int = req.int,
+			implicits = #implicits > 0 and implicits or nil,
+		}
+	end
+
+	function itemData.searchCommand(cmd)
+		local needle = itemData.lower(cmd.query)
+		local modNeedle = (cmd.modQuery ~= nil and cmd.modQuery ~= dkjson.null) and itemData.lower(cmd.modQuery) or nil
+		if modNeedle == "" then modNeedle = nil end
+		local kind = cmd.kind or "any"
+		local slotOk = itemData.slotFilter(cmd.slot)
+		local found = { }
+		if kind ~= "base" then
+			for _, item in ipairs(itemData.uniques()) do
+				if not slotOk or slotOk(item.base) then
+					local rank = itemData.rank(needle, item.title, { item.baseName, item.base.type, item.base.subType })
+					if rank and (not modNeedle or itemData.hasModText(item, modNeedle)) then
+						found[#found + 1] = { rank = rank, order = 1, name = item.name, item = item }
+					end
+				end
+			end
+		end
+		if kind ~= "unique" then
+			for name, base in pairs(data.itemBases) do
+				if not base.hidden and (not slotOk or slotOk(base)) then
+					local rank = itemData.rank(needle, name, { base.type, base.subType })
+					if rank and (not modNeedle or tostring(base.implicit or ""):lower():find(modNeedle, 1, true)) then
+						found[#found + 1] = { rank = rank, order = 2, name = name, base = base }
+					end
+				end
+			end
+		end
+		table.sort(found, function(a, b)
+			if a.rank ~= b.rank then return a.rank < b.rank end
+			if a.order ~= b.order then return a.order < b.order end
+			return a.name < b.name
+		end)
+		local limit = tonumber(cmd.limit) or 20
+		local results = { }
+		for i = 1, math.min(limit, #found) do
+			local f = found[i]
+			results[i] = f.item and itemData.describeUnique(f.item) or itemData.describeBase(f.name, f.base)
+		end
+		return { total = #found, more = math.max(0, #found - #results), results = results }
+	end
+
+	-- A unique by title ("Kaom's Heart") or full name ("Grand Spectrum, Cobalt Jewel").
+	function itemData.findUnique(name)
+		local low = itemData.lower(name)
+		local matches, similar = { }, { }
+		for _, item in ipairs(itemData.uniques()) do
+			if item.name:lower() == low then return item end
+			if item.title:lower() == low then
+				matches[#matches + 1] = item.name
+			elseif #similar < 5 and #low > 0 and item.name:lower():find(low, 1, true) then
+				similar[#similar + 1] = item.title
+			end
+		end
+		if #matches == 1 then
+			for _, item in ipairs(itemData.uniques()) do
+				if item.name == matches[1] then return item end
+			end
+		end
+		if #matches > 1 then
+			userError("\"" .. itemData.trim(name) .. "\" names several uniques: " .. table.concat(matches, "; ") .. " (pass the full name)")
+		end
+		userError("Unknown unique \"" .. itemData.trim(name) .. "\"" ..
+			(#similar > 0 and (" (did you mean: " .. table.concat(similar, "; ") .. "?)") or "") .. "; use search_items")
+	end
+
+	-- A base by exact name, then case-insensitively.
+	function itemData.findBase(name)
+		local wanted = itemData.trim(name)
+		if data.itemBases[wanted] then return wanted, data.itemBases[wanted] end
+		local low = wanted:lower()
+		local similar = { }
+		for baseName, base in pairs(data.itemBases) do
+			if baseName:lower() == low then return baseName, base end
+			if not base.hidden and #low > 0 and baseName:lower():find(low, 1, true) then similar[#similar + 1] = baseName end
+		end
+		table.sort(similar)
+		while #similar > 5 do table.remove(similar) end
+		userError("Unknown item base \"" .. wanted .. "\"" ..
+			(#similar > 0 and (" (did you mean: " .. table.concat(similar, "; ") .. "?)") or "") .. "; use search_items with kind \"base\"")
+	end
+
+	function itemData.setRoll(lines, roll)
+		for _, ml in ipairs(lines or { }) do
+			if type(ml.line) == "string" and ml.line:match("%(%-?[%d%.]+%-%-?[%d%.]+%)") then ml.range = roll end
+		end
+	end
+
+	-- A new item on `base`, as the items tab's "Craft item" popup makes it
+	-- (ItemsTab:CraftItem's makeItem): base implicits, PoB's default quality,
+	-- `crafted` for magic and rare so PoB tracks its prefixes and suffixes.
+	function itemData.newItem(baseName, base, rarity, title)
+		local item = construct("Item")
+		item.name = baseName
+		item.base = base
+		item.baseName = baseName
+		item.buffModLines, item.enchantModLines, item.classRequirementModLines = { }, { }, { }
+		item.scourgeModLines, item.implicitModLines, item.explicitModLines, item.crucibleModLines = { }, { }, { }, { }
+		local t = base.type
+		if t == "Amulet" or t == "Belt" or t == "Jewel" or t == "Quiver" or t == "Ring" or t == "Graft" then
+			item.quality = nil
+		else
+			item.quality = 0
+		end
+		item.rarity = rarity
+		if rarity == "MAGIC" or rarity == "RARE" then item.crafted = true end
+		if rarity == "RARE" then item.title = title or "New Item" end
+		if base.implicit then
+			local index = 1
+			for line in base.implicit:gmatch("[^\n]+") do
+				local modList, extra = modLib.parseMod(line)
+				item.implicitModLines[#item.implicitModLines + 1] = {
+					line = line, extra = extra, modList = modList or { },
+					modTags = base.implicitModTypes and base.implicitModTypes[index] or { },
+				}
+				index = index + 1
+			end
+		end
+		item:NormaliseQuality()
+		return item
+	end
+
+	function itemData.rolledLines(item, lines, suffix)
+		local out = { }
+		for _, ml in ipairs(lines or { }) do
+			if item:CheckModLineVariant(ml) then
+				local line = itemLib.applyRange(ml.line, ml.range or main.defaultItemAffixQuality or 0.5, ml.valueScalar)
+				out[#out + 1] = itemData.clip(line) .. ((suffix and ml.crafted) and " (crafted)" or "")
+			end
+		end
+		return out
+	end
+
+	-- Text from BuildRaw, checked to parse back as swap_item parses item text.
+	function itemData.textResult(item)
+		local text = item:BuildRaw()
+		local ok, check = pcall(construct, "Item", text)
+		if not ok or not (check and check.base) then
+			error("Path of Building could not parse the item text it built: " .. stripColorCodes(tostring(check)), 0)
+		end
+		local variants, variantsMore = itemData.variantNames(check)
+		local warnings = { }
+		for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do
+			for _, ml in ipairs(check[key] or { }) do
+				if ml.extra and check:CheckModLineVariant(ml) then
+					warnings[#warnings + 1] = "Path of Building does not model this line: " .. itemData.clip(ml.line)
+				end
+			end
+		end
+		return {
+			name = check.title or check.name,
+			base = check.baseName,
+			rarity = check.rarity,
+			type = check.base.type,
+			slot = itemData.primarySlot(check.base),
+			levelReq = check.requirements and check.requirements.level or nil,
+			variant = check.variantList and check.variantList[check.variant] or nil,
+			variants = variants,
+			variantsMore = variantsMore,
+			implicits = itemData.rolledLines(check, check.implicitModLines),
+			mods = itemData.rolledLines(check, check.explicitModLines, true),
+			warnings = #warnings > 0 and warnings or nil,
+			text = text,
+		}
+	end
+
+	function itemData.selectVariant(item, variant)
+		if variant == nil or variant == dkjson.null then return end
+		if not item.variantList then userError(item.title .. " has no variants") end
+		if item.usesVariantGroups then
+			userError(item.title .. " picks its mods by variant groups; get_item_text uses PoB's default selection for it (omit variant)")
+		end
+		if type(variant) == "number" then
+			if variant ~= math.floor(variant) or not item.variantList[variant] then
+				userError("variant " .. tostring(variant) .. " is out of range: " .. item.title .. " has " .. #item.variantList .. " variants")
+			end
+			item.variant = variant
+			return
+		end
+		local low = itemData.lower(variant)
+		local hit = nil
+		for i, name in ipairs(item.variantList) do
+			if name:lower() == low then item.variant = i return end
+			if name:lower():find(low, 1, true) then
+				if hit then userError("variant \"" .. itemData.trim(variant) .. "\" matches several variants of " .. item.title .. ": " .. table.concat(item.variantList, "; ")) end
+				hit = i
+			end
+		end
+		if not hit then userError("Unknown variant \"" .. itemData.trim(variant) .. "\" for " .. item.title .. "; variants: " .. table.concat(item.variantList, "; ")) end
+		item.variant = hit
+	end
+
+	function itemData.textCommand(cmd)
+		local roll = itemData.roll(cmd.roll)
+		local item
+		if cmd.unique ~= nil and cmd.unique ~= dkjson.null then
+			local entry = itemData.findUnique(cmd.unique)
+			item = construct("Item", entry:BuildRaw())
+			itemData.selectVariant(item, cmd.variant)
+			for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do itemData.setRoll(item[key], roll) end
+		else
+			local baseName, base = itemData.findBase(cmd.base)
+			item = itemData.newItem(baseName, base, "NORMAL")
+			itemData.setRoll(item.implicitModLines, roll)
+		end
+		item:BuildAndParseRaw()
+		local result = itemData.textResult(item)
+		result.roll = cmd.roll or "max"
+		return result
+	end
+
+	-- Influence keys from display names ("Shaper", "Searing Exarch") or keys.
+	function itemData.influenceKeys(list)
+		local keys = { }
+		for _, name in ipairs(list or { }) do
+			local low = itemData.lower(name)
+			local key = nil
+			for _, info in ipairs(itemLib.influenceInfo.all) do
+				if info.display:lower() == low or info.key == low then key = info.key end
+			end
+			if not key then userError("Unknown influence \"" .. itemData.trim(name) .. "\"") end
+			keys[#keys + 1] = key
+		end
+		return keys
+	end
+
+	-- The item list_item_mods and build_item work on: a magic or rare item of
+	-- `base` with its influences, item level and implicits, parsed by PoB.
+	function itemData.craftItem(cmd)
+		local baseName, base = itemData.findBase(cmd.base)
+		local onlyMagic = base.flask or base.type == "Tincture" or (base.type == "Jewel" and base.subType == "Charm")
+		local rarity = (cmd.rarity or (onlyMagic and "magic" or "rare")):upper()
+		if rarity == "RARE" and onlyMagic then
+			userError(baseName .. " cannot be rare in Path of Building (flasks, tinctures and charms are at most magic): use rarity \"magic\"")
+		end
+		local title = cmd.name ~= nil and cmd.name ~= dkjson.null and itemData.trim(cmd.name) or nil
+		local item = itemData.newItem(baseName, base, rarity, title)
+		local influences = itemData.influenceKeys(cmd.influences)
+		if #influences > 0 and not base.influenceTags then
+			userError(baseName .. " (" .. base.type .. ") cannot have influences")
+		end
+		for _, key in ipairs(influences) do item[key] = true end
+		item.itemLevel = tonumber(cmd.itemLevel) or 86
+		if cmd.implicits ~= nil and cmd.implicits ~= dkjson.null then
+			item.implicitModLines = { }
+			for _, line in ipairs(cmd.implicits) do
+				item.implicitModLines[#item.implicitModLines + 1] = { line = itemData.trim(line), modTags = { } }
+			end
+		end
+		item:BuildAndParseRaw()
+		if rarity ~= "NORMAL" and not item.crafted then
+			userError(baseName .. " (" .. base.type .. ") has no prefixes or suffixes Path of Building can craft")
+		end
+		return item, baseName, base
+	end
+
+	function itemData.limits(item)
+		local half = (item.affixLimit or 0) / 2
+		return item.prefixes.limit or half, item.suffixes.limit or half
+	end
+
+	-- Prefixes and suffixes that can roll on `item` (PoB's spawn weights, delve
+	-- mods left out as the crafting dropdowns do), with tiers: within one
+	-- family (type, group, stats) the highest-level mod is tier 1. Item level
+	-- is not applied here.
+	function itemData.rollable(item)
+		if item.rollableCache then return item.rollableCache.ok, item.rollableCache.tiers end
+		local ok, families = { }, { }
+		for modId, mod in pairs(item.affixes or { }) do
+			if (mod.type == "Prefix" or mod.type == "Suffix") and mod.weightKey and not item:CheckIfModIsDelve(mod) and item:CanHaveMod(mod, { }) then
+				ok[modId] = true
+				local key = mod.type .. "|" .. tostring(mod.group) .. "|" .. table.concat(mod.statOrder or { }, ",")
+				families[key] = families[key] or { }
+				table.insert(families[key], modId)
+			end
+		end
+		local tiers = { }
+		for _, ids in pairs(families) do
+			table.sort(ids, function(a, b)
+				local la, lb = item.affixes[a].level or 0, item.affixes[b].level or 0
+				if la ~= lb then return la > lb end
+				return a < b
+			end)
+			for i, id in ipairs(ids) do tiers[id] = { tier = i, of = #ids } end
+		end
+		item.rollableCache = { ok = ok, tiers = tiers }
+		return ok, tiers
+	end
+
+	function itemData.compareMods(item, a, b)
+		local ma, mb = item.affixes[a], item.affixes[b]
+		if ma.type ~= mb.type then return ma.type == "Prefix" end
+		local sa, sb = ma.statOrder or { }, mb.statOrder or { }
+		for i = 1, math.max(#sa, #sb) do
+			if not sa[i] then return true end
+			if not sb[i] then return false end
+			if sa[i] ~= sb[i] then return sa[i] < sb[i] end
+		end
+		if tostring(ma.group) ~= tostring(mb.group) then return tostring(ma.group) < tostring(mb.group) end
+		if (ma.level or 0) ~= (mb.level or 0) then return (ma.level or 0) > (mb.level or 0) end
+		return a < b
+	end
+
+	function itemData.benchMods(item)
+		local list = { }
+		for i, craft in ipairs(data.masterMods or { }) do
+			if craft.types and craft.types[item.type] and (craft.type == "Prefix" or craft.type == "Suffix") then
+				list[#list + 1] = { id = "bench:" .. i, mod = craft }
+			end
+		end
+		return list
+	end
+
+	function itemData.modsCommand(cmd)
+		local item, baseName = itemData.craftItem(cmd)
+		local ilvl = item.itemLevel
+		local ok, tiers = itemData.rollable(item)
+		local want = cmd.affix ~= nil and cmd.affix ~= dkjson.null and cmd.affix ~= "any" and cmd.affix or nil
+		local needle = cmd.query ~= nil and cmd.query ~= dkjson.null and itemData.lower(cmd.query) or ""
+		local function wanted(id, mod)
+			if want and mod.type:lower() ~= want then return false end
+			if needle == "" then return true end
+			return table.concat(mod, " / "):lower():find(needle, 1, true) ~= nil
+				or id:lower():find(needle, 1, true) ~= nil or tostring(mod.affix or ""):lower():find(needle, 1, true) ~= nil
+		end
+		local ids = { }
+		for id in pairs(ok) do
+			local mod = item.affixes[id]
+			if (mod.level or 0) <= ilvl and wanted(id, mod) then ids[#ids + 1] = id end
+		end
+		table.sort(ids, function(a, b) return itemData.compareMods(item, a, b) end)
+		local limit = tonumber(cmd.limit) or 50
+		local mods = { }
+		for i = 1, math.min(limit, #ids) do
+			local id = ids[i]
+			local mod = item.affixes[id]
+			mods[i] = {
+				id = id, type = mod.type:lower(), tier = tiers[id].tier, tiers = tiers[id].of,
+				level = mod.level, group = mod.group, affix = mod.affix ~= "" and mod.affix or nil,
+				weight = item:GetModSpawnWeight(mod), text = itemData.clip(table.concat(mod, " / ")),
+			}
+		end
+		local result = {
+			base = baseName, type = item.base.type, itemLevel = ilvl,
+			prefixLimit = select(1, itemData.limits(item)), suffixLimit = select(2, itemData.limits(item)),
+			total = #ids, more = math.max(0, #ids - #mods), mods = mods,
+		}
+		if cmd.includeCrafted then
+			local crafted = { }
+			local craftedTotal = 0
+			for _, entry in ipairs(itemData.benchMods(item)) do
+				if wanted(entry.id, entry.mod) then
+					craftedTotal = craftedTotal + 1
+					if #crafted < limit then
+						crafted[#crafted + 1] = {
+							id = entry.id, type = entry.mod.type:lower(), level = entry.mod.level, group = entry.mod.group,
+							text = itemData.clip(table.concat(entry.mod, " / ")),
+						}
+					end
+				end
+			end
+			result.crafted, result.craftedMore = crafted, math.max(0, craftedTotal - #crafted)
+		end
+		return result
+	end
+
+	function itemData.norm(text)
+		return (itemData.lower(text):gsub("%s*\n%s*", " / "):gsub("%s*/%s*", " / "):gsub("%s+", " "))
+	end
+
+	-- Ranges and numbers become "#", signs before them are dropped.
+	function itemData.template(normText)
+		return (normText:gsub("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", "#"):gsub("%d+%.?%d*", "#"):gsub("[%+%-]#", "#"))
+	end
+
+	-- A mod's numbers in order: ranges { min, max } and fixed values.
+	function itemData.tokens(text)
+		local tokens, pos = { }, 1
+		while true do
+			local rs, re, a, b = text:find("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", pos)
+			local ns, ne = text:find("%d+%.?%d*", pos)
+			if not ns then break end
+			if rs and rs <= ns then
+				tokens[#tokens + 1] = { min = tonumber(a), max = tonumber(b) }
+				pos = re + 1
+			else
+				tokens[#tokens + 1] = { value = tonumber(text:sub(ns, ne)) }
+				pos = ne + 1
+			end
+		end
+		return tokens
+	end
+
+	function itemData.modTemplate(mod)
+		local cached = itemData.templates[mod]
+		if cached then return cached end
+		local norm = itemData.norm(table.concat(mod, " / "))
+		cached = { norm = norm, template = itemData.template(norm) }
+		itemData.templates[mod] = cached
+		return cached
+	end
+
+	-- nil: the text is not this mod; false: same mod text, numbers outside its
+	-- ranges; else { ranges } giving those numbers (empty: the mod's own text,
+	-- ranges included, which takes the requested roll).
+	function itemData.matchMod(spec, mod)
+		local t = itemData.modTemplate(mod)
+		if t.norm == spec.norm then return { exact = true } end
+		if t.template ~= spec.template then return nil end
+		local tokens = itemData.tokens(t.norm)
+		if #tokens ~= #spec.values then return nil end
+		local ranges = { }
+		for i, tok in ipairs(tokens) do
+			local v = spec.values[i]
+			if tok.value then
+				if math.abs(tok.value - v) > 1e-9 then return false end
+			else
+				local lo, hi = math.min(tok.min, tok.max), math.max(tok.min, tok.max)
+				if v < lo - 1e-9 or v > hi + 1e-9 then return false end
+				ranges[#ranges + 1] = tok.max == tok.min and 1 or (v - tok.min) / (tok.max - tok.min)
+			end
+		end
+		return { ranges = ranges }
+	end
+
+	-- One roll for the mod: the requested roll for its own text, else the
+	-- roll that gives the numbers asked for (a mod with several ranges that
+	-- need different rolls gets the average, with a warning).
+	function itemData.rangeFor(match, roll, label, warnings)
+		if match.exact or #match.ranges == 0 then return roll end
+		local sum, same = 0, true
+		for _, r in ipairs(match.ranges) do
+			sum = sum + r
+			if math.abs(r - match.ranges[1]) > 1e-9 then same = false end
+		end
+		local r = same and match.ranges[1] or sum / #match.ranges
+		if not same then warnings[#warnings + 1] = label .. ": its values need different rolls; one average roll is used" end
+		-- BuildRaw keeps 3 decimals of an affix roll: round up so the value is reached.
+		return math.min(1, math.ceil(r * 1000 - 1e-6) / 1000)
+	end
+
+	function itemData.parseSpec(text)
+		local norm = itemData.norm(text)
+		local values = { }
+		for n in norm:gmatch("%d+%.?%d*") do values[#values + 1] = tonumber(n) end
+		return { text = itemData.trim(text), norm = norm, template = itemData.template(norm), values = values }
+	end
+
+	function itemData.describeCandidates(item, ids)
+		local out = { }
+		for i = 1, math.min(5, #ids) do
+			local mod = item.affixes[ids[i]]
+			out[i] = ids[i] .. " (level " .. tostring(mod.level) .. "): " .. itemData.clip(table.concat(mod, " / "))
+		end
+		return table.concat(out, "; ")
+	end
+
+	-- A prefix or suffix by mod id or text, checked against the base, its
+	-- influences and the item level.
+	function itemData.resolveAffix(item, baseName, specText, roll, warnings)
+		local ok = itemData.rollable(item)
+		local ilvl = item.itemLevel
+		local where = baseName .. " at item level " .. ilvl
+		local id = nil
+		local trimmed = itemData.trim(specText)
+		if item.affixes[trimmed] then
+			id = trimmed
+		elseif not trimmed:find("%s") then
+			for modId in pairs(item.affixes) do
+				if modId:lower() == trimmed:lower() then id = modId break end
+			end
+		end
+		if id then
+			local mod = item.affixes[id]
+			if not (mod.type == "Prefix" or mod.type == "Suffix") then
+				userError(id .. " is a " .. tostring(mod.type) .. " modifier, not a prefix or suffix")
+			end
+			if not ok[id] then userError(id .. " (" .. itemData.clip(table.concat(mod, " / ")) .. ") cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them)") end
+			if (mod.level or 0) > ilvl then userError(id .. " needs item level " .. mod.level .. " (itemLevel is " .. ilvl .. ")") end
+			return { id = id, mod = mod, range = roll }
+		end
+		local spec = itemData.parseSpec(specText)
+		local best, bestMatch, outOfRange, tooHigh, notRollable = nil, nil, { }, { }, { }
+		for modId, mod in pairs(item.affixes) do
+			if mod.type == "Prefix" or mod.type == "Suffix" then
+				local m = itemData.matchMod(spec, mod)
+				if m ~= nil then
+					if not ok[modId] then
+						notRollable[#notRollable + 1] = modId
+					elseif m == false then
+						outOfRange[#outOfRange + 1] = modId
+					elseif (mod.level or 0) > ilvl then
+						tooHigh[#tooHigh + 1] = modId
+					elseif not best or (mod.level or 0) > (item.affixes[best].level or 0) or ((mod.level or 0) == (item.affixes[best].level or 0) and modId < best) then
+						best, bestMatch = modId, m
+					end
+				end
+			end
+		end
+		if best then
+			return { id = best, mod = item.affixes[best], range = itemData.rangeFor(bestMatch, roll, best, warnings) }
+		end
+		local function sorted(list)
+			table.sort(list, function(a, b) return (item.affixes[a].level or 0) > (item.affixes[b].level or 0) end)
+			return list
+		end
+		if #tooHigh > 0 then
+			userError("\"" .. spec.text .. "\" needs a higher item level than " .. ilvl .. ": " .. itemData.describeCandidates(item, sorted(tooHigh)))
+		end
+		if #outOfRange > 0 then
+			userError("\"" .. spec.text .. "\" is outside every tier that can roll on " .. where .. ": " .. itemData.describeCandidates(item, sorted(outOfRange)))
+		end
+		if #notRollable > 0 then
+			userError("\"" .. spec.text .. "\" cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them): " .. itemData.describeCandidates(item, sorted(notRollable)))
+		end
+		userError("No prefix or suffix matches \"" .. spec.text .. "\" (give a mod id or its text, e.g. \"+(100-114) to maximum Life\" or \"+110 to maximum Life\"; use list_item_mods)")
+	end
+
+	function itemData.resolveCraft(item, baseName, specText, roll, warnings)
+		local bench = itemData.benchMods(item)
+		local trimmed = itemData.trim(specText)
+		for _, entry in ipairs(bench) do
+			if entry.id == trimmed:lower() then return { id = entry.id, mod = entry.mod, range = roll, crafted = true } end
+		end
+		if trimmed:lower():match("^bench:%d+$") then
+			userError(trimmed .. " is not a crafting bench prefix or suffix for " .. baseName .. " (use list_item_mods with includeCrafted)")
+		end
+		local spec = itemData.parseSpec(specText)
+		local best, bestMatch, outOfRange = nil, nil, { }
+		for _, entry in ipairs(bench) do
+			local m = itemData.matchMod(spec, entry.mod)
+			if m == false then
+				outOfRange[#outOfRange + 1] = entry.id .. ": " .. itemData.clip(table.concat(entry.mod, " / "))
+			elseif m and (not best or (entry.mod.level or 0) > (best.mod.level or 0)) then
+				best, bestMatch = entry, m
+			end
+		end
+		if best then
+			return { id = best.id, mod = best.mod, range = itemData.rangeFor(bestMatch, roll, best.id, warnings), crafted = true }
+		end
+		if #outOfRange > 0 then
+			while #outOfRange > 5 do table.remove(outOfRange) end
+			userError("\"" .. spec.text .. "\" is outside every crafting bench tier for " .. baseName .. ": " .. table.concat(outOfRange, "; "))
+		end
+		userError("No crafting bench prefix or suffix for " .. baseName .. " matches \"" .. spec.text .. "\" (use list_item_mods with includeCrafted)")
+	end
+
+	function itemData.buildCommand(cmd)
+		local roll = itemData.roll(cmd.roll)
+		local item, baseName, base = itemData.craftItem(cmd)
+		local warnings = { }
+		local affixes, crafts = { }, { }
+		for _, spec in ipairs(cmd.mods or { }) do affixes[#affixes + 1] = itemData.resolveAffix(item, baseName, spec, roll, warnings) end
+		for _, spec in ipairs(cmd.crafted or { }) do crafts[#crafts + 1] = itemData.resolveCraft(item, baseName, spec, roll, warnings) end
+		local total = #affixes + #crafts
+		if item.rarity == "NORMAL" and total > 0 then
+			userError("A normal item has no prefixes or suffixes: use rarity \"magic\" or \"rare\"")
+		end
+		-- As PoB's crafting dropdowns: one mod of each group.
+		local groups = { }
+		for _, list in ipairs({ affixes, crafts }) do
+			for _, r in ipairs(list) do
+				if r.mod.group then
+					if groups[r.mod.group] then
+						userError(r.id .. " and " .. groups[r.mod.group] .. " are both in mod group " .. r.mod.group .. ": an item can have one mod of each group")
+					end
+					groups[r.mod.group] = r.id
+				end
+			end
+		end
+		local prefixLimit, suffixLimit = itemData.limits(item)
+		local counts = { Prefix = 0, Suffix = 0 }
+		for _, list in ipairs({ affixes, crafts }) do
+			for _, r in ipairs(list) do counts[r.mod.type] = counts[r.mod.type] + 1 end
+		end
+		local rarityName = item.rarity:lower()
+		if counts.Prefix > prefixLimit then
+			userError(counts.Prefix .. " prefixes (crafted ones included) but a " .. rarityName .. " " .. base.type .. " can have " .. prefixLimit)
+		end
+		if counts.Suffix > suffixLimit then
+			userError(counts.Suffix .. " suffixes (crafted ones included) but a " .. rarityName .. " " .. base.type .. " can have " .. suffixLimit)
+		end
+		if #crafts > 1 then
+			warnings[#warnings + 1] = "more than one crafted modifier needs the bench's \"Can have up to 3 Crafted Modifiers\" craft"
+		end
+		if cmd.name ~= nil and cmd.name ~= dkjson.null and item.rarity ~= "RARE" then
+			warnings[#warnings + 1] = "name is used for rare items only; a " .. rarityName .. " item is named from its affixes"
+		end
+		if cmd.quality ~= nil and cmd.quality ~= dkjson.null then
+			if item.quality == nil then userError(base.type .. " items have no quality") end
+			item.quality = tonumber(cmd.quality)
+		end
+		if cmd.corrupted == true then item.corrupted = true end
+		local p, s = 0, 0
+		for _, r in ipairs(affixes) do
+			if r.mod.type == "Prefix" then
+				p = p + 1
+				item.prefixes[p] = { modId = r.id, range = r.range }
+			else
+				s = s + 1
+				item.suffixes[s] = { modId = r.id, range = r.range }
+			end
+		end
+		for i = p + 1, prefixLimit do item.prefixes[i] = { modId = "None" } end
+		for i = s + 1, suffixLimit do item.suffixes[i] = { modId = "None" } end
+		for _, r in ipairs(crafts) do
+			for _, line in ipairs(r.mod) do
+				item.explicitModLines[#item.explicitModLines + 1] = { line = line, modTags = r.mod.modTags or { }, crafted = true, range = r.range }
+			end
+		end
+		if item.crafted then
+			item:Craft()
+		else
+			item:BuildAndParseRaw()
+		end
+		local result = itemData.textResult(item)
+		local _, tiers = itemData.rollable(item)
+		local chosen = { }
+		for _, list in ipairs({ affixes, crafts }) do
+			for _, r in ipairs(list) do
+				chosen[#chosen + 1] = {
+					id = r.id, type = r.mod.type:lower(), crafted = r.crafted,
+					tier = tiers[r.id] and tiers[r.id].tier or nil, tiers = tiers[r.id] and tiers[r.id].of or nil,
+					text = itemData.clip(itemLib.applyRange(table.concat(r.mod, "\n"), type(r.range) == "number" and r.range or 0.5)),
+				}
+			end
+		end
+		result.affixes = chosen
+		result.itemLevel = item.itemLevel
+		result.roll = cmd.roll or "max"
+		for _, w in ipairs(warnings) do
+			result.warnings = result.warnings or { }
+			result.warnings[#result.warnings + 1] = w
+		end
+		return result
+	end
+
+	for name, handler in pairs({
+		itemSearch = itemData.searchCommand,
+		itemText = itemData.textCommand,
+		itemMods = itemData.modsCommand,
+		itemBuild = itemData.buildCommand,
+	}) do
+		DISPATCH[name] = { handler = handler }
+		NO_BUILD_REQUIRED[name] = true
+	end
+end
+
 local function dispatch(cmd)
 	if type(cmd) ~= "table" then
 		error("Command must be a JSON object")
