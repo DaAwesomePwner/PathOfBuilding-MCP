@@ -37,6 +37,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   // Build lifecycle: load_build may fetch a pastebin / pobb.in link.
   load_build: { ...REPLACES, idempotentHint: true, openWorldHint: true },
   reset_build: { ...REPLACES, idempotentHint: true },
+  // Replaces the build with a blank one (same arguments, same build).
+  new_build: { ...REPLACES, idempotentHint: true },
   // Discards the last change; it cannot be redone.
   undo_last_change: { ...UNDOABLE, destructiveHint: true },
   // Committed changes (undo_last_change reverts them)
@@ -50,6 +52,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   create_socket_group: UNDOABLE,
   delete_socket_group: UNDOABLE,
   set_main_skill: UNDOABLE,
+  set_character_level: { ...UNDOABLE, idempotentHint: true },
+  set_ascendancy: { ...UNDOABLE, idempotentHint: true },
   // Session-scoped stat snapshots only; the build is untouched.
   snapshot_and_compare: { ...UNDOABLE, idempotentHint: true },
   // Reads

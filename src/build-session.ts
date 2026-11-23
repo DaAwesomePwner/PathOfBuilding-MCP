@@ -290,6 +290,8 @@ export type UndoEntry = (
   | { kind: 'tree'; snapshot: TreeSnapshot }
   /** Committed socket group edit (create / delete / main skill): restores every skill set exactly. */
   | { kind: 'skills'; snapshot: SkillsSnapshot }
+  /** set_character_level: the level and PoB's auto level mode before the change. */
+  | { kind: 'level'; level: number; autoMode: boolean }
 ) & {
   /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
   journal?: number;
@@ -498,15 +500,45 @@ export class BuildSession {
     // order, not call order (a slow URL load started first can land after, and
     // replace, a build code loaded later).
     const xml = await resolveBuildSource(source);
+    return this.withLoadLock(() => this.replaceBuildUnlocked(xml));
+  }
+
+  /**
+   * Load a build XML as the session's build (load_build, new_build): the
+   * bridge records it for crash recovery only once it is accepted; it becomes
+   * reset_build's target, and undo history and stat snapshots are cleared.
+   */
+  private async replaceBuildUnlocked(xml: string): Promise<BuildInfo> {
+    const info = await this.bridge.loadBuildXML(xml);
+    this.originalXML = xml;
+    this.buildInfo = withoutRestartNote(info);
+    this.configMetaCache = null;
+    this.undoStack.length = 0;
+    this.undoClearedByRestart = false;
+    this.snapshots.clear();
+    return info;
+  }
+
+  /**
+   * Start a blank build (new_build): the bridge checks the class, ascendancy,
+   * secondary ascendancy, level and tree version against PoB's tree data and
+   * writes the XML of a blank build (refusals change nothing), which is then
+   * loaded exactly as load_build loads XML: same recovery baseline, undo
+   * reset, reset_build target and engineRestart note.
+   */
+  async newBuild(spec: NewBuildSpec): Promise<BuildInfo> {
     return this.withLoadLock(async () => {
-      // The bridge records the build for crash recovery only once it is accepted.
-      const info = await this.bridge.loadBuildXML(xml);
-      this.originalXML = xml;
-      this.buildInfo = withoutRestartNote(info);
-      this.configMetaCache = null;
-      this.undoStack.length = 0;
-      this.undoClearedByRestart = false;
-      this.snapshots.clear();
+      const blank = await this.bridge.send<{ ok: true; xml: string; build: NewBuildExpected }>({ cmd: 'blankBuildXML', ...spec });
+      const info = await this.replaceBuildUnlocked(blank.xml);
+      const want = blank.build;
+      const ext = info as BuildInfo & { secondaryAscendancy?: string };
+      const got = { class: info.class, ascendancy: info.ascendancy, secondaryAscendancy: ext.secondaryAscendancy, level: info.level, treeVersion: info.treeVersion };
+      const wrong = (Object.keys(want) as Array<keyof NewBuildExpected>).filter((k) => (want[k] ?? null) !== (got[k] ?? null));
+      if (wrong.length > 0) {
+        throw new Error(
+          `Path of Building loaded the new build with a different ${wrong.join(', ')} (${JSON.stringify(got)}, expected ${JSON.stringify(want)})`,
+        );
+      }
       return info;
     });
   }
@@ -1029,8 +1061,13 @@ export class BuildSession {
         await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'tree') {
         await this.restoreTreeUnlocked(entry.snapshot);
+        // set_ascendancy pushes tree entries: the class / ascendancy may change back.
+        await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'skills') {
         await this.restoreSkillsUnlocked(entry.snapshot);
+        await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'level') {
+        await this.bridge.send({ cmd: 'setCharacterLevel', level: entry.level, autoMode: entry.autoMode });
         await this.refreshBuildInfoUnlocked();
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
@@ -1335,6 +1372,88 @@ export class BuildSession {
     } catch (rollbackError) {
       console.error('[pob-mcp] could not roll back a failed tree conversion:', rollbackError);
     }
+  }
+
+  /**
+   * Set the character level (set_character_level), as PoB's level box does:
+   * the level goes to manual mode. Pushes a level undo entry (the level and
+   * auto mode before) and records the command for crash replay. The same
+   * level already in manual mode is `unchanged`: nothing pushed or recorded.
+   */
+  async setCharacterLevel(level: number): Promise<LevelChangeResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build or new_build first');
+    return this.withLock(async () => {
+      const current = await this.bridge.send<{ ok: true; level: number; autoMode: boolean }>({ cmd: 'getCharacterLevel' });
+      const previous = { level: current.level, autoMode: current.autoMode === true };
+      if (previous.level === level && !previous.autoMode) {
+        const stats = await this.bridge.getStats();
+        return { unchanged: true, previous, level, before: stats, after: stats, diff: {} };
+      }
+      const entry: UndoEntry = { kind: 'level', ...previous };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const command = { cmd: 'setCharacterLevel', level };
+      try {
+        await this.bridge.send(command);
+      } catch (err) {
+        // The level may be set (PoB's recalculation failed): undo can revert it, but it is never replayed, as for set_config.
+        if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+        throw err;
+      }
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        return { previous, level, before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * Change the class / ascendancy / secondary ascendancy (set_ascendancy) as
+   * PoB's dropdowns do: passives that no longer connect are removed. The
+   * bridge checks the names first (and refuses a class change that would
+   * reset the tree unless `allowTreeReset`), so a refusal changes nothing.
+   * Pushes one tree undo entry (class and ascendancies are part of the tree
+   * state) and records the chosen ids for crash replay.
+   */
+  async setAscendancy(spec: AscendancySpec): Promise<AscendancyChangeResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build or new_build first');
+    return this.withLock(async () => {
+      const snapshot = await this.snapshotTreeUnlocked();
+      const entry: UndoEntry = { kind: 'tree', snapshot };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const { res, failure } = await this.sendBuildEditUnlocked<RawAscendancyChange>({ cmd: 'setAscendancy', ...spec }, entry, journal, () =>
+        this.restoreTreeUnlocked(snapshot),
+      );
+      const summaryOf = async () =>
+        (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
+      if (res.unchanged === true && failure === undefined) {
+        return { unchanged: true, from: res.from, to: res.to, removed: [], summary: await summaryOf(), before, after: before, diff: {} };
+      }
+      const to = res.to;
+      const command = {
+        cmd: 'setAscendancy',
+        replay: true,
+        classId: to.classId,
+        ascendClassId: to.ascendClassId,
+        secondaryAscendClassId: to.secondaryAscendClassId,
+      };
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        return {
+          from: res.from,
+          to,
+          removed: treeEditNodes(res.removed),
+          summary: await summaryOf(),
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
+      });
+    });
   }
 
   /**
@@ -3018,6 +3137,65 @@ export interface SkillEditResult extends StatDiffResult {
   details: Record<string, unknown>;
   /** The build's main skill after the change. */
   mainSkill: string | null;
+}
+
+export interface NewBuildSpec {
+  className?: string;
+  ascendancy?: string;
+  secondaryAscendancy?: string;
+  level?: number;
+  treeVersion?: string;
+}
+
+/** What the bridge's blank build should load as (checked against the loaded build info). */
+interface NewBuildExpected {
+  class: string;
+  ascendancy: string;
+  secondaryAscendancy?: string;
+  level: number;
+  treeVersion: string;
+}
+
+export interface LevelChangeResult extends StatDiffResult {
+  /** The level and PoB's auto level mode before the change. */
+  previous: { level: number; autoMode: boolean };
+  level: number;
+  /** True when the level was already this, in manual mode: nothing was pushed or journaled. */
+  unchanged?: true;
+}
+
+export interface AscendancySpec {
+  className?: string;
+  ascendancy?: string;
+  secondaryAscendancy?: string;
+  allowTreeReset?: boolean;
+}
+
+/** Class, ascendancy and secondary ascendancy (names and PoB ids; "None" / 0 when there is none). */
+export interface ClassChoice {
+  className: string;
+  ascendancy: string;
+  secondaryAscendancy: string;
+  classId: number;
+  ascendClassId: number;
+  secondaryAscendClassId: number;
+}
+
+interface RawAscendancyChange {
+  unchanged?: boolean;
+  from: ClassChoice;
+  to: ClassChoice;
+  removed?: unknown;
+}
+
+export interface AscendancyChangeResult extends StatDiffResult {
+  from: ClassChoice;
+  to: ClassChoice;
+  /** Passives removed because they no longer connect (class / ascendancy start nodes left out). */
+  removed: TreeEditNode[];
+  summary: PassiveTreeSummary;
+  /** True when nothing changed: nothing was pushed or journaled. */
+  unchanged?: true;
 }
 
 export interface PassiveTreeSummary {

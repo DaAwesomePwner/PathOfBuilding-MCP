@@ -1,11 +1,20 @@
 // Committed build edits beyond items, config and the passive tree:
-// apply_changes (keep an evaluate_changes variant as one undoable step) and
-// the socket group edits create_socket_group, delete_socket_group and
-// set_main_skill. Each pushes one undo entry and records one command for
+// apply_changes (keep an evaluate_changes variant as one undoable step), the
+// socket group edits create_socket_group, delete_socket_group and
+// set_main_skill, and the build's fundamentals set_character_level and
+// set_ascendancy. Each pushes one undo entry and records one command for
 // crash replay (BuildSession).
 
 import { z } from 'zod';
-import type { ApplyChangesResult, SkillEditResult, StatDiffResult, TreeEditNode } from './build-session.js';
+import type {
+  ApplyChangesResult,
+  AscendancyChangeResult,
+  ClassChoice,
+  LevelChangeResult,
+  SkillEditResult,
+  StatDiffResult,
+  TreeEditNode,
+} from './build-session.js';
 import { type EvaluateChangesVariant, gemLevel, gemQuality, MAX_LABEL, MAX_VARIANT_GEMS, variantSchema } from './evaluate-changes.js';
 import type { ToolRegistrar } from './tool-registry.js';
 
@@ -60,6 +69,42 @@ function applyResponse(result: ApplyChangesResult, label: string | undefined, su
           },
         }
       : {}),
+    ...(summarize(result) as object),
+    undo: UNDO,
+  };
+}
+
+function classChoice(c: ClassChoice): Record<string, unknown> {
+  return { className: c.className, ascendancy: c.ascendancy, secondaryAscendancy: c.secondaryAscendancy };
+}
+
+function levelResponse(result: LevelChangeResult, summarize: SummarizeStatDiff): unknown {
+  const previous = { previousLevel: result.previous.level, ...(result.previous.autoMode ? { previousLevelMode: 'auto' } : {}) };
+  if (result.unchanged) {
+    return { status: 'unchanged', level: result.level, ...previous, message: 'The level is already this (manual mode); nothing was changed or pushed to undo.' };
+  }
+  return { status: 'set', level: result.level, ...previous, ...(summarize(result) as object), undo: UNDO };
+}
+
+function ascendancyResponse(result: AscendancyChangeResult, summarize: SummarizeStatDiff): unknown {
+  if (result.unchanged) {
+    return { status: 'unchanged', ...classChoice(result.to), message: 'The build already has that class and ascendancy; nothing was changed or pushed to undo.' };
+  }
+  const s = result.summary;
+  return {
+    status: 'changed',
+    from: classChoice(result.from),
+    to: classChoice(result.to),
+    ...(result.removed.length > 0 ? { removed: result.removed.map(node) } : {}),
+    pointsRefunded: points(result.removed, 'passive'),
+    ascendancyPointsRefunded: points(result.removed, 'ascendancy'),
+    points: {
+      used: s.totalPoints,
+      max: s.maxNormalPoints,
+      remaining: s.maxNormalPoints - s.totalPoints,
+      ascendancyUsed: s.ascendancyPoints,
+      ascendancyMax: s.maxAscendancyPoints,
+    },
     ...(summarize(result) as object),
     undo: UNDO,
   };
@@ -159,5 +204,37 @@ export function registerBuildEditTools(tools: ToolRegistrar, summarize: Summariz
       const result = await session.setMainSkill(group, activeSkill);
       return skillEditResponse('set', { mainGroup: result.details.mainSocketGroup, activeSkill: result.details.activeSkill }, result, summarize);
     },
+  );
+
+  tools.engine<{ level: number }>(
+    'set_character_level',
+    {
+      description:
+        "Set the character level (1-100), as Path of Building's level box does, and return the before/after stat diff (life, mana, energy shield, accuracy, evasion and the enemy level used by the calculations follow the level). " +
+        "The level is in manual mode afterwards (PoB's automatic level-from-passive-points mode is turned off, so the level stays put as passives change). PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes it). " +
+        'The same level already set manually is reported `unchanged` (nothing pushed to undo).',
+      inputSchema: {
+        level: z.number().int().min(1).max(100).describe('Character level, 1-100.'),
+      },
+    },
+    async ({ level }, session) => levelResponse(await session.setCharacterLevel(level), summarize),
+  );
+
+  tools.engine<{ ascendancy?: string; secondaryAscendancy?: string; className?: string; allowTreeReset?: boolean }>(
+    'set_ascendancy',
+    {
+      description:
+        "Change the build's ascendancy, secondary ascendancy (bloodline, on 3.25+ trees) or class, as Path of Building's class / ascendancy dropdowns do, and return what changed, the passives removed, the point totals and the before/after stat diff. " +
+        "Switching ascendancy removes the old ascendancy's passives (PoB keeps only passives that still connect to a start); `None` removes the ascendancy. PERMANENTLY mutates the build (undo_last_change restores the class, ascendancies and every removed passive; export_build includes it). " +
+        "An ascendancy of another class needs `className` too. A class change keeps the allocated passives only when they connect to the new class's start (PoB changes class without asking then); otherwise it is refused unless `allowTreeReset: true` (PoB's Continue: every passive that no longer connects is removed). " +
+        'Unknown names are refused without changing anything, with the choices listed (names ignore case).',
+      inputSchema: {
+        ascendancy: z.string().min(1).max(60).optional().describe('Ascendancy name, e.g. "Elementalist", or "None".'),
+        secondaryAscendancy: z.string().min(1).max(60).optional().describe('Secondary ascendancy (bloodline), e.g. "Aul Bloodline", or "None".'),
+        className: z.string().min(1).max(30).optional().describe('Class name, e.g. "Witch" (only to change class).'),
+        allowTreeReset: z.boolean().optional().describe('Allow a class change that removes the passive tree (default false).'),
+      },
+    },
+    async (args, session) => ascendancyResponse(await session.setAscendancy(args), summarize),
   );
 }

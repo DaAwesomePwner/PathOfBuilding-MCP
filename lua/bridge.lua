@@ -793,9 +793,12 @@ end
 local function getBuildInfo()
 	local treeVersion = build.spec and build.spec.treeVersion
 	local latest = rawget(_G, "latestTreeVersion")
+	local secondary = build.spec and build.spec.curSecondaryAscendClassName
 	return {
 		class = build.className or (build.spec and build.spec.curClassName),
 		ascendancy = build.ascendClassName or (build.spec and build.spec.curAscendClassName),
+		-- Only when one is chosen (a bloodline on 3.25+ trees).
+		secondaryAscendancy = (secondary ~= nil and secondary ~= "None") and secondary or nil,
 		level = build.characterLevel,
 		mainSkill = getMainSkillName(),
 		treeVersion = treeVersion ~= nil and tostring(treeVersion) or nil,
@@ -6335,6 +6338,306 @@ do
 		DISPATCH[name] = { handler = handler }
 		NO_BUILD_REQUIRED[name] = true
 	end
+end
+
+-- The build's fundamentals: a blank build to start from (new_build), the
+-- character level (set_character_level) and the class / ascendancy /
+-- secondary ascendancy (set_ascendancy). Names are matched without regard to
+-- case, spaces, `_` or `-`; a refusal lists the choices. (A `do` block: the
+-- main chunk is at Lua's limit of 200 locals.)
+do
+	local basics = { }
+
+	function basics.given(v)
+		return v ~= nil and v ~= dkjson.null
+	end
+
+	function basics.key(s)
+		return (tostring(s or ""):lower():gsub("[%s_%-]+", " "):gsub("^ ", ""):gsub(" $", ""))
+	end
+
+	function basics.isNone(s)
+		local k = basics.key(s)
+		return k == "" or k == "none"
+	end
+
+	-- PoB's tree data for `version`. main:LoadTree sets PoB's global jewel
+	-- radii for the version it loads, so they are put back for the active
+	-- tree (TreeTab:SetActiveSpec sets them the same way).
+	function basics.tree(version)
+		local tree = mainObject.main:LoadTree(version)
+		local spec = build and build.spec
+		data.setJewelRadiiGlobally(spec and type(spec.treeVersion) == "string" and spec.treeVersion or latestTreeVersion)
+		if not tree then error("Path of Building could not load passive tree " .. tostring(version), 0) end
+		return tree
+	end
+
+	-- A tree version as PoB names it ("3_30", "3_30_ruthless"); "3.30" and
+	-- "latest" are accepted. Default: PoB's latest tree.
+	function basics.version(v)
+		if not basics.given(v) or basics.key(v) == "latest" or basics.key(v) == "" then return latestTreeVersion end
+		local s = tostring(v):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("[%.%s%-]+", "_")
+		if treeVersions[s] and listContains(treeVersionList, s) then return s end
+		userError("Unknown passive tree version '" .. tostring(v) .. "'. Path of Building has: "
+			.. table.concat(treeVersionList, ", ") .. " (default: the latest, " .. latestTreeVersion .. ")")
+	end
+
+	function basics.sortedById(map, skipZero)
+		local list = { }
+		for id, entry in pairs(map or { }) do
+			if not (skipZero and id == 0) and type(entry) == "table" then list[#list + 1] = { id = id, entry = entry } end
+		end
+		table.sort(list, function(a, b) return a.id < b.id end)
+		return list
+	end
+
+	-- "Scion (Ascendant), Marauder (Juggernaut, Berserker, Chieftain), ..."
+	function basics.classChoices(tree)
+		local out = { }
+		for _, c in ipairs(basics.sortedById(tree.classes)) do
+			local asc = { }
+			for _, a in ipairs(basics.sortedById(c.entry.classes, true)) do asc[#asc + 1] = a.entry.name end
+			out[#out + 1] = c.entry.name .. " (" .. table.concat(asc, ", ") .. ")"
+		end
+		return table.concat(out, ", ")
+	end
+
+	function basics.findClass(tree, name, version)
+		local want = basics.key(name)
+		for _, c in ipairs(basics.sortedById(tree.classes)) do
+			if basics.key(c.entry.name) == want then return c.id end
+		end
+		userError("Unknown class '" .. tostring(name) .. "'. Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+	end
+
+	-- The class id and ascendancy id of an ascendancy name (or PoB id), or nil.
+	function basics.findAscendancy(tree, name)
+		local want = basics.key(name)
+		for _, c in ipairs(basics.sortedById(tree.classes)) do
+			for _, a in ipairs(basics.sortedById(c.entry.classes, true)) do
+				if basics.key(a.entry.name) == want or (a.entry.id and basics.key(a.entry.id) == want) then return c.id, a.id end
+			end
+		end
+		return nil
+	end
+
+	function basics.unknownAscendancy(tree, name, version)
+		userError("Unknown ascendancy '" .. tostring(name) .. "'. Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+	end
+
+	-- Secondary ascendancies (bloodlines) the tree offers, by name. PoB's tree
+	-- loader already drops the legacy ones its dropdown no longer offers.
+	function basics.secondaryChoices(tree)
+		local names = { }
+		for _, a in ipairs(basics.sortedById(tree.alternate_ascendancies)) do names[#names + 1] = a.entry.name end
+		table.sort(names)
+		return names
+	end
+
+	function basics.findSecondary(tree, name, version)
+		if basics.isNone(name) then return 0 end
+		local names = basics.secondaryChoices(tree)
+		if #names == 0 then
+			userError("Passive tree " .. version .. " has no secondary ascendancies (bloodlines); leave secondaryAscendancy out")
+		end
+		local want = basics.key(name)
+		for _, a in ipairs(basics.sortedById(tree.alternate_ascendancies)) do
+			local n = basics.key(a.entry.name)
+			if n == want or basics.key(a.entry.id) == want or (n:gsub(" bloodline$", "")) == want then return a.id end
+		end
+		userError("Unknown secondary ascendancy '" .. tostring(name) .. "'. Tree " .. version .. " offers: "
+			.. table.concat(names, ", ") .. " (or None)")
+	end
+
+	function basics.level(v)
+		local level = tonumber(v)
+		if not level or level ~= math.floor(level) or level < 1 or level > 100 then
+			userError("level must be a whole number from 1 to 100")
+		end
+		return level
+	end
+
+	function basics.xmlAttr(s)
+		return (tostring(s):gsub("&", "&amp;"):gsub('"', "&quot;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	end
+
+	-- new_build: the XML of a blank build (what PoB's "New" gives, with the
+	-- class, ascendancies, level and tree chosen; the level in manual mode),
+	-- checked against the tree first. Nothing is loaded: the caller loads it
+	-- like any build (loadXML), so a refusal leaves the current build as it is.
+	function basics.blankBuild(cmd)
+		local version = basics.version(cmd.treeVersion)
+		local tree = basics.tree(version)
+		local classId, ascendClassId = nil, 0
+		if basics.given(cmd.className) then classId = basics.findClass(tree, cmd.className, version) end
+		if basics.given(cmd.ascendancy) and not basics.isNone(cmd.ascendancy) then
+			local cid, aid = basics.findAscendancy(tree, cmd.ascendancy)
+			if not cid then basics.unknownAscendancy(tree, cmd.ascendancy, version) end
+			if classId and cid ~= classId then
+				userError(tostring(cmd.ascendancy) .. " is a " .. tree.classes[cid].name .. " ascendancy, not a "
+					.. tree.classes[classId].name .. " one. Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+			end
+			classId, ascendClassId = cid, aid
+		end
+		if not classId then
+			userError("Pass className (or an ascendancy). Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+		end
+		local secondaryId = basics.given(cmd.secondaryAscendancy) and basics.findSecondary(tree, cmd.secondaryAscendancy, version) or 0
+		local level = basics.given(cmd.level) and basics.level(cmd.level) or 1
+		local class = tree.classes[classId]
+		local ascendancy = class.classes[ascendClassId] or class.classes[0]
+		local secondary = secondaryId ~= 0 and tree.alternate_ascendancies[secondaryId] or nil
+		local attr = basics.xmlAttr
+		local xml = table.concat({
+			'<?xml version="1.0" encoding="UTF-8"?>',
+			"<PathOfBuilding>",
+			string.format('\t<Build level="%d" targetVersion="%s" className="%s" ascendClassName="%s" mainSocketGroup="1" viewMode="TREE" characterLevelAutoMode="false"/>',
+				level, attr(liveTargetVersion), attr(class.name), attr(ascendancy.name)),
+			'\t<Tree activeSpec="1">',
+			string.format('\t\t<Spec treeVersion="%s" clusterHashFormatVersion="2" classId="%d" ascendClassId="%d" secondaryAscendClassId="%d" nodes="" masteryEffects=""/>',
+				attr(version), classId, ascendClassId, secondaryId),
+			"\t</Tree>",
+			"</PathOfBuilding>",
+			"",
+		}, "\n")
+		return {
+			xml = xml,
+			build = {
+				class = class.name,
+				ascendancy = ascendancy.name,
+				secondaryAscendancy = secondary and secondary.name or nil,
+				level = level,
+				treeVersion = version,
+			},
+		}
+	end
+
+	function basics.levelState()
+		return { level = build.characterLevel, autoMode = build.characterLevelAutoMode == true }
+	end
+
+	-- set_character_level (and its undo, which may put PoB's auto level mode
+	-- back): what PoB's level box does. The level is in manual mode afterwards
+	-- unless `autoMode` is true.
+	function basics.setLevel(cmd)
+		local level = basics.level(cmd.level)
+		build.characterLevel = level
+		build.characterLevelAutoMode = cmd.autoMode == true
+		local controls = build.controls or { }
+		if controls.characterLevel and controls.characterLevel.SetText then controls.characterLevel:SetText(level) end
+		if controls.levelScalingButton then controls.levelScalingButton.label = build.characterLevelAutoMode and "Auto" or "Manual" end
+		build.configTab:BuildModList()
+		build.buildFlag = true
+		runCallback("OnFrame")
+		return basics.levelState()
+	end
+
+	function basics.describeClass(spec)
+		return {
+			className = spec.curClassName,
+			ascendancy = spec.curAscendClassName or "None",
+			secondaryAscendancy = spec.curSecondaryAscendClassName or "None",
+			classId = spec.curClassId,
+			ascendClassId = spec.curAscendClassId or 0,
+			secondaryAscendClassId = spec.curSecondaryAscendClassId or 0,
+		}
+	end
+
+	-- The class, ascendancy and secondary ascendancy set_ascendancy asks for,
+	-- as ids (`replay`: the ids a committed change recorded).
+	function basics.targetClass(cmd, spec, from)
+		local tree, version = spec.tree, spec.treeVersion
+		if cmd.replay then
+			local classId, ascendClassId, secondaryId = tonumber(cmd.classId), tonumber(cmd.ascendClassId), tonumber(cmd.secondaryAscendClassId)
+			local class = classId and tree.classes[classId]
+			if not (class and ascendClassId and class.classes[ascendClassId] and secondaryId
+				and (secondaryId == 0 or (tree.alternate_ascendancies and tree.alternate_ascendancies[secondaryId]))) then
+				error("setAscendancy replay: unknown class / ascendancy ids", 0)
+			end
+			return classId, ascendClassId, secondaryId
+		end
+		if not (basics.given(cmd.className) or basics.given(cmd.ascendancy) or basics.given(cmd.secondaryAscendancy)) then
+			userError("Pass ascendancy, secondaryAscendancy or className")
+		end
+		local classId = from.classId
+		if basics.given(cmd.className) then classId = basics.findClass(tree, cmd.className, version) end
+		local ascendClassId = classId == from.classId and from.ascendClassId or 0
+		if basics.given(cmd.ascendancy) then
+			if basics.isNone(cmd.ascendancy) then
+				ascendClassId = 0
+			else
+				local cid, aid = basics.findAscendancy(tree, cmd.ascendancy)
+				if not cid then basics.unknownAscendancy(tree, cmd.ascendancy, version) end
+				if cid ~= classId then
+					local other = tree.classes[cid].name
+					if basics.given(cmd.className) then
+						userError(tostring(cmd.ascendancy) .. " is a " .. other .. " ascendancy, not a " .. tree.classes[classId].name .. " one")
+					end
+					userError(tostring(cmd.ascendancy) .. " is a " .. other .. " ascendancy and this build is a " .. tostring(from.className)
+						.. ". Pass className: \"" .. other .. "\" as well to change class (Path of Building keeps the allocated passives only "
+						.. "when they connect to the " .. other .. " start), or start over with new_build")
+				end
+				ascendClassId = aid
+			end
+		end
+		local secondaryId = from.secondaryAscendClassId
+		if basics.given(cmd.secondaryAscendancy) then secondaryId = basics.findSecondary(tree, cmd.secondaryAscendancy, version) end
+		return classId, ascendClassId, secondaryId
+	end
+
+	-- set_ascendancy: PoB's class / ascendancy / secondary ascendancy
+	-- dropdowns (PassiveSpec:SelectClass, SelectAscendClass,
+	-- SelectSecondaryAscendClass). Passives that no longer connect to a start
+	-- (the old ascendancy's, the old class's) are removed, as PoB does. A class
+	-- change is refused, as PoB asks first, when passives are allocated and none
+	-- connects to the new class's start, unless `allowTreeReset` (PoB's
+	-- "Continue"). Returns { unchanged } or { from, to, removed }.
+	function basics.setAscendancy(cmd)
+		local spec = build.spec
+		local from = basics.describeClass(spec)
+		local classId, ascendClassId, secondaryId = basics.targetClass(cmd, spec, from)
+		if classId == from.classId and ascendClassId == from.ascendClassId and secondaryId == from.secondaryAscendClassId then
+			return { unchanged = true, from = from, to = from }
+		end
+		local classChange = classId ~= from.classId
+		if classChange and not cmd.replay and cmd.allowTreeReset ~= true then
+			local used = spec:CountAllocNodes()
+			if (tonumber(used) or 0) > 0 and not spec:IsClassConnected(classId) then
+				local name = spec.tree.classes[classId].name
+				userError("Changing class from " .. tostring(from.className) .. " to " .. name .. " would reset the passive tree: no allocated "
+					.. "passive connects to the " .. name .. " start (Path of Building asks before doing this). Pass allowTreeReset: true "
+					.. "to change class anyway (every passive that no longer connects is removed, as with PoB's Continue), connect the tree "
+					.. "to the " .. name .. " start with allocate_nodes first, or start over with new_build")
+			end
+		end
+		local before = nodeBatch.captureAllocated()
+		buildEdit.started()
+		withTreeRollback(function()
+			if classChange then spec:SelectClass(classId) end
+			if (spec.curAscendClassId or 0) ~= ascendClassId then spec:SelectAscendClass(ascendClassId) end
+			if (spec.curSecondaryAscendClassId or 0) ~= secondaryId then spec:SelectSecondaryAscendClass(secondaryId) end
+			local now = basics.describeClass(spec)
+			if now.classId ~= classId or now.ascendClassId ~= ascendClassId or now.secondaryAscendClassId ~= secondaryId then
+				error("Path of Building did not switch the class / ascendancy (PassiveSpec changed?)", 0)
+			end
+		end)
+		local removed = { }
+		for _, node in ipairs(nodeBatch.lostSince(before)) do
+			if node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then removed[#removed + 1] = node end
+		end
+		local result = { from = from, to = basics.describeClass(spec), removed = removed }
+		buildEdit.applied(result, cmd.replay)
+		build.buildFlag = true
+		runCallback("OnFrame")
+		return result
+	end
+
+	buildEdit.COMMANDS.setAscendancy = true
+	DISPATCH.blankBuildXML = { handler = basics.blankBuild }
+	NO_BUILD_REQUIRED.blankBuildXML = true
+	DISPATCH.getCharacterLevel = { handler = function(_cmd) return basics.levelState() end }
+	DISPATCH.setCharacterLevel = { handler = basics.setLevel }
+	DISPATCH.setAscendancy = { handler = basics.setAscendancy }
 end
 
 local function dispatch(cmd)

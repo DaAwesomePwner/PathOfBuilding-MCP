@@ -36,15 +36,16 @@ Three layers, three responsibilities:
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 54 tools
+## The 57 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
 - `get_engine_info` — status (`unconfigured` / `starting` / `ready` / `stopped` / `failed` / `stale` / `updating`), PoB version, paths and where they came from, layout, whether PoB changed on disk, config file location, loaded-build info.
 - `reload_engine` — restart LuaJIT against the PoB currently on disk (after a PoB update); reloads the current build, clears undo history, reports old → new version.
 
-### Loading and inspection (5)
-- `load_build` — accepts a base64 PoB code, pastebin/pobb.in URL, or raw XML. Must be called first.
+### Loading and inspection (6)
+- `load_build` — accepts a base64 PoB code, pastebin/pobb.in URL, or raw XML. Must be called first (or `new_build`).
+- `new_build` — `{ className?, ascendancy?, secondaryAscendancy?, level?, treeVersion? }`: start a blank build (PoB's New) instead of loading one. Replaces the loaded build like `load_build` (undo history cleared; `reset_build` returns to the blank build). Level defaults to 1 in manual mode; tree to PoB's latest.
 - `get_stats` — returns calculated stats grouped into categories (`offense`, `defense`, `sustain`, `charges`, `attributes`, `movement`), or with `stats: ["CombinedDPS", "CritChance", ...]` exactly those PoB output keys (null for an unknown key).
 - `get_skill_breakdown` — active gem + supports + DPS for the main skill (or any group by index).
 - `list_equipped_items` — every equipped item with rarity, base, mods (implicit/explicit/enchant lists, each line with its `crafted` / `fractured` flag when set), quality, item level, sockets. `includeItemText: true` adds each item's PoB text; `detail: "full"` returns every field.
@@ -63,7 +64,7 @@ Three layers, three responsibilities:
 - `list_item_mods` — `{ base, affix?, query?, itemLevel? (86), influences?, includeCrafted?, limit? }`: the prefixes and suffixes that can roll on the base according to PoB's spawn weights: id, tier (1 = best), level, mod group, weight and text with ranges; `includeCrafted` adds crafting bench mods, named by their text (pass it to `build_item` `crafted`). Essences, eldritch implicits, fossils and veiled mods are not covered.
 - `build_item` — `{ base, rarity? ("rare"), name?, itemLevel?, quality?, mods: [ids or texts], crafted?, implicits?, influences?, corrupted?, roll? }`: builds the item with PoB's crafting code after checking each mod can roll on the base at that item level, the prefix / suffix limits (crafted mods count) and one mod per group. A mod can be its id (`"IncreasedLife7"`), its text (`"+(100-114) to maximum Life"`, at `roll`) or a rolled line (`"+110 to maximum Life"`, the tier and roll that give exactly that). For a cluster jewel, give its enchant as implicits (`["Adds 8 Passive Skills", "Added Small Passive Skills grant: 12% increased Fire Damage"]`) and its notables can be added. Read-only.
 
-### Passive tree (8)
+### Passive tree (10)
 - `get_passive_tree` — point counts and class info, keystones and notables with their stats, and every allocated node (id, name, type; masteries with their chosen effect id and text); `detail: "full"` adds every node's stats and flags. `masteries: [ids or names]` lists those masteries' effect options (`effect` id, `stats`, `takenBy` when another mastery has it).
 - `simulate_passive_change` — temporarily allocate/deallocate by node ID or name (allocating takes the node's path with it, deallocating its dependents). Validates connectivity. Always restored. A name several candidate nodes share (e.g. "Strength") is refused with their ids; pass the id.
 - `find_best_next_nodes` — evaluates every unallocated node whose path from your tree costs at most `maxPoints` points (default 3, up to 10), so a notable two travel nodes away is found too, and ranks by gain per point (`rankBy: "perPoint"`, default) or total gain (`"total"`) of your chosen stat (Life, CombinedDPS, TotalEHP, etc.). Each result lists its `pointsCost` and `path`. ~2s on a typical end-game build (~0.4s with `maxPoints: 1`).
@@ -73,6 +74,8 @@ Three layers, three responsibilities:
 - `plan_respec` — `{ target: [ids or unique names] }`: how to get from your tree to a target node set. Allocated nodes not in the target are removed (with their dependents) unless they are class starts, ascendancy nodes (`keepAscendancy`, default true) or needed to connect kept nodes; missing target nodes are added with PoB's shortest paths, nearest first. Returns `removed` / `added`, the points (before, after, net, remaining), the stat change and `applyChanges` (`deallocate` then `allocate`, one undoable step) or `deallocateNodes` + `allocateNodes`. Unknown, ambiguous, unreachable targets and unallocated masteries are refused, all listed at once. Nothing is applied.
 - `allocate_nodes` — `{ nodes: [ids or names] }`: allocate each node with its shortest path from your tree (as clicking it in PoB does). **Mutates** (undoable with `undo_last_change`; kept by `export_build`). Returns the nodes added (tree side first), points used, the tree's `points` (`used` / `max` / `remaining`, negative when over budget) and the stat diff. `masteries: [{ node, effect }]` allocates a mastery (with its path) with the chosen effect, or switches an allocated mastery's effect (effect by id or text; deallocate a mastery to clear it). Unknown, ambiguous, already-allocated and unreachable nodes, a mastery in `nodes`, and an effect the mastery does not offer or that another mastery already has are refused without changing anything. Typical loop: `find_best_next_nodes` → `allocate_nodes` with the winner's id → repeat.
 - `deallocate_nodes` — `{ nodes: [ids or names] }`: remove each node together with every node that depends on it. **Mutates** (undoable). Returns the nodes removed, points refunded and the stat diff.
+- `set_ascendancy` — `{ ascendancy?, secondaryAscendancy?, className?, allowTreeReset? }`: switch ascendancy or bloodline (or class) as PoB's dropdowns do; the old ascendancy's passives are removed and listed. A class change keeps the tree only when it connects to the new class's start, otherwise it is refused unless `allowTreeReset: true`. **Mutates** (undoable).
+- `set_character_level` — `{ level }`: set the level (manual mode), returns the stat diff. **Mutates** (undoable).
 - `convert_tree_to_latest` — move a build saved on an old league's tree to PoB's latest tree (a ruthless/alternate sub-type is kept, like PoB's own convert button). **Mutates** (undoable with `undo_last_change`). Reports old → new tree version, allocated node counts, the nodes lost or renamed, mastery selections the new tree no longer offers on that node, and tattoos it lacks (each capped at 50, with an omitted count) and key stat deltas. Already on the latest tree → no change.
 
 ### Skill gems and links (10)
@@ -264,10 +267,28 @@ To shop for an upgrade on the trade site:
 2. PoB scores already-capped stats as 0, so if the current helmet carries 40% fire resistance the search would happily replace it with none. Claude finds the id with `search_trade_mods({ slot: "Helmet", query: "fire resistance" })` and calls again with `weightAdjustments: [{ tradeId: "pseudo.pseudo_total_fire_resistance", weight: 2 }]`, or makes it a hard requirement with `requiredMods: [{ tradeId: "pseudo.pseudo_total_fire_resistance", min: 35 }]`.
 3. The user opens the returned URL; results are sorted by weighted sum, best first.
 
+## Creating a build from scratch
+
+With no build to load, Claude can start from a blank one and build it up with the committed tools (each undoable, and kept by `export_build`):
+
+```
+new_build({ className: "Witch", ascendancy: "Elementalist", level: 90 })
+plan_passive_points({ points: 20 })            // or find_best_next_nodes; nothing is committed yet
+allocate_nodes({ nodes: [<ids from the plan>, "Shaper of Flames"] })   // passives and ascendancy notables
+create_socket_group({ gems: [{ name: "Fireball" }, { name: "Spell Echo" }, { name: "Elemental Focus" }], setAsMain: true })
+build_item({ base: "Vaal Regalia", mods: ["+110 to maximum Life"], crafted: ["+20% to Fire Resistance"] })
+swap_item({ slot: "Body Armour", itemText: <build_item text> })
+set_config({ options: { enemyIsBoss: "Pinnacle" } })
+get_stats({ stats: ["CombinedDPS", "Life", "EnergyShield"] })
+export_build({ format: "code" })               // paste into PoB, or back into load_build
+```
+
+`set_character_level` and `set_ascendancy` change the level or the ascendancy later; `reset_build` goes back to the blank build. A class or ascendancy name PoB does not have is refused with the list of choices.
+
 ## Important behavior to know
 
 - **All work is serial.** If you ask Claude to compare 5 items and find optimal links at the same time, the second tool call waits. This is intentional — PoB cannot run concurrent calculations.
-- **Mutations require explicit undo or reset.** `swap_item`, `unequip_item`, `set_config` and `convert_tree_to_latest` push to the undo stack; `simulate_passive_change` and the other what-if tools never do. `undo_last_change` reverts one step; `reset_build` reverts everything.
+- **Mutations require explicit undo or reset.** `swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, the socket group edits, `set_character_level`, `set_ascendancy` and `convert_tree_to_latest` push to the undo stack; `simulate_passive_change` and the other what-if tools never do. `undo_last_change` reverts one step; `reset_build` reverts everything.
 - **Simulation tools never persist.** `simulate_*`, `compare_*`, `evaluate_*`, `find_*` run through PoB's calculator without changing the build; the few variants that need a real recalculation are restored exactly in `finally`, even if the operation throws, and checked against a fingerprint of the build.
 - **Build code round-trip is lossless.** `export_build({ format: "code" })` produces a string you can paste back into PoB-the-app or back into `load_build`. Same for `format: "xml"`.
 - **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; node searches (`find_best_next_nodes`, `find_worst_allocated_nodes`) a few seconds.
