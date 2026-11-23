@@ -1281,7 +1281,41 @@ return function(ctx)
 			end
 		end
 		table.sort(out, function(a, b) return a.id < b.id end)
+		if adding and cmd.includeMasteries then
+			return { nodes = out, names = names, masteries = M.masteryCandidates(spec, maxPoints, name) }
+		end
 		return { nodes = out, names = names }
+	end
+
+	-- `candidates = "allocate"` with `includeMasteries` (plan_passive_points):
+	-- every unallocated mastery a path of at most `maxPoints` points reaches,
+	-- with that path (tree side first, the mastery last), its points, and the
+	-- effects it offers that no other mastery has chosen (PoB's mastery popup
+	-- offers each effect once). Sorted by id; `name` records the names.
+	function M.masteryCandidates(spec, maxPoints, name)
+		local taken = { }
+		for _, effect in pairs(spec.masterySelections or { }) do taken[effect] = true end
+		local out = { }
+		for _, node in pairs(spec.nodes) do
+			if node.type == "Mastery" and not node.alloc and not node.ascendancyName and node.path and #node.path > 0 then
+				local set = allocSet(node)
+				local points = 0
+				for n in pairs(set) do
+					if countsAsPoint(n) then points = points + 1 end
+				end
+				local effects = { }
+				for _, e in ipairs(ctx.nodeBatch.masteryEffectList(node)) do
+					if not taken[e.effect] then effects[#effects + 1] = e end
+				end
+				if points <= maxPoints and #effects > 0 then
+					local ids = { }
+					for i = #node.path, 1, -1 do ids[#ids + 1] = name(node.path[i]) end
+					out[#out + 1] = { id = node.id, name = node.dn or "", type = node.type, nodes = ids, points = points, effects = effects }
+				end
+			end
+		end
+		table.sort(out, function(a, b) return a.id < b.id end)
+		return out
 	end
 
 	-- ------------------------------------------------------------------

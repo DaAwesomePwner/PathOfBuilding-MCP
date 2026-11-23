@@ -165,7 +165,7 @@ async function main(): Promise<void> {
       const a = annotated.get(name);
       assert(a && typeof a.readOnlyHint === 'boolean' && typeof a.destructiveHint === 'boolean', `${name}: missing annotations`);
     }
-    for (const name of ['get_stats', 'evaluate_changes', 'stat_weights', 'suggest_upgrades', 'simulate_passive_change', 'find_best_next_nodes', 'swap_gem', 'compare_items', 'get_passive_tree']) {
+    for (const name of ['get_stats', 'evaluate_changes', 'stat_weights', 'suggest_upgrades', 'simulate_passive_change', 'find_best_next_nodes', 'plan_passive_points', 'plan_respec', 'swap_gem', 'compare_items', 'get_passive_tree']) {
       assert(annotated.get(name)?.readOnlyHint === true && annotated.get(name)?.destructiveHint === false, `${name} should be read-only`);
     }
     for (const name of ['load_build', 'reset_build', 'configure_pob_path', 'reload_engine']) {
@@ -237,6 +237,25 @@ async function main(): Promise<void> {
     assert(evaluated.results[0].delta!.CombinedDPS >= evaluated.results[1].delta!.CombinedDPS, 'ranked by CombinedDPS');
     assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'evaluate_changes changed the build');
     log(`PASS: ${evaluated.results.map((r) => `${r.label}=${r.delta?.CombinedDPS ?? r.error}`).join(', ')}`);
+
+    log('Test 12b: plan_passive_points / plan_respec through MCP');
+    const plan = JSON.parse(await text('plan_passive_points', { points: 1 })) as {
+      steps: Array<{ node: { id: number } }>;
+      applyChanges: { allocate: number[] };
+    };
+    assert(plan.steps.length === 1 && plan.applyChanges.allocate.includes(plan.steps[0].node.id), `plan_passive_points: ${JSON.stringify(plan)}`);
+    const current = (JSON.parse(await text('get_passive_tree')) as { allocatedNodes: Array<{ id: number }> }).allocatedNodes.map((n) => n.id);
+    const respec = JSON.parse(await text('plan_respec', { target: [...current, plan.steps[0].node.id] })) as {
+      unchanged: boolean;
+      addedCount: number;
+      points: { net: number };
+      applyChanges?: { allocate?: number[] };
+    };
+    assert(!respec.unchanged && respec.addedCount >= 1 && respec.points.net === respec.addedCount && respec.applyChanges?.allocate?.length === respec.addedCount,
+      `plan_respec: ${JSON.stringify(respec)}`);
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'plan tools changed the build');
+    assert(((await client.callTool({ name: 'plan_passive_points', arguments: { points: 41 } })) as { isError?: boolean }).isError === true, 'plan_passive_points with 41 points should be refused');
+    log('PASS');
 
     log('Test 13: input bounds');
     const refused = async (name: string, args: Record<string, unknown>, what: string): Promise<void> => {

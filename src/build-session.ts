@@ -17,6 +17,14 @@ import {
 } from './probe.js';
 import { toNumber } from './stat-values.js';
 import { DEFAULT_MAX_POINTS, findBestNextNodes, findWorstAllocatedNodes, type RankBy, type TreeSearchResult } from './tree-search.js';
+import {
+  MAX_RESPEC_TARGET,
+  planPassivePoints,
+  validatePlanOptions,
+  type PlanPointsOptions,
+  type PlanPointsResult,
+  type RespecRaw,
+} from './tree-plan.js';
 import { topTradeMods, type ModLineCheck, type SuggestedMod } from './stat-weights.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
 import { tradeQueryCommand } from './trade-search-command.js';
@@ -1801,6 +1809,80 @@ export class BuildSession {
 
   private treeSearchDeps(): { send<T>(command: object): Promise<T>; probe(request: ProbeRequest): Promise<ProbeResponse> } {
     return { send: (command) => this.bridge.send(command), probe: (request) => this.probeUnlocked(request) };
+  }
+
+  /**
+   * plan_passive_points (src/tree-plan.ts): the plan's steps are allocated
+   * for real inside one passive-tree scope (withPlanTreeScopeUnlocked), so
+   * nothing is committed, pushed to undo or journaled.
+   */
+  async planPassivePoints(opts: PlanPointsOptions): Promise<PlanPointsResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    validatePlanOptions(opts);
+    return this.withLock(() =>
+      this.withPlanTreeScopeUnlocked('plan_passive_points', (resetTree) =>
+        planPassivePoints({ ...this.treeSearchDeps(), resetTree }, opts),
+      ),
+    );
+  }
+
+  /**
+   * plan_respec: the bridge's `respecTree` changes the tree to the target
+   * (removals, then additions with PoB's paths; see nodeBatch.respec in
+   * lua/bridge.lua) inside one passive-tree scope, and the stats are read from
+   * the recalculated tree. When a path re-adds a node a removal took (the
+   * variant would list it in both lists), the tree is put back and the
+   * command runs again with those nodes kept (a few rounds at most).
+   */
+  async planRespec(target: Array<number | string>, keepAscendancy: boolean, keys: string[]): Promise<RespecRaw> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    if (target.length === 0) throw new UserError('target needs at least one node');
+    if (target.length > MAX_RESPEC_TARGET) throw new UserError(`target has ${target.length} nodes; at most ${MAX_RESPEC_TARGET}`);
+    return this.withLock(() =>
+      this.withPlanTreeScopeUnlocked('plan_respec', async (resetTree) => {
+        const readBase = async (): Promise<Stats> => (await this.probeUnlocked({ stats: keys, variants: [] })).base;
+        const points = async (): Promise<PassiveTreeSummary> =>
+          (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
+        const before = await readBase();
+        const pointsBefore = await points();
+        type Raw = Omit<RespecRaw, 'before' | 'after' | 'pointsBefore' | 'pointsAfter'>;
+        let keep: number[] = [];
+        let res: Raw;
+        for (let round = 0; ; round++) {
+          const r = await this.bridge.send<Record<string, unknown>>({ cmd: 'respecTree', target, keepAscendancy, keep });
+          const list = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+          res = {
+            target: list(r.target),
+            removed: list(r.removed),
+            added: list(r.added),
+            deallocate: list(r.deallocate),
+            allocate: list(r.allocate),
+            readded: list(r.readded),
+          };
+          if (res.readded.length === 0 || round >= 4) break;
+          await resetTree();
+          keep = [...keep, ...res.readded];
+        }
+        return { ...res, before, after: await readBase(), pointsBefore, pointsAfter: await points() };
+      }),
+    );
+  }
+
+  /**
+   * Run `fn` on a temporary passive tree: the tree is snapshotted once and
+   * restored exactly once at the end (`resetTree` restores it mid-way), and
+   * the committed state is compared by value (`probe` with `fingerprint`)
+   * before and after; a difference is an internal error naming reset_build.
+   */
+  private async withPlanTreeScopeUnlocked<T>(tool: string, fn: (resetTree: () => Promise<void>) => Promise<T>): Promise<T> {
+    const deps = { send: <R>(c: object) => this.bridge.send<R>(c) };
+    const before = await committedFingerprint(deps);
+    const snap = await this.snapshotTreeUnlocked();
+    const restore = (): Promise<void> => this.restoreTreeUnlocked(snap);
+    const result = await probeThenRestore(() => fn(restore), restore);
+    const diff = fingerprintDiff(before, await committedFingerprint(deps));
+    if (diff !== null) throw new Error(`${tool}: restoring the build afterwards was not exact (${diff}); call reset_build`);
+    return result;
   }
 
   /**

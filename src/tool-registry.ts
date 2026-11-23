@@ -72,6 +72,9 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   simulate_passive_change: READ_ONLY,
   find_best_next_nodes: READ_ONLY,
   find_worst_allocated_nodes: READ_ONLY,
+  // Steps / respec applied to a temporary tree and restored exactly.
+  plan_passive_points: READ_ONLY,
+  plan_respec: READ_ONLY,
   evaluate_keystone: READ_ONLY,
   swap_gem: READ_ONLY,
   compare_supports: READ_ONLY,
