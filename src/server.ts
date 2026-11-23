@@ -5,6 +5,7 @@ import { z } from 'zod';
 import {
   BuildSession,
   ComparisonResult,
+  DEFAULT_MOD_SLOTS,
   computeDiff,
   EquippedItem,
   ItemModLine,
@@ -12,13 +13,21 @@ import {
   SCENARIO_NAMES,
   SkillGemInstance,
   StatDiffResult,
+  TreeEditNode,
+  TreeEditResult,
 } from './build-session.js';
-import { registerEvaluateChanges } from './evaluate-changes.js';
+import { registerBuildEditTools } from './build-edit-tools.js';
+import { registerCompareBuilds } from './compare-builds.js';
+import { masteriesSchema, registerEvaluateChanges } from './evaluate-changes.js';
+import { registerItemDataTools } from './item-data.js';
+import { registerTreePlanTools } from './tree-plan.js';
+import type { ProbeMasteryChoice } from './probe.js';
 import { createPathPrompt, registerEngineTools } from './engine-tools.js';
 import { EngineManager } from './engine-manager.js';
-import type { Stats } from './lua-bridge.js';
+import type { BuildInfo, Stats } from './lua-bridge.js';
 import { startTimer } from './timing.js';
 import { registerTradeTools } from './trade-search.js';
+import { registerStatWeights } from './stat-weights.js';
 import { createToolRegistrar } from './tool-registry.js';
 import { DEFAULT_LINK_POOL, EXHAUSTIVE_BUDGET, MAX_COMBINATIONS } from './link-search.js';
 import { DEFAULT_MAX_POINTS, MAX_MAX_POINTS, MAX_SEARCH_FALLBACKS } from './tree-search.js';
@@ -63,6 +72,14 @@ const STAT_CATEGORIES: Record<string, string[]> = {
 };
 
 const ALL_CATEGORIES = Object.keys(STAT_CATEGORIES);
+
+/** The union of the PoB output keys of the given categories (all categories when none are given). */
+function statKeysForCategories(categories?: string[]): string[] {
+  const cats = categories && categories.length > 0 ? categories : ALL_CATEGORIES;
+  const keys = new Set<string>();
+  for (const cat of cats) for (const key of STAT_CATEGORIES[cat] ?? []) keys.add(key);
+  return [...keys];
+}
 
 function categorizeStats(stats: Stats, categories?: string[]): Record<string, Record<string, unknown>> {
   const cats = categories && categories.length > 0 ? categories : ALL_CATEGORIES;
@@ -120,7 +137,11 @@ const tools = createToolRegistrar(server, engine);
 
 registerEngineTools(tools, engine);
 registerTradeTools(tools);
+registerStatWeights(tools);
 registerEvaluateChanges(tools);
+registerItemDataTools(tools);
+registerTreePlanTools(tools);
+registerCompareBuilds(tools, engine);
 
 tools.engine<{ source: string }>(
   'load_build',
@@ -155,6 +176,47 @@ tools.engine<{ source: string }>(
   },
 );
 
+tools.engine<{ className?: string; ascendancy?: string; secondaryAscendancy?: string; level?: number; treeVersion?: string }>(
+  'new_build',
+  {
+    description:
+      "Start a new, blank build (what Path of Building's New gives: no passives beyond the class start, no items, no skills, default configuration) with the class, ascendancy, secondary ascendancy (bloodline, 3.25+ trees), level and passive tree chosen. " +
+      'It REPLACES the loaded build exactly as load_build does: undo history and stat snapshots are cleared, and reset_build returns to this blank build. ' +
+      'Build it up with allocate_nodes / plan_passive_points (passives), create_socket_group (skills), build_item + swap_item (gear) and set_config, then export_build. ' +
+      'The level defaults to 1, as in PoB, and is in manual mode (pass the level you plan for, e.g. 90 for an endgame build, or change it later with set_character_level). ' +
+      'Unknown class, ascendancy, bloodline or tree names are refused without changing the loaded build, with the choices listed (names ignore case).',
+    inputSchema: {
+      className: z.string().min(1).max(30).optional().describe('Class, e.g. "Witch" (may be left out when an ascendancy is given).'),
+      ascendancy: z.string().min(1).max(60).optional().describe('Ascendancy, e.g. "Elementalist" (default none).'),
+      secondaryAscendancy: z
+        .string()
+        .min(1)
+        .max(60)
+        .optional()
+        .describe('Secondary ascendancy (bloodline), e.g. "Aul Bloodline" (default none).'),
+      level: z.number().int().min(1).max(100).optional().describe('Character level, 1-100 (default 1).'),
+      treeVersion: z
+        .string()
+        .min(1)
+        .max(40)
+        .optional()
+        .describe('Passive tree version as PoB names it, e.g. "3_30" or "3_30_ruthless" (default: the latest).'),
+    },
+  },
+  async (args, session) => {
+    const info = (await session.newBuild(args)) as BuildInfo & { secondaryAscendancy?: string };
+    return {
+      status: 'created',
+      class: info.class,
+      ascendancy: info.ascendancy,
+      ...(info.secondaryAscendancy ? { secondaryAscendancy: info.secondaryAscendancy } : {}),
+      level: info.level,
+      treeVersion: info.treeVersion,
+      ...(info.engineRestart ? { engineRestart: info.engineRestart } : {}),
+    };
+  },
+);
+
 tools.engine<{
   categories?: Array<'offense' | 'defense' | 'sustain' | 'charges' | 'attributes' | 'movement'>;
   stats?: string[];
@@ -182,8 +244,10 @@ tools.engine<{
       const { base } = await session.probe({ stats: [...new Set(keys)], variants: [] });
       return { stats: base };
     }
-    const stats = await session.getStats();
-    return categorizeStats(stats, categories);
+    // The bridge's default stat list covers only a few keys; read every key of the
+    // requested categories through the probe's base read (no recalc, build untouched).
+    const { base } = await session.probe({ stats: statKeysForCategories(categories), variants: [] });
+    return categorizeStats(base as Stats, categories);
   },
 );
 
@@ -387,7 +451,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, set_config or convert_tree_to_latest). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill, set_character_level, set_ascendancy or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -412,23 +476,32 @@ function compactTree(tree: PassiveTreeInfo): unknown {
       name: n.name,
       type: n.type,
       ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
-      ...(n.isMastery || n.type === 'Mastery' ? { stats: n.stats ?? [] } : {}),
+      ...(n.isMastery || n.type === 'Mastery' ? { effect: n.effect, stats: n.stats ?? [] } : {}),
     })),
+    ...(tree.masteryOptions ? { masteryOptions: tree.masteryOptions } : {}),
   };
 }
 
-tools.engine<{ detail?: 'summary' | 'full' }>(
+tools.engine<{ detail?: 'summary' | 'full'; masteries?: Array<string | number> }>(
   'get_passive_tree',
   {
     description:
-      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type; allocated masteries also carry `stats`, their chosen effect). ' +
-      '`detail: "full"` returns every allocated node with all its fields and stats.',
+      'Return the passive tree state: point counts and class info (`summary`), active keystones and allocated notables with their stats, and every allocated node (`allocatedNodes`: id, name, type; allocated masteries also carry `effect`, the chosen effect id, and `stats`, its text). ' +
+      '`detail: "full"` returns every allocated node with all its fields and stats. ' +
+      '`masteries` (node ids or mastery names, e.g. "Life Mastery") adds `masteryOptions`: per mastery node its id, name, `allocated`, the chosen `effect`, `points` (path cost when unallocated) or `reachable: false`, and `options` [{effect, stats, takenBy?}] (takenBy: another mastery that has that effect chosen; each effect can be chosen once). ' +
+      `A name lists every mastery of that name (allocated ones first, then the cheapest; at most 12, then {name, more}). Choose effects with allocate_nodes / evaluate_changes / apply_changes \`masteries\`.`,
     inputSchema: {
       detail: detailSchema.optional().describe('"summary" (default) or "full" (every allocated node with its stats and flags).'),
+      masteries: z
+        .array(z.union([z.number().int(), z.string().min(1)]))
+        .min(1)
+        .max(20)
+        .optional()
+        .describe('Mastery node ids or names whose effect options to list.'),
     },
   },
-  async ({ detail }, session) => {
-    const tree = await session.getPassiveTree();
+  async ({ detail, masteries }, session) => {
+    const tree = await session.getPassiveTree(masteries);
     return detail === 'full' ? tree : compactTree(tree);
   },
 );
@@ -487,6 +560,82 @@ tools.engine<{ allocate?: Array<string | number>; deallocate?: Array<string | nu
     };
   },
 );
+
+const nodeRefsSchema = z
+  .array(z.union([z.string().min(1), z.number().int()]))
+  .min(1)
+  .max(50);
+
+/** Passive and ascendancy points a set of nodes costs, as PoB's CountAllocNodes counts them (`pointCost`). */
+function pointCounts(nodes: TreeEditNode[]): { points: number; ascendancyPoints: number } {
+  return {
+    points: nodes.filter((n) => n.pointCost === 'passive').length,
+    ascendancyPoints: nodes.filter((n) => n.pointCost === 'ascendancy').length,
+  };
+}
+
+function treeEditResponse(result: TreeEditResult, verb: 'allocated' | 'deallocated'): unknown {
+  const node = (n: TreeEditNode) => ({ id: n.id, name: n.name, type: n.type, ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}) });
+  const s = result.summary;
+  const changed = verb === 'allocated' ? result.added : result.removed;
+  const cost = pointCounts(changed);
+  if (result.unchanged) {
+    return { status: 'unchanged', masteries: result.masteries ?? [], message: 'Every mastery already has that effect; nothing was changed or pushed to undo.' };
+  }
+  return {
+    status: verb,
+    ...(verb === 'allocated' ? { added: result.added.map(node) } : {}),
+    ...(result.removed.length > 0 ? { removed: result.removed.map(node) } : {}),
+    ...(result.masteries && result.masteries.length > 0 ? { masteries: result.masteries } : {}),
+    ...(verb === 'allocated'
+      ? { pointsUsed: cost.points, ascendancyPointsUsed: cost.ascendancyPoints }
+      : { pointsRefunded: cost.points, ascendancyPointsRefunded: cost.ascendancyPoints }),
+    points: {
+      used: s.totalPoints,
+      max: s.maxNormalPoints,
+      remaining: s.maxNormalPoints - s.totalPoints,
+      ascendancyUsed: s.ascendancyPoints,
+      ascendancyMax: s.maxAscendancyPoints,
+    },
+    ...(summarizeStatDiff(result) as object),
+    undo: 'Call undo_last_change to revert this change.',
+  };
+}
+
+tools.engine<{ nodes?: Array<string | number>; masteries?: ProbeMasteryChoice[] }>(
+  'allocate_nodes',
+  {
+    description:
+      "Allocate passive nodes in the build, each together with its shortest path from the allocated tree (as clicking it in PoB, simulate_passive_change and find_best_next_nodes do), and return the nodes added, the points used, the tree's point totals and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes the change). " +
+      '`masteries` [{node, effect}] allocates masteries (with their path, after `nodes`) with the chosen effect, or switches an allocated mastery to another effect (to clear a mastery, deallocate it with deallocate_nodes); get_passive_tree `masteries` lists the effect ids. ' +
+      'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, already allocated, a mastery listed in `nodes`, listed twice, cannot be allocated because no path from the allocated tree reaches it, or is a second option of the same choice node, or a mastery effect is not offered by that mastery or already chosen on another one. ' +
+      'A node name resolves among the unallocated nodes a path reaches; a name several of them share (e.g. "Strength") is refused with the candidate ids, so pass ids for those (a mastery name, e.g. "Life Mastery", picks the allocated mastery that has the effect, else the only allocated one of that name, else the only reachable one; pass an id to allocate a second one); masteries that already have their effect alone return `status: "unchanged"` and push nothing. `removed` lists any node the change deallocated (another option of a choice node); `masteries` the masteries given an effect (with `previousEffect` when switched). At most 50 nodes and 20 masteries.',
+    inputSchema: {
+      nodes: z
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .max(50)
+        .optional()
+        .describe('Node names (e.g. "Resolute Technique") or numeric node IDs to allocate.'),
+      masteries: masteriesSchema.optional(),
+    },
+  },
+  async ({ nodes, masteries }, session) => treeEditResponse(await session.allocateNodes(nodes ?? [], masteries ?? []), 'allocated'),
+);
+
+tools.engine<{ nodes: Array<string | number> }>(
+  'deallocate_nodes',
+  {
+    description:
+      "Deallocate passive nodes in the build, each together with every node that depends on it (as in PoB), and return the nodes removed, the points refunded, the tree's point totals and the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes the change). " +
+      'The whole request is checked first and refused with an error (nothing changes) if any node is unknown, not allocated, a class start or listed twice. A node name resolves among the allocated nodes; a name several of them share is refused with the candidate ids. At most 50 nodes.',
+    inputSchema: {
+      nodes: nodeRefsSchema.describe('Node names or numeric node IDs to deallocate.'),
+    },
+  },
+  async ({ nodes }, session) => treeEditResponse(await session.deallocateNodes(nodes), 'deallocated'),
+);
+
+registerBuildEditTools(tools, summarizeStatDiff);
 
 const rankBySchema = z.enum(['perPoint', 'total']);
 
@@ -892,19 +1041,36 @@ tools.engine<{ focus?: 'defense' | 'offense' | 'qol' | 'balance' }>(
   },
 );
 
-tools.engine<{ slot?: string; budget?: 'low' | 'medium' | 'high' }>(
+tools.engine<{ slot?: string; modSlots?: number }>(
   'suggest_upgrades',
   {
     description:
-      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. Provides archetype-aware mod suggestions. A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (lowest contribution first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods; list_equipped_items / get_item_in_slot give the items themselves.",
+      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
+      `The first modSlots slots (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods Path of Building's own weighted trade query generator weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
+      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (highest priority first; empty slots come first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods / modsError; ' +
+      'list_equipped_items / get_item_in_slot give the items themselves, generate_trade_search the full weighted search, stat_weights the worth of any mod line.',
     inputSchema: {
       slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
-      budget: z.enum(['low', 'medium', 'high']).optional().describe('Budget tier to bias suggestions.'),
+      modSlots: z.number().int().min(0).max(10).optional()
+        .describe(`How many of the highest-priority slots get suggestedMods (default ${DEFAULT_MOD_SLOTS}, 0 for none, 10 for all; each takes about 0.5-1 s).`),
     },
   },
-  async ({ slot, budget }, session) => {
-    const suggestions = await session.suggestUpgrades(slot, budget);
-    return { suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest) };
+  async ({ slot, modSlots }, session) => {
+    const suggestions = await session.suggestUpgrades(slot, { modSlots });
+    const tried = suggestions.filter((s) => s.suggestedMods !== undefined || s.modsError !== undefined).length;
+    const measured = suggestions.filter((s) => s.error === undefined).length;
+    let modsNote: string | undefined;
+    if (measured < suggestions.length) {
+      modsNote = 'slots that could not be measured (error) get no suggestedMods';
+    }
+    if (tried < measured) {
+      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for the first ${tried} measured slot(s) only; ` +
+        'pass slot, or a larger modSlots, for the others';
+    }
+    return {
+      suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest),
+      ...(modsNote ? { modsNote } : {}),
+    };
   },
 );
 
@@ -965,7 +1131,7 @@ tools.engine<Record<string, never>>(
   'reset_build',
   {
     description:
-      'Reset the build to its original state (as it was when first loaded). All session mutations (item swaps, tree changes, gem swaps, config changes) are reverted.',
+      'Reset the build to its original state (as it was when first loaded, or as new_build created it). All session mutations (item swaps, tree changes, gem swaps, config changes) are reverted.',
     inputSchema: {},
   },
   async (_args, session) => {

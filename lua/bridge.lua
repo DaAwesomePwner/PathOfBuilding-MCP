@@ -793,9 +793,12 @@ end
 local function getBuildInfo()
 	local treeVersion = build.spec and build.spec.treeVersion
 	local latest = rawget(_G, "latestTreeVersion")
+	local secondary = build.spec and build.spec.curSecondaryAscendClassName
 	return {
 		class = build.className or (build.spec and build.spec.curClassName),
 		ascendancy = build.ascendClassName or (build.spec and build.spec.curAscendClassName),
+		-- Only when one is chosen (a bloodline on 3.25+ trees).
+		secondaryAscendancy = (secondary ~= nil and secondary ~= "None") and secondary or nil,
 		level = build.characterLevel,
 		mainSkill = getMainSkillName(),
 		treeVersion = treeVersion ~= nil and tostring(treeVersion) or nil,
@@ -1970,7 +1973,12 @@ local function restoreTreeState(encoded)
 		if not ok then
 			error("Tree restore failed in PassiveSpec:RestoreUndoState (PoB API may have changed): " .. tostring(err))
 		end
-		if jewelsChanged then
+		-- ImportFromNodeList only queues cluster subgraph nodes (allocSubgraphNodes);
+		-- a graph rebuild allocates them. Needed when the jewels changed, and when
+		-- wanted subgraph nodes are still missing: a Large socket that was
+		-- deallocated (its subgraph dropped) with its jewel kept, as undoing
+		-- deallocate_nodes on the socket does.
+		if jewelsChanged or #treeStateDifferences(spec, state).pending > 0 then
 			spec:BuildClusterJewelGraphs()
 			if build.itemsTab.PopulateSlots then build.itemsTab:PopulateSlots() end
 		end
@@ -2013,7 +2021,14 @@ end
 -- table and reorder it. What-ifs therefore never write to these tables: they
 -- swap in copies and later put the very same objects back. (One table of
 -- functions: the main chunk is at Lua's limit of 200 locals.)
-local ConfigTables = { stash = nil }
+-- `remembered` holds, by a token the caller chose, the committed tables a
+-- change replaced with copies (a probe fallback, apply_changes), untouched
+-- since: only the restore sent with that token (the fallback's restore, the
+-- rollback or undo of that apply_changes) puts those very tables back, and
+-- it forgets them. A plain table holding at most MAX_REMEMBERED entries
+-- (oldest dropped: its restore then writes by value), emptied when a build
+-- is loaded, so nothing outlives the build it belongs to.
+local ConfigTables = { remembered = { }, rememberedOrder = { }, MAX_REMEMBERED = 64 }
 do
 	local function current()
 		local configTab = build.configTab
@@ -2086,11 +2101,33 @@ do
 		return n == 0
 	end
 
-	-- probeCommit detached the config tables for a fallback variant: the
-	-- restore that follows puts `orig` back (while `detached` is still the
-	-- live input table), before comparing or changing any key.
-	function ConfigTables.stashCommitted(orig, detached)
-		ConfigTables.stash = { orig = orig, detached = detached }
+	-- probeCommit and apply_changes swapped in copies (`detached` is their
+	-- input table) for the committed tables `orig`: restoreInput with `token`
+	-- puts orig back instead of writing to the copies. No token: nothing is
+	-- remembered.
+	function ConfigTables.stashCommitted(token, orig, detached)
+		if type(token) ~= "string" then return end
+		local order = ConfigTables.rememberedOrder
+		if ConfigTables.remembered[token] == nil then order[#order + 1] = token end
+		ConfigTables.remembered[token] = { orig = orig, detached = detached }
+		while #order > ConfigTables.MAX_REMEMBERED do
+			ConfigTables.remembered[table.remove(order, 1)] = nil
+		end
+	end
+
+	-- Returns the entry of `token` and forgets it.
+	function ConfigTables.takeRemembered(token)
+		local entry = token and ConfigTables.remembered[token]
+		if not entry then return nil end
+		ConfigTables.remembered[token] = nil
+		for i, t in ipairs(ConfigTables.rememberedOrder) do
+			if t == token then table.remove(ConfigTables.rememberedOrder, i) break end
+		end
+		return entry
+	end
+
+	function ConfigTables.forgetAll()
+		ConfigTables.remembered, ConfigTables.rememberedOrder = { }, { }
 	end
 end
 
@@ -2104,18 +2141,20 @@ function ConfigTables.fullInput()
 	return result
 end
 
--- set_config undo and the full snapshot restore (restoreConfig).
-function ConfigTables.restoreInput(input)
+-- set_config undo and the full snapshot restore (restoreConfig). `token`:
+-- the restore a probe fallback or apply_changes remembered tables for.
+function ConfigTables.restoreInput(input, token)
 	if not (build.configTab and build.configTab.input) then
 		error("Config tab not available")
 	end
 	input = input or { }
-	local stash = ConfigTables.stash
-	ConfigTables.stash = nil
-	if stash and stash.detached == build.configTab.input then
-		-- After a fallback variant with config: the committed tables, never
-		-- written, go back first; the copies are dropped.
-		ConfigTables.attach(stash.orig)
+	local entry = ConfigTables.takeRemembered(token)
+	local live = ConfigTables.current()
+	if entry and entry.detached == live.input and entry.orig.set == live.set and ConfigTables.sameInput(entry.orig.input, input) then
+		-- The live tables are still the copies swapped in for the remembered
+		-- ones, which hold exactly the target values: those tables, never
+		-- written since, go back; the copies are dropped.
+		ConfigTables.attach(entry.orig)
 	end
 	local current = ConfigTables.current()
 	if ConfigTables.sameInput(current.input, input) then
@@ -2307,6 +2346,10 @@ local function describeTreeNode(node, includeStats)
 		ascendancyName = node.ascendancyName,
 		alloc = node.alloc and true or false,
 	}
+	if node.type == "Mastery" and node.alloc and build.spec.masterySelections then
+		-- The chosen effect's id (get_passive_tree's `masteries` lists the options).
+		desc.effect = build.spec.masterySelections[node.id]
+	end
 	if includeStats then
 		desc.stats = copyStats(node.sd)
 	end
@@ -2442,8 +2485,445 @@ local function withTreeRollback(fn)
 	error(err, 0)
 end
 
-local function allocNodesBatch(nodeIds)
+-- Helpers of the node batches below, in one table (the main chunk is close
+-- to LuaJIT's limit of 200 locals).
+local nodeBatch = { }
+
+-- `strict` (allocate_nodes / deallocate_nodes) also refuses a repeated id
+-- and, when allocating, a mastery given without an effect (masteries are
+-- allocated through `masteries`, nodeBatch.resolveMasteries) or a node that
+-- is already allocated.
+function nodeBatch.strictChecks(nodes, allocating)
+	local seen = { }
+	for _, node in ipairs(nodes) do
+		if seen[node.id] then
+			userError("Node " .. nodeLabel(node) .. " is listed more than once")
+		end
+		seen[node.id] = true
+		if allocating and node.type == "Mastery" then
+			userError(nodeBatch.masteryInNodes(node))
+		end
+		if allocating and node.alloc then
+			userError("Node " .. nodeLabel(node) .. " is already allocated")
+		end
+	end
+end
+
+-- What a node batch reports about a node, captured while the node object is
+-- current: rebuilding the cluster jewel graphs (allocating or deallocating a
+-- socket holding a cluster jewel) drops subgraph nodes from spec.nodes and
+-- replaces their objects. `pointCost` follows PassiveSpec:CountAllocNodes:
+-- class starts and ascendancy choice options cost nothing.
+function nodeBatch.describe(node)
+	local cost = "passive"
+	if node.type == "ClassStart" or node.type == "AscendClassStart" then
+		cost = "none"
+	elseif node.ascendancyName then
+		cost = node.isMultipleChoiceOption and "none" or "ascendancy"
+	end
+	return { id = node.id, name = node.dn, type = node.type, ascendancyName = node.ascendancyName, pointCost = cost }
+end
+
+-- Descriptions of every allocated node, by id.
+function nodeBatch.captureAllocated()
+	local set = { }
+	for id, node in pairs(build.spec.allocNodes) do set[id] = nodeBatch.describe(node) end
+	return set
+end
+
+-- Nodes allocated before (`before`, from captureAllocated) and not now, by id.
+function nodeBatch.lostSince(before)
+	local ids = { }
+	for id in pairs(before) do
+		if not build.spec.allocNodes[id] then ids[#ids + 1] = id end
+	end
+	table.sort(ids)
+	local lost = { }
+	for i, id in ipairs(ids) do lost[i] = before[id] end
+	return lost
+end
+
+-- ---------------------------------------------------------------------------
+-- Masteries. A mastery is allocated together with the effect chosen on it
+-- (PoB's TreeTab:SaveMasteryPopup: spec.masterySelections[id] = effect, then
+-- AllocNode); PassiveSpec:BuildAllDependsAndPaths gives an allocated mastery
+-- its effect's stats and drops a selection on a mastery that is not
+-- allocated, so a selection is set right before its node is allocated
+-- (allocNodesBatch). An allocated mastery changes effect by a new selection
+-- and a rebuild. Each effect can be chosen on one mastery only (PoB's mastery
+-- popup leaves out effects chosen elsewhere).
+-- ---------------------------------------------------------------------------
+
+nodeBatch.MAX_MASTERIES = 20
+nodeBatch.MAX_LISTED = 12
+
+function nodeBatch.masteryInNodes(node)
+	return "Node " .. nodeLabel(node) .. " is a mastery; pass it in `masteries` as { node, effect } "
+		.. "(get_passive_tree with `masteries` lists its effects)"
+end
+
+-- Passive points of the path that allocating `node` would add.
+function nodeBatch.pathPoints(node)
+	local n = 0
+	for _, pathNode in ipairs(node.path or { }) do
+		if not pathNode.ascendancyName and pathNode.type ~= "ClassStart" and pathNode.type ~= "AscendClassStart" then n = n + 1 end
+	end
+	return n
+end
+
+-- The mastery nodes named `name` (case-insensitive), allocated ones first,
+-- then by path points, then by id.
+function nodeBatch.masteriesNamed(name)
+	local target, out = name:lower(), { }
+	for _, node in pairs(build.spec.nodes) do
+		if node.type == "Mastery" and node.dn and node.dn:lower() == target then out[#out + 1] = node end
+	end
+	table.sort(out, function(a, b)
+		if (a.alloc and true or false) ~= (b.alloc and true or false) then return a.alloc and true or false end
+		local pa, pb = nodeBatch.pathPoints(a), nodeBatch.pathPoints(b)
+		if pa ~= pb then return pa < pb end
+		return a.id < b.id
+	end)
+	return out
+end
+
+function nodeBatch.reachable(node)
+	return node.alloc or (node.path ~= nil and #node.path > 0)
+end
+
+function nodeBatch.describeMasteryCandidate(node)
+	if node.alloc then
+		return tostring(node.id) .. " (allocated, effect " .. tostring(build.spec.masterySelections[node.id]) .. ")"
+	end
+	if not nodeBatch.reachable(node) then return tostring(node.id) .. " (unallocated, no path)" end
+	local points = nodeBatch.pathPoints(node)
+	return tostring(node.id) .. " (unallocated, " .. points .. " point" .. (points == 1 and "" or "s") .. " away)"
+end
+
+-- A mastery node by id or name. Masteries share names ("Life Mastery"), so a
+-- name resolves in steps: among the allocated masteries of that name, the one
+-- that has `effectRef` chosen already, else the only allocated one (an effect
+-- switch); with none allocated, the only unallocated one a path reaches.
+-- Anything else (several allocated ones, none with that effect; several
+-- reachable unallocated ones) is refused with their ids. To allocate another
+-- mastery of a name that is allocated already, pass its id.
+function nodeBatch.masteryNode(ref, label, effectRef)
+	local spec = build.spec
+	if type(ref) == "number" then
+		local node = spec.nodes[ref]
+		if not node then userError(label .. ": unknown node id " .. tostring(ref)) end
+		if node.type ~= "Mastery" then userError(label .. ": node " .. nodeLabel(node) .. " is not a mastery") end
+		return node
+	end
+	if type(ref) ~= "string" or ref == "" then userError(label .. ": node must be a node id or a mastery name") end
+	local all = nodeBatch.masteriesNamed(ref)
+	if #all == 0 then userError(label .. ": no mastery named \"" .. ref .. "\"") end
+	local allocated, usable = { }, { }
+	for _, node in ipairs(all) do
+		if node.alloc then allocated[#allocated + 1] = node end
+		if nodeBatch.reachable(node) then usable[#usable + 1] = node end
+	end
+	if #allocated > 0 then
+		if effectRef ~= nil then
+			-- The effect, as the masteries of this name offer it (they share their options).
+			local ok, effect = pcall(nodeBatch.masteryEffect, allocated[1], effectRef, label)
+			for _, node in ipairs(ok and allocated or { }) do
+				if spec.masterySelections[node.id] == effect then return node end
+			end
+		end
+		if #allocated == 1 then return allocated[1] end
+		usable = allocated
+	end
+	local pick = #usable > 0 and usable or all
+	if #pick == 1 then return pick[1] end
+	local listed = { }
+	for i = 1, math.min(#pick, nodeBatch.MAX_LISTED) do listed[i] = nodeBatch.describeMasteryCandidate(pick[i]) end
+	userError(label .. ": mastery name \"" .. ref .. "\" matches " .. #pick .. " nodes: " .. table.concat(listed, ", ")
+		.. (#pick > #listed and (" and " .. (#pick - #listed) .. " more") or "") .. ". Pass the node id instead.")
+end
+
+-- The effects a mastery node offers, as { effect = id, stats = text }.
+function nodeBatch.masteryEffectList(node)
+	local out = { }
+	for _, effect in ipairs(node.masteryEffects or { }) do
+		out[#out + 1] = { effect = effect.effect, stats = masteryEffectText(build.spec, effect.effect)
+			or table.concat(effect.stats or { }, " / ") }
+	end
+	return out
+end
+
+-- An effect of `node` by id or by text: the whole effect text or one of its
+-- lines (case-insensitive), else a part of its text that only one effect has.
+function nodeBatch.masteryEffect(node, ref, label)
+	local effects = nodeBatch.masteryEffectList(node)
+	local function options()
+		local shown = { }
+		for i, e in ipairs(effects) do shown[i] = tostring(e.effect) .. ": " .. e.stats end
+		return " Its effects: " .. table.concat(shown, "; ")
+	end
+	if type(ref) == "number" then
+		if not nodeOffersMasteryEffect(node, ref) then
+			userError(label .. ": mastery " .. nodeLabel(node) .. " does not offer effect " .. tostring(ref) .. "." .. options())
+		end
+		return ref
+	end
+	if type(ref) ~= "string" or ref:match("^%s*$") then userError(label .. ": effect must be an effect id or its text") end
+	local want = ref:lower():match("^%s*(.-)%s*$")
+	local partial = { }
+	for _, e in ipairs(effects) do
+		local text = e.stats:lower()
+		if text == want then return e.effect end
+		for line in (text .. " / "):gmatch("(.-) / ") do
+			if line == want then return e.effect end
+		end
+		if text:find(want, 1, true) then partial[#partial + 1] = e.effect end
+	end
+	if #partial == 1 then return partial[1] end
+	userError(label .. ": " .. (#partial > 1 and ("effect text \"" .. ref .. "\" matches " .. #partial .. " effects of mastery ")
+		or ("no effect of mastery ")) .. nodeLabel(node) .. (#partial > 1 and "; pass the effect id." or (" matches \"" .. ref .. "\".")) .. options())
+end
+
+-- Resolve and check a list of { node, effect } entries (user errors before
+-- any change). Returns { { node, id, effect } ... } in order. `opts.replay`
+-- (a crash replay of a committed change: node and effect are ids that were
+-- checked when the change was made) only resolves the ids. `opts.skip` (ids)
+-- are nodes the same change lists elsewhere, refused as listed twice;
+-- `opts.removed` (ids) are allocated nodes the same change deallocates (a
+-- deallocated node's dependents among them): a mastery among them is
+-- refused, since the change would remove it and re-allocate it with a path.
+-- Each entry carries `noop` when the mastery is allocated with that effect.
+function nodeBatch.resolveMasteries(entries, opts)
+	opts = opts or { }
+	if entries == nil then return { } end
+	if type(entries) ~= "table" then userError("masteries must be an array of { node, effect }") end
+	if #entries > nodeBatch.MAX_MASTERIES then
+		userError("masteries has " .. #entries .. " entries; at most " .. nodeBatch.MAX_MASTERIES .. " are allowed")
+	end
+	local spec = build.spec
+	local out, seen, byEffect = { }, { }, { }
+	for i, entry in ipairs(entries) do
+		local label = "masteries[" .. i .. "]"
+		if type(entry) ~= "table" or entry.node == nil or entry.effect == nil then
+			userError(label .. " must be { node, effect }")
+		end
+		local node = nodeBatch.masteryNode(entry.node, label, not opts.replay and entry.effect or nil)
+		local effect = opts.replay and tonumber(entry.effect) or nodeBatch.masteryEffect(node, entry.effect, label)
+		if not opts.replay then
+			if seen[node.id] or (opts.skip and opts.skip[node.id]) then userError("Node " .. nodeLabel(node) .. " is listed twice") end
+			if opts.removed and opts.removed[node.id] then
+				userError(label .. ": mastery " .. nodeLabel(node) .. " is removed by this change's deallocation (it depends on a "
+					.. "deallocated node); deallocate it too, or keep the node it depends on")
+			end
+			if spec.hashOverrides and spec.hashOverrides[node.id] then
+				userError(label .. ": mastery " .. nodeLabel(node) .. " carries a tattoo or runegraft; its effect cannot be chosen")
+			end
+			if not nodeBatch.reachable(node) then
+				userError("Node " .. nodeLabel(node) .. " cannot be allocated: no path from the allocated tree reaches it")
+			end
+			if byEffect[effect] then
+				userError(label .. ": effect " .. effect .. " is also chosen for mastery " .. nodeLabel(byEffect[effect])
+					.. " in this change; each mastery effect can be chosen on one mastery only")
+			end
+		end
+		seen[node.id] = true
+		byEffect[effect] = node
+		out[#out + 1] = { node = node, id = node.id, effect = effect,
+			noop = (node.alloc and spec.masterySelections[node.id] == effect) and true or nil }
+	end
+	if not opts.replay then
+		-- Taken on a mastery this change leaves alone (PoB's mastery popup
+		-- does not offer an effect chosen on another mastery).
+		for otherId, effect in pairs(spec.masterySelections or { }) do
+			local mine = byEffect[effect]
+			if mine and mine.id ~= otherId and not seen[otherId] then
+				local other = spec.nodes[otherId]
+				userError("Effect " .. effect .. " (" .. tostring(masteryEffectText(spec, effect)) .. ") is already chosen on mastery "
+					.. (other and nodeLabel(other) or tostring(otherId)) .. "; each mastery effect can be chosen on one mastery only")
+			end
+		end
+	end
+	return out
+end
+
+-- What a committed mastery change reports: { id, name, effect, stats, previousEffect? }.
+function nodeBatch.describeMastery(id, previous)
+	local spec = build.spec
+	local node = spec.nodes[id]
+	local effect = spec.masterySelections[id]
+	return { id = id, name = node and node.dn, effect = effect, stats = effect and masteryEffectText(spec, effect),
+		previousEffect = previous }
+end
+
+-- True when every mastery entry is a no-op (allocated with that effect already).
+function nodeBatch.allNoop(masteries)
+	for _, m in ipairs(masteries) do
+		if not m.noop then return false end
+	end
+	return true
+end
+
+-- A change that changes nothing (only no-op mastery entries): no rebuild, no
+-- recalculation, and the caller pushes no undo entry or journal record.
+function nodeBatch.unchanged(masteries)
+	local out = { }
+	for i, m in ipairs(masteries) do out[i] = nodeBatch.describeMastery(m.id, m.effect) end
+	return { added = { }, removed = { }, masteries = out, unchanged = true }
+end
+
+-- get_passive_tree's `masteries`: each referenced mastery (a name lists
+-- every mastery of that name, allocated ones first, at most MAX_LISTED) with
+-- its effects; `takenBy` names another mastery that has an effect chosen.
+function nodeBatch.masteryOptions(refs)
+	if type(refs) ~= "table" then userError("masteries must be an array of node ids or mastery names") end
+	if #refs > nodeBatch.MAX_MASTERIES then
+		userError("masteries has " .. #refs .. " entries; at most " .. nodeBatch.MAX_MASTERIES .. " are allowed")
+	end
+	local spec = build.spec
+	local takenBy = { }
+	for id, effect in pairs(spec.masterySelections or { }) do takenBy[effect] = id end
+	local out, listed = { }, { }
+	for i, ref in ipairs(refs) do
+		local label = "masteries[" .. i .. "]"
+		local nodes, more = { }, 0
+		if type(ref) == "number" then
+			nodes[1] = nodeBatch.masteryNode(ref, label)
+		elseif type(ref) == "string" and ref ~= "" then
+			local all = nodeBatch.masteriesNamed(ref)
+			if #all == 0 then userError(label .. ": no mastery named \"" .. ref .. "\"") end
+			for j = 1, math.min(#all, nodeBatch.MAX_LISTED) do nodes[j] = all[j] end
+			more = #all - #nodes
+		else
+			userError(label .. " must be a node id or a mastery name")
+		end
+		for _, node in ipairs(nodes) do
+			if not listed[node.id] then
+				listed[node.id] = true
+				local options = { }
+				for j, e in ipairs(nodeBatch.masteryEffectList(node)) do
+					local owner = takenBy[e.effect]
+					options[j] = { effect = e.effect, stats = e.stats, takenBy = owner ~= node.id and owner or nil }
+				end
+				local entry = { id = node.id, name = node.dn, allocated = node.alloc and true or false, options = options }
+				if node.alloc then
+					entry.effect = spec.masterySelections[node.id]
+				elseif nodeBatch.reachable(node) then
+					entry.points = nodeBatch.pathPoints(node)
+				else
+					entry.reachable = false
+				end
+				out[#out + 1] = entry
+			end
+		end
+		if more > 0 then out[#out + 1] = { name = ref, more = more } end
+	end
+	return out
+end
+
+-- A strict batch (allocate_nodes / deallocate_nodes) records what it changed
+-- as soon as the tree has changed, before PoB recalculates: when anything
+-- after that fails (OnFrame, the stats, a PoB error popup), the command fails
+-- but the change is in the build, and the caller reads the record
+-- (treeEditApplied, its next command) to commit it. `record` is { } once a
+-- strict batch has started and gets `applied` once the tree changed. Every
+-- other command clears it when dispatched, so the record only ever describes
+-- the command right before the read: a later batch that fails before its
+-- handler runs is reported as not started, never credited with an earlier
+-- batch's change.
+nodeBatch.record = nil
+
+function nodeBatch.recordApplied(strict, result)
+	if not strict then return end
+	nodeBatch.record.applied = result
+	if TEST_FAULTS.treeEditFailsAfterChange then error("test fault: tree edit failed after changing the tree", 0) end
+end
+
+-- Committed build edits other than node batches (applyChanges in
+-- lua/probe.lua, createSocketGroup / deleteSocketGroup / setMainSkill below),
+-- in one table like nodeBatch. Each checks everything it can first, then
+-- records (`record`, read with buildEditApplied right after a failure) that
+-- it started changing the build and, once the whole change is in, what it
+-- changed (before PoB recalculates): the caller rolls a started-but-unfinished
+-- change back and commits an applied one even when the command then fails.
+-- Every other command clears the record when dispatched, as for nodeBatch.
+local buildEdit = { record = nil }
+
+function buildEdit.started()
+	buildEdit.record = buildEdit.record or { }
+end
+
+-- `replay`: the command is a crash replay of a committed edit (the test
+-- faults below never fire for one).
+function buildEdit.applied(result, replay)
+	buildEdit.started()
+	buildEdit.record.applied = result
+	if replay then return end
+	-- Test faults: the next getStats fails (PoB's recalculation after an
+	-- applied change failing too) or ends the process (buildEditRecalcExits),
+	-- and the command fails after the change.
+	if TEST_FAULTS.buildEditRecalcFails or TEST_FAULTS.buildEditRecalcExits then buildEdit.failNextStats = true end
+	if TEST_FAULTS.buildEditFailsAfterChange then error("test fault: build edit failed after changing the build", 0) end
+end
+
+-- applyChangesFailsMidway raises part-way through the change (the caller
+-- rolls it back); with buildEditRollbackInexact it also arms the rollback's
+-- committed-state fingerprint read (`probe` with `fingerprint` and
+-- `rollbackCheck`) to come back with one extra line, so the caller's check
+-- after the rollback sees a difference (the build itself is left as the
+-- rollback put it). The next fingerprint read disarms it either way, so a
+-- rollback that fails before its check leaves nothing armed.
+function buildEdit.testFaultMidway(replay)
+	if TEST_FAULTS.applyChangesFailsMidway and not replay then
+		if TEST_FAULTS.buildEditRollbackInexact then buildEdit.rollbackInexact = true end
+		error("test fault: apply_changes failed part-way", 0)
+	end
+end
+
+-- The commands that start a build edit. Dispatching one disarms the test
+-- faults an earlier edit armed but never reached (failNextStats when the
+-- edit failed before its recalculation, rollbackInexact when no rollback
+-- read the fingerprint), so they only ever hit the edit that armed them.
+buildEdit.COMMANDS = { applyChanges = true, createSocketGroup = true, deleteSocketGroup = true, setMainSkill = true }
+
+-- Returns { added, removed }: the nodes the batch added, in the order they
+-- joined the tree (each one next to the tree as it was then: PoB's path runs
+-- from the node back to the tree), and the nodes it removed (another option
+-- of a choice node), as nodeBatch.describe tables. Allocating exactly the
+-- added ids in that order reproduces the change whichever of several equally
+-- short paths PoB picked (its choice depends on table order, which differs
+-- between processes): what a crash replay needs. Nodes are looked up by id
+-- at every step: an earlier node of the batch may have rebuilt the cluster
+-- jewel graphs.
+-- `masteries` (resolved by nodeBatch.resolveMasteries: { id, effect } each)
+-- are masteries to allocate with that effect, or allocated ones to give that
+-- effect. Unallocated ones not in nodeIds are allocated after nodeIds (a
+-- crash replay lists them in nodeIds, in join order); each selection is set
+-- right before its node is allocated, those of allocated masteries first.
+-- `masteries` in the result: { id, name, effect, stats, previousEffect? } each.
+local function allocNodesBatch(nodeIds, strict, masteries)
+	if strict then nodeBatch.record = { } end
+	masteries = masteries or { }
 	local nodes = batchNodes(nodeIds)
+	if strict then nodeBatch.strictChecks(nodes, true) end
+	local effectOf, previous = { }, { }
+	do
+		local requested = { }
+		for _, id in ipairs(nodeIds) do requested[id] = true end
+		local extended = { }
+		for i, id in ipairs(nodeIds) do extended[i] = id end
+		for _, m in ipairs(masteries) do
+			effectOf[m.id] = m.effect
+			previous[m.id] = build.spec.masterySelections[m.id]
+			local node = build.spec.nodes[m.id]
+			if node and not node.alloc and not requested[m.id] then
+				extended[#extended + 1] = m.id
+				nodes[#nodes + 1] = node
+			end
+		end
+		nodeIds = extended
+	end
+	for _, node in ipairs(nodes) do
+		if node.type == "Mastery" and not node.alloc and not effectOf[node.id] then userError(nodeBatch.masteryInNodes(node)) end
+	end
 	local choiceParent = { }
 	for _, node in ipairs(nodes) do
 		-- PassiveSpec:AllocNode silently does nothing for a node no path
@@ -2463,22 +2943,74 @@ local function allocNodesBatch(nodeIds)
 			choiceParent[parent] = node
 		end
 	end
+	local before = nodeBatch.captureAllocated()
+	local order, listed = { }, { }
 	withTreeRollback(function()
-		for _, node in ipairs(nodes) do
-			build.spec:AllocNode(node)
+		local spec = build.spec
+		for _, m in ipairs(masteries) do
+			if spec.allocNodes[m.id] then spec.masterySelections[m.id] = m.effect end
 		end
-		for _, node in ipairs(nodes) do
-			if not node.alloc then
-				userError("Node " .. nodeLabel(node) .. " could not be allocated")
+		for i, id in ipairs(nodeIds) do
+			local node = spec.nodes[id]
+			if not node then
+				userError("Node " .. nodeLabel(nodes[i]) .. " no longer exists after an earlier node of the batch rebuilt the cluster jewel graphs")
+			end
+			local path = node.path or { }
+			if #(node.intuitiveLeapLikesAffecting or { }) > 0 then path = { node } end
+			for j = #path, 1, -1 do
+				local pathNode = path[j]
+				if not pathNode.alloc and not listed[pathNode.id] then
+					listed[pathNode.id] = true
+					order[#order + 1] = pathNode.id
+				end
+			end
+			if effectOf[id] then spec.masterySelections[id] = effectOf[id] end
+			spec:AllocNode(node)
+		end
+		-- Allocated masteries whose effect changed get it from the rebuild.
+		if #masteries > 0 then spec:BuildAllDependsAndPaths() end
+		for i, id in ipairs(nodeIds) do
+			if not spec.allocNodes[id] then
+				userError("Node " .. nodeLabel(nodes[i]) .. " could not be allocated")
+			end
+		end
+		for _, m in ipairs(masteries) do
+			if spec.masterySelections[m.id] ~= m.effect then
+				userError("Mastery " .. nodeLabel(spec.nodes[m.id]) .. " could not be given effect " .. tostring(m.effect))
 			end
 		end
 	end)
+	local added = { }
+	for _, id in ipairs(order) do
+		local node = build.spec.allocNodes[id]
+		if node then added[#added + 1] = nodeBatch.describe(node) end
+	end
+	-- Anything else that became allocated (not expected) follows, by id.
+	local extra = { }
+	for id in pairs(build.spec.allocNodes) do
+		if not before[id] and not listed[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
+	local result = { added = added, removed = nodeBatch.lostSince(before) }
+	if #masteries > 0 then
+		result.masteries = { }
+		for i, m in ipairs(masteries) do result.masteries[i] = nodeBatch.describeMastery(m.id, previous[m.id]) end
+	end
 	build.buildFlag = true
+	nodeBatch.recordApplied(strict, result)
 	runCallback("OnFrame")
+	return result
 end
 
-local function deallocNodesBatch(nodeIds)
+-- Returns { removed }: the nodes removed (the requested ones and every node
+-- that depended on them), by id, as nodeBatch.describe tables. Nodes are
+-- looked up by id at every step (see allocNodesBatch); one an earlier node
+-- of the batch already removed (it depended on it) is skipped.
+local function deallocNodesBatch(nodeIds, strict)
+	if strict then nodeBatch.record = { } end
 	local nodes = batchNodes(nodeIds)
+	if strict then nodeBatch.strictChecks(nodes, false) end
 	for _, node in ipairs(nodes) do
 		if node.type == "ClassStart" or node.type == "AscendClassStart" then
 			userError("Node " .. nodeLabel(node) .. " is a class start and cannot be deallocated")
@@ -2490,13 +3022,195 @@ local function deallocNodesBatch(nodeIds)
 			userError("Node " .. nodeLabel(node) .. " is not allocated")
 		end
 	end
+	local before = nodeBatch.captureAllocated()
 	withTreeRollback(function()
-		for _, node in ipairs(nodes) do
-			build.spec:DeallocNode(node)
+		for _, id in ipairs(nodeIds) do
+			local node = build.spec.nodes[id]
+			if node and build.spec.allocNodes[id] then
+				build.spec:DeallocNode(node)
+			end
 		end
 	end)
+	local result = { removed = nodeBatch.lostSince(before) }
+	build.buildFlag = true
+	nodeBatch.recordApplied(strict, result)
+	runCallback("OnFrame")
+	return result
+end
+
+-- plan_respec (BuildSession.planRespec, which runs it between a passive-tree
+-- snapshot and its exact restore): change the tree so that exactly the
+-- `target` nodes (ids or unique names) are allocated, plus class starts, the
+-- allocated ascendancy nodes when `keepAscendancy` is not false, the `keep`
+-- ids, and the nodes connecting them. The whole target is checked first
+-- (unknown ids or names, names several nodes share, nodes no path reaches,
+-- unallocated masteries, two options of one choice): a refusal changes
+-- nothing. Then, on the tree as it is:
+--   1. removals: while an allocated node can go without taking a kept node
+--      with it (its PoB `depends`), the one taking the most nodes (lowest id
+--      on ties) is deallocated as PoB does (with its dependents). Kept nodes
+--      stay connected without every removed node, so deallocating `deallocate`
+--      in order on the original tree removes the same nodes;
+--   2. additions: the unallocated target node with the shortest PoB path
+--      (lowest id on ties) is allocated with that path, until none is left.
+--      `allocate` lists the nodes added in the order they joined the tree
+--      (allocating them in that order reproduces the change exactly).
+-- `readded`: nodes of `allocate` that were allocated before (a removal took
+-- them, a path needed them again); the caller restores the tree and runs the
+-- command again with them in `keep`. `removed` / `added`: the net change.
+function nodeBatch.respec(cmd)
+	local spec = build.spec
+	local refs = cmd.target
+	if type(refs) ~= "table" then userError("target must be an array of node ids or names") end
+	local problems = { unknown = { }, ambiguous = { }, unreachable = { }, masteries = { } }
+	local byName
+	local target, targetIds = { }, { }
+	local choiceOf = { }
+	for _, ref in ipairs(refs) do
+		local node
+		if type(ref) == "number" then
+			node = spec.nodes[ref]
+			if not node then table.insert(problems.unknown, tostring(ref)) end
+		elseif type(ref) == "string" and ref ~= "" then
+			if not byName then
+				byName = { }
+				for _, n in pairs(spec.nodes) do
+					if n.dn then
+						local key = n.dn:lower()
+						byName[key] = byName[key] or { }
+						table.insert(byName[key], n)
+					end
+				end
+			end
+			local all = byName[ref:lower()] or { }
+			if #all == 1 then
+				node = all[1]
+			elseif #all == 0 then
+				table.insert(problems.unknown, "\"" .. ref .. "\"")
+			else
+				table.sort(all, function(a, b) return a.id < b.id end)
+				local ids = { }
+				for i = 1, math.min(#all, 8) do ids[i] = tostring(all[i].id) end
+				table.insert(problems.ambiguous, "\"" .. ref .. "\" (" .. #all .. " nodes: " .. table.concat(ids, ", ")
+					.. (#all > 8 and ", ..." or "") .. ")")
+			end
+		else
+			userError("target entries must be node ids or non-empty names")
+		end
+		if node and not target[node.id] and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+			if node.type == "Mastery" and not node.alloc then
+				table.insert(problems.masteries, nodeLabel(node))
+			elseif not node.alloc and not (node.path and #node.path > 0) then
+				table.insert(problems.unreachable, nodeLabel(node))
+			else
+				if node.isMultipleChoiceOption and node.linked and node.linked[1] then
+					local other = choiceOf[node.linked[1]]
+					if other then
+						userError("target: nodes " .. nodeLabel(other) .. " and " .. nodeLabel(node) .. " are options of the same choice; only one can be allocated")
+					end
+					choiceOf[node.linked[1]] = node
+				end
+				target[node.id] = true
+				targetIds[#targetIds + 1] = node.id
+			end
+		end
+	end
+	local parts = { }
+	if #problems.unknown > 0 then parts[#parts + 1] = "unknown nodes: " .. table.concat(problems.unknown, ", ") end
+	if #problems.ambiguous > 0 then parts[#parts + 1] = "names several nodes share (pass the id): " .. table.concat(problems.ambiguous, "; ") end
+	if #problems.unreachable > 0 then parts[#parts + 1] = "no path from the class start reaches: " .. table.concat(problems.unreachable, ", ") end
+	if #problems.masteries > 0 then
+		parts[#parts + 1] = "unallocated masteries need an effect (leave them out, then allocate them with allocate_nodes `masteries`): "
+			.. table.concat(problems.masteries, ", ")
+	end
+	if #parts > 0 then userError("target: " .. table.concat(parts, "; ")) end
+	table.sort(targetIds)
+
+	local required = { }
+	for id in pairs(target) do required[id] = true end
+	for _, id in ipairs(type(cmd.keep) == "table" and cmd.keep or { }) do
+		if spec.allocNodes[id] then required[id] = true end
+	end
+	if cmd.keepAscendancy ~= false then
+		for id, node in pairs(spec.allocNodes) do
+			if node.ascendancyName then required[id] = true end
+		end
+	end
+	local before = nodeBatch.captureAllocated()
+
+	-- 1. Removals.
+	local roots = { }
+	for _ = 1, 10000 do
+		local best, bestSize = nil, 0
+		for id, node in pairs(spec.allocNodes) do
+			if not required[id] and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
+				local size, ok = 0, true
+				for _, dep in ipairs(node.depends or { node }) do
+					if required[dep.id] or dep.type == "ClassStart" or dep.type == "AscendClassStart" then
+						ok = false
+						break
+					end
+					size = size + 1
+				end
+				if ok and (best == nil or size > bestSize or (size == bestSize and id < best.id)) then best, bestSize = node, size end
+			end
+		end
+		if not best then break end
+		roots[#roots + 1] = best.id
+		spec:DeallocNode(best)
+	end
+
+	-- 2. Additions.
+	local order, listed = { }, { }
+	for _ = 1, 10000 do
+		local pick, pickLen = nil, 0
+		for _, id in ipairs(targetIds) do
+			local node = spec.nodes[id]
+			if not node then error("target node " .. id .. " no longer exists after the removals rebuilt the cluster jewel graphs", 0) end
+			if not node.alloc then
+				if not (node.path and #node.path > 0) then error("no path reaches target node " .. nodeLabel(node) .. " after the removals", 0) end
+				if pick == nil or #node.path < pickLen or (#node.path == pickLen and id < pick.id) then pick, pickLen = node, #node.path end
+			end
+		end
+		if not pick then break end
+		local path = pick.path
+		if #(pick.intuitiveLeapLikesAffecting or { }) > 0 then path = { pick } end
+		for j = #path, 1, -1 do
+			local pathNode = path[j]
+			if not pathNode.alloc and not listed[pathNode.id] then
+				listed[pathNode.id] = true
+				order[#order + 1] = pathNode.id
+			end
+		end
+		spec:AllocNode(pick)
+		if not spec.allocNodes[pick.id] then error("target node " .. nodeLabel(pick) .. " could not be allocated", 0) end
+	end
+	for id in pairs(required) do
+		if not spec.allocNodes[id] then error("node " .. id .. " was to be kept but is no longer allocated", 0) end
+	end
+
+	-- `added` in join order; anything else that became allocated (not expected) follows, by id.
+	local added, readded, inAdded = { }, { }, { }
+	for _, id in ipairs(order) do
+		if before[id] then
+			readded[#readded + 1] = id
+		elseif spec.allocNodes[id] then
+			added[#added + 1] = nodeBatch.describe(spec.allocNodes[id])
+			inAdded[id] = true
+		end
+	end
+	local extra = { }
+	for id in pairs(spec.allocNodes) do
+		if not before[id] and not inAdded[id] then extra[#extra + 1] = id end
+	end
+	table.sort(extra)
+	for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(spec.allocNodes[id]) end
 	build.buildFlag = true
 	runCallback("OnFrame")
+	return {
+		removed = nodeBatch.lostSince(before), added = added, deallocate = roots, allocate = order,
+		readded = readded, target = targetIds,
+	}
 end
 
 local function isTreeConnected()
@@ -2948,7 +3662,7 @@ local function getAvailableSupports(activeSkillTags, includeAwakened)
 	return result
 end
 
-local function setMainSocketGroupImpl(groupIndex)
+function buildEdit.setMainSocketGroup(groupIndex)
 	if not (build and build.skillsTab and build.skillsTab.socketGroupList) then
 		error("Skills tab not available")
 	end
@@ -3211,6 +3925,177 @@ local function restoreSkills(snap)
 		error("Skills restore was not exact (monster-explosion gem settings lost because their explosion source is gone: "
 			.. table.concat(unlinked, ", ") .. "); call reset_build to return to the loaded build", 0)
 	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Committed socket group edits (create_socket_group / delete_socket_group /
+-- set_main_skill): everything is checked before the skills change; see
+-- buildEdit above for the record.
+-- ---------------------------------------------------------------------------
+
+-- The slots PoB's socket group "Socketed in" list offers (SkillsTab's groupSlotDropList).
+buildEdit.GROUP_SLOTS = {
+	["Weapon 1"] = true, ["Weapon 2"] = true, ["Weapon 1 Swap"] = true, ["Weapon 2 Swap"] = true,
+	["Helmet"] = true, ["Body Armour"] = true, ["Gloves"] = true, ["Boots"] = true, ["Amulet"] = true,
+	["Ring 1"] = true, ["Ring 2"] = true, ["Ring 3"] = true, ["Belt"] = true,
+}
+buildEdit.MAX_GROUP_GEMS = 20
+
+function buildEdit.isInt(v, min)
+	return type(v) == "number" and v == v and v % 1 == 0 and v >= min and v < 2 ^ 31
+end
+
+function buildEdit.groupAt(index)
+	local list = skillsTabOrError().socketGroupList
+	if not buildEdit.isInt(index, 1) then userError("group must be a 1-based integer") end
+	local group = list[index]
+	if not group then
+		userError("Skill group not found at index " .. tostring(index) .. " (the build has " .. #list .. " socket groups)")
+	end
+	return group, list
+end
+
+-- How many active skills PoB makes from the group when it is the main group
+-- (CalcSetup's "Create active skills" loop): every granted effect of every
+-- enabled gem (a Vaal gem grants two) that is not a support, is supported,
+-- and, for an effect with a global part, has that part enabled. PoB builds a
+-- group's display skill list only for enabled or main groups, so it is
+-- counted here rather than read.
+function buildEdit.activeSkillCount(group)
+	local n = 0
+	for _, gem in ipairs(group.gemList or { }) do
+		if gem.enabled and (gem.gemData or gem.grantedEffect) then
+			local effects = gem.gemData and gem.gemData.grantedEffectList or { gem.grantedEffect }
+			for index, effect in ipairs(effects) do
+				if not effect.support and not effect.unsupported and (not effect.hasGlobalEffect or gem["enableGlobal" .. index]) then
+					n = n + 1
+				end
+			end
+		end
+	end
+	return n
+end
+
+function buildEdit.describeGroup(index, group)
+	local gems = { }
+	for i, gem in ipairs(group.gemList or { }) do
+		gems[i] = { name = (gem.gemData and gem.gemData.name) or gem.nameSpec or "", level = gem.level, quality = gem.quality, enabled = gem.enabled ~= false }
+	end
+	return { index = index, label = group.displayLabel or group.label or "", slot = group.slot, enabled = group.enabled ~= false, gems = gems }
+end
+
+-- Keep the main socket group (and the Calcs tab's copy) on a valid group
+-- after group `removed` was deleted, as PoB's own delete does for indices
+-- past it; the main group itself moves to the group that took its place
+-- (the last group when it was last).
+function buildEdit.shiftMainAfterDelete(removed)
+	local count = #build.skillsTab.socketGroupList
+	local function shifted(index)
+		index = tonumber(index) or 1
+		if index > removed then index = index - 1 end
+		return math.max(1, math.min(index, count))
+	end
+	build.mainSocketGroup = shifted(build.mainSocketGroup)
+	if build.calcsTab and build.calcsTab.input and build.calcsTab.input.skill_number then
+		build.calcsTab.input.skill_number = shifted(build.calcsTab.input.skill_number)
+	end
+end
+
+-- cmd: { gems = [{ name, level?, quality?, enabled? }], slot?, label?,
+-- enabled?, setAsMain? }. The new group goes last, as PoB's "New" button
+-- puts it. Returns its index and its gems (names as PoB knows them).
+function buildEdit.createSocketGroup(cmd)
+	local tab = skillsTabOrError()
+	local specs = cmd.gems
+	if type(specs) ~= "table" or #specs == 0 then userError("gems must list at least one gem") end
+	if #specs > buildEdit.MAX_GROUP_GEMS then
+		userError("gems has " .. #specs .. " entries; at most " .. buildEdit.MAX_GROUP_GEMS .. " are allowed")
+	end
+	local gems = { }
+	for i, spec in ipairs(specs) do
+		local label = "gems[" .. i .. "]"
+		if type(spec) ~= "table" or type(spec.name) ~= "string" then userError(label .. " must be { name, level?, quality?, enabled? }") end
+		local gemData, errMsg = findGemByName(spec.name)
+		if not gemData then userError(label .. ": gem lookup failed for '" .. spec.name .. "': " .. tostring(errMsg)) end
+		if spec.level ~= nil and not buildEdit.isInt(spec.level, 1) then userError(label .. ": level must be a positive integer") end
+		if spec.quality ~= nil and not buildEdit.isInt(spec.quality, 0) then userError(label .. ": quality must be a non-negative integer") end
+		if spec.enabled ~= nil and type(spec.enabled) ~= "boolean" then userError(label .. ": enabled must be a boolean") end
+		-- As addGem / replaceSocketGroup create gems.
+		gems[i] = {
+			nameSpec = gemData.name, gemId = gemData.id, skillId = gemData.grantedEffectId,
+			level = spec.level or 20, quality = spec.quality or 0, enabled = spec.enabled ~= false,
+			enableGlobal1 = true, enableGlobal2 = true, count = 1,
+		}
+	end
+	if cmd.slot ~= nil and not buildEdit.GROUP_SLOTS[cmd.slot] then
+		userError("slot must be one of the slots a socket group can be socketed in (Weapon 1, Weapon 2, Helmet, Body Armour, Gloves, Boots, Amulet, Ring 1-3, Belt, or a weapon swap slot), got " .. tostring(cmd.slot))
+	end
+	if cmd.label ~= nil and type(cmd.label) ~= "string" then userError("label must be a string") end
+	if cmd.enabled ~= nil and type(cmd.enabled) ~= "boolean" then userError("enabled must be a boolean") end
+	if cmd.setAsMain ~= nil and type(cmd.setAsMain) ~= "boolean" then userError("setAsMain must be a boolean") end
+	-- mainActiveSkill / mainActiveSkillCalcs as SkillsTab:LoadSkill defaults them.
+	local group = {
+		label = cmd.label or "", enabled = cmd.enabled ~= false, slot = cmd.slot, gemList = gems,
+		mainActiveSkill = 1, mainActiveSkillCalcs = 1,
+	}
+	buildEdit.started()
+	tab.socketGroupList[#tab.socketGroupList + 1] = group
+	local index = #tab.socketGroupList
+	tab:ProcessSocketGroup(group)
+	tab:UpdateSocketGroups()
+	if cmd.setAsMain then build.mainSocketGroup = index end
+	build.buildFlag = true
+	local result = { index = index, group = buildEdit.describeGroup(index, group) }
+	buildEdit.applied(result, cmd.replay == true)
+	runCallback("OnFrame")
+	result.group = buildEdit.describeGroup(index, group)
+	return result
+end
+
+-- cmd: { group }. A group granted by an item or the passive tree is refused.
+-- Later groups move up by one.
+function buildEdit.deleteSocketGroup(cmd)
+	local tab = skillsTabOrError()
+	local group = buildEdit.groupAt(cmd.group)
+	if group.source then
+		userError("Skill group " .. cmd.group .. " is granted by " .. tostring(group.source)
+			.. " and cannot be deleted; remove the item or passive node that grants it instead")
+	end
+	local deleted = buildEdit.describeGroup(cmd.group, group)
+	buildEdit.started()
+	table.remove(tab.socketGroupList, cmd.group)
+	if type(tab.RebuildImbuedSupportBySlot) == "function" then tab:RebuildImbuedSupportBySlot() end
+	if tab.displayGroup == group then tab.displayGroup = tab.socketGroupList[1] end
+	buildEdit.shiftMainAfterDelete(cmd.group)
+	build.buildFlag = true
+	local result = { deleted = deleted, mainSocketGroup = build.mainSocketGroup }
+	buildEdit.applied(result, cmd.replay == true)
+	runCallback("OnFrame")
+	return result
+end
+
+-- cmd: { group, activeSkill? }: make the group the main skill group and,
+-- with activeSkill, pick which of its active skills is the main skill.
+function buildEdit.setMainSkill(cmd)
+	pumpAndRead() -- display skill lists as of the last recalculation
+	local group = buildEdit.groupAt(cmd.group)
+	local count = buildEdit.activeSkillCount(group)
+	if count == 0 then
+		userError("Skill group " .. cmd.group .. " has no enabled active skill gem to use as the main skill")
+	end
+	if cmd.activeSkill ~= nil then
+		if not buildEdit.isInt(cmd.activeSkill, 1) then userError("activeSkill must be a 1-based integer") end
+		if cmd.activeSkill > count then
+			userError("activeSkill " .. cmd.activeSkill .. " is out of range: skill group " .. cmd.group .. " has " .. count .. " active skill(s)")
+		end
+	end
+	buildEdit.started()
+	build.mainSocketGroup = cmd.group
+	if cmd.activeSkill ~= nil then group.mainActiveSkill = cmd.activeSkill end
+	build.buildFlag = true
+	buildEdit.applied({ mainSocketGroup = cmd.group }, cmd.replay == true)
+	runCallback("OnFrame")
+	return { mainSocketGroup = build.mainSocketGroup, activeSkill = group.mainActiveSkill or 1 }
 end
 
 -- ---------------------------------------------------------------------------
@@ -3778,6 +4663,11 @@ local DISPATCH = {
 			if not xmlText:find("<PathOfBuilding", 1, true) or not xmlText:find("</PathOfBuilding>", 1, true) then
 				userError("Invalid Path of Building XML")
 			end
+			-- Remembered config tables belong to the build being replaced (a
+			-- load PoB rejects puts that build back from XML, as new tables).
+			-- XML refused above never reaches PoB: the build, its tables and
+			-- the session's undo entries stay as they are, so they are kept.
+			ConfigTables.forgetAll()
 			-- Capture the current build (including unsaved mutations) so a failed
 			-- load can put the engine back exactly where the caller left it.
 			local previous = nil
@@ -3854,7 +4744,7 @@ local DISPATCH = {
 		end,
 	},
 	restoreConfig = {
-		handler = function(cmd) ConfigTables.restoreInput(cmd.input or { }) return { } end,
+		handler = function(cmd) ConfigTables.restoreInput(cmd.input or { }, cmd.token) return { } end,
 		mutating = true,
 	},
 
@@ -3927,12 +4817,51 @@ local DISPATCH = {
 		mutating = true,
 	},
 	allocNodes = {
-		handler = function(cmd) allocNodesBatch(cmd.nodeIds or { }) return { } end,
+		-- `masteries`: [{ node, effect }] (allocate_nodes: ids or names; a
+		-- crash replay: the ids recorded, its nodeIds listing the masteries it
+		-- allocated in join order).
+		handler = function(cmd)
+			local strict = cmd.strict == true
+			local skip = { }
+			for _, id in ipairs(type(cmd.nodeIds) == "table" and cmd.nodeIds or { }) do skip[id] = true end
+			local masteries = nodeBatch.resolveMasteries(cmd.masteries, { replay = not strict, skip = strict and skip or nil })
+			if strict and #masteries > 0 and #(cmd.nodeIds or { }) == 0 and nodeBatch.allNoop(masteries) then
+				return nodeBatch.unchanged(masteries)
+			end
+			return allocNodesBatch(cmd.nodeIds or { }, strict, masteries)
+		end,
+		mutating = true,
+	},
+	masteryOptions = {
+		handler = function(cmd) return { masteries = nodeBatch.masteryOptions(cmd.nodes) } end,
+	},
+	respecTree = {
+		-- plan_respec only, between a tree snapshot and its exact restore.
+		handler = function(cmd) return nodeBatch.respec(cmd) end,
 		mutating = true,
 	},
 	deallocNodes = {
-		handler = function(cmd) deallocNodesBatch(cmd.nodeIds or { }) return { } end,
+		handler = function(cmd) return deallocNodesBatch(cmd.nodeIds or { }, cmd.strict == true) end,
 		mutating = true,
+	},
+	treeEditApplied = {
+		-- Whether the previous command ran a strict node batch, and what it
+		-- changed if it changed the tree.
+		handler = function(_cmd)
+			local record = nodeBatch.record
+			nodeBatch.record = nil
+			return { started = record ~= nil, applied = record and record.applied or dkjson.null }
+		end,
+	},
+	buildEditApplied = {
+		-- Whether the previous command (applyChanges, createSocketGroup,
+		-- deleteSocketGroup, setMainSkill) started changing the build, and
+		-- what it changed if the whole change went in.
+		handler = function(_cmd)
+			local record = buildEdit.record
+			buildEdit.record = nil
+			return { started = record ~= nil, applied = record and record.applied or dkjson.null }
+		end,
 	},
 	restoreTreeFromList = {
 		handler = function(cmd)
@@ -4007,8 +4936,17 @@ local DISPATCH = {
 		end,
 	},
 	setMainSocketGroup = {
-		handler = function(cmd) setMainSocketGroupImpl(cmd.groupIndex) return { } end,
+		handler = function(cmd) buildEdit.setMainSocketGroup(cmd.groupIndex) return { } end,
 		mutating = true,
+	},
+	createSocketGroup = {
+		handler = function(cmd) return buildEdit.createSocketGroup(cmd) end,
+	},
+	deleteSocketGroup = {
+		handler = function(cmd) return buildEdit.deleteSocketGroup(cmd) end,
+	},
+	setMainSkill = {
+		handler = function(cmd) return buildEdit.setMainSkill(cmd) end,
 	},
 	snapshotSkills = {
 		handler = function(_cmd) return { snapshot = snapshotSkills() } end,
@@ -4189,23 +5127,1564 @@ do
 		parseItemText = parseItemText,
 		assertItemFitsSlot = assertItemFitsSlot,
 		usableSlot = slotChecks.usableSlot,
+		construct = construct,
 		findGemByName = findGemByName,
 		getConfigMetadata = getConfigMetadata,
 		equipItemInSlot = equipItemInSlot,
 		detachConfigTables = ConfigTables.detach,
 		restoreConfigTables = ConfigTables.restore,
 		stashCommittedConfigTables = ConfigTables.stashCommitted,
+		sameConfigValue = ConfigTables.sameValue,
 		allocNodesBatch = allocNodesBatch,
 		deallocNodesBatch = deallocNodesBatch,
 		pumpAndRead = pumpAndRead,
+		nodeBatch = nodeBatch,
+		buildEdit = buildEdit,
 	})
-	DISPATCH.probe = { handler = function(cmd) return probe.probe(cmd) end }
+	DISPATCH.probe = {
+		handler = function(cmd)
+			local res = probe.probe(cmd)
+			if cmd.fingerprint and buildEdit.rollbackInexact then
+				-- Test fault (buildEditRollbackInexact): see buildEdit.testFaultMidway.
+				-- Only the read that checks a build edit's rollback
+				-- (`rollbackCheck`) gets the extra line; any other fingerprint
+				-- read disarms the fault (the rollback failed before its check).
+				buildEdit.rollbackInexact = nil
+				if cmd.rollbackCheck == true then
+					res.fingerprint[#res.fingerprint + 1] = "testFault|buildEditRollbackInexact"
+				end
+			end
+			return res
+		end,
+	}
 	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
+	-- apply_changes: one probe variant applied for real and kept.
+	DISPATCH.applyChanges = { handler = function(cmd) return probe.applyChanges(cmd) end }
+
+	-- compare_builds: everything the comparison of two builds reads, in one
+	-- read-only call: build info, the `stats` keys (as `probe` reads the
+	-- committed build), allocated passive nodes, items by slot, socket groups
+	-- and the config input. Changes nothing. (Helpers are locals of the
+	-- handler: the main chunk is at Lua's limit of 200 locals.)
+	DISPATCH.compareSnapshot = {
+		handler = function(cmd)
+			local stats = probe.probe({ stats = cmd.stats or statKeys }).base
+			local spec = build.spec
+			local points, ascPoints = 0, 0
+			if spec and spec.CountAllocNodes then points, ascPoints = spec:CountAllocNodes() end
+			local nodes = { }
+			for id, node in pairs(spec and spec.allocNodes or { }) do
+				local effectId = node.type == "Mastery" and spec.masterySelections and spec.masterySelections[id] or nil
+				nodes[#nodes + 1] = {
+					id = id,
+					name = node.dn,
+					type = node.type,
+					ascendancy = node.ascendancyName,
+					effect = effectId and masteryEffectText(spec, effectId) or nil,
+				}
+			end
+			table.sort(nodes, function(a, b) return a.id < b.id end)
+
+			local function modLines(item)
+				local out = { }
+				local function add(lines, tag)
+					for _, ml in ipairs(lines or { }) do
+						local active = not item.CheckModLineVariant or item:CheckModLineVariant(ml)
+						if ml.line and active then
+							local prefix = tag or (ml.crafted and "{crafted}" or (ml.fractured and "{fractured}" or ""))
+							out[#out + 1] = prefix .. stripColorCodes(ml.line)
+						end
+					end
+				end
+				add(item.enchantModLines, "{enchant}")
+				add(item.scourgeModLines, "{scourge}")
+				add(item.implicitModLines, "{implicit}")
+				add(item.explicitModLines, nil)
+				return out
+			end
+			local function socketText(item)
+				local parts = { }
+				for i, socket in ipairs(item.sockets or { }) do
+					parts[#parts + 1] = tostring(socket.color or "?")
+					local nextSocket = item.sockets[i + 1]
+					if nextSocket then parts[#parts + 1] = socket.group == nextSocket.group and "-" or " " end
+				end
+				return #parts > 0 and table.concat(parts) or nil
+			end
+			local items = { }
+			local tab = build.itemsTab
+			local function addItem(slotName, itemId, flags)
+				local item = itemId and itemId ~= 0 and tab.items[itemId]
+				if not item then return end
+				items[#items + 1] = {
+					slot = slotName,
+					name = item.title or item.name,
+					base = item.baseName,
+					rarity = item.rarity,
+					quality = item.quality,
+					sockets = socketText(item),
+					corrupted = item.corrupted or nil,
+					hidden = flags.hidden,
+					swap = flags.swap,
+					inactive = flags.inactive,
+					mods = modLines(item),
+				}
+			end
+			local useSecond = tab and tab.activeItemSet and tab.activeItemSet.useSecondWeaponSet
+			for _, slot in ipairs(tab and tab.orderedSlots or { }) do
+				-- Passive-tree socket slots ("Jewel <nodeId>") keep their item
+				-- after the socket is deallocated: they are listed from
+				-- spec.jewels below, allocated sockets only.
+				if slot.slotName and not slot.nodeId then
+					local inactive = nil
+					-- The weapon set not in use, and an abyss jewel in a socket
+					-- its parent item does not have: PoB's CalcSetup skips both.
+					if slot.weaponSet and slot.weaponSet ~= (useSecond and 2 or 1) then inactive = true end
+					if slot.parentSlot then
+						local parentId = slot.parentSlot.selItemId or 0
+						local parent = parentId ~= 0 and tab.items[parentId] or nil
+						if not parent or (parent.abyssalSocketCount or 0) < (slot.slotNum or 0) then inactive = true end
+					end
+					addItem(slot.slotName, slot.selItemId, {
+						hidden = slotChecks.hiddenGate(slot) and true or nil,
+						swap = slot.weaponSet == 2 or nil,
+						inactive = inactive,
+					})
+				end
+			end
+			-- Jewels in allocated passive-tree sockets (part of the tree
+			-- state), by node id so both sides list them in the same order.
+			local socketIds = { }
+			for nodeId in pairs(spec and spec.jewels or { }) do
+				if spec.allocNodes and spec.allocNodes[nodeId] then socketIds[#socketIds + 1] = nodeId end
+			end
+			table.sort(socketIds)
+			for _, nodeId in ipairs(socketIds) do
+				addItem("Tree jewel " .. tostring(nodeId), spec.jewels[nodeId], { })
+			end
+
+			local groups = { }
+			for i, group in ipairs(build.skillsTab and build.skillsTab.socketGroupList or { }) do
+				local gems = { }
+				for j, gem in ipairs(group.gemList or { }) do
+					local gd = gem.gemData
+					local ge = (gd and gd.grantedEffect) or gem.grantedEffect
+					gems[j] = {
+						name = (gd and gd.name) or (ge and ge.name) or gem.nameSpec or "",
+						level = gem.level,
+						quality = gem.quality,
+						enabled = gem.enabled ~= false,
+						support = (ge and ge.support) and true or false,
+					}
+				end
+				groups[i] = {
+					label = group.label ~= "" and group.label or nil,
+					slot = group.slot ~= "" and group.slot or nil,
+					enabled = group.enabled ~= false,
+					source = group.source,
+					main = build.mainSocketGroup == i or nil,
+					gems = gems,
+				}
+			end
+			return {
+				info = getBuildInfo(),
+				stats = stats,
+				tree = { points = points, ascendancyPoints = ascPoints, nodes = nodes },
+				items = items,
+				groups = groups,
+				config = ConfigTables.fullInput(),
+			}
+		end,
+	}
+end
+
+-- Item data (search_items, get_item_text, list_item_mods, build_item): PoB's
+-- own unique list (main.uniqueDB), item bases, affixes with their spawn
+-- weights (Item:CanHaveMod, as the items tab's crafting dropdowns filter them)
+-- and crafting bench mods (data.masterMods). Items are made with PoB's Item
+-- class (BuildAndParseRaw, Craft, BuildRaw) and never added to the build:
+-- these commands change nothing. (A `do` block: the main chunk is at Lua's
+-- limit of 200 locals.)
+do
+	local itemData = {
+		ROLLS = { max = 1, min = 0, avg = 0.5 },
+		LINE_CAP = 160,
+		SUMMARY_LINES = 6,
+		VARIANT_CAP = 20,
+		templates = { },
+	}
+
+	function itemData.trim(s)
+		return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+
+	function itemData.lower(s)
+		return itemData.trim(s):lower()
+	end
+
+	function itemData.clip(s)
+		local text = stripColorCodes(tostring(s or "")):gsub("\n", " / ")
+		if #text > itemData.LINE_CAP then text = text:sub(1, itemData.LINE_CAP - 3) .. "..." end
+		return text
+	end
+
+	function itemData.roll(name)
+		if name == nil or name == dkjson.null then return itemData.ROLLS.max end
+		local roll = itemData.ROLLS[name]
+		if not roll then userError("roll must be max, min or avg") end
+		return roll
+	end
+
+	-- PoB fills main.uniqueDB in an OnFrame coroutine after startup; finish it
+	-- here (its own loader) if a command comes first.
+	function itemData.uniques()
+		if itemData.uniqueArray then return itemData.uniqueArray end
+		local m = mainObject.main
+		local db = m and m.uniqueDB
+		if not db then error("Path of Building's unique item list is not available", 0) end
+		local guard = 0
+		while db.loading and m.onFrameFuncs and m.onFrameFuncs["LoadItems"] and guard < 100000 do
+			m.onFrameFuncs["LoadItems"]()
+			guard = guard + 1
+		end
+		if db.loading then error("Path of Building's unique item list did not finish loading", 0) end
+		local list = { }
+		for _, item in pairs(db.list) do list[#list + 1] = item end
+		table.sort(list, function(a, b) return a.name < b.name end)
+		itemData.uniqueArray = list
+		return list
+	end
+
+	function itemData.primarySlot(base)
+		if base.weapon then return "Weapon 1" end
+		local t = base.type
+		if t == "Quiver" or t == "Shield" then return "Weapon 2" end
+		if t == "Ring" then return "Ring 1" end
+		if t == "Flask" or t == "Tincture" then return "Flask 1" end
+		if t == "Graft" then return "Graft 1" end
+		return t
+	end
+
+	-- `slot` as list_valid_slots names it ("Ring 1", "Weapon 2 Swap") or an item
+	-- type ("Body Armour", "Two Handed Sword", "Flask", "Jewel: Abyss").
+	function itemData.slotFilter(slot)
+		if slot == nil or slot == dkjson.null then return nil end
+		local s = itemData.lower(slot):gsub(" swap$", "")
+		local key = s:match("^(.-) %d+$") or s
+		local function matches(base)
+			local t = base.type:lower()
+			if key == "weapon" then
+				if s == "weapon 2" then
+					local info = data.weaponTypeInfo and data.weaponTypeInfo[base.type]
+					return t == "shield" or t == "quiver" or (base.weapon ~= nil and info ~= nil and info.oneHand == true)
+				end
+				return base.weapon ~= nil
+			end
+			if key == "flask" then return t == "flask" or t == "tincture" end
+			if t == key then return true end
+			if base.subType and (base.subType:lower() == key or (t .. ": " .. base.subType:lower()) == key) then return true end
+			return false
+		end
+		for _, base in pairs(data.itemBases) do
+			if matches(base) then return matches end
+		end
+		userError("No item base fits slot or item type \"" .. itemData.trim(slot) .. "\" (use a slot name such as \"Body Armour\", \"Ring 1\", \"Weapon 1\" or an item type such as \"Two Handed Sword\")")
+	end
+
+	-- 0 exact, 1 prefix, 2 contains, 3 found only in `extra` (base, type), nil no match.
+	function itemData.rank(needle, name, extra)
+		if needle == "" then return 3 end
+		local n = name:lower()
+		if n == needle then return 0 end
+		if n:sub(1, #needle) == needle then return 1 end
+		if n:find(needle, 1, true) then return 2 end
+		for _, e in ipairs(extra) do
+			if e and e:lower():find(needle, 1, true) then return 3 end
+		end
+		return nil
+	end
+
+	function itemData.activeLines(item, lines, cap)
+		local out, more = { }, 0
+		for _, ml in ipairs(lines or { }) do
+			if item:CheckModLineVariant(ml) then
+				if #out < cap then out[#out + 1] = itemData.clip(ml.line) else more = more + 1 end
+			end
+		end
+		return out, more
+	end
+
+	function itemData.hasModText(item, needle)
+		for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do
+			for _, ml in ipairs(item[key] or { }) do
+				if tostring(ml.line):lower():find(needle, 1, true) then return true end
+			end
+		end
+		return false
+	end
+
+	function itemData.variantNames(item)
+		if not item.variantList then return nil, nil end
+		local names = { }
+		for i = 1, math.min(#item.variantList, itemData.VARIANT_CAP) do names[i] = item.variantList[i] end
+		local more = #item.variantList - #names
+		return names, more > 0 and more or nil
+	end
+
+	function itemData.describeUnique(item)
+		local implicits = itemData.activeLines(item, item.implicitModLines, 4)
+		local mods, more = itemData.activeLines(item, item.explicitModLines, itemData.SUMMARY_LINES)
+		local variants, variantsMore = itemData.variantNames(item)
+		return {
+			kind = "unique",
+			name = item.title,
+			base = item.baseName,
+			type = item.base.type,
+			subType = item.base.subType,
+			slot = itemData.primarySlot(item.base),
+			levelReq = item.requirements and item.requirements.level or nil,
+			variants = variants,
+			variantsMore = variantsMore,
+			variant = item.variantList and item.variantList[item.variant] or nil,
+			implicits = #implicits > 0 and implicits or nil,
+			mods = mods,
+			modsMore = more > 0 and more or nil,
+		}
+	end
+
+	function itemData.describeBase(name, base)
+		local implicits = { }
+		for line in tostring(base.implicit or ""):gmatch("[^\n]+") do implicits[#implicits + 1] = itemData.clip(line) end
+		local req = base.req or { }
+		return {
+			kind = "base",
+			name = name,
+			type = base.type,
+			subType = base.subType,
+			slot = itemData.primarySlot(base),
+			levelReq = req.level,
+			str = req.str, dex = req.dex, int = req.int,
+			implicits = #implicits > 0 and implicits or nil,
+		}
+	end
+
+	function itemData.searchCommand(cmd)
+		local needle = itemData.lower(cmd.query)
+		local modNeedle = (cmd.modQuery ~= nil and cmd.modQuery ~= dkjson.null) and itemData.lower(cmd.modQuery) or nil
+		if modNeedle == "" then modNeedle = nil end
+		local kind = cmd.kind or "any"
+		local slotOk = itemData.slotFilter(cmd.slot)
+		local found = { }
+		if kind ~= "base" then
+			for _, item in ipairs(itemData.uniques()) do
+				if not slotOk or slotOk(item.base) then
+					local rank = itemData.rank(needle, item.title, { item.baseName, item.base.type, item.base.subType })
+					if rank and (not modNeedle or itemData.hasModText(item, modNeedle)) then
+						found[#found + 1] = { rank = rank, order = 1, name = item.name, item = item }
+					end
+				end
+			end
+		end
+		if kind ~= "unique" then
+			for name, base in pairs(data.itemBases) do
+				if not base.hidden and (not slotOk or slotOk(base)) then
+					local rank = itemData.rank(needle, name, { base.type, base.subType })
+					if rank and (not modNeedle or tostring(base.implicit or ""):lower():find(modNeedle, 1, true)) then
+						found[#found + 1] = { rank = rank, order = 2, name = name, base = base }
+					end
+				end
+			end
+		end
+		table.sort(found, function(a, b)
+			if a.rank ~= b.rank then return a.rank < b.rank end
+			if a.order ~= b.order then return a.order < b.order end
+			return a.name < b.name
+		end)
+		local limit = tonumber(cmd.limit) or 20
+		local results = { }
+		for i = 1, math.min(limit, #found) do
+			local f = found[i]
+			results[i] = f.item and itemData.describeUnique(f.item) or itemData.describeBase(f.name, f.base)
+		end
+		return { total = #found, more = math.max(0, #found - #results), results = results }
+	end
+
+	-- A unique by title ("Kaom's Heart") or full name ("Grand Spectrum, Cobalt Jewel").
+	function itemData.findUnique(name)
+		local low = itemData.lower(name)
+		local matches, similar = { }, { }
+		for _, item in ipairs(itemData.uniques()) do
+			if item.name:lower() == low then return item end
+			if item.title:lower() == low then
+				matches[#matches + 1] = item.name
+			elseif #similar < 5 and #low > 0 and item.name:lower():find(low, 1, true) then
+				similar[#similar + 1] = item.title
+			end
+		end
+		if #matches == 1 then
+			for _, item in ipairs(itemData.uniques()) do
+				if item.name == matches[1] then return item end
+			end
+		end
+		if #matches > 1 then
+			userError("\"" .. itemData.trim(name) .. "\" names several uniques: " .. table.concat(matches, "; ") .. " (pass the full name)")
+		end
+		userError("Unknown unique \"" .. itemData.trim(name) .. "\"" ..
+			(#similar > 0 and (" (did you mean: " .. table.concat(similar, "; ") .. "?)") or "") .. "; use search_items")
+	end
+
+	-- A base by exact name, then case-insensitively.
+	function itemData.findBase(name)
+		local wanted = itemData.trim(name)
+		if data.itemBases[wanted] then return wanted, data.itemBases[wanted] end
+		local low = wanted:lower()
+		local similar = { }
+		for baseName, base in pairs(data.itemBases) do
+			if baseName:lower() == low then return baseName, base end
+			if not base.hidden and #low > 0 and baseName:lower():find(low, 1, true) then similar[#similar + 1] = baseName end
+		end
+		table.sort(similar)
+		while #similar > 5 do table.remove(similar) end
+		userError("Unknown item base \"" .. wanted .. "\"" ..
+			(#similar > 0 and (" (did you mean: " .. table.concat(similar, "; ") .. "?)") or "") .. "; use search_items with kind \"base\"")
+	end
+
+	function itemData.setRoll(lines, roll)
+		for _, ml in ipairs(lines or { }) do
+			if type(ml.line) == "string" and ml.line:match("%(%-?[%d%.]+%-%-?[%d%.]+%)") then ml.range = roll end
+		end
+	end
+
+	-- A new item on `base`, as the items tab's "Craft item" popup makes it
+	-- (ItemsTab:CraftItem's makeItem): base implicits, PoB's default quality,
+	-- `crafted` for magic and rare so PoB tracks its prefixes and suffixes.
+	function itemData.newItem(baseName, base, rarity, title)
+		local item = construct("Item")
+		item.name = baseName
+		item.base = base
+		item.baseName = baseName
+		item.buffModLines, item.enchantModLines, item.classRequirementModLines = { }, { }, { }
+		item.scourgeModLines, item.implicitModLines, item.explicitModLines, item.crucibleModLines = { }, { }, { }, { }
+		local t = base.type
+		if t == "Amulet" or t == "Belt" or t == "Jewel" or t == "Quiver" or t == "Ring" or t == "Graft" then
+			item.quality = nil
+		else
+			item.quality = 0
+		end
+		item.rarity = rarity
+		if rarity == "MAGIC" or rarity == "RARE" then item.crafted = true end
+		if rarity == "RARE" then item.title = title or "New Item" end
+		if base.implicit then
+			local index = 1
+			for line in base.implicit:gmatch("[^\n]+") do
+				local modList, extra = modLib.parseMod(line)
+				item.implicitModLines[#item.implicitModLines + 1] = {
+					line = line, extra = extra, modList = modList or { },
+					modTags = base.implicitModTypes and base.implicitModTypes[index] or { },
+				}
+				index = index + 1
+			end
+		end
+		item:NormaliseQuality()
+		return item
+	end
+
+	function itemData.rolledLines(item, lines, suffix)
+		local out = { }
+		for _, ml in ipairs(lines or { }) do
+			if item:CheckModLineVariant(ml) then
+				local line = itemLib.applyRange(ml.line, ml.range or main.defaultItemAffixQuality or 0.5, ml.valueScalar)
+				out[#out + 1] = itemData.clip(line) .. ((suffix and ml.crafted) and " (crafted)" or "")
+			end
+		end
+		return out
+	end
+
+	-- Spec names PoB's ParseRaw reads from "Name: value" lines (Item:ParseRaw),
+	-- plus the header lines it reads before them.
+	itemData.HEADER_SPECS = { }
+	for name in ([[Allow Duplicate Variants|Armour|Attacks per Second|Block chance|Catalyst|CatalystQuality|Chance to Block|Chaos Damage|Cluster Jewel Node Count|Cluster Jewel Skill|Crafted|Critical Strike Chance|Critical Strike Range|Crucible|Dex|Dexterity|Elemental Damage|Energy Shield|Evasion Rating|Evasion|Has Alt Variant Five|Has Alt Variant Four|Has Alt Variant Three|Has Alt Variant Two|Has Alt Variant|Has Variants|Implicit|Implicits|Int|Intangibility|Intelligence|Item Level|League|Level|LevelReq|Limited to|Memory Strands|Note|Physical Damage|Prefix|Quality|Radius|Requires Class|Requires Level|Scourge|Selected Alt Variant Five|Selected Alt Variant Four|Selected Alt Variant Three|Selected Alt Variant Two|Selected Alt Variant|Selected Variant Group|Selected Variant|Selected Variants|Selected Version|Sockets|Source|Str|Strength|Suffix|Talisman Tier|Unique ID|Unreleased|Upgrade|Variant|Version|Ward|Weapon Range|Rarity|Item Class|Class:]]):gmatch("[^|]+") do
+		itemData.HEADER_SPECS[name] = true
+	end
+	itemData.FLAG_LINES = { ["--------"] = true, Split = true, Mirrored = true, Corrupted = true, ["Fractured Item"] = true,
+		["Synthesised Item"] = true, Unidentified = true, ["Requirements:"] = true, ["Prefixes:"] = true,
+		["Veiled Prefix"] = true, ["Veiled Suffix"] = true }
+
+	-- Why PoB's ParseRaw would read `line` as an item header or flag instead
+	-- of a modifier ("Corrupted", "Shaper Item", "Quality: 30", "--------"),
+	-- or nil. In a name or an implicit such a line would change the item
+	-- behind build_item's checks.
+	function itemData.headerReason(line)
+		if itemData.FLAG_LINES[line] or line:find("Foil Unique", 1, true) then return "is an item flag line" end
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			if line == info.display .. " Item" then return "is an influence line (use influences)" end
+		end
+		if line:match("^{") then return "starts with a { } tag" end
+		if line:match("^%(%a") or line:match("^%(%d+%%? of ") then return "is read as reminder text" end
+		local spec = line:match("^([%a %(%)]+:?): .+$")
+		if spec and (itemData.HEADER_SPECS[spec] or spec:match("BasePercentile") or spec:match("^Quality %(")) then
+			return "is read as the item header \"" .. spec .. "\""
+		end
+		if line:match("^Requires %a+ ") then return "is read as an item requirement" end
+		return nil
+	end
+
+	-- Why an implicit line PoB keeps as a modifier but reads as a crafting rule
+	-- (Item:ParseRaw / CanHaveMod: prefix or suffix limits, a crucible tree,
+	-- "Cannot roll" restrictions, extra influences) is refused, or nil.
+	function itemData.ruleReason(line)
+		local low = line:lower()
+		if low:match(" prefix modifiers? allowed") or low:match(" suffix modifiers? allowed") then
+			return "changes the prefix or suffix limits"
+		end
+		if low:find("crucible passive skill tree", 1, true) then return "gives the item a crucible passive tree" end
+		if low:match("^cannot roll ") then return "restricts the mods the item can roll" end
+		if low == "has elder, shaper and all conqueror influences" or low:find("if the eater of worlds is dominant", 1, true) then
+			return "adds influences (use influences)"
+		end
+		return nil
+	end
+
+	-- Why PoB would treat a rare named `title` as something else, or nil: a
+	-- rare-like unique (its own affix pool and limits), a crucible unique
+	-- (extra mod tags) or a Foulborn name (PoB renames it).
+	function itemData.nameReason(title)
+		local low = title:lower()
+		if data.rareLikeUniques and data.rareLikeUniques[low] then
+			return "is a unique Path of Building crafts with its own affix pool; pick another name"
+		end
+		for _, list in ipairs({ data.casterTagCrucibleUniques or { }, data.minionTagCrucibleUniques or { } }) do
+			for name in pairs(list) do
+				if tostring(name):lower() == low then return "is a unique whose name changes the mods Path of Building lets it roll; pick another name" end
+			end
+		end
+		if low:match("^foulborn ") then return "starts with \"Foulborn \", which Path of Building reads as a Foulborn unique; pick another name" end
+		return nil
+	end
+
+	-- What build_item asked for, checked on PoB's parse of the item: nothing
+	-- may come out different (a line read as a header or flag, an implicit
+	-- read as an explicit or the other way round).
+	function itemData.verifyParsed(item, expect)
+		local function refuse(what)
+			userError("Path of Building reads the item differently from the request (" .. what ..
+				"): a name or implicit line is probably read as an item header or flag; use plain modifier lines")
+		end
+		if item.baseName ~= expect.baseName then refuse("base " .. tostring(item.baseName)) end
+		if item.rarity ~= expect.rarity then refuse("rarity " .. tostring(item.rarity)) end
+		if expect.title and item.title ~= expect.title then refuse("name " .. tostring(item.title)) end
+		if (item.corrupted == true) ~= expect.corrupted then refuse(item.corrupted and "corrupted" or "not corrupted") end
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			if (item[info.key] == true) ~= (expect.influences[info.key] == true) then
+				refuse(info.display .. " influence " .. (item[info.key] and "added" or "lost"))
+			end
+		end
+		if tonumber(item.itemLevel) ~= expect.itemLevel then refuse("item level " .. tostring(item.itemLevel)) end
+		if item.quality ~= expect.quality then refuse("quality " .. tostring(item.quality)) end
+		for _, part in ipairs({ { "implicits", "implicitModLines", "implicit" }, { "explicits", "explicitModLines", "mod" } }) do
+			local wanted, lines = expect[part[1]], item[part[2]] or { }
+			if wanted then
+				if #lines ~= #wanted then refuse(#lines .. " " .. part[3] .. " lines instead of " .. #wanted) end
+				for i, line in ipairs(wanted) do
+					if lines[i].line ~= line then refuse(part[3] .. " line " .. i .. " is \"" .. itemData.clip(lines[i].line) .. "\"") end
+				end
+			end
+		end
+	end
+
+	-- Text from BuildRaw, checked to parse back as swap_item parses item text
+	-- (and, for build_item, to be the item that was asked for).
+	function itemData.textResult(item, expect)
+		local text = item:BuildRaw()
+		local ok, check = pcall(construct, "Item", text)
+		if not ok or not (check and check.base) then
+			local message = "Path of Building could not parse the item text it built: " .. stripColorCodes(tostring(check))
+			-- The name and implicits already parsed once (craftItem): a failure here is the engine's.
+			error(message, 0)
+		end
+		if expect then itemData.verifyParsed(check, expect) end
+		local variants, variantsMore = itemData.variantNames(check)
+		local warnings = { }
+		for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do
+			for _, ml in ipairs(check[key] or { }) do
+				if ml.extra and check:CheckModLineVariant(ml) then
+					warnings[#warnings + 1] = "Path of Building does not model this line: " .. itemData.clip(ml.line)
+				end
+			end
+		end
+		return {
+			name = check.title or check.name,
+			base = check.baseName,
+			rarity = check.rarity,
+			type = check.base.type,
+			slot = itemData.primarySlot(check.base),
+			levelReq = check.requirements and check.requirements.level or nil,
+			variant = check.variantList and check.variantList[check.variant] or nil,
+			variants = variants,
+			variantsMore = variantsMore,
+			implicits = itemData.rolledLines(check, check.implicitModLines),
+			mods = itemData.rolledLines(check, check.explicitModLines, true),
+			warnings = #warnings > 0 and warnings or nil,
+			text = text,
+		}
+	end
+
+	function itemData.selectVariant(item, variant)
+		if variant == nil or variant == dkjson.null then return end
+		if not item.variantList then userError(item.title .. " has no variants") end
+		if item.usesVariantGroups then
+			userError(item.title .. " picks its mods by variant groups; get_item_text uses PoB's default selection for it (omit variant)")
+		end
+		if type(variant) == "number" then
+			if variant ~= math.floor(variant) or not item.variantList[variant] then
+				userError("variant " .. tostring(variant) .. " is out of range: " .. item.title .. " has " .. #item.variantList .. " variants")
+			end
+			item.variant = variant
+			return
+		end
+		local low = itemData.lower(variant)
+		local hit = nil
+		for i, name in ipairs(item.variantList) do
+			if name:lower() == low then item.variant = i return end
+			if name:lower():find(low, 1, true) then
+				if hit then userError("variant \"" .. itemData.trim(variant) .. "\" matches several variants of " .. item.title .. ": " .. table.concat(item.variantList, "; ")) end
+				hit = i
+			end
+		end
+		if not hit then userError("Unknown variant \"" .. itemData.trim(variant) .. "\" for " .. item.title .. "; variants: " .. table.concat(item.variantList, "; ")) end
+		item.variant = hit
+	end
+
+	function itemData.textCommand(cmd)
+		local roll = itemData.roll(cmd.roll)
+		local item
+		if cmd.unique ~= nil and cmd.unique ~= dkjson.null then
+			local entry = itemData.findUnique(cmd.unique)
+			item = construct("Item", entry:BuildRaw())
+			itemData.selectVariant(item, cmd.variant)
+			for _, key in ipairs({ "implicitModLines", "explicitModLines" }) do itemData.setRoll(item[key], roll) end
+		else
+			local baseName, base = itemData.findBase(cmd.base)
+			item = itemData.newItem(baseName, base, "NORMAL")
+			itemData.setRoll(item.implicitModLines, roll)
+		end
+		item:BuildAndParseRaw()
+		local result = itemData.textResult(item)
+		result.roll = cmd.roll or "max"
+		return result
+	end
+
+	-- Influence keys from display names ("Shaper", "Searing Exarch") or keys.
+	function itemData.influenceKeys(list)
+		local keys = { }
+		for _, name in ipairs(list or { }) do
+			local low = itemData.lower(name)
+			local key = nil
+			for _, info in ipairs(itemLib.influenceInfo.all) do
+				if info.display:lower() == low or info.key == low then key = info.key end
+			end
+			if not key then userError("Unknown influence \"" .. itemData.trim(name) .. "\"") end
+			keys[#keys + 1] = key
+		end
+		return keys
+	end
+
+	-- The item list_item_mods and build_item work on: a normal, magic or rare
+	-- item of `base` with its influences, item level, corruption and
+	-- implicits, parsed by PoB and checked to be exactly that. Returns the
+	-- item and what it must stay (for build_item's final check).
+	function itemData.craftItem(cmd)
+		local baseName, base = itemData.findBase(cmd.base)
+		local onlyMagic = base.flask or base.type == "Tincture" or (base.type == "Jewel" and base.subType == "Charm")
+		local rarity = (cmd.rarity or (onlyMagic and "magic" or "rare")):upper()
+		if rarity == "RARE" and onlyMagic then
+			userError(baseName .. " cannot be rare in Path of Building (flasks, tinctures and charms are at most magic): use rarity \"magic\"")
+		end
+		local title = nil
+		if cmd.name ~= nil and cmd.name ~= dkjson.null then
+			title = itemData.trim(cmd.name)
+			local reason = itemData.headerReason(title)
+			if reason then userError("name \"" .. title .. "\" " .. reason .. " in Path of Building item text") end
+			reason = itemData.nameReason(title)
+			if reason then userError("name \"" .. title .. "\" " .. reason) end
+		end
+		local item = itemData.newItem(baseName, base, rarity, title)
+		local influences = itemData.influenceKeys(cmd.influences)
+		if #influences > 0 and not base.influenceTags then
+			userError(baseName .. " (" .. base.type .. ") cannot have influences")
+		end
+		local wanted = { }
+		for _, key in ipairs(influences) do
+			item[key] = true
+			wanted[key] = true
+		end
+		item.itemLevel = tonumber(cmd.itemLevel) or 86
+		-- Before the parse: PoB's prefix/suffix limits depend on it (a corrupted abyss jewel).
+		if cmd.corrupted == true then item.corrupted = true end
+		local implicits = nil
+		if cmd.implicits ~= nil and cmd.implicits ~= dkjson.null then
+			implicits = { }
+			item.implicitModLines = { }
+			for _, raw in ipairs(cmd.implicits) do
+				local line = itemData.trim(raw)
+				local reason = itemData.headerReason(line)
+				if reason then userError("implicit \"" .. line .. "\" " .. reason .. " in Path of Building item text, not a modifier") end
+				reason = itemData.ruleReason(line)
+				if reason then userError("implicit \"" .. line .. "\" " .. reason .. ", which build_item does not model") end
+				implicits[#implicits + 1] = line
+				item.implicitModLines[#item.implicitModLines + 1] = { line = line, modTags = { } }
+			end
+		end
+		local expect = {
+			baseName = baseName, rarity = rarity, title = rarity == "RARE" and (title or "New Item") or nil,
+			corrupted = cmd.corrupted == true, influences = wanted, itemLevel = item.itemLevel, quality = item.quality,
+			implicits = implicits, explicits = { },
+		}
+		local parsed, parseError = pcall(item.BuildAndParseRaw, item)
+		if not parsed then
+			local message = "Path of Building could not parse the item: " .. stripColorCodes(tostring(parseError))
+			-- Only the name and implicit lines come from the caller here.
+			if title or implicits then userError(message .. " (check the name and implicit lines)") end
+			error(message, 0)
+		end
+		itemData.verifyParsed(item, expect)
+		if rarity ~= "NORMAL" and not item.crafted then
+			userError(baseName .. " (" .. base.type .. ") has no prefixes or suffixes Path of Building can craft")
+		end
+		return item, baseName, base, expect
+	end
+
+	function itemData.limits(item)
+		local half = (item.affixLimit or 0) / 2
+		return item.prefixes.limit or half, item.suffixes.limit or half
+	end
+
+	-- Tags every affix check gets, as the items tab's crafting dropdowns add
+	-- them: the cluster jewel skill's tag.
+	function itemData.baseTags(item)
+		local tags = { }
+		if item.clusterJewel and item.clusterJewelSkill then
+			local skill = item.clusterJewel.skills and item.clusterJewel.skills[item.clusterJewelSkill]
+			if skill and skill.tag then tags[skill.tag] = true end
+		end
+		return tags
+	end
+
+	-- PoB's check that `mod` can roll (Item:CanHaveMod with `tags`), on
+	-- prefixes and suffixes only, delve mods left out as the dropdowns do.
+	function itemData.canRoll(item, mod, tags)
+		if not (mod.type == "Prefix" or mod.type == "Suffix") or not mod.weightKey or item:CheckIfModIsDelve(mod) then return false end
+		local copy = { }
+		for k, v in pairs(tags or { }) do copy[k] = v end
+		return item:CanHaveMod(mod, copy) and true or false
+	end
+
+	-- Affix ids that can roll with `tags` (cached per tag set).
+	function itemData.rollableWith(item, tags)
+		local keys = { }
+		for tag in pairs(tags) do keys[#keys + 1] = tag end
+		table.sort(keys)
+		local key = table.concat(keys, ",")
+		item.rollableByTags = item.rollableByTags or { }
+		if item.rollableByTags[key] then return item.rollableByTags[key] end
+		local ok = { }
+		for modId, mod in pairs(item.affixes or { }) do
+			if itemData.canRoll(item, mod, tags) then ok[modId] = true end
+		end
+		item.rollableByTags[key] = ok
+		return ok
+	end
+
+	-- Prefixes and suffixes that can roll on `item` with its base tags, with
+	-- tiers: within one family (type, group, stats) the highest-level mod is
+	-- tier 1. Item level is not applied here.
+	function itemData.rollable(item)
+		if item.rollableCache then return item.rollableCache.ok, item.rollableCache.tiers end
+		local ok = itemData.rollableWith(item, itemData.baseTags(item))
+		local families = { }
+		for modId in pairs(ok) do
+			local mod = item.affixes[modId]
+			local key = mod.type .. "|" .. tostring(mod.group) .. "|" .. table.concat(mod.statOrder or { }, ",")
+			families[key] = families[key] or { }
+			table.insert(families[key], modId)
+		end
+		local tiers = { }
+		for _, ids in pairs(families) do
+			table.sort(ids, function(a, b)
+				local la, lb = item.affixes[a].level or 0, item.affixes[b].level or 0
+				if la ~= lb then return la > lb end
+				return a < b
+			end)
+			for i, id in ipairs(ids) do tiers[id] = { tier = i, of = #ids } end
+		end
+		item.rollableCache = { ok = ok, tiers = tiers }
+		return ok, tiers
+	end
+
+	function itemData.compareMods(item, a, b)
+		local ma, mb = item.affixes[a], item.affixes[b]
+		if ma.type ~= mb.type then return ma.type == "Prefix" end
+		local sa, sb = ma.statOrder or { }, mb.statOrder or { }
+		for i = 1, math.max(#sa, #sb) do
+			if not sa[i] then return true end
+			if not sb[i] then return false end
+			if sa[i] ~= sb[i] then return sa[i] < sb[i] end
+		end
+		if tostring(ma.group) ~= tostring(mb.group) then return tostring(ma.group) < tostring(mb.group) end
+		if (ma.level or 0) ~= (mb.level or 0) then return (ma.level or 0) > (mb.level or 0) end
+		return a < b
+	end
+
+	-- Crafting bench prefixes and suffixes for the item class. PoB's bench
+	-- data has no ids (and group + level is not unique), so a bench mod is
+	-- named by its text with ranges, which stays valid as long as the mod.
+	function itemData.benchMods(item)
+		local list = { }
+		for _, craft in ipairs(data.masterMods or { }) do
+			if craft.types and craft.types[item.type] and (craft.type == "Prefix" or craft.type == "Suffix") then
+				list[#list + 1] = { id = table.concat(craft, " / "), mod = craft }
+			end
+		end
+		return list
+	end
+
+	function itemData.modsCommand(cmd)
+		local item, baseName = itemData.craftItem(cmd)
+		local ilvl = item.itemLevel
+		local ok, tiers = itemData.rollable(item)
+		local want = cmd.affix ~= nil and cmd.affix ~= dkjson.null and cmd.affix ~= "any" and cmd.affix or nil
+		local needle = cmd.query ~= nil and cmd.query ~= dkjson.null and itemData.lower(cmd.query) or ""
+		local function wanted(id, mod)
+			if want and mod.type:lower() ~= want then return false end
+			if needle == "" then return true end
+			return table.concat(mod, " / "):lower():find(needle, 1, true) ~= nil
+				or id:lower():find(needle, 1, true) ~= nil or tostring(mod.affix or ""):lower():find(needle, 1, true) ~= nil
+		end
+		local ids = { }
+		for id in pairs(ok) do
+			local mod = item.affixes[id]
+			if (mod.level or 0) <= ilvl and wanted(id, mod) then ids[#ids + 1] = id end
+		end
+		table.sort(ids, function(a, b) return itemData.compareMods(item, a, b) end)
+		local limit = tonumber(cmd.limit) or 50
+		local mods = { }
+		for i = 1, math.min(limit, #ids) do
+			local id = ids[i]
+			local mod = item.affixes[id]
+			mods[i] = {
+				id = id, type = mod.type:lower(), tier = tiers[id].tier, tiers = tiers[id].of,
+				level = mod.level, group = mod.group, affix = mod.affix ~= "" and mod.affix or nil,
+				weight = item:GetModSpawnWeight(mod), text = itemData.clip(table.concat(mod, " / ")),
+			}
+		end
+		local prefixLimit, suffixLimit = itemData.limits(item)
+		local result = {
+			base = baseName, type = item.base.type, itemLevel = ilvl,
+			prefixLimit = prefixLimit, suffixLimit = suffixLimit,
+			total = #ids, more = math.max(0, #ids - #mods), mods = mods,
+		}
+		if cmd.includeCrafted then
+			local crafted = { }
+			local craftedTotal = 0
+			for _, entry in ipairs(itemData.benchMods(item)) do
+				if wanted(entry.id, entry.mod) then
+					craftedTotal = craftedTotal + 1
+					if #crafted < limit then
+						crafted[#crafted + 1] = {
+							type = entry.mod.type:lower(), level = entry.mod.level, group = entry.mod.group,
+							text = itemData.clip(entry.id),
+						}
+					end
+				end
+			end
+			result.crafted, result.craftedMore = crafted, math.max(0, craftedTotal - #crafted)
+		end
+		return result
+	end
+
+	function itemData.norm(text)
+		return (itemData.lower(text):gsub("%s*\n%s*", " / "):gsub("%s*/%s*", " / "):gsub("%s+", " "))
+	end
+
+	-- Ranges and numbers become "#"; a "+" before them is dropped (optional),
+	-- a "-" is kept, so "-10%" never matches a "+(..)%" mod.
+	function itemData.template(normText)
+		return (normText:gsub("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", "#"):gsub("%d+%.?%d*", "#"):gsub("%+#", "#"))
+	end
+
+	-- A mod's numbers in order: ranges { min, max } and fixed values.
+	function itemData.tokens(text)
+		local tokens, pos = { }, 1
+		while true do
+			local rs, re, a, b = text:find("%((%-?%d+%.?%d*)%-(%-?%d+%.?%d*)%)", pos)
+			local ns, ne = text:find("%d+%.?%d*", pos)
+			if not ns then break end
+			if rs and rs <= ns then
+				tokens[#tokens + 1] = { min = tonumber(a), max = tonumber(b) }
+				pos = re + 1
+			else
+				tokens[#tokens + 1] = { value = tonumber(text:sub(ns, ne)) }
+				pos = ne + 1
+			end
+		end
+		return tokens
+	end
+
+	function itemData.modTemplate(mod)
+		local cached = itemData.templates[mod]
+		if cached then return cached end
+		local norm = itemData.norm(table.concat(mod, " / "))
+		cached = { norm = norm, template = itemData.template(norm) }
+		itemData.templates[mod] = cached
+		return cached
+	end
+
+	-- nil: the text is not this mod; false: same mod text, numbers outside its
+	-- ranges; else { ranges } giving those numbers (exact: the mod's own text,
+	-- ranges included, which takes the requested roll).
+	function itemData.matchMod(spec, mod)
+		local t = itemData.modTemplate(mod)
+		if t.norm == spec.norm then return { exact = true } end
+		if t.template ~= spec.template then return nil end
+		local tokens = itemData.tokens(t.norm)
+		if #tokens ~= #spec.values then return nil end
+		local ranges = { }
+		for i, tok in ipairs(tokens) do
+			local v = spec.values[i]
+			if tok.value then
+				if math.abs(tok.value - v) > 1e-9 then return false end
+			else
+				local lo, hi = math.min(tok.min, tok.max), math.max(tok.min, tok.max)
+				if v < lo - 1e-9 or v > hi + 1e-9 then return false end
+				ranges[#ranges + 1] = tok.max == tok.min and 1 or (v - tok.min) / (tok.max - tok.min)
+			end
+		end
+		return { ranges = ranges }
+	end
+
+	-- The roll for a matched mod: the requested roll for its own text (every
+	-- range at that roll), else the rolls that give the numbers asked for.
+	-- A one-line mod keeps one roll per range (itemLib.applyRange takes a
+	-- list); several lines that need different rolls, or a bench craft
+	-- (PoB keeps one roll per crafted line), get the average, with a warning.
+	function itemData.rangeFor(match, mod, roll, label, warnings, scalarOnly)
+		if match.exact or #match.ranges == 0 then return roll end
+		local function up(r)
+			-- BuildRaw keeps 3 decimals of an affix roll: round up so the value is reached.
+			local v = math.ceil(r * 1000 - 1e-6) / 1000
+			if v <= 0 then return 0 end
+			return math.min(1, v)
+		end
+		local sum, same = 0, true
+		for _, r in ipairs(match.ranges) do
+			sum = sum + r
+			if math.abs(r - match.ranges[1]) > 1e-9 then same = false end
+		end
+		if same then return up(match.ranges[1]) end
+		if #mod == 1 and not scalarOnly then
+			local list = { }
+			for i, r in ipairs(match.ranges) do list[i] = up(r) end
+			return list
+		end
+		warnings[#warnings + 1] = label .. ": its values need different rolls; one average roll is used"
+		return up(sum / #match.ranges)
+	end
+
+	function itemData.parseSpec(text)
+		local norm = itemData.norm(text)
+		local values = { }
+		for n in norm:gmatch("%d+%.?%d*") do values[#values + 1] = tonumber(n) end
+		return { text = itemData.trim(text), norm = norm, template = itemData.template(norm), values = values }
+	end
+
+	function itemData.describeCandidates(item, ids)
+		local out = { }
+		for i = 1, math.min(5, #ids) do
+			local mod = item.affixes[ids[i]]
+			out[i] = ids[i] .. " (level " .. tostring(mod.level) .. "): " .. itemData.clip(table.concat(mod, " / "))
+		end
+		return table.concat(out, "; ")
+	end
+
+	-- A prefix or suffix by mod id or text, checked against the base, its
+	-- influences, the item level and `ok` (what can roll with the other
+	-- mods' tags). Returns the choice, or nil and why not.
+	function itemData.resolveAffix(item, baseName, specText, roll, warnings, ok)
+		local ilvl = item.itemLevel
+		local where = baseName .. " at item level " .. ilvl
+		local id = nil
+		local trimmed = itemData.trim(specText)
+		if item.affixes[trimmed] then
+			id = trimmed
+		elseif not trimmed:find("%s") then
+			for modId in pairs(item.affixes) do
+				if modId:lower() == trimmed:lower() then id = modId break end
+			end
+		end
+		if id then
+			local mod = item.affixes[id]
+			if not (mod.type == "Prefix" or mod.type == "Suffix") then
+				return nil, id .. " is a " .. tostring(mod.type) .. " modifier, not a prefix or suffix"
+			end
+			if not ok[id] then
+				return nil, id .. " (" .. itemData.clip(table.concat(mod, " / ")) .. ") cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them)"
+			end
+			if (mod.level or 0) > ilvl then return nil, id .. " needs item level " .. mod.level .. " (itemLevel is " .. ilvl .. ")" end
+			return { id = id, mod = mod, range = roll }
+		end
+		local spec = itemData.parseSpec(specText)
+		local best, bestMatch, outOfRange, tooHigh, notRollable = nil, nil, { }, { }, { }
+		for modId, mod in pairs(item.affixes) do
+			if mod.type == "Prefix" or mod.type == "Suffix" then
+				local m = itemData.matchMod(spec, mod)
+				if m ~= nil then
+					if not ok[modId] then
+						notRollable[#notRollable + 1] = modId
+					elseif m == false then
+						outOfRange[#outOfRange + 1] = modId
+					elseif (mod.level or 0) > ilvl then
+						tooHigh[#tooHigh + 1] = modId
+					elseif not best or (mod.level or 0) > (item.affixes[best].level or 0) or ((mod.level or 0) == (item.affixes[best].level or 0) and modId < best) then
+						best, bestMatch = modId, m
+					end
+				end
+			end
+		end
+		if best then
+			local mod = item.affixes[best]
+			return { id = best, mod = mod, range = itemData.rangeFor(bestMatch, mod, roll, best, warnings) }
+		end
+		local function sorted(list)
+			table.sort(list, function(a, b) return (item.affixes[a].level or 0) > (item.affixes[b].level or 0) end)
+			return list
+		end
+		if #tooHigh > 0 then
+			return nil, "\"" .. spec.text .. "\" needs a higher item level than " .. ilvl .. ": " .. itemData.describeCandidates(item, sorted(tooHigh))
+		end
+		if #outOfRange > 0 then
+			return nil, "\"" .. spec.text .. "\" is outside every tier that can roll on " .. where .. ": " .. itemData.describeCandidates(item, sorted(outOfRange))
+		end
+		if #notRollable > 0 then
+			return nil, "\"" .. spec.text .. "\" cannot roll on " .. baseName .. " (Path of Building's spawn weights; influences change them): " .. itemData.describeCandidates(item, sorted(notRollable))
+		end
+		return nil, "No prefix or suffix matches \"" .. spec.text .. "\" (give a mod id or its text, e.g. \"+(100-114) to maximum Life\" or \"+110 to maximum Life\"; use list_item_mods)"
+	end
+
+	function itemData.resolveCraft(item, baseName, specText, roll, warnings)
+		local bench = itemData.benchMods(item)
+		local spec = itemData.parseSpec(specText)
+		local best, bestMatch, outOfRange = nil, nil, { }
+		for _, entry in ipairs(bench) do
+			local m = itemData.matchMod(spec, entry.mod)
+			if m == false then
+				outOfRange[#outOfRange + 1] = itemData.clip(entry.id)
+			elseif m and (not best or (entry.mod.level or 0) > (best.mod.level or 0)) then
+				best, bestMatch = entry, m
+			end
+		end
+		if best then
+			return { id = best.id, mod = best.mod, range = itemData.rangeFor(bestMatch, best.mod, roll, best.id, warnings, true), crafted = true }
+		end
+		if #outOfRange > 0 then
+			while #outOfRange > 5 do table.remove(outOfRange) end
+			userError("\"" .. spec.text .. "\" is outside every crafting bench tier for " .. baseName .. ": " .. table.concat(outOfRange, "; "))
+		end
+		userError("No crafting bench prefix or suffix for " .. baseName .. " matches \"" .. spec.text .. "\" (use list_item_mods with includeCrafted)")
+	end
+
+	-- Every `mods` entry resolved; each is checked with the tags the other
+	-- chosen mods add (PoB's UpdateAffixControl passes them to CanHaveMod),
+	-- so a mod that needs another one's tag is found once that one is.
+	function itemData.resolveAffixes(item, baseName, specs, roll, warnings)
+		local resolved = { }
+		local function tagsExcept(i)
+			local tags = itemData.baseTags(item)
+			for j, r in pairs(resolved) do
+				if j ~= i then
+					for _, tag in ipairs(r.mod.tags or { }) do tags[tag] = true end
+				end
+			end
+			return tags
+		end
+		local progress = true
+		while progress do
+			progress = false
+			for i, spec in ipairs(specs) do
+				if not resolved[i] then
+					local r = itemData.resolveAffix(item, baseName, spec, roll, warnings, itemData.rollableWith(item, tagsExcept(i)))
+					if r then
+						resolved[i] = r
+						progress = true
+					end
+				end
+			end
+		end
+		local list = { }
+		for i, spec in ipairs(specs) do
+			if not resolved[i] then
+				local _, message = itemData.resolveAffix(item, baseName, spec, roll, { }, itemData.rollableWith(item, tagsExcept(i)))
+				userError(message)
+			end
+		end
+		for i = 1, #specs do
+			-- Tags only ever add weight keys, but a key can carry weight 0: check each with all the others.
+			if not itemData.canRoll(item, resolved[i].mod, tagsExcept(i)) then
+				userError(resolved[i].id .. " cannot roll on " .. baseName .. " together with the other mods")
+			end
+			list[i] = resolved[i]
+		end
+		return list
+	end
+
+	function itemData.buildCommand(cmd)
+		local roll = itemData.roll(cmd.roll)
+		local item, baseName, base, expect = itemData.craftItem(cmd)
+		local warnings = { }
+		local affixes = itemData.resolveAffixes(item, baseName, cmd.mods or { }, roll, warnings)
+		local crafts = { }
+		for _, spec in ipairs(cmd.crafted or { }) do crafts[#crafts + 1] = itemData.resolveCraft(item, baseName, spec, roll, warnings) end
+		local total = #affixes + #crafts
+		if item.rarity == "NORMAL" and total > 0 then
+			userError("A normal item has no prefixes or suffixes: use rarity \"magic\" or \"rare\"")
+		end
+		-- As PoB's crafting dropdowns: one mod of each group.
+		local groups = { }
+		for _, list in ipairs({ affixes, crafts }) do
+			for _, r in ipairs(list) do
+				if r.mod.group then
+					if groups[r.mod.group] then
+						userError(r.id .. " and " .. groups[r.mod.group] .. " are both in mod group " .. r.mod.group .. ": an item can have one mod of each group")
+					end
+					groups[r.mod.group] = r.id
+				end
+			end
+		end
+		local prefixLimit, suffixLimit = itemData.limits(item)
+		local counts = { Prefix = 0, Suffix = 0 }
+		for _, list in ipairs({ affixes, crafts }) do
+			for _, r in ipairs(list) do counts[r.mod.type] = counts[r.mod.type] + 1 end
+		end
+		local rarityName = item.rarity:lower()
+		local what = rarityName .. (item.corrupted and " corrupted " or " ") .. base.type
+		if counts.Prefix > prefixLimit then
+			userError(counts.Prefix .. " prefixes (crafted ones included) but a " .. what .. " can have " .. prefixLimit)
+		end
+		if counts.Suffix > suffixLimit then
+			userError(counts.Suffix .. " suffixes (crafted ones included) but a " .. what .. " can have " .. suffixLimit)
+		end
+		if #crafts > 1 then
+			warnings[#warnings + 1] = "more than one crafted modifier needs the bench's \"Can have up to 3 Crafted Modifiers\" craft"
+		end
+		if cmd.name ~= nil and cmd.name ~= dkjson.null and item.rarity ~= "RARE" then
+			warnings[#warnings + 1] = "name is used for rare items only; a " .. rarityName .. " item is named from its affixes"
+		end
+		if cmd.quality ~= nil and cmd.quality ~= dkjson.null then
+			if item.quality == nil then userError(base.type .. " items have no quality") end
+			item.quality = tonumber(cmd.quality)
+			expect.quality = item.quality
+		end
+		local p, s = 0, 0
+		for _, r in ipairs(affixes) do
+			if r.mod.type == "Prefix" then
+				p = p + 1
+				item.prefixes[p] = { modId = r.id, range = r.range }
+			else
+				s = s + 1
+				item.suffixes[s] = { modId = r.id, range = r.range }
+			end
+		end
+		for i = p + 1, prefixLimit do item.prefixes[i] = { modId = "None" } end
+		for i = s + 1, suffixLimit do item.suffixes[i] = { modId = "None" } end
+		for _, r in ipairs(crafts) do
+			for _, line in ipairs(r.mod) do
+				item.explicitModLines[#item.explicitModLines + 1] = { line = line, modTags = r.mod.modTags or { }, crafted = true, range = r.range }
+			end
+		end
+		if item.crafted then
+			item:Craft()
+		else
+			item:BuildAndParseRaw()
+		end
+		expect.explicits = { }
+		for i, ml in ipairs(item.explicitModLines) do expect.explicits[i] = ml.line end
+		local result = itemData.textResult(item, expect)
+		local _, tiers = itemData.rollable(item)
+		local chosen = { }
+		for _, list in ipairs({ affixes, crafts }) do
+			for _, r in ipairs(list) do
+				chosen[#chosen + 1] = {
+					id = r.id, type = r.mod.type:lower(), crafted = r.crafted,
+					tier = tiers[r.id] and tiers[r.id].tier or nil, tiers = tiers[r.id] and tiers[r.id].of or nil,
+					text = itemData.clip(itemLib.applyRange(table.concat(r.mod, "\n"), r.range)),
+				}
+			end
+		end
+		result.affixes = chosen
+		result.itemLevel = item.itemLevel
+		result.roll = cmd.roll or "max"
+		for _, w in ipairs(warnings) do
+			result.warnings = result.warnings or { }
+			result.warnings[#result.warnings + 1] = w
+		end
+		return result
+	end
+
+	for name, handler in pairs({
+		itemSearch = itemData.searchCommand,
+		itemText = itemData.textCommand,
+		itemMods = itemData.modsCommand,
+		itemBuild = itemData.buildCommand,
+	}) do
+		DISPATCH[name] = { handler = handler }
+		NO_BUILD_REQUIRED[name] = true
+	end
+end
+
+-- The build's fundamentals: a blank build to start from (new_build), the
+-- character level (set_character_level) and the class / ascendancy /
+-- secondary ascendancy (set_ascendancy). Names are matched without regard to
+-- case, spaces, `_` or `-`; a refusal lists the choices. (A `do` block: the
+-- main chunk is at Lua's limit of 200 locals.)
+do
+	local basics = { }
+
+	function basics.given(v)
+		return v ~= nil and v ~= dkjson.null
+	end
+
+	function basics.key(s)
+		return (tostring(s or ""):lower():gsub("[%s_%-]+", " "):gsub("^ ", ""):gsub(" $", ""))
+	end
+
+	function basics.isNone(s)
+		local k = basics.key(s)
+		return k == "" or k == "none"
+	end
+
+	-- PoB's tree data for `version`. main:LoadTree sets PoB's global jewel
+	-- radii for the version it loads, so they are put back for the active
+	-- tree (TreeTab:SetActiveSpec sets them the same way).
+	function basics.tree(version)
+		local tree = mainObject.main:LoadTree(version)
+		local spec = build and build.spec
+		data.setJewelRadiiGlobally(spec and type(spec.treeVersion) == "string" and spec.treeVersion or latestTreeVersion)
+		if not tree then error("Path of Building could not load passive tree " .. tostring(version), 0) end
+		return tree
+	end
+
+	-- A tree version as PoB names it ("3_30", "3_30_ruthless"); "3.30" and
+	-- "latest" are accepted. Default: PoB's latest tree.
+	function basics.version(v)
+		if not basics.given(v) or basics.key(v) == "latest" or basics.key(v) == "" then return latestTreeVersion end
+		local s = tostring(v):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("[%.%s%-]+", "_")
+		if treeVersions[s] and listContains(treeVersionList, s) then return s end
+		userError("Unknown passive tree version '" .. tostring(v) .. "'. Path of Building has: "
+			.. table.concat(treeVersionList, ", ") .. " (default: the latest, " .. latestTreeVersion .. ")")
+	end
+
+	function basics.sortedById(map, skipZero)
+		local list = { }
+		for id, entry in pairs(map or { }) do
+			if not (skipZero and id == 0) and type(entry) == "table" then list[#list + 1] = { id = id, entry = entry } end
+		end
+		table.sort(list, function(a, b) return a.id < b.id end)
+		return list
+	end
+
+	-- "Scion (Ascendant), Marauder (Juggernaut, Berserker, Chieftain), ..."
+	function basics.classChoices(tree)
+		local out = { }
+		for _, c in ipairs(basics.sortedById(tree.classes)) do
+			local asc = { }
+			for _, a in ipairs(basics.sortedById(c.entry.classes, true)) do asc[#asc + 1] = a.entry.name end
+			out[#out + 1] = c.entry.name .. " (" .. table.concat(asc, ", ") .. ")"
+		end
+		return table.concat(out, ", ")
+	end
+
+	function basics.findClass(tree, name, version)
+		local want = basics.key(name)
+		for _, c in ipairs(basics.sortedById(tree.classes)) do
+			if basics.key(c.entry.name) == want then return c.id end
+		end
+		userError("Unknown class '" .. tostring(name) .. "'. Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+	end
+
+	-- The class id and ascendancy id of an ascendancy name (or PoB id), or nil.
+	function basics.findAscendancy(tree, name)
+		local want = basics.key(name)
+		for _, c in ipairs(basics.sortedById(tree.classes)) do
+			for _, a in ipairs(basics.sortedById(c.entry.classes, true)) do
+				if basics.key(a.entry.name) == want or (a.entry.id and basics.key(a.entry.id) == want) then return c.id, a.id end
+			end
+		end
+		return nil
+	end
+
+	function basics.unknownAscendancy(tree, name, version)
+		userError("Unknown ascendancy '" .. tostring(name) .. "'. Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+	end
+
+	-- Secondary ascendancies (bloodlines) the tree offers, by name. PoB's tree
+	-- loader already drops the legacy ones its dropdown no longer offers.
+	function basics.secondaryChoices(tree)
+		local names = { }
+		for _, a in ipairs(basics.sortedById(tree.alternate_ascendancies)) do names[#names + 1] = a.entry.name end
+		table.sort(names)
+		return names
+	end
+
+	function basics.findSecondary(tree, name, version)
+		if basics.isNone(name) then return 0 end
+		local names = basics.secondaryChoices(tree)
+		if #names == 0 then
+			userError("Passive tree " .. version .. " has no secondary ascendancies (bloodlines); leave secondaryAscendancy out")
+		end
+		local want = basics.key(name)
+		for _, a in ipairs(basics.sortedById(tree.alternate_ascendancies)) do
+			local n = basics.key(a.entry.name)
+			if n == want or basics.key(a.entry.id) == want or (n:gsub(" bloodline$", "")) == want then return a.id end
+		end
+		userError("Unknown secondary ascendancy '" .. tostring(name) .. "'. Tree " .. version .. " offers: "
+			.. table.concat(names, ", ") .. " (or None)")
+	end
+
+	function basics.level(v)
+		local level = tonumber(v)
+		if not level or level ~= math.floor(level) or level < 1 or level > 100 then
+			userError("level must be a whole number from 1 to 100")
+		end
+		return level
+	end
+
+	function basics.xmlAttr(s)
+		return (tostring(s):gsub("&", "&amp;"):gsub('"', "&quot;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	end
+
+	-- new_build: the XML of a blank build (what PoB's "New" gives, with the
+	-- class, ascendancies, level and tree chosen; the level in manual mode),
+	-- checked against the tree first, so a refusal changes nothing.
+	function basics.blankBuild(cmd)
+		local version = basics.version(cmd.treeVersion)
+		local tree = basics.tree(version)
+		local classId, ascendClassId = nil, 0
+		if basics.given(cmd.className) then classId = basics.findClass(tree, cmd.className, version) end
+		if basics.given(cmd.ascendancy) and not basics.isNone(cmd.ascendancy) then
+			local cid, aid = basics.findAscendancy(tree, cmd.ascendancy)
+			if not cid then basics.unknownAscendancy(tree, cmd.ascendancy, version) end
+			if classId and cid ~= classId then
+				userError(tostring(cmd.ascendancy) .. " is a " .. tree.classes[cid].name .. " ascendancy, not a "
+					.. tree.classes[classId].name .. " one. Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+			end
+			classId, ascendClassId = cid, aid
+		end
+		if not classId then
+			userError("Pass className (or an ascendancy). Classes (ascendancies) on tree " .. version .. ": " .. basics.classChoices(tree))
+		end
+		local secondaryId = basics.given(cmd.secondaryAscendancy) and basics.findSecondary(tree, cmd.secondaryAscendancy, version) or 0
+		local level = basics.given(cmd.level) and basics.level(cmd.level) or 1
+		local class = tree.classes[classId]
+		local ascendancy = class.classes[ascendClassId] or class.classes[0]
+		local secondary = secondaryId ~= 0 and tree.alternate_ascendancies[secondaryId] or nil
+		local attr = basics.xmlAttr
+		local xml = table.concat({
+			'<?xml version="1.0" encoding="UTF-8"?>',
+			"<PathOfBuilding>",
+			string.format('\t<Build level="%d" targetVersion="%s" className="%s" ascendClassName="%s" mainSocketGroup="1" viewMode="TREE" characterLevelAutoMode="false"/>',
+				level, attr(liveTargetVersion), attr(class.name), attr(ascendancy.name)),
+			'\t<Tree activeSpec="1">',
+			string.format('\t\t<Spec treeVersion="%s" clusterHashFormatVersion="2" classId="%d" ascendClassId="%d" secondaryAscendClassId="%d" nodes="" masteryEffects=""/>',
+				attr(version), classId, ascendClassId, secondaryId),
+			"\t</Tree>",
+			"</PathOfBuilding>",
+			"",
+		}, "\n")
+		return {
+			xml = xml,
+			build = {
+				class = class.name,
+				ascendancy = ascendancy.name,
+				secondaryAscendancy = secondary and secondary.name or nil,
+				level = level,
+				treeVersion = version,
+			},
+		}
+	end
+
+	function basics.levelState()
+		return { level = build.characterLevel, autoMode = build.characterLevelAutoMode == true }
+	end
+
+	-- set_character_level (and its undo, which may put PoB's auto level mode
+	-- back): what PoB's level box does. The level is in manual mode afterwards
+	-- unless `autoMode` is true.
+	function basics.setLevel(cmd)
+		local level = basics.level(cmd.level)
+		build.characterLevel = level
+		build.characterLevelAutoMode = cmd.autoMode == true
+		local controls = build.controls or { }
+		if controls.characterLevel and controls.characterLevel.SetText then controls.characterLevel:SetText(level) end
+		if controls.levelScalingButton then controls.levelScalingButton.label = build.characterLevelAutoMode and "Auto" or "Manual" end
+		build.configTab:BuildModList()
+		build.buildFlag = true
+		runCallback("OnFrame")
+		return basics.levelState()
+	end
+
+	function basics.describeClass(spec)
+		return {
+			className = spec.curClassName,
+			ascendancy = spec.curAscendClassName or "None",
+			secondaryAscendancy = spec.curSecondaryAscendClassName or "None",
+			classId = spec.curClassId,
+			ascendClassId = spec.curAscendClassId or 0,
+			secondaryAscendClassId = spec.curSecondaryAscendClassId or 0,
+		}
+	end
+
+	-- The class, ascendancy and secondary ascendancy set_ascendancy asks for,
+	-- as ids (`replay`: the ids a committed change recorded).
+	function basics.targetClass(cmd, spec, from)
+		local tree, version = spec.tree, spec.treeVersion
+		if cmd.replay then
+			local classId, ascendClassId, secondaryId = tonumber(cmd.classId), tonumber(cmd.ascendClassId), tonumber(cmd.secondaryAscendClassId)
+			local class = classId and tree.classes[classId]
+			if not (class and ascendClassId and class.classes[ascendClassId] and secondaryId
+				and (secondaryId == 0 or (tree.alternate_ascendancies and tree.alternate_ascendancies[secondaryId]))) then
+				error("setAscendancy replay: unknown class / ascendancy ids", 0)
+			end
+			return classId, ascendClassId, secondaryId
+		end
+		if not (basics.given(cmd.className) or basics.given(cmd.ascendancy) or basics.given(cmd.secondaryAscendancy)) then
+			userError("Pass ascendancy, secondaryAscendancy or className")
+		end
+		local classId = from.classId
+		if basics.given(cmd.className) then classId = basics.findClass(tree, cmd.className, version) end
+		local ascendClassId = classId == from.classId and from.ascendClassId or 0
+		if basics.given(cmd.ascendancy) then
+			if basics.isNone(cmd.ascendancy) then
+				ascendClassId = 0
+			else
+				local cid, aid = basics.findAscendancy(tree, cmd.ascendancy)
+				if not cid then basics.unknownAscendancy(tree, cmd.ascendancy, version) end
+				if cid ~= classId then
+					local other = tree.classes[cid].name
+					if basics.given(cmd.className) then
+						userError(tostring(cmd.ascendancy) .. " is a " .. other .. " ascendancy, not a " .. tree.classes[classId].name .. " one")
+					end
+					userError(tostring(cmd.ascendancy) .. " is a " .. other .. " ascendancy and this build is a " .. tostring(from.className)
+						.. ". Pass className: \"" .. other .. "\" as well to change class (Path of Building keeps the allocated passives only "
+						.. "when they connect to the " .. other .. " start), or start over with new_build")
+				end
+				ascendClassId = aid
+			end
+		end
+		local secondaryId = from.secondaryAscendClassId
+		if basics.given(cmd.secondaryAscendancy) then secondaryId = basics.findSecondary(tree, cmd.secondaryAscendancy, version) end
+		return classId, ascendClassId, secondaryId
+	end
+
+	-- set_ascendancy: PoB's class / ascendancy / secondary ascendancy
+	-- dropdowns (PassiveSpec:SelectClass, SelectAscendClass,
+	-- SelectSecondaryAscendClass). Passives that no longer connect to a start
+	-- (the old ascendancy's, the old class's) are removed, as PoB does. A class
+	-- change is refused, as PoB asks first, when passives are allocated and none
+	-- connects to the new class's start, unless `allowTreeReset` (PoB's
+	-- "Continue"). Returns { unchanged } or { from, to, removed }.
+	function basics.setAscendancy(cmd)
+		local spec = build.spec
+		local from = basics.describeClass(spec)
+		local classId, ascendClassId, secondaryId = basics.targetClass(cmd, spec, from)
+		if classId == from.classId and ascendClassId == from.ascendClassId and secondaryId == from.secondaryAscendClassId then
+			return { unchanged = true, from = from, to = from }
+		end
+		local classChange = classId ~= from.classId
+		if classChange and not cmd.replay and cmd.allowTreeReset ~= true then
+			local used = spec:CountAllocNodes()
+			if (tonumber(used) or 0) > 0 and not spec:IsClassConnected(classId) then
+				local name = spec.tree.classes[classId].name
+				userError("Changing class from " .. tostring(from.className) .. " to " .. name .. " would reset the passive tree: no allocated "
+					.. "passive connects to the " .. name .. " start (Path of Building asks before doing this). Pass allowTreeReset: true "
+					.. "to change class anyway (every passive that no longer connects is removed, as with PoB's Continue), connect the tree "
+					.. "to the " .. name .. " start with allocate_nodes first, or start over with new_build")
+			end
+		end
+		local before = nodeBatch.captureAllocated()
+		buildEdit.started()
+		withTreeRollback(function()
+			if classChange then spec:SelectClass(classId) end
+			if (spec.curAscendClassId or 0) ~= ascendClassId then spec:SelectAscendClass(ascendClassId) end
+			if (spec.curSecondaryAscendClassId or 0) ~= secondaryId then spec:SelectSecondaryAscendClass(secondaryId) end
+			local now = basics.describeClass(spec)
+			if now.classId ~= classId or now.ascendClassId ~= ascendClassId or now.secondaryAscendClassId ~= secondaryId then
+				error("Path of Building did not switch the class / ascendancy (PassiveSpec changed?)", 0)
+			end
+		end)
+		local removed = { }
+		for _, node in ipairs(nodeBatch.lostSince(before)) do
+			if node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then removed[#removed + 1] = node end
+		end
+		local result = { from = from, to = basics.describeClass(spec), removed = removed }
+		buildEdit.applied(result, cmd.replay)
+		build.buildFlag = true
+		runCallback("OnFrame")
+		return result
+	end
+
+	-- A new_build request: an XML document whose only element under
+	-- <PathOfBuilding> is <MCPNewBuild className=... ascendancy=...
+	-- secondaryAscendancy=... level=... treeVersion=.../> (BuildSession.newBuild).
+	-- Returns its attributes, or nil for any other XML.
+	function basics.newBuildRequest(xmlText)
+		if type(xmlText) ~= "string" or not xmlText:find("<MCPNewBuild", 1, true) then return nil end
+		local parsed = common.xml.ParseXML(xmlText)
+		local root = type(parsed) == "table" and parsed[1]
+		if not (type(root) == "table" and root.elem == "PathOfBuilding") then return nil end
+		local request = nil
+		for _, child in ipairs(root) do
+			if type(child) == "table" then
+				if child.elem ~= "MCPNewBuild" or request then return nil end
+				request = child.attrib or { }
+			end
+		end
+		return request
+	end
+
+	-- new_build goes through loadXML like any build (BuildSession.newBuild
+	-- sends the request as the build's XML), so it shares load_build's path in
+	-- the bridge and in LuaBridge: a respawn for it skips the replay, a refusal
+	-- (raised here before anything changes) puts the last committed build
+	-- back, and the request is the recovery build and reset_build's target,
+	-- which give the same blank build again. `info.newBuild` is what the build
+	-- should load as (BuildSession checks it).
+	local plainLoad = DISPATCH.loadXML.handler
+	DISPATCH.loadXML.handler = function(cmd)
+		local request = basics.newBuildRequest(cmd.xml)
+		if not request then return plainLoad(cmd) end
+		local blank = basics.blankBuild(request)
+		local body = plainLoad({ xml = blank.xml, name = cmd.name })
+		body.info.newBuild = blank.build
+		return body
+	end
+
+	buildEdit.COMMANDS.setAscendancy = true
+	DISPATCH.getCharacterLevel = { handler = function(_cmd) return basics.levelState() end }
+	DISPATCH.setCharacterLevel = { handler = basics.setLevel }
+	DISPATCH.setAscendancy = { handler = basics.setAscendancy }
 end
 
 local function dispatch(cmd)
 	if type(cmd) ~= "table" then
 		error("Command must be a JSON object")
+	end
+	if cmd.cmd ~= "treeEditApplied" then nodeBatch.record = nil end
+	if cmd.cmd ~= "buildEditApplied" then buildEdit.record = nil end
+	if buildEdit.COMMANDS[cmd.cmd] then buildEdit.failNextStats, buildEdit.rollbackInexact = nil, nil end
+	if buildEdit.failNextStats and cmd.cmd == "getStats" then
+		-- Test fault (buildEditRecalcFails): PoB's recalculation after an applied edit fails.
+		buildEdit.failNextStats = nil
+		if TEST_FAULTS.buildEditRecalcExits then os.exit(3) end
+		error("test fault: the recalculation after a build edit failed", 0)
 	end
 	local entry = DISPATCH[cmd.cmd]
 	if not entry then

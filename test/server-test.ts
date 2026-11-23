@@ -62,6 +62,7 @@ async function main(): Promise<void> {
     assert(names.includes('get_stats'), 'get_stats missing');
     assert(names.includes('get_skill_breakdown'), 'get_skill_breakdown missing');
     assert(names.includes('list_equipped_items'), 'list_equipped_items missing');
+    assert(names.includes('compare_builds'), 'compare_builds missing');
 
     log('Test 1: load_build (raw XML)');
     const loadResult = await client.callTool({
@@ -84,6 +85,13 @@ async function main(): Promise<void> {
     assert(typeof stats.defense.Life === 'number' && (stats.defense.Life as number) > 0, 'Life should be > 0');
     assert(typeof stats.offense.CombinedDPS === 'number' && (stats.offense.CombinedDPS as number) > 0, 'CombinedDPS > 0');
     log(`PASS: Life=${stats.defense.Life}, CombinedDPS=${stats.offense.CombinedDPS}`);
+    // Keys outside the bridge's default stat list come through the category mode too.
+    assert(typeof stats.offense.Speed === 'number' && (stats.offense.Speed as number) > 0, 'offense.Speed missing');
+    assert(typeof stats.offense.CritChance === 'number' && (stats.offense.CritChance as number) > 0, 'offense.CritChance missing');
+    assert(typeof stats.defense.BlockChance === 'number' && (stats.defense.BlockChance as number) > 0, 'defense.BlockChance missing');
+    assert(typeof stats.attributes?.Str === 'number' && typeof stats.attributes?.Int === 'number', 'attributes missing');
+    assert(typeof stats.charges?.PowerChargesMax === 'number', 'charges.PowerChargesMax missing');
+    log('PASS: category stats include keys outside the bridge default list');
 
     log('Test 3: get_stats (filtered to defense)');
     const defResult = await client.callTool({
@@ -157,7 +165,7 @@ async function main(): Promise<void> {
       const a = annotated.get(name);
       assert(a && typeof a.readOnlyHint === 'boolean' && typeof a.destructiveHint === 'boolean', `${name}: missing annotations`);
     }
-    for (const name of ['get_stats', 'evaluate_changes', 'simulate_passive_change', 'find_best_next_nodes', 'swap_gem', 'compare_items', 'get_passive_tree']) {
+    for (const name of ['get_stats', 'evaluate_changes', 'stat_weights', 'suggest_upgrades', 'simulate_passive_change', 'find_best_next_nodes', 'plan_passive_points', 'plan_respec', 'swap_gem', 'compare_items', 'get_passive_tree']) {
       assert(annotated.get(name)?.readOnlyHint === true && annotated.get(name)?.destructiveHint === false, `${name} should be read-only`);
     }
     for (const name of ['load_build', 'reset_build', 'configure_pob_path', 'reload_engine']) {
@@ -165,7 +173,9 @@ async function main(): Promise<void> {
     }
     assert(annotated.get('reset_build')?.idempotentHint === true, 'reset_build is idempotent');
     assert(annotated.get('load_build')?.openWorldHint === true, 'load_build may fetch a URL');
-    for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest']) {
+    assert(annotated.get('compare_builds')?.readOnlyHint === true && annotated.get('compare_builds')?.openWorldHint === true,
+      'compare_builds is read-only and may fetch a URL');
+    for (const name of ['swap_item', 'unequip_item', 'set_config', 'convert_tree_to_latest', 'allocate_nodes', 'deallocate_nodes', 'apply_changes', 'create_socket_group', 'delete_socket_group', 'set_main_skill']) {
       assert(annotated.get(name)?.readOnlyHint === false && annotated.get(name)?.destructiveHint === false, `${name} is an undoable change`);
     }
     // undo_last_change discards a change that cannot be redone.
@@ -228,6 +238,25 @@ async function main(): Promise<void> {
     assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'evaluate_changes changed the build');
     log(`PASS: ${evaluated.results.map((r) => `${r.label}=${r.delta?.CombinedDPS ?? r.error}`).join(', ')}`);
 
+    log('Test 12b: plan_passive_points / plan_respec through MCP');
+    const plan = JSON.parse(await text('plan_passive_points', { points: 1 })) as {
+      steps: Array<{ node: { id: number } }>;
+      applyChanges: { allocate: number[] };
+    };
+    assert(plan.steps.length === 1 && plan.applyChanges.allocate.includes(plan.steps[0].node.id), `plan_passive_points: ${JSON.stringify(plan)}`);
+    const current = (JSON.parse(await text('get_passive_tree')) as { allocatedNodes: Array<{ id: number }> }).allocatedNodes.map((n) => n.id);
+    const respec = JSON.parse(await text('plan_respec', { target: [...current, plan.steps[0].node.id] })) as {
+      unchanged: boolean;
+      addedCount: number;
+      points: { net: number };
+      applyChanges?: { allocate?: number[] };
+    };
+    assert(!respec.unchanged && respec.addedCount >= 1 && respec.points.net === respec.addedCount && respec.applyChanges?.allocate?.length === respec.addedCount,
+      `plan_respec: ${JSON.stringify(respec)}`);
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'plan tools changed the build');
+    assert(((await client.callTool({ name: 'plan_passive_points', arguments: { points: 41 } })) as { isError?: boolean }).isError === true, 'plan_passive_points with 41 points should be refused');
+    log('PASS');
+
     log('Test 13: input bounds');
     const refused = async (name: string, args: Record<string, unknown>, what: string): Promise<void> => {
       const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content?: ToolTextContent[] };
@@ -249,6 +278,87 @@ async function main(): Promise<void> {
     assert(atBounds.results[0].error === undefined, `a variant within the bounds failed: ${atBounds.results[0].error}`);
     assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'bounds checks changed the build');
     log('PASS: oversized inputs refused');
+
+    log('Test 14: compare_builds through MCP (the loaded build against its own export)');
+    const ownCode = await text('export_build', { format: 'code' });
+    const compared = JSON.parse(await text('compare_builds', { source: ownCode })) as {
+      a: string; meta: { differs: string[] }; stats: Record<string, { a: number; b: number; delta: number }>;
+      tree: { onlyA: object; onlyB: object }; items: { changed: unknown[]; onlyA: unknown[]; onlyB: unknown[] };
+    };
+    assert(compared.a === 'loaded build' && compared.meta.differs.length === 0, `meta: ${JSON.stringify(compared.meta)}`);
+    assert(compared.stats.CombinedDPS.delta === 0 && compared.stats.Life.delta === 0, `stats: ${JSON.stringify(compared.stats)}`);
+    assert(JSON.stringify(compared.tree.onlyA) === '{}' && JSON.stringify(compared.tree.onlyB) === '{}', 'tree differs');
+    assert(compared.items.changed.length === 0 && compared.items.onlyA.length === 0 && compared.items.onlyB.length === 0, 'items differ');
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'compare_builds changed the build');
+    const badCompare = (await client.callTool({ name: 'compare_builds', arguments: { source: 'not a build' } })) as {
+      isError?: boolean; content?: ToolTextContent[];
+    };
+    const badText = badCompare.content?.[0]?.text ?? '';
+    assert(badCompare.isError === true && /^source: /.test(badText), `bad source: ${badText}`);
+    log('PASS: compare_builds');
+
+    log('Test 14b: item data tools through MCP');
+    for (const name of ['search_items', 'get_item_text', 'list_item_mods', 'build_item']) {
+      assert(annotated.get(name)?.readOnlyHint === true && annotated.get(name)?.destructiveHint === false, `${name} should be read-only`);
+    }
+    const found = JSON.parse(await text('search_items', { query: 'Vaal Regalia', kind: 'base', limit: 1 })) as { results: Array<{ name: string }> };
+    assert(found.results[0]?.name === 'Vaal Regalia', `search_items: ${JSON.stringify(found)}`);
+    const listed = JSON.parse(await text('list_item_mods', { base: 'Vaal Regalia', query: 'maximum life', limit: 2 })) as { mods: Array<{ id: string }> };
+    assert(listed.mods.length === 2, `list_item_mods: ${JSON.stringify(listed)}`);
+    const built = JSON.parse(await text('build_item', { base: 'Vaal Regalia', mods: ['+110 to maximum Life'], crafted: ['+20% to Fire Resistance'] })) as { text: string };
+    const uniqueText = (JSON.parse(await text('get_item_text', { unique: "Kaom's Heart" })) as { text: string }).text;
+    const viaMcp = JSON.parse(await text('compare_items', { slot: 'Body Armour', items: [built.text, uniqueText] })) as { candidates: Array<{ error: string | null }> };
+    assert(viaMcp.candidates.every((c) => c.error === null), `compare_items took the item data texts: ${JSON.stringify(viaMcp.candidates)}`);
+    await refused('build_item', { base: 'Vaal Regalia', name: 'Two\nLines' }, 'a two-line item name');
+    await refused('build_item', { base: 'Vaal Regalia', mods: ['LocalIncreasedPhysicalDamagePercent1'] }, 'a mod that cannot roll');
+    await refused('get_item_text', { unique: "Kaom's Heart", base: 'Vaal Regalia' }, 'unique and base together');
+    assert((await text('export_build', { format: 'xml' })) === xmlBefore, 'item data tools changed the build');
+    log('PASS: item data tools');
+
+    log('Test 15: masteries and mainSkill through MCP (ConvertTreeMasteries.xml)');
+    await text('load_build', { source: readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8') });
+    const mBefore = await text('export_build', { format: 'xml' });
+    const tree = JSON.parse(await text('get_passive_tree', { masteries: [2841] })) as {
+      allocatedNodes: Array<{ id: number; type: string; effect?: number; stats?: string[] }>;
+      masteryOptions: Array<{ id: number; allocated: boolean; effect?: number; options: Array<{ effect: number; stats: string; takenBy?: number }> }>;
+    };
+    const lifeNode = tree.allocatedNodes.find((n) => n.id === 2841);
+    assert(lifeNode && lifeNode.effect === 64381 && (lifeNode.stats ?? []).length > 0, `allocated mastery carries its effect: ${JSON.stringify(lifeNode)}`);
+    const opt = tree.masteryOptions[0];
+    assert(opt.id === 2841 && opt.allocated && opt.effect === 64381 && opt.options.length >= 4, `masteryOptions: ${JSON.stringify(tree.masteryOptions)}`);
+    const freeEffect = opt.options.find((o) => o.takenBy === undefined && o.effect !== opt.effect)!;
+    const mEval = JSON.parse(await text('evaluate_changes', {
+      variants: [
+        { label: 'mastery', masteries: [{ node: 2841, effect: freeEffect.effect }] },
+        { label: 'skill', mainSkill: { group: 2, activeSkill: 2 } },
+        { label: 'taken', masteries: [{ node: 2841, effect: opt.options.find((o) => o.takenBy !== undefined)!.effect }] },
+      ],
+    })) as { results: Array<{ label: string; error?: string; userError?: boolean; fallback?: boolean }> };
+    const byLabel = new Map(mEval.results.map((r) => [r.label, r]));
+    assert(!byLabel.get('mastery')!.error && !byLabel.get('skill')!.error && !byLabel.get('mastery')!.fallback, `evaluate: ${JSON.stringify(mEval.results)}`);
+    assert(byLabel.get('taken')!.userError === true && /already chosen/.test(byLabel.get('taken')!.error ?? ''), 'a taken effect is refused per variant');
+    assert((await text('export_build', { format: 'xml' })) === mBefore, 'evaluate_changes changed the build');
+    const allocated = JSON.parse(await text('allocate_nodes', { masteries: [{ node: 2841, effect: freeEffect.stats }] })) as {
+      status: string; masteries: Array<{ id: number; effect: number; previousEffect?: number }>;
+    };
+    assert(allocated.status === 'allocated' && allocated.masteries[0].effect === freeEffect.effect && allocated.masteries[0].previousEffect === 64381, `allocate_nodes: ${JSON.stringify(allocated)}`);
+    assert((await text('export_build', { format: 'xml' })).includes(`{2841,${freeEffect.effect}}`), 'the export holds the effect');
+    await text('undo_last_change');
+    const applied = JSON.parse(await text('apply_changes', { variant: { label: 'both', masteries: [{ node: 2841, effect: freeEffect.effect }], mainSkill: { group: 2, activeSkill: 2 } } })) as {
+      status: string; masteries: Array<{ id: number }>; mainSkill: string;
+    };
+    assert(applied.status === 'applied' && applied.masteries[0].id === 2841 && applied.mainSkill === 'Cold Snap', `apply_changes: ${JSON.stringify(applied)}`);
+    await text('undo_last_change');
+    assert((await text('export_build', { format: 'xml' })) === mBefore, 'undo_last_change reverts the mastery edits');
+    const badEffect = (await client.callTool({ name: 'allocate_nodes', arguments: { masteries: [{ node: 2841, effect: 41322 }] } })) as {
+      isError?: boolean; content?: ToolTextContent[];
+    };
+    assert(badEffect.isError === true && /does not offer/.test(badEffect.content?.[0]?.text ?? '') && !/Internal error/.test(badEffect.content?.[0]?.text ?? ''), 'an effect the mastery lacks is a user error');
+    await refused('allocate_nodes', { masteries: Array.from({ length: 21 }, () => ({ node: 2841, effect: 1 })) }, '21 masteries');
+    await refused('evaluate_changes', { variants: [{ mainSkill: { group: 0 } }] }, 'mainSkill group 0');
+    await refused('get_passive_tree', { masteries: Array.from({ length: 21 }, () => 2841) }, 'get_passive_tree with 21 masteries');
+    assert((await text('export_build', { format: 'xml' })) === mBefore, 'refusals changed the build');
+    log('PASS: masteries and mainSkill');
   } finally {
     try {
       await client.close();

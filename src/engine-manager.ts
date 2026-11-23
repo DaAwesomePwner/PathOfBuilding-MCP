@@ -1,4 +1,4 @@
-import { BuildSession } from './build-session.js';
+import { AsyncMutex, BuildSession } from './build-session.js';
 import { configFilePath, loadConfig, saveConfig, SavedConfig } from './config-store.js';
 import { CrashLedger } from './crash-ledger.js';
 import { EngineGate } from './engine-gate.js';
@@ -42,9 +42,23 @@ export type PathPrompt = () => Promise<{ configured: boolean; message?: string }
 
 export type BridgeFactory = (paths: ResolvedPaths, opts: { initialCrashCount: number }) => LuaBridge;
 
+/** Per-command timeout of a temporary engine (boot, build load and each read). */
+export const TEMPORARY_ENGINE_TIMEOUT_MS = 60_000;
+
+export interface TemporaryEngineOptions {
+  /** Override TEMPORARY_ENGINE_TIMEOUT_MS (tests). */
+  timeoutMs?: number;
+  /** Test-only fault names for the temporary engine's LuaJIT process (LuaBridgeOptions.testFaults). */
+  testFaults?: string;
+}
+
+export type TemporaryBridgeFactory = (paths: ResolvedPaths, opts: { timeoutMs: number; testFaults?: string }) => LuaBridge;
+
 export interface EngineManagerOptions {
   env?: NodeJS.ProcessEnv;
   bridgeFactory?: BridgeFactory;
+  /** Builds the bridge of a temporary engine (withTemporaryEngine); tests inject it. */
+  temporaryBridgeFactory?: TemporaryBridgeFactory;
   log?: (line: string) => void;
   /** Extra resolve options (tests inject probe tables). */
   resolveOptions?: Partial<ResolveOptions>;
@@ -76,6 +90,10 @@ export class EngineManager {
   private readonly gate = new EngineGate();
   private readonly ledger = new CrashLedger();
   private readonly retiring = new Set<LuaBridge>();
+  private readonly temporaryBridgeFactory: TemporaryBridgeFactory;
+  /** Temporary engines (compare_builds) run one at a time. */
+  private readonly temporaryMutex = new AsyncMutex();
+  private readonly temporary = new Set<LuaBridge>();
 
   private paths: FullyResolvedPaths | null = null;
   private resolveError: string | null = null;
@@ -104,6 +122,8 @@ export class EngineManager {
   constructor(opts: EngineManagerOptions = {}) {
     this.env = opts.env ?? process.env;
     this.bridgeFactory = opts.bridgeFactory ?? ((p, o) => new LuaBridge(p, 60_000, o));
+    this.temporaryBridgeFactory =
+      opts.temporaryBridgeFactory ?? ((p, o) => new LuaBridge(p, o.timeoutMs, { testFaults: o.testFaults }));
     this.log = opts.log ?? ((line) => process.stderr.write(`pob-mcp-server: ${line}\n`));
     this.resolveOptions = opts.resolveOptions ?? {};
   }
@@ -297,6 +317,70 @@ export class EngineManager {
     }
     if (!this.session) throw new EngineNotReadyError(msg.bootFailed(paths, this.bootError ?? 'engine not started'));
     return this.session;
+  }
+
+  // ------------------------------------------------------------------ temporary engines
+
+  /**
+   * Run `fn` against a short-lived, read-only second engine on the live
+   * engine's paths (compare_builds evaluates other builds in it). Temporary
+   * engines run one at a time. The process is started for the call, never
+   * respawned (a crash or timeout fails `fn`'s next command), and always
+   * killed when `fn` ends. Its strikes are its own: it never takes part in
+   * the crash ledger, so it cannot open the live engine's breaker. Call it
+   * from inside run() (a shared gate slot), so an engine swap or shutdown
+   * waits for it or kills it, never leaves it behind.
+   */
+  async withTemporaryEngine<T>(fn: (bridge: LuaBridge) => Promise<T>, options: TemporaryEngineOptions = {}): Promise<T> {
+    const release = await this.temporaryMutex.acquire();
+    let bridge: LuaBridge | null = null;
+    try {
+      const paths = this.paths;
+      if (!paths) throw new EngineNotReadyError(msg.unconfigured(this.resolveError, this.promptMessage));
+      if (this.shuttingDown) throw new EngineNotReadyError('The server is shutting down.');
+      // The same install checks engine tools get, right before spawning.
+      if (detectUpdateState(paths.pobPath) === 'applying') throw new EngineNotReadyError(msg.updating(paths.pobPath));
+      if (this.startFingerprint) {
+        const current = fingerprintInstall(paths.pobPath);
+        if (installChanged(this.startFingerprint, current)) {
+          throw new EngineNotReadyError(msg.stale(this.startFingerprint, current, paths.pobPath));
+        }
+      }
+      // An install whose engine keeps crashing must not get a process per call.
+      // The live bridge holds the ledger's count for these paths plus its own.
+      const strikes =
+        this.bridge && this.bridgePaths?.pobPath === paths.pobPath && this.bridgePaths.luajitPath === paths.luajitPath
+          ? this.bridge.getCrashCount()
+          : this.ledger.initialCount(paths.pobPath, paths.luajitPath);
+      if (strikes >= msg.MAX_CRASHES) {
+        throw new UserError(
+          `compare_builds is refused: the Path of Building engine has crashed ${strikes} times with this install ` +
+            '(the crash breaker is open), so no second engine is started for it. ' + msg.circuitOpen(strikes),
+        );
+      }
+      bridge = this.temporaryBridgeFactory(paths, {
+        timeoutMs: options.timeoutMs ?? TEMPORARY_ENGINE_TIMEOUT_MS,
+        testFaults: options.testFaults,
+      });
+      this.temporary.add(bridge);
+      await bridge.start();
+      bridge.setRespawnHeld(true);
+      return await fn(bridge);
+    } finally {
+      if (bridge) {
+        try {
+          await bridge.dispose();
+        } finally {
+          this.temporary.delete(bridge);
+        }
+      }
+      release();
+    }
+  }
+
+  /** Number of temporary engines alive right now (tests, diagnostics). */
+  temporaryEngineCount(): number {
+    return this.temporary.size;
   }
 
   // ------------------------------------------------------------------ swaps
@@ -521,12 +605,13 @@ export class EngineManager {
   /** Server shutdown: no new boots; in-flight calls get the retry error; the process is killed. */
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
-    await this.stopEngine();
+    await Promise.all([this.stopEngine(), ...[...this.temporary].map((b) => b.dispose())]);
   }
 
   /** Synchronous last-resort kill of every LuaJIT process this manager owns (live or retiring). */
   killProcess(): void {
     this.bridge?.forceKill();
     for (const b of this.retiring) b.forceKill();
+    for (const b of this.temporary) b.forceKill();
   }
 }

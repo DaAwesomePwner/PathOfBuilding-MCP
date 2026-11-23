@@ -73,7 +73,7 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 **What the server does:** the stuck process is killed and the timeout counts as one of the three strikes (see above); the in-flight tool call returns an error. The next tool call restarts the engine — see the next section.
 
 **Fix:**
-- Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter on `suggest_upgrades`.
+- Reduce work: lower `count` on `find_best_next_nodes`, use a narrower `slot` filter or a smaller `modSlots` on `suggest_upgrades`.
 - If a specific build always times out, capture stderr (`POB_TIMING=1` helps) and try simplifying the build (remove very large jewel clusters, exotic skill setups) to isolate the offending data.
 
 ## "The Path of Building engine stopped unexpectedly and was restarted"
@@ -101,6 +101,24 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 `swap_item`, `compare_items` and item variants in `evaluate_changes` require PoB item-paste format. Copy the item text from PoB itself (`Right click → Copy`) — the first line is always `Rarity: <Normal|Magic|Rare|Unique>`. The one exception is a Viscera (Wickerman) item copied from the game, whose first line is `Item Class: Viscera` and which has no `Rarity:` line; it is accepted as is.
 
+## `build_item` / `list_item_mods` refusals
+
+- **"… cannot roll on <base>"** — Path of Building's spawn weights give that mod weight 0 on the base's tags (e.g. a local weapon mod on armour). Influenced mods need `influences` (e.g. `["Shaper"]`). `list_item_mods` lists what can roll.
+- **"… needs item level N"** / **"needs a higher item level"** — the tier is above `itemLevel` (default 86): raise it or pick a lower tier.
+- **"… is outside every tier that can roll"** — a rolled line's number is not inside any tier's range; the message lists the tiers. Give the mod's range text or id instead.
+- **"N prefixes (crafted ones included) but a rare … can have 3"** — magic items take 1 prefix and 1 suffix, rare items 3 and 3 (jewels 2 and 2), crafted mods included.
+- **"X and Y are both in mod group …"** — an item has at most one mod of each group (a bench craft too).
+- **"Unknown item base" / "Unknown unique"** — use `search_items` (`kind: "base"` for bases); a unique name several items share (e.g. Grand Spectrum) needs its full `"Name, Base"`.
+- **"implicit … is an influence line" / "is read as the item header …" / "name … is an item flag line"** — Path of Building reads that line as part of the item's header (influence, corruption, quality, sockets, item level, …), not as a modifier. Use `influences`, `corrupted` or `quality` instead, and plain modifier lines for implicits and names.
+- **"implicit … changes the prefix or suffix limits" / "gives the item a crucible passive tree" / "restricts the mods the item can roll"** — PoB keeps such a line as a mod but reads it as a crafting rule that `build_item` does not model; leave it out.
+- **"name … is a unique …" / "starts with \"Foulborn \""** — PoB treats a rare with that name as the unique (its own affix pool or extra mod tags); pick another name.
+- **A cluster notable "cannot roll"** — give the jewel's enchant as implicits (`"Added Small Passive Skills grant: …"`, plus `"Adds N Passive Skills"`); PoB takes the cluster skill from it, and only that skill's notables roll.
+- **"Path of Building reads the item differently from the request"** — PoB's parse of the built text came out different (a line moved between implicits and mods, an influence or flag appeared). Rephrase the named line.
+- **"No crafting bench prefix or suffix … matches"** — bench mods are named by their text (`list_item_mods` with `includeCrafted`), not by an id.
+- **"Path of Building does not model this line"** (a warning) — the item is built, but PoB's mod parser ignores that line in its calculations.
+
+Not covered: essences, eldritch implicits (pass them as `implicits` lines), fossils, harvest and veiled mods.
+
 ## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
 
 The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
@@ -119,9 +137,28 @@ An item already in a hidden slot is still listed by `list_equipped_items` (with 
 2. Use `reset_build` to return to original loaded state and try again.
 3. If the drift is reproducible, file an issue with: build XML + sequence of tool calls + observed vs expected values.
 
+## "Node … is a mastery; pass it in `masteries` as { node, effect }" / mastery effect errors
+
+A mastery is always allocated together with the effect chosen on it, so it cannot go in `allocate` (evaluate_changes / apply_changes) or `nodes` (allocate_nodes). Pass `masteries: [{ node, effect }]` instead; `get_passive_tree({ masteries: [<id or name>] })` lists each mastery's effects with their ids.
+
+- **"does not offer effect N"** / **"no effect of mastery … matches"** — the effect id or text is not one of that mastery's options (each mastery type has its own list). Use an id from `masteryOptions`, or a text that only one of its effects contains.
+- **"Effect N … is already chosen on mastery M"** — Path of Exile allows each mastery effect on one mastery only (`takenBy` in `masteryOptions`). Switch mastery M to another effect, or deallocate it, first.
+- **"mastery name … matches N nodes"** — masteries share names ("Life Mastery"). A name picks the allocated mastery that has the effect already, else the only allocated one of that name, else the only one a path reaches; otherwise pass the node id from the list in the error (also to allocate a second mastery of a name you already have).
+- **"mastery … is removed by this change's deallocation"** — the same variant deallocates a node the mastery depends on. Deallocate the mastery too, or keep that node.
+- **"mainSkill cannot be combined with a change that may add or remove skill groups"** — an item or passive in the same variant grants (or replaced one that grants) a skill, so socket group indices may shift. Apply that change first, re-read `list_skill_groups`, then set the main skill.
+- **`status: "unchanged"`** — every mastery listed already had that effect; nothing changed and nothing was pushed to undo.
+- A mastery has no "allocated without an effect" state: to clear one, deallocate it with `deallocate_nodes`.
+
+## `new_build` / `set_ascendancy` refusals
+
+- *"Unknown class / ascendancy / secondary ascendancy …"* — the error lists every class with its ascendancies (or the bloodlines) of that passive tree; names ignore case. Nothing was changed.
+- *"… is a Marauder ascendancy and this build is a Witch"* — `set_ascendancy` changes class only when `className` is given too.
+- *"Changing class from X to Y would reset the passive tree"* — no allocated passive connects to the new class's start, so PoB would ask before removing them. Pass `allowTreeReset: true` to do it anyway (undoable), connect the tree to that start first, or start over with `new_build`.
+- *"Passive tree 3_20 has no secondary ascendancies"* — bloodlines exist on 3.25+ trees only.
+
 ## "Nothing to undo"
 
-The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only `swap_item`, `unequip_item`, `set_config` and `convert_tree_to_latest` push an entry, and only when the change succeeded; the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
+The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only the committed edits (`swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, `create_socket_group`, `delete_socket_group`, `set_main_skill`, `set_character_level`, `set_ascendancy`, `convert_tree_to_latest`) push an entry, and only when the change succeeded (a `new_build` clears the stack, like `load_build`); the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
 
 ## "The Path of Building engine was restarted … Retry the call"
 
@@ -132,6 +169,16 @@ A tool call was queued or running when the engine was replaced (`reload_engine`,
 **Cause:** Two MCP tool calls reached the bridge simultaneously without going through `BuildSession`'s lock. This should not happen in normal use; all session methods route through `withLock`.
 
 **Fix:** This is an internal invariant violation. Capture stderr and the call sequence and file an issue.
+
+## "The temporary Path of Building engine stopped while … the source build"
+
+`compare_builds` evaluates the other build in a second, short-lived engine started for that call. It crashed, timed out (60 s per step) or could not start, so the call failed. That engine is always discarded and never restarted, and its failures do not count towards the main engine's three-strike limit: the loaded build, its undo history and the main engine are unaffected. Retry the call; if it keeps failing for the same build, check that the build opens in Path of Building itself ("Path of Building could not load the source build: …" means PoB refused it).
+
+`compare_builds is refused: the Path of Building engine has crashed N times …` means the main engine's crash breaker is open for this install: no second engine is started for it either (see "Lua engine has crashed N times" above). After a Path of Building update on disk, `compare_builds` asks for `reload_engine` first, like every engine tool.
+
+## `stat_weights` lists a line under `unparsed`
+
+Path of Building's mod parser could not use the line (the same check its Custom modifiers box applies: a line with any unrecognised text is skipped there), so it was not evaluated; `reason` says whether nothing or only part of it was recognised. Write it the way the game or PoB shows the mod on an item, one modifier per line, with numbers filled in (`+50 to maximum Life`, not `+# to maximum Life`). A line that grants a skill is not supported. Lines are added as global modifiers, so local item mods (a weapon's added damage, an armour piece's own armour) are counted as global ones.
 
 ## Performance reference (OccVortex on a typical desktop)
 
@@ -145,7 +192,9 @@ A tool call was queued or running when the engine was replaced (`reload_engine`,
 | `find_worst_allocated_nodes` | 2–3 s |
 | `compare_supports`, `swap_gem`, `evaluate_gem_levels` | milliseconds |
 | `find_optimal_links` (6-link, default topN) | 1–3 s |
-| `suggest_upgrades` (all slots) | <1 s |
+| `suggest_upgrades` (all slots; suggested mods for 3) | ~2 s (`modSlots: 10` ~5 s, `modSlots: 0` <0.1 s) |
+| `stat_weights` (default 37 lines) | ~0.1 s |
+| `compare_builds` | ~5 s (a second engine boots and loads the other build; with `against` both builds load in that engine) |
 | `simulate_scenario`, `compare_scenarios`, `toggle_buffs` | milliseconds |
 
 Run the server with `POB_TIMING=1` to log every Lua bridge command's wall time to stderr.

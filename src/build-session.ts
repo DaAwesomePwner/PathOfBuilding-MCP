@@ -1,11 +1,15 @@
 import { encodeBuildCode, resolveBuildSource } from './build-source.js';
 import { appliedButFailed, carriedWithoutChanges, engineRestarted } from './engine-messages.js';
-import { BuildInfo, LuaBridge, Stats } from './lua-bridge.js';
+import { BuildInfo, EngineCommandError, LuaBridge, Stats } from './lua-bridge.js';
 import { findOptimalLinks, type OptimalLinksResult } from './link-search.js';
 import {
+  checkVariant,
+  committedFingerprint,
+  fingerprintDiff,
   runProbe,
   withoutNulls,
   type ProbeGemChange,
+  type ProbeMasteryChoice,
   type ProbeRequest,
   type ProbeResponse,
   type ProbeVariant,
@@ -13,7 +17,18 @@ import {
 } from './probe.js';
 import { toNumber } from './stat-values.js';
 import { DEFAULT_MAX_POINTS, findBestNextNodes, findWorstAllocatedNodes, type RankBy, type TreeSearchResult } from './tree-search.js';
+import {
+  MAX_RESPEC_TARGET,
+  planPassivePoints,
+  validatePlanOptions,
+  type PlanPointsOptions,
+  type PlanPointsResult,
+  type RespecRaw,
+} from './tree-plan.js';
+import { topTradeMods, type ModLineCheck, type SuggestedMod } from './stat-weights.js';
+import type { ItemDataCommand } from './item-data.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
+import { tradeQueryCommand } from './trade-search-command.js';
 import { UserError, normalizeItemText } from './validation.js';
 
 /**
@@ -242,6 +257,13 @@ function describeTreeMismatch(report: TreeRestoreReport): string {
 
 export interface ConfigSnapshot {
   input: Record<string, unknown>;
+  /**
+   * Set on the snapshot taken around a probe fallback or an apply_changes: the
+   * engine remembered the committed config tables under this token, and only
+   * this snapshot's restore (the fallback's restore, the rollback or undo of
+   * that apply_changes) puts those very tables back.
+   */
+  token?: string;
 }
 
 export interface FullSnapshot {
@@ -264,6 +286,15 @@ export type UndoEntry = (
   | { kind: 'config'; snapshot: ConfigSnapshot }
   /** Tree-version change: restores the whole spec, version included. */
   | { kind: 'spec'; state: SpecState }
+  /** Committed socket group edit (create / delete / main skill): restores every skill set exactly. */
+  | { kind: 'skills'; snapshot: SkillsSnapshot }
+  /**
+   * allocate_nodes / deallocate_nodes / set_ascendancy: the tree exactly and every
+   * skill set (a node added or removed may grant a socket group); items are untouched.
+   */
+  | { kind: 'treeSkills'; tree: TreeSnapshot; skills: SkillsSnapshot }
+  /** set_character_level: the level and PoB's auto level mode before the change. */
+  | { kind: 'level'; level: number; autoMode: boolean }
 ) & {
   /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
   journal?: number;
@@ -277,7 +308,7 @@ export interface StatDelta {
 
 export type StatDiff = Record<string, StatDelta>;
 
-class AsyncMutex {
+export class AsyncMutex {
   private queue: Array<() => void> = [];
   private locked = false;
 
@@ -472,15 +503,49 @@ export class BuildSession {
     // order, not call order (a slow URL load started first can land after, and
     // replace, a build code loaded later).
     const xml = await resolveBuildSource(source);
+    return this.withLoadLock(async () => (await this.replaceBuildUnlocked(xml)).info);
+  }
+
+  /**
+   * Load a build XML as the session's build (load_build, new_build): the
+   * bridge records it for crash recovery only once it is accepted; it becomes
+   * reset_build's target, and undo history and stat snapshots are cleared.
+   */
+  private async replaceBuildUnlocked(xml: string): Promise<{ info: BuildInfo; newBuild?: NewBuildExpected }> {
+    // `newBuild`: a new_build request's expected result (the bridge adds it to the load's info).
+    const { newBuild, ...info } = (await this.bridge.loadBuildXML(xml)) as BuildInfo & { newBuild?: NewBuildExpected };
+    this.originalXML = xml;
+    this.buildInfo = withoutRestartNote(info);
+    this.configMetaCache = null;
+    this.undoStack.length = 0;
+    this.undoClearedByRestart = false;
+    this.snapshots.clear();
+    return { info, newBuild };
+  }
+
+  /**
+   * Start a blank build (new_build). The request goes to the bridge as the
+   * build's XML (newBuildRequestXML), loaded exactly as load_build loads
+   * XML: the bridge's loadXML checks the class, ascendancy, secondary
+   * ascendancy, level and tree version against PoB's tree data and loads
+   * the blank build it writes; a refusal changes nothing. So the recovery
+   * baseline, the undo reset, the reset_build target (the request, which
+   * gives the same blank build again) and the engineRestart note are
+   * load_build's, and a respawn for it never replays the old build.
+   */
+  async newBuild(spec: NewBuildSpec): Promise<BuildInfo> {
+    const xml = newBuildRequestXML(spec);
     return this.withLoadLock(async () => {
-      // The bridge records the build for crash recovery only once it is accepted.
-      const info = await this.bridge.loadBuildXML(xml);
-      this.originalXML = xml;
-      this.buildInfo = withoutRestartNote(info);
-      this.configMetaCache = null;
-      this.undoStack.length = 0;
-      this.undoClearedByRestart = false;
-      this.snapshots.clear();
+      const { info, newBuild: want } = await this.replaceBuildUnlocked(xml);
+      const ext = info as BuildInfo & { secondaryAscendancy?: string };
+      const got = { class: info.class, ascendancy: info.ascendancy, secondaryAscendancy: ext.secondaryAscendancy, level: info.level, treeVersion: info.treeVersion };
+      const wrong = want ? (Object.keys(want) as Array<keyof NewBuildExpected>).filter((k) => (want[k] ?? null) !== (got[k] ?? null)) : ['build'];
+      if (wrong.length > 0) {
+        throw new Error(
+          `new_build replaced the loaded build (undo history cleared), but Path of Building loaded it with a different ${wrong.join(', ')} ` +
+            `(${JSON.stringify(got)}, expected ${JSON.stringify(want ?? null)})`,
+        );
+      }
       return info;
     });
   }
@@ -488,15 +553,8 @@ export class BuildSession {
   async resetBuild(): Promise<BuildInfo> {
     if (!this.originalXML) throw new UserError('No build loaded — call load_build first');
     const xml = this.originalXML;
-    return this.withLoadLock(async () => {
-      const info = await this.bridge.loadBuildXML(xml);
-      this.buildInfo = withoutRestartNote(info);
-      this.configMetaCache = null;
-      this.undoStack.length = 0;
-      this.undoClearedByRestart = false;
-      this.snapshots.clear();
-      return info;
-    });
+    // Same XML, so originalXML is unchanged (a new_build request gives the same blank build).
+    return this.withLoadLock(async () => (await this.replaceBuildUnlocked(xml)).info);
   }
 
   /** True once a build has been loaded into this session. */
@@ -515,6 +573,16 @@ export class BuildSession {
 
   async getStats(): Promise<Stats> {
     return this.withLock(() => this.bridge.getStats());
+  }
+
+  /**
+   * compare_builds' read of the loaded build (the bridge's read-only
+   * `compareSnapshot`): build info, the given stat keys, allocated nodes,
+   * items by slot, socket groups and the config input.
+   */
+  async compareSnapshot<T>(stats: string[]): Promise<T> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first, or pass `against` to compare two other builds');
+    return this.withLock(() => this.bridge.send<T>({ cmd: 'compareSnapshot', stats }));
   }
 
   // ------------------------------------------------------------------
@@ -740,6 +808,7 @@ export class BuildSession {
     await this.bridge.send({
       cmd: 'restoreConfig',
       input: snapshot.input,
+      ...(snapshot.token !== undefined ? { token: snapshot.token } : {}),
     });
   }
 
@@ -815,14 +884,46 @@ export class BuildSession {
     return this.withLock(() => this.probeUnlocked(request));
   }
 
+  /**
+   * stat_weights (src/stat-weights.ts), under one lock: which lines PoB's mod
+   * parser can use (`probe` with `parseModLines`), then one calculator variant
+   * per usable line (`modLines`: the line's mods appended to a copy of the
+   * config mod list, lua/probe.lua). `probe.results` has one entry per usable
+   * line, in order. Changes nothing and records nothing.
+   */
+  async probeModLines(lines: string[], stats: string[]): Promise<{ checks: ModLineCheck[]; probe: ProbeResponse }> {
+    return this.withLock(async () => {
+      const parsed = await this.bridge.send<{ ok: true; lines: ModLineCheck[] }>({ cmd: 'probe', parseModLines: lines });
+      const checks = lines.map((_, i) => parsed.lines?.[i] ?? { ok: false, reason: 'not checked' });
+      const variants: Array<ProbeVariant & { modLines: string[] }> = lines
+        .filter((_, i) => checks[i].ok)
+        .map((line) => ({ modLines: [line] }));
+      return { checks, probe: await this.probeUnlocked({ stats, variants }) };
+    });
+  }
+
   private probeUnlocked(request: ProbeRequest): Promise<ProbeResponse> {
+    // A full-snapshot fallback runs snapshot -> probeCommit -> restore: the
+    // probeCommit carries the snapshot's config token (see ConfigSnapshot).
+    let fallbackToken: string | undefined;
     return runProbe(
       {
-        send: (command) => this.bridge.send(command),
+        send: (command) => {
+          const isCommit = (command as { cmd?: string }).cmd === 'probeCommit';
+          return this.bridge.send(isCommit && fallbackToken !== undefined ? { ...command, configToken: fallbackToken } : command);
+        },
         validateConfig: (options) => this.validateConfigOptionsUnlocked(options),
-        snapshot: () => this.snapshotAllUnlocked(),
+        snapshot: async () => {
+          const snapshot = await this.snapshotAllUnlocked();
+          fallbackToken = this.nextConfigToken();
+          snapshot.config.token = fallbackToken;
+          return snapshot;
+        },
         restore: (snapshot) => this.restoreAllUnlocked(snapshot as FullSnapshot),
-        snapshotTree: () => this.snapshotTreeUnlocked(),
+        snapshotTree: () => {
+          fallbackToken = undefined;
+          return this.snapshotTreeUnlocked();
+        },
         restoreTree: (snapshot) => this.restoreTreeUnlocked(snapshot as TreeSnapshot),
         probeThenRestore,
       },
@@ -953,8 +1054,20 @@ export class BuildSession {
       }
       if (entry.kind === 'full') {
         await this.restoreAllUnlocked(entry.snapshot);
+        // apply_changes can change the main skill (a gem change), so the cached build info may differ.
+        await this.refreshBuildInfoUnlocked();
       } else if (entry.kind === 'spec') {
         await this.bridge.send({ cmd: 'restoreSpecState', state: entry.state });
+        await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'skills') {
+        await this.restoreSkillsUnlocked(entry.snapshot);
+        await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'treeSkills') {
+        await this.restoreTreeAndSkillsUnlocked(entry.tree, entry.skills);
+        // The class / ascendancy and the main skill may change back.
+        await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'level') {
+        await this.bridge.send({ cmd: 'setCharacterLevel', level: entry.level, autoMode: entry.autoMode });
         await this.refreshBuildInfoUnlocked();
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
@@ -963,6 +1076,14 @@ export class BuildSession {
       if (entry.journal !== undefined) this.bridge.truncateCommitted(entry.journal);
       return this.bridge.getStats();
     });
+  }
+
+  private configTokenSeq = 0;
+
+  /** A new token for ConfigSnapshot.token. */
+  private nextConfigToken(): string {
+    this.configTokenSeq += 1;
+    return `config-${this.configTokenSeq}`;
   }
 
   undoStackDepth(): number {
@@ -1033,6 +1154,22 @@ export class BuildSession {
     return this.withLock(async () => {
       const result = await this.bridge.send<{ ok: true } & TradeModsResult>({ cmd: 'searchTradeMods', slot, query, limit });
       return { itemCategory: result.itemCategory, total: result.total, mods: result.mods };
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Item data (read-only: PoB's unique list, item bases, affixes, bench crafts)
+  // ------------------------------------------------------------------
+
+  /**
+   * One of the bridge's item-data reads (search_items, get_item_text,
+   * list_item_mods, build_item). They build items with PoB's Item class and
+   * never add them to the build: nothing is undo-pushed or journaled.
+   */
+  async readItemData<T = Record<string, unknown>>(command: ItemDataCommand): Promise<T> {
+    return this.withLock(async () => {
+      const { ok: _ok, ...result } = await this.bridge.send<{ ok: true } & Record<string, unknown>>(command);
+      return result as T;
     });
   }
 
@@ -1237,7 +1374,445 @@ export class BuildSession {
     }
   }
 
-  async getPassiveTree(): Promise<PassiveTreeInfo> {
+  /**
+   * Set the character level (set_character_level), as PoB's level box does:
+   * the level goes to manual mode. Pushes a level undo entry (the level and
+   * auto mode before) and records the command for crash replay. The same
+   * level already in manual mode is `unchanged`: nothing pushed or recorded.
+   */
+  async setCharacterLevel(level: number): Promise<LevelChangeResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build or new_build first');
+    return this.withLock(async () => {
+      const current = await this.bridge.send<{ ok: true; level: number; autoMode: boolean }>({ cmd: 'getCharacterLevel' });
+      const previous = { level: current.level, autoMode: current.autoMode === true };
+      if (previous.level === level && !previous.autoMode) {
+        const stats = await this.bridge.getStats();
+        return { unchanged: true, previous, level, before: stats, after: stats, diff: {} };
+      }
+      const entry: UndoEntry = { kind: 'level', ...previous };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const command = { cmd: 'setCharacterLevel', level };
+      try {
+        await this.bridge.send(command);
+      } catch (err) {
+        // The level may be set (PoB's recalculation failed): undo can revert it, but it is never replayed, as for set_config.
+        if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+        throw err;
+      }
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        return { previous, level, before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * Change the class / ascendancy / secondary ascendancy (set_ascendancy) as
+   * PoB's dropdowns do: passives that no longer connect are removed. The
+   * bridge checks the names first (and refuses a class change that would
+   * reset the tree unless `allowTreeReset`), so a refusal changes nothing.
+   * Pushes one undo entry with the tree (class and ascendancies are part of
+   * it) and the skills, and records the chosen ids for crash replay.
+   */
+  async setAscendancy(spec: AscendancySpec): Promise<AscendancyChangeResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build or new_build first');
+    return this.withLock(async () => {
+      // Skills too: a removed node may have granted a socket group (Radiant
+      // Crusade), which a tree restore alone brings back with default fields.
+      const tree = await this.snapshotTreeUnlocked();
+      const skills = await this.snapshotSkillsUnlocked();
+      const entry: UndoEntry = { kind: 'treeSkills', tree, skills };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const { res, failure } = await this.sendBuildEditUnlocked<RawAscendancyChange>({ cmd: 'setAscendancy', ...spec }, entry, journal, () =>
+        this.restoreTreeAndSkillsUnlocked(tree, skills),
+      );
+      const summaryOf = async () =>
+        (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
+      if (res.unchanged === true && failure === undefined) {
+        return { unchanged: true, from: res.from, to: res.to, removed: [], summary: await summaryOf(), before, after: before, diff: {} };
+      }
+      const to = res.to;
+      const command = {
+        cmd: 'setAscendancy',
+        replay: true,
+        classId: to.classId,
+        ascendClassId: to.ascendClassId,
+        secondaryAscendClassId: to.secondaryAscendClassId,
+      };
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        return {
+          from: res.from,
+          to,
+          removed: treeEditNodes(res.removed),
+          summary: await summaryOf(),
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
+      });
+    });
+  }
+
+  /**
+   * Commit an allocation (allocate_nodes): each node with its shortest path
+   * from the allocated tree, as PoB's click and simulate_passive_change do.
+   * Names resolve as in simulate_passive_change. The bridge checks the whole
+   * batch first (unknown, unreachable, already allocated, mastery, repeated,
+   * two options of one choice node), so a refusal changes nothing and pushes
+   * nothing. Pushes one tree + skills undo entry and records, for crash replay, the
+   * added node ids in the order they joined the tree (so the replay does not
+   * depend on which of several equally short paths PoB picks).
+   */
+  async allocateNodes(refs: Array<string | number>, masteries: ProbeMasteryChoice[] = []): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'allocate', masteries);
+  }
+
+  /**
+   * Commit a deallocation (deallocate_nodes): each node together with every
+   * node that depends on it. Checked first like allocateNodes; one tree +
+   * skills undo entry; the requested ids are recorded for replay (what depends on a node
+   * is a property of the tree, not of table order).
+   */
+  async deallocateNodes(refs: Array<string | number>): Promise<TreeEditResult> {
+    return this.treeEdit(refs, 'deallocate');
+  }
+
+  private async treeEdit(
+    refs: Array<string | number>,
+    mode: 'allocate' | 'deallocate',
+    masteries: ProbeMasteryChoice[] = [],
+  ): Promise<TreeEditResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    if (refs.length === 0 && masteries.length === 0) {
+      throw new UserError(mode === 'allocate' ? 'Pass at least one node or mastery' : 'Pass at least one node');
+    }
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const ids = await resolver.resolveAll(refs, mode);
+      // Skills too, as for set_ascendancy: a node that grants a skill (Radiant
+      // Crusade, or one depending on it) adds or drops a socket group when PoB
+      // recalculates, and a tree restore alone brings the group back with
+      // default fields and loses a main socket group pointing at it.
+      const entry: UndoEntry = {
+        kind: 'treeSkills',
+        tree: await this.snapshotTreeUnlocked(),
+        skills: await this.snapshotSkillsUnlocked(),
+      };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      let res: TreeEditApplied;
+      let failure: unknown;
+      try {
+        res = await this.bridge.send({
+          cmd: mode === 'allocate' ? 'allocNodes' : 'deallocNodes',
+          nodeIds: ids,
+          strict: true,
+          ...(masteries.length > 0 ? { masteries } : {}),
+        });
+      } catch (err) {
+        // The batch records what it changed once the tree has changed; a failure
+        // after that (PoB's recalculation, the stats, an error popup) leaves the
+        // change applied, so it is committed below and the error says so.
+        if (!this.bridge.isRunning()) throw err;
+        const record = await this.treeEditRecordUnlocked();
+        if (!record?.applied) {
+          // A batch that never started (the command failed before its handler)
+          // or was refused changed nothing (the bridge checks first and rolls a
+          // failed batch back exactly). Any other failure, or one whose record
+          // cannot be read, may have left part of a change (a rollback that
+          // failed): undo can revert it, but it is never replayed, as for set_config.
+          if (!(err instanceof UserError) && record?.started !== false) this.pushUndoEntryUnlocked(entry, journal);
+          throw err;
+        }
+        res = record.applied;
+        failure = err;
+      }
+      const added = treeEditNodes(res.added);
+      const removed = treeEditNodes(res.removed);
+      const chosen = masteryChoices(res.masteries);
+      if (res.unchanged === true && failure === undefined) {
+        // Only masteries that already had their effect: no undo entry, no journal record.
+        const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
+        return { added, removed, masteries: chosen, unchanged: true, summary: summary.summary, before, after: before, diff: {} };
+      }
+      // The replay: added ids in join order (masteries among them) and the
+      // masteries by node id and effect id.
+      const command =
+        mode === 'allocate'
+          ? {
+              cmd: 'allocNodes',
+              nodeIds: added.map((n) => n.id),
+              ...(chosen.length > 0 ? { masteries: chosen.map((m) => ({ node: m.id, effect: m.effect })) } : {}),
+            }
+          : { cmd: 'deallocNodes', nodeIds: ids };
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        // A granted skill group added or removed can move the main group: the cached main skill is re-read.
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        const summary = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' });
+        return {
+          added,
+          removed,
+          ...(chosen.length > 0 ? { masteries: chosen } : {}),
+          summary: summary.summary,
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
+      });
+    });
+  }
+
+  /**
+   * After a tree edit that was applied but whose command then failed: run
+   * PoB's recalculation (reading the stats does), so the build's outputs, and
+   * the PlayerStat lines export_build writes, match the changed tree. Returns
+   * the error to report; when the recalculation fails too it says so.
+   */
+  private async recalcAfterAppliedFailureUnlocked(failure: unknown): Promise<unknown> {
+    try {
+      await this.bridge.getStats();
+      return failure;
+    } catch (e) {
+      // With the engine gone the change is not committed (the restarted
+      // engine will not have it), so there are no stale values to warn about.
+      const stale = this.bridge.isRunning()
+        ? '; stats and export_build may show values from before the change until a later call recalculates'
+        : '';
+      const message = `${(failure as Error).message} (PoB's recalculation also failed: ${(e as Error).message}${stale})`;
+      return new Error(message, { cause: failure });
+    }
+  }
+
+  /**
+   * Read right after a failed strict node batch: whether the batch started
+   * and, when it changed the tree, what it changed. Null when it cannot be read.
+   */
+  private async treeEditRecordUnlocked(): Promise<{ started: boolean; applied: TreeEditApplied | null } | null> {
+    try {
+      const res = await this.bridge.send<{ ok: true; started: boolean; applied: TreeEditApplied | null }>({ cmd: 'treeEditApplied' });
+      const applied = res.applied && typeof res.applied === 'object' ? res.applied : null;
+      return { started: res.started === true, applied };
+    } catch (e) {
+      console.error('[pob-mcp] could not read what a failed tree edit changed:', (e as Error).message);
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Committed build edits: apply_changes and socket group edits
+  // ------------------------------------------------------------------
+
+  /**
+   * Commit one evaluate_changes variant (apply_changes) as one undo step.
+   * Node names resolve as in evaluate_changes; the variant is checked as the
+   * probe checks it, and the bridge checks it against the build (gem changes
+   * by applying them to copies and undoing them) before anything changes, so
+   * a refusal changes nothing and pushes nothing. Then config, gems, items,
+   * deallocations and allocations are applied in that order, as the probe
+   * applies them. A change that fails part-way is rolled back to the full
+   * snapshot taken first (the undo entry). Records, for crash replay, the
+   * variant with gem names as PoB names them and the allocated node ids in
+   * the order they joined the tree.
+   */
+  async applyChanges(variant: NamedProbeVariant): Promise<ApplyChangesResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    const hasConfig = variant.config !== undefined && Object.keys(variant.config).length > 0;
+    const lists = [variant.allocate, variant.deallocate, variant.items, variant.gems, variant.masteries];
+    if (!hasConfig && variant.mainSkill === undefined && lists.every((list) => list === undefined || list.length === 0)) {
+      throw new UserError('The variant changes nothing: give at least one of allocate, deallocate, masteries, items, gems, config or mainSkill');
+    }
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const { allocate, deallocate, ...rest } = variant;
+      const resolved: ProbeVariant = { ...rest };
+      if (!hasConfig) delete resolved.config;
+      if (allocate?.length) resolved.allocate = await resolver.resolveAll(allocate, 'allocate');
+      if (deallocate?.length) resolved.deallocate = await resolver.resolveAll(deallocate, 'deallocate');
+      const toEngine = await checkVariant({ validateConfig: (options) => this.validateConfigOptionsUnlocked(options) }, resolved);
+      const undoSnap = await this.snapshotAllUnlocked();
+      undoSnap.config.token = this.nextConfigToken();
+      const entry: UndoEntry = { kind: 'full', snapshot: undoSnap };
+      const before = undoSnap.stats;
+      const journal = this.bridge.committedCount();
+      const { res, failure } = await this.sendBuildEditUnlocked<RawApplyChanges>(
+        { cmd: 'applyChanges', variant: toEngine, configToken: undoSnap.config.token },
+        entry,
+        journal,
+        () => this.restoreAllUnlocked(undoSnap),
+      );
+      const added = treeEditNodes(res.added);
+      const removed = treeEditNodes(res.removed);
+      if (res.unchanged === true && failure === undefined) {
+        // Only masteries that already had their effect: no undo entry, no journal record.
+        return { added, removed, masteries: masteryChoices(res.masteries), unchanged: true, before, after: before, diff: {} };
+      }
+      // The replay: gem names as PoB names them, allocations in join order.
+      const gemNames = Array.isArray(res.gemNames) ? res.gemNames : [];
+      const replay: ProbeVariant = { ...toEngine };
+      if (toEngine.gems) {
+        replay.gems = toEngine.gems.map((ch, i) => {
+          const name = gemNames[i];
+          return typeof name === 'string' && 'name' in ch && ch.name !== undefined ? { ...ch, name } : ch;
+        });
+      }
+      delete replay.allocate;
+      if (Array.isArray(res.allocOrder) && res.allocOrder.length > 0) replay.allocate = res.allocOrder;
+      // Masteries by node id and effect id (a name or effect text may resolve differently later).
+      const masteries = masteryChoices(res.masteries);
+      delete replay.masteries;
+      if (masteries.length > 0) replay.masteries = masteries.map((m) => ({ node: m.id, effect: m.effect }));
+      return this.commitAfterUnlocked(entry, journal, { cmd: 'applyChanges', replay: true, variant: replay }, async () => {
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        let summary: PassiveTreeSummary | undefined;
+        if (added.length + removed.length + masteries.length > 0) {
+          summary = (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
+        }
+        await this.refreshBuildInfoUnlocked();
+        return {
+          added,
+          removed,
+          ...(masteries.length > 0 ? { masteries } : {}),
+          ...(toEngine.mainSkill ? { mainSkill: this.buildInfo?.mainSkill ?? null } : {}),
+          ...(summary ? { summary } : {}),
+          before,
+          after,
+          diff: computeDiff(before, after),
+        };
+      });
+    });
+  }
+
+  /**
+   * Add a socket group (create_socket_group) at the end of the active skill
+   * set, optionally as the main skill group. One skills undo entry; the
+   * command is recorded for replay with gem names as PoB names them.
+   */
+  async createSocketGroup(spec: CreateSocketGroupSpec): Promise<SkillEditResult> {
+    return this.skillsEdit({ cmd: 'createSocketGroup', ...spec }, (res) => {
+      const names = (res.group as { gems?: Array<{ name?: string }> } | undefined)?.gems ?? [];
+      return { cmd: 'createSocketGroup', ...spec, gems: spec.gems.map((g, i) => ({ ...g, name: names[i]?.name || g.name })), replay: true };
+    });
+  }
+
+  /** Delete a socket group (delete_socket_group); later groups move up by one. */
+  async deleteSocketGroup(group: number): Promise<SkillEditResult> {
+    return this.skillsEdit({ cmd: 'deleteSocketGroup', group });
+  }
+
+  /** Make a group the main skill group, optionally picking its active skill (set_main_skill). */
+  async setMainSkill(group: number, activeSkill?: number): Promise<SkillEditResult> {
+    return this.skillsEdit({ cmd: 'setMainSkill', group, ...(activeSkill !== undefined ? { activeSkill } : {}) });
+  }
+
+  /**
+   * A socket group edit: one skills undo entry and one journal record
+   * (`replayOf` the bridge's report; marked `replay`, which the bridge's
+   * test faults skip).
+   */
+  private async skillsEdit(
+    command: Record<string, unknown>,
+    replayOf: (res: Record<string, unknown>) => object = () => ({ ...command, replay: true }),
+  ): Promise<SkillEditResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    return this.withLock(async () => {
+      const snapshot = await this.snapshotSkillsUnlocked();
+      const entry: UndoEntry = { kind: 'skills', snapshot };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const { res, failure } = await this.sendBuildEditUnlocked<Record<string, unknown>>(command, entry, journal, () =>
+        this.restoreSkillsUnlocked(snapshot),
+      );
+      return this.commitAfterUnlocked(entry, journal, replayOf(res), async () => {
+        if (failure !== undefined) throw await this.editFailureAfterApplyUnlocked(failure);
+        const after = await this.bridge.getStats();
+        await this.refreshBuildInfoUnlocked();
+        const { ok: _ok, ...details } = res;
+        return { details, mainSkill: this.buildInfo?.mainSkill ?? null, before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * Send a build edit (applyChanges or a socket group edit). When it fails
+   * with the engine alive, the bridge's record (buildEditApplied) says how
+   * far it got: not started (a refusal, or a failure before any change) is
+   * rethrown; applied in full is returned with the failure, to be committed
+   * (commitAfterUnlocked); started but not finished (or unknown) is rolled
+   * back with `rollback` and rethrown. The rollback must give back the
+   * committed state the command started from, compared by value as probe
+   * fallbacks compare it (`probe` with `fingerprint`). A rollback that fails
+   * or leaves the state different pushes the undo entry (undo can try again;
+   * nothing is journaled) and throws an internal error naming reset_build.
+   */
+  private async sendBuildEditUnlocked<R extends object>(
+    command: object,
+    entry: UndoEntry,
+    journal: number,
+    rollback: () => Promise<void>,
+  ): Promise<{ res: R & { ok?: true }; failure?: unknown }> {
+    const deps = { send: <T>(c: object) => this.bridge.send<T>(c) };
+    const before = await committedFingerprint(deps);
+    try {
+      return { res: await this.bridge.send<R & { ok: true }>(command) };
+    } catch (err) {
+      if (!this.bridge.isRunning()) throw err;
+      const record = await this.buildEditRecordUnlocked<R>();
+      if (record?.applied) return { res: record.applied, failure: err };
+      if (record && !record.started) throw err;
+      try {
+        await rollback();
+        // `rollbackCheck` marks the read for the bridge's buildEditRollbackInexact test fault.
+        const check = { send: <T>(c: object) => this.bridge.send<T>({ ...c, rollbackCheck: true }) };
+        const diff = fingerprintDiff(before, await committedFingerprint(check));
+        if (diff !== null) {
+          throw new Error(`rolling the build back after a failed build edit was not exact (${diff}); call reset_build`);
+        }
+      } catch (rollbackError) {
+        this.pushUndoEntryUnlocked(entry, journal);
+        throw withRestoreFailure(err, rollbackError);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The error to report for a build edit that was applied but failed: the
+   * recalculation runs (recalcAfterAppliedFailureUnlocked) and the cached
+   * build info (main skill) is re-read when the engine allows it.
+   */
+  private async editFailureAfterApplyUnlocked(failure: unknown): Promise<unknown> {
+    const error = await this.recalcAfterAppliedFailureUnlocked(failure);
+    await this.refreshBuildInfoUnlocked().catch(() => undefined);
+    return error;
+  }
+
+  /** Read right after a failed build edit: whether it started and what it applied. Null when it cannot be read. */
+  private async buildEditRecordUnlocked<R>(): Promise<{ started: boolean; applied: R | null } | null> {
+    try {
+      const res = await this.bridge.send<{ ok: true; started: boolean; applied: R | null }>({ cmd: 'buildEditApplied' });
+      const applied = res.applied && typeof res.applied === 'object' ? res.applied : null;
+      return { started: res.started === true, applied };
+    } catch (e) {
+      console.error('[pob-mcp] could not read what a failed build edit changed:', (e as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * The passive tree; with `masteries` (node ids or mastery names; a name
+   * lists every mastery of that name, allocated ones first) also each
+   * mastery's effect options (`masteryOptions`).
+   */
+  async getPassiveTree(masteries?: Array<string | number>): Promise<PassiveTreeInfo> {
     return this.withLock(async () => {
       const allocatedRes = await this.bridge.send<{ ok: true; nodes: TreeNodeInfo[] }>({
         cmd: 'getAllocatedNodesDetailed',
@@ -1245,12 +1820,18 @@ export class BuildSession {
       const summaryRes = await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({
         cmd: 'getPassiveTreeSummary',
       });
+      let masteryOptions: MasteryOptions[] | undefined;
+      if (masteries && masteries.length > 0) {
+        const res = await this.bridge.send<{ ok: true; masteries: MasteryOptions[] }>({ cmd: 'masteryOptions', nodes: masteries });
+        masteryOptions = (res.masteries ?? []).map((m) => ({ ...m, options: Array.isArray(m.options) ? m.options : undefined }));
+      }
       const allocated = allocatedRes.nodes ?? [];
       return {
         allocatedNodes: allocated,
         keystones: allocated.filter((n) => n.isKeystone),
         notables: allocated.filter((n) => n.isNotable),
         summary: summaryRes.summary,
+        ...(masteryOptions ? { masteryOptions } : {}),
       };
     });
   }
@@ -1377,6 +1958,92 @@ export class BuildSession {
 
   private treeSearchDeps(): { send<T>(command: object): Promise<T>; probe(request: ProbeRequest): Promise<ProbeResponse> } {
     return { send: (command) => this.bridge.send(command), probe: (request) => this.probeUnlocked(request) };
+  }
+
+  /**
+   * plan_passive_points (src/tree-plan.ts): the plan's steps are allocated
+   * for real inside one passive-tree scope (withPlanTreeScopeUnlocked), so
+   * nothing is committed, pushed to undo or journaled.
+   */
+  async planPassivePoints(opts: PlanPointsOptions): Promise<PlanPointsResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    validatePlanOptions(opts);
+    return this.withLock(() =>
+      this.withPlanTreeScopeUnlocked('plan_passive_points', (resetTree) =>
+        planPassivePoints({ ...this.treeSearchDeps(), resetTree }, opts),
+      ),
+    );
+  }
+
+  /**
+   * plan_respec: the bridge's `respecTree` changes the tree to the target
+   * (removals, then additions with PoB's paths; see nodeBatch.respec in
+   * lua/bridge.lua) inside one passive-tree scope, and the stats are read from
+   * the recalculated tree. When a path re-adds a node a removal took (the
+   * variant would list it in both lists), the tree is put back and the
+   * command runs again with those nodes kept (a few rounds at most).
+   */
+  async planRespec(target: Array<number | string>, keepAscendancy: boolean, keys: string[]): Promise<RespecRaw> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
+    if (target.length === 0) throw new UserError('target needs at least one node');
+    if (target.length > MAX_RESPEC_TARGET) throw new UserError(`target has ${target.length} nodes; at most ${MAX_RESPEC_TARGET}`);
+    return this.withLock(() =>
+      this.withPlanTreeScopeUnlocked('plan_respec', async (resetTree) => {
+        const readBase = async (): Promise<Stats> => (await this.probeUnlocked({ stats: keys, variants: [] })).base;
+        const points = async (): Promise<PassiveTreeSummary> =>
+          (await this.bridge.send<{ ok: true; summary: PassiveTreeSummary }>({ cmd: 'getPassiveTreeSummary' })).summary;
+        const before = await readBase();
+        const pointsBefore = await points();
+        type Raw = Omit<RespecRaw, 'before' | 'after' | 'pointsBefore' | 'pointsAfter'>;
+        let keep: number[] = [];
+        let res: Raw;
+        for (let round = 0; ; round++) {
+          const r = await this.bridge.send<Record<string, unknown>>({ cmd: 'respecTree', target, keepAscendancy, keep });
+          const list = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+          res = {
+            target: list(r.target),
+            removed: list(r.removed),
+            added: list(r.added),
+            deallocate: list(r.deallocate),
+            allocate: list(r.allocate),
+            readded: list(r.readded),
+          };
+          if (res.readded.length === 0 || round >= 4) break;
+          await resetTree();
+          keep = [...keep, ...res.readded];
+        }
+        return { ...res, before, after: await readBase(), pointsBefore, pointsAfter: await points() };
+      }),
+    );
+  }
+
+  /**
+   * Run `fn` on a temporary passive tree: the tree and the skills are
+   * snapshotted once and restored exactly once at the end (`resetTree`
+   * restores them mid-way), and the committed state is compared by value
+   * (`probe` with `fingerprint`) before and after; a difference is an
+   * internal error naming reset_build. The skills are part of the scope
+   * because a node that grants a skill (Radiant Crusade) adds or drops a
+   * socket group when it changes: a tree restore alone brings the group back
+   * with default fields and loses a main socket group pointing at it.
+   */
+  /** Skills last: the tree restore re-adds a granted group, the skills restore gives it its fields back. */
+  private async restoreTreeAndSkillsUnlocked(tree: TreeSnapshot, skills: SkillsSnapshot): Promise<void> {
+    await this.restoreTreeUnlocked(tree);
+    await this.restoreSkillsUnlocked(skills);
+  }
+
+  private async withPlanTreeScopeUnlocked<T>(tool: string, fn: (resetTree: () => Promise<void>) => Promise<T>): Promise<T> {
+    const deps = { send: <R>(c: object) => this.bridge.send<R>(c) };
+    const before = await committedFingerprint(deps);
+    const tree = await this.snapshotTreeUnlocked();
+    const skills = await this.snapshotSkillsUnlocked();
+    // Skills last: the tree restore re-adds a granted group, the skills restore gives it its fields back.
+    const restore = (): Promise<void> => this.restoreTreeAndSkillsUnlocked(tree, skills);
+    const result = await probeThenRestore(() => fn(restore), restore);
+    const diff = fingerprintDiff(before, await committedFingerprint(deps));
+    if (diff !== null) throw new Error(`${tool}: restoring the build afterwards was not exact (${diff}); call reset_build`);
+    return result;
   }
 
   /**
@@ -1926,6 +2593,15 @@ export class BuildSession {
         passiveTreeSummary: PassiveTreeSummary;
       }>({ cmd: 'diagnoseSnapshot' });
 
+      // The snapshot's stats cover only the bridge's default key list; the crit, hit and
+      // suppression checks need keys outside it, read as the probe's base (no recalc).
+      const extra = (await this.probeUnlocked({ stats: [...DIAGNOSTIC_EXTRA_STATS], variants: [] })).base;
+      const diagStats: Stats = { ...snap.stats };
+      for (const key of DIAGNOSTIC_EXTRA_STATS) {
+        const value = extra[key];
+        if (value !== undefined && value !== null) diagStats[key] = value;
+      }
+
       const tree: PassiveTreeInfo = {
         allocatedNodes: snap.allocatedNodes,
         keystones: snap.allocatedNodes.filter((n) => n.isKeystone),
@@ -1939,8 +2615,8 @@ export class BuildSession {
         return focus === cat;
       };
 
-      if (want('defense')) checks.push(...runDefenseDiagnostics(snap.stats));
-      if (want('offense')) checks.push(...runOffenseDiagnostics(snap.stats, snap.groups, tree));
+      if (want('defense')) checks.push(...runDefenseDiagnostics(diagStats));
+      if (want('offense')) checks.push(...runOffenseDiagnostics(diagStats, snap.groups, tree));
       if (want('qol')) checks.push(...runQoLDiagnostics(snap.groups, snap.items));
 
       const order: Record<DiagnosticCheck['severity'], number> = { critical: 0, warning: 1, info: 2 };
@@ -1949,17 +2625,22 @@ export class BuildSession {
     });
   }
 
+  /**
+   * suggest_upgrades. Each equipped slot's DPS / EHP contribution is measured
+   * by emptying it as unequip_item would (one probe variant per slot); slots
+   * are sorted by upgrade priority. The first `modSlots` measured slots (the
+   * target slot when one is given) get `suggestedMods`: the mods Path of
+   * Building's own weighted trade query generator weighs highest for that
+   * slot (topTradeMods; ~0.4-1 s a slot on the OccVortex fixture, so not
+   * every slot by default). Highest priority first: measured slots (empty
+   * ones first), then slots that could not be measured. Changes nothing.
+   */
   async suggestUpgrades(
     targetSlot?: string,
-    budget?: 'low' | 'medium' | 'high',
+    options: { modSlots?: number; modsPerSlot?: number } = {},
   ): Promise<UpgradeSuggestion[]> {
     return this.withLock(async () => {
       const baseline = await this.bridge.getStats();
-      const groupsRes = await this.bridge.send<{ ok: true; groups: SkillGroupInfo[] }>({
-        cmd: 'getSocketGroups',
-      });
-      const archetype = identifyArchetype(groupsRes.groups);
-
       const focusSlots = targetSlot
         ? [targetSlot]
         : ['Weapon 1', 'Weapon 2', 'Helmet', 'Body Armour', 'Gloves', 'Boots', 'Amulet', 'Ring 1', 'Ring 2', 'Belt'];
@@ -1990,7 +2671,6 @@ export class BuildSession {
             dpsContribution: 0,
             ehpContribution: 0,
             priority: 100,
-            suggestedMods: getSuggestedMods(slot, archetype, budget),
           });
           continue;
         }
@@ -2007,7 +2687,6 @@ export class BuildSession {
           dpsContribution: dpsLoss,
           ehpContribution: ehpLoss,
           priority: without ? computeUpgradePriority(dpsLoss, ehpLoss, baseline) : 0,
-          suggestedMods: getSuggestedMods(slot, archetype, budget),
           ...(r.error !== undefined ? { error: r.error } : {}),
         });
       }
@@ -2016,8 +2695,33 @@ export class BuildSession {
         if ((a.error === undefined) !== (b.error === undefined)) return a.error === undefined ? -1 : 1;
         if (a.empty && !b.empty) return -1;
         if (!a.empty && b.empty) return 1;
-        return (a.dpsContribution + a.ehpContribution) - (b.dpsContribution + b.ehpContribution);
+        // Higher priority = the slot matters less relative to the build (upgrade it first).
+        return b.priority - a.priority;
       });
+
+      // Suggested mods: PoB's weighted trade query for the highest-priority slots.
+      const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, focusSlots.length));
+      const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
+      // A failure the engine reported for its query (a UserError or an
+      // EngineCommandError: the engine answered in step) is recorded on its
+      // slot and the measurements are kept. Anything else fails the call and
+      // no further slot is queried: a query that ended the engine (a bridge
+      // timeout kills it and counts as a crash strike), as a crash part-way
+      // through any operation does, and a transport or protocol failure (a
+      // stdin write error, a reply that is not JSON), after which the next
+      // reply may not belong to the next query.
+      for (const s of out.filter((x) => x.error === undefined).slice(0, modSlots)) {
+        try {
+          const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
+          const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
+          s.suggestedMods = topTradeMods(raw, modsPerSlot);
+        } catch (e) {
+          if (!this.bridge.isRunning()) throw e;
+          if (e instanceof UserError) s.modsError = e.message;
+          else if (e instanceof EngineCommandError) s.modsError = `Path of Building's trade query generator failed: ${e.message}`;
+          else throw e;
+        }
+      }
       return out;
     });
   }
@@ -2318,8 +3022,217 @@ export interface TreeNodeInfo {
   isAscendancy: boolean;
   ascendancyName?: string | null;
   alloc: boolean;
+  /** An allocated mastery's chosen effect id. */
+  effect?: number;
   stats?: string[];
   linked?: number[];
+}
+
+/** A node allocate_nodes / deallocate_nodes added or removed. */
+export interface TreeEditNode {
+  id: number;
+  name: string;
+  type: string;
+  ascendancyName?: string;
+  /** What the node costs, as PoB counts points (class starts and ascendancy choice options cost none). */
+  pointCost: 'passive' | 'ascendancy' | 'none';
+}
+
+/** The bridge's report of a strict node batch (allocNodes / deallocNodes / treeEditApplied). */
+interface TreeEditApplied {
+  added?: unknown;
+  removed?: unknown;
+  masteries?: unknown;
+  /** Nothing changed (only masteries that already had their effect). */
+  unchanged?: boolean;
+}
+
+export interface TreeEditResult extends StatDiffResult {
+  /** Allocated by the change, in the order they joined the tree. */
+  added: TreeEditNode[];
+  /** Deallocated by the change (dependents; another option of a choice node), by id. */
+  removed: TreeEditNode[];
+  /** Masteries given an effect (allocate_nodes `masteries`). */
+  masteries?: MasteryChoice[];
+  /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
+  unchanged?: boolean;
+  /** The tree after the change (point counts). */
+  summary: PassiveTreeSummary;
+}
+
+function xmlAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * new_build's request, sent as the build XML (see BuildSession.newBuild and
+ * basics.newBuildRequest in lua/bridge.lua): <PathOfBuilding> with one
+ * <MCPNewBuild/> carrying the arguments given.
+ */
+export function newBuildRequestXML(spec: NewBuildSpec): string {
+  const attrs = (['className', 'ascendancy', 'secondaryAscendancy', 'level', 'treeVersion'] as const)
+    .filter((k) => spec[k] !== undefined)
+    .map((k) => ` ${k}="${xmlAttr(String(spec[k]))}"`)
+    .join('');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<PathOfBuilding>
+	<MCPNewBuild${attrs}/>
+</PathOfBuilding>
+`;
+}
+
+function treeEditNodes(value: unknown): TreeEditNode[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((n: TreeEditNode) => ({
+    id: n.id,
+    name: n.name,
+    type: n.type,
+    ...(n.ascendancyName ? { ascendancyName: n.ascendancyName } : {}),
+    pointCost: n.pointCost === 'ascendancy' || n.pointCost === 'none' ? n.pointCost : 'passive',
+  }));
+}
+
+/** The bridge's report of an applyChanges command (lua/probe.lua). */
+interface RawApplyChanges {
+  added?: unknown;
+  removed?: unknown;
+  /** Ids the allocation added, in the order they joined the tree. */
+  allocOrder?: number[];
+  /** Each gem change's gem as PoB names it, or null. */
+  gemNames?: Array<string | null>;
+  /** The masteries given an effect, by id. */
+  masteries?: unknown;
+  /** Nothing changed (only masteries that already had their effect). */
+  unchanged?: boolean;
+}
+
+/** A mastery a committed change gave an effect (allocate_nodes, apply_changes). */
+export interface MasteryChoice {
+  id: number;
+  name?: string;
+  /** The chosen effect's id and text. */
+  effect: number;
+  stats?: string;
+  /** The effect it had before, when it was allocated already. */
+  previousEffect?: number;
+}
+
+function masteryChoices(value: unknown): MasteryChoice[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((m): m is MasteryChoice => typeof m === 'object' && m !== null && typeof m.id === 'number' && typeof m.effect === 'number')
+    .map((m) => ({
+      id: m.id,
+      ...(typeof m.name === 'string' ? { name: m.name } : {}),
+      effect: m.effect,
+      ...(typeof m.stats === 'string' ? { stats: m.stats } : {}),
+      ...(typeof m.previousEffect === 'number' ? { previousEffect: m.previousEffect } : {}),
+    }));
+}
+
+/** A mastery node's effect options (get_passive_tree `masteries`). */
+export interface MasteryOptions {
+  id?: number;
+  name?: string;
+  allocated?: boolean;
+  /** The chosen effect, when allocated. */
+  effect?: number;
+  /** Passive points of its path, when unallocated and reachable. */
+  points?: number;
+  /** False when no path from the allocated tree reaches it. */
+  reachable?: boolean;
+  options?: Array<{ effect: number; stats: string; takenBy?: number }>;
+  /** For a name with more masteries than listed: how many were left out. */
+  more?: number;
+}
+
+export interface ApplyChangesResult extends StatDiffResult {
+  /** Allocated by the change (the allocation's nodes, in the order they joined the tree, first). */
+  added: TreeEditNode[];
+  /** Deallocated by the change, by id. */
+  removed: TreeEditNode[];
+  /** Masteries given an effect. */
+  masteries?: MasteryChoice[];
+  /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
+  unchanged?: boolean;
+  /** The build's main skill after the change, when the variant set one. */
+  mainSkill?: string | null;
+  /** The tree after the change (point counts), when nodes changed. */
+  summary?: PassiveTreeSummary;
+}
+
+export interface CreateSocketGroupSpec {
+  gems: Array<{ name: string; level?: number; quality?: number; enabled?: boolean }>;
+  slot?: string;
+  label?: string;
+  enabled?: boolean;
+  setAsMain?: boolean;
+}
+
+export interface SkillEditResult extends StatDiffResult {
+  /** What the bridge reported (the new group, the deleted group, the main group). */
+  details: Record<string, unknown>;
+  /** The build's main skill after the change. */
+  mainSkill: string | null;
+}
+
+export interface NewBuildSpec {
+  className?: string;
+  ascendancy?: string;
+  secondaryAscendancy?: string;
+  level?: number;
+  treeVersion?: string;
+}
+
+/** What the bridge's blank build should load as (checked against the loaded build info). */
+interface NewBuildExpected {
+  class: string;
+  ascendancy: string;
+  secondaryAscendancy?: string;
+  level: number;
+  treeVersion: string;
+}
+
+export interface LevelChangeResult extends StatDiffResult {
+  /** The level and PoB's auto level mode before the change. */
+  previous: { level: number; autoMode: boolean };
+  level: number;
+  /** True when the level was already this, in manual mode: nothing was pushed or journaled. */
+  unchanged?: true;
+}
+
+export interface AscendancySpec {
+  className?: string;
+  ascendancy?: string;
+  secondaryAscendancy?: string;
+  allowTreeReset?: boolean;
+}
+
+/** Class, ascendancy and secondary ascendancy (names and PoB ids; "None" / 0 when there is none). */
+export interface ClassChoice {
+  className: string;
+  ascendancy: string;
+  secondaryAscendancy: string;
+  classId: number;
+  ascendClassId: number;
+  secondaryAscendClassId: number;
+}
+
+interface RawAscendancyChange {
+  unchanged?: boolean;
+  from: ClassChoice;
+  to: ClassChoice;
+  removed?: unknown;
+}
+
+export interface AscendancyChangeResult extends StatDiffResult {
+  from: ClassChoice;
+  to: ClassChoice;
+  /** Passives removed because they no longer connect (class / ascendancy start nodes left out). */
+  removed: TreeEditNode[];
+  summary: PassiveTreeSummary;
+  /** True when nothing changed: nothing was pushed or journaled. */
+  unchanged?: true;
 }
 
 export interface PassiveTreeSummary {
@@ -2408,6 +3321,8 @@ export interface PassiveTreeInfo {
   keystones: TreeNodeInfo[];
   notables: TreeNodeInfo[];
   summary: PassiveTreeSummary;
+  /** With get_passive_tree `masteries`: each mastery's effect options. */
+  masteryOptions?: MasteryOptions[];
 }
 
 export type { NodeRanking, RankBy, TreeSearchResult } from './tree-search.js';
@@ -2584,66 +3499,17 @@ export interface UpgradeSuggestion {
   dpsContribution: number;
   ehpContribution: number;
   priority: number;
-  suggestedMods: string[];
+  /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
+  suggestedMods?: SuggestedMod[];
+  /** PoB's trade query generator could not weigh mods for the slot (a refusal, or a failure of the generator). */
+  modsError?: string;
   /** The slot could not be measured (refused as input); its contributions are 0. */
   error?: string;
 }
 
-type BuildArchetype = 'archmage' | 'minion' | 'totem' | 'dot' | 'generic';
-
-function identifyArchetype(groups: SkillGroupInfo[]): BuildArchetype {
-  const main = groups.find((g) => g.isMainGroup) ?? groups[0];
-  if (!main) return 'generic';
-  const active = main.gems.find((g) => !g.isSupport);
-  const supports = main.gems.filter((g) => g.isSupport).map((g) => g.name);
-  const activeName = active?.name ?? '';
-
-  if (supports.some((s) => /Archmage/i.test(s))) return 'archmage';
-  if (
-    supports.some((s) => /Minion/i.test(s)) ||
-    /Summon|Raise|Animate/i.test(activeName)
-  ) {
-    return 'minion';
-  }
-  if (supports.some((s) => /Spell Totem|Ballista Totem/i.test(s))) return 'totem';
-  if (supports.some((s) => /Deadly Ailments|Swift Affliction|Void Manipulation/i.test(s))) return 'dot';
-  return 'generic';
-}
-
-function getSuggestedMods(
-  slot: string,
-  archetype: BuildArchetype,
-  budget?: 'low' | 'medium' | 'high',
-): string[] {
-  const mods: string[] = [];
-  if (['Helmet', 'Body Armour', 'Gloves', 'Boots', 'Belt'].includes(slot)) {
-    mods.push('Maximum Life', 'Elemental Resistances');
-  }
-  switch (archetype) {
-    case 'archmage':
-      mods.push('Maximum Mana', 'Mana Regeneration');
-      if (slot === 'Amulet') mods.push('-X to Total Mana Cost of Non-Channelling Skills');
-      break;
-    case 'minion':
-      mods.push('Minion Damage', 'Minion Attack/Cast Speed');
-      if (slot === 'Helmet') mods.push('+Level to Socketed Minion Gems');
-      break;
-    case 'dot':
-      mods.push('Damage over Time Multiplier', '+Level to Skill Gems');
-      break;
-    case 'totem':
-      mods.push('Totem Damage', '+1 Totem');
-      break;
-    default:
-      if (slot === 'Weapon 1') mods.push('Increased Damage', 'Critical Strike Chance', 'Attack/Cast Speed');
-      if (slot === 'Amulet') mods.push('Critical Strike Multiplier', '+Level to Skill Gems');
-      break;
-  }
-  if (slot === 'Boots') mods.push('Movement Speed');
-  if (slot === 'Gloves' && archetype !== 'minion') mods.push('Attack Speed', 'Accuracy');
-  if (slot === 'Body Armour' && budget === 'high') mods.push('Astramentis', 'Saviour, Mageblood, or Headhunter pairings');
-  return mods;
-}
+/** Slots that get suggested mods by default (PoB's trade query takes ~0.4-1 s a slot). */
+export const DEFAULT_MOD_SLOTS = 3;
+export const DEFAULT_MODS_PER_SLOT = 6;
 
 function computeUpgradePriority(dpsLoss: number, ehpLoss: number, baseline: Stats): number {
   const dpsBase = toNumber(baseline.CombinedDPS) || 1;
@@ -2654,6 +3520,9 @@ function computeUpgradePriority(dpsLoss: number, ehpLoss: number, baseline: Stat
   const score = (dpsRatio + ehpRatio) * 100;
   return Math.round(Math.max(0, 100 - score));
 }
+
+/** PoB output keys the diagnostics read that the bridge's default stat list does not return. */
+const DIAGNOSTIC_EXTRA_STATS = ['SpellSuppressionChance', 'CritChance', 'HitChance'] as const;
 
 function pct(n: Stats[string]): number {
   return Math.round(toNumber(n));

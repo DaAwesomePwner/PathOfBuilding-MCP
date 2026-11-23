@@ -18,6 +18,10 @@
 // the engine in chunks (PROBE_CHUNK) so no single bridge command nears its
 // timeout. Nothing is pushed to the undo stack or the crash-recovery journal:
 // the build never changes.
+// Masteries: one mastery change (allocating a mastery with an effect, or a
+// new effect on an allocated one) goes through the calculator with a copy of
+// the mastery node carrying that effect in place of the node; a main skill
+// (`mainSkill`) is set on the build for the calculator and put back.
 
 import type { Stats } from './lua-bridge.js';
 import { UserError, normalizeItemText, validateItemText, validateSlot } from './validation.js';
@@ -36,12 +40,30 @@ export type ProbeGemChange =
 export type ProbeItemChange = { slot: string; itemText: string } | { slot: string; unequip: true };
 
 /**
+ * A mastery and the effect to choose on it. `node` is a node id or a mastery
+ * name (a name several reachable masteries share is refused with their ids);
+ * `effect` an effect id or its text (a whole effect, one of its lines, or a
+ * part of its text only one of the node's effects has).
+ */
+export interface ProbeMasteryChoice {
+  node: number | string;
+  effect: number | string;
+}
+
+/** The main skill to evaluate the variant with (as set_main_skill sets it); 1-based. */
+export interface ProbeMainSkill {
+  group: number;
+  activeSkill?: number;
+}
+
+/**
  * One what-if variant of the committed build. Changes combine; they apply in
  * this order: config, gems (in list order; indices refer to the group as it
- * is when that change applies), items, then passive nodes.
+ * is when that change applies), items, passive nodes (deallocations, then
+ * allocations and masteries), then the main skill.
  */
 export interface ProbeVariant {
-  /** Node ids to allocate, each together with its path from the allocated tree. Masteries are refused. */
+  /** Node ids to allocate, each together with its path from the allocated tree. Masteries go in `masteries`. */
   allocate?: number[];
   /** Allocated node ids to remove, each together with every node that depends on it. */
   deallocate?: number[];
@@ -53,6 +75,14 @@ export interface ProbeVariant {
   gems?: ProbeGemChange[];
   /** Config options, validated like set_config. */
   config?: Record<string, unknown>;
+  /**
+   * Masteries to allocate (with their path) with the given effect, or
+   * allocated ones to give another effect. Each effect can be chosen on one
+   * mastery only.
+   */
+  masteries?: ProbeMasteryChoice[];
+  /** Evaluate the variant with this socket group (and active skill) as the main skill. */
+  mainSkill?: ProbeMainSkill;
 }
 
 export interface ProbeRequest {
@@ -153,8 +183,9 @@ export function validateProbeRequest(request: unknown): ProbeRequest {
  * validation (set_config's schema takes booleans, numbers and strings only,
  * so a null value is refused here too). Returns the variant to send to the
  * engine: item text normalized as swap_item sends it (a leading BOM removed).
+ * apply_changes checks its variant with it too.
  */
-async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<ProbeVariant> {
+export async function checkVariant(deps: Pick<ProbeDeps, 'validateConfig'>, variant: unknown): Promise<ProbeVariant> {
   if (!isPlainObject(variant)) throw new UserError('each variant must be an object');
   let toEngine = variant;
   if (Array.isArray(variant.items)) {
@@ -187,7 +218,7 @@ async function checkVariant(deps: ProbeDeps, variant: unknown): Promise<ProbeVar
 function checkFallbackCap(count: number): void {
   if (count > MAX_FALLBACK_VARIANTS) {
     throw new UserError(
-      `${count} variants need a full recalculation each (several node changes in one variant, jewel ` +
+      `${count} variants need a full recalculation each (several node or mastery changes in one variant, jewel ` +
         `sockets, skill-granting nodes or items); at most ${MAX_FALLBACK_VARIANTS} are allowed per call`,
     );
   }
@@ -212,13 +243,14 @@ function chunks<T>(list: T[], size: number): T[][] {
   return out;
 }
 
-async function committedFingerprint(deps: ProbeDeps): Promise<string[]> {
+/** The committed state by value (lua/probe.lua's fingerprint); apply_changes compares it around a rollback too. */
+export async function committedFingerprint(deps: Pick<ProbeDeps, 'send'>): Promise<string[]> {
   const res = await deps.send<{ fingerprint: unknown }>({ cmd: 'probe', fingerprint: true });
   return Array.isArray(res.fingerprint) ? (res.fingerprint as string[]) : [];
 }
 
 /** The first line that differs between two fingerprints, or null. */
-function fingerprintDiff(a: string[], b: string[]): string | null {
+export function fingerprintDiff(a: string[], b: string[]): string | null {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     if (a[i] !== b[i]) return `${a[i] ?? '(none)'} -> ${b[i] ?? '(none)'}`;
   }

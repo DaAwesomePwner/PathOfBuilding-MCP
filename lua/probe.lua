@@ -9,8 +9,16 @@
 --      2.67 exports them in pairs() order),
 --      gem lists (changed gems are copies; the original gem objects are put
 --      back), items (each assigned to its slot under a free item id, or the
---      slot emptied for an `unequip` entry);
+--      slot emptied for an `unequip` entry), `modLines` (custom-modifier
+--      lines read from a copy of the config mod list; see applyModLines);
+--      `mainSkill` (build.mainSocketGroup and the group's mainActiveSkill,
+--      which the calculator reads, set after every other change);
 --   2. calcFunc({ addNodes / removeNodes }, useFullDPS) runs on that data;
+--      one mastery change (`masteries`: allocating a mastery with an effect,
+--      or a new effect on an allocated one) passes a copy of the mastery
+--      node with that effect's stats (masteryEffectNode, as PoB's power
+--      builder evaluates mastery effects) in addNodes, with its path, or in
+--      place of the allocated node (removeNodes holds the node itself);
 --   3. every data change is undone, in reverse order.
 -- After the whole command the committed state is compared with a fingerprint
 -- taken before it (gem lists, config input, item slots and items, allocated
@@ -23,8 +31,10 @@
 -- snapshot and its exact restore (BuildSession.probe does this; `treeOnly`
 -- marks a single node change that touches no skill, for which a passive-tree
 -- snapshot and restore are enough). They are:
---   * more than one node change (allocate/deallocate together, or several of
---     either): PoB recomputes paths/dependencies after every single change;
+--   * more than one node change (allocate/deallocate together, several of
+--     either, mastery changes counted as node changes): PoB recomputes
+--     paths/dependencies after every single change;
+--   * a mastery change on a mastery in a timeless jewel's radius;
 --   * a node change touching a cluster-jewel socket or expansion node, a
 --     jewel socket holding a jewel, a multiple-choice option, or a node that
 --     grants a skill (the skill's socket group exists only after a full recalc);
@@ -183,7 +193,9 @@ return function(ctx)
 	end
 
 	-- Validate a variant's node lists against the committed tree (user errors
-	-- before any change). Returns the nodes to allocate and to deallocate.
+	-- before any change). Returns the nodes to allocate, the nodes to
+	-- deallocate and the mastery choices (ctx.nodeBatch.resolveMasteries:
+	-- { node, id, effect } each).
 	function M.checkNodes(variant)
 		local spec = build.spec
 		local alloc = optArray(variant.allocate, "allocate", M.MAX_NODE_LIST)
@@ -194,9 +206,7 @@ return function(ctx)
 			local node = nodeById(spec, id, "allocate[" .. i .. "]")
 			if seen[node] then userError("Node " .. nodeLabel(node) .. " is listed twice") end
 			seen[node] = true
-			if node.type == "Mastery" then
-				userError("Node " .. nodeLabel(node) .. " is a mastery; probe cannot allocate masteries (they need an effect choice)")
-			end
+			if node.type == "Mastery" then userError(ctx.nodeBatch.masteryInNodes(node)) end
 			if node.alloc then userError("Node " .. nodeLabel(node) .. " is already allocated") end
 			if not node.path or #node.path == 0 then
 				userError("Node " .. nodeLabel(node) .. " cannot be allocated: no path from the allocated tree reaches it")
@@ -213,7 +223,36 @@ return function(ctx)
 			if not node.alloc then userError("Node " .. nodeLabel(node) .. " is not allocated") end
 			removeList[#removeList + 1] = node
 		end
-		return addList, removeList
+		local skip, removed = { }, { }
+		for node in pairs(seen) do skip[node.id] = true end
+		-- What the deallocations remove (each node with its dependents): a
+		-- mastery among them is refused, so the calculator path (which drops
+		-- it with its node) and a fallback / apply_changes (which would
+		-- deallocate it and allocate it again with a path) never disagree.
+		for _, node in ipairs(removeList) do
+			for _, dep in ipairs(node.depends or { }) do removed[dep.id] = true end
+		end
+		local masteries = ctx.nodeBatch.resolveMasteries(variant.masteries, { skip = skip, removed = removed })
+		return addList, removeList, masteries
+	end
+
+	-- A copy of mastery `node` with effect `effectId` chosen, as
+	-- PassiveSpec:BuildAllDependsAndPaths makes an allocated mastery (sd =
+	-- the effect's lines, tree:ProcessStats) and as CalcsTab's power builder
+	-- evaluates a mastery effect: the calculator reads the copy in place of
+	-- the node (same id), so the committed node is never changed.
+	local function masteryEffectNode(node, effectId)
+		local copy = { }
+		for k, v in pairs(node) do copy[k] = v end
+		local effect = build.spec.tree.masteryEffects[effectId]
+		local sd = { }
+		for i, line in ipairs(effect and effect.sd or { }) do sd[i] = line end
+		copy.sd = sd
+		copy.allMasteryOptions = false
+		copy.unknown, copy.extra = nil, nil
+		copy.grantedSkills = { } -- calcs.buildModListForNode wipes this table
+		build.spec.tree:ProcessStats(copy)
+		return copy
 	end
 
 	-- The node set one change touches, exactly as PassiveSpec:AllocNode /
@@ -531,6 +570,60 @@ return function(ctx)
 	end
 
 	-- ------------------------------------------------------------------
+	-- Main skill
+	-- ------------------------------------------------------------------
+
+	-- `mainSkill = { group, activeSkill? }`: the variant's stats are those
+	-- with that socket group as the main skill group (and, with activeSkill,
+	-- that active skill of it as the group's main one), as set_main_skill
+	-- makes it. The group is checked against the groups as they are now
+	-- (gem changes never add or remove groups); its active skill count when
+	-- it applies, after the variant's gem changes.
+	function M.checkMainSkill(variant)
+		local ms = variant.mainSkill
+		if ms == nil then return nil end
+		if type(ms) ~= "table" or (next(ms) ~= nil and isArray(ms)) then userError("mainSkill must be { group, activeSkill? }") end
+		if not isInt(ms.group, 1) then userError("mainSkill.group must be a 1-based integer") end
+		if ms.activeSkill ~= nil and not isInt(ms.activeSkill, 1) then userError("mainSkill.activeSkill must be a 1-based integer") end
+		ctx.buildEdit.groupAt(ms.group)
+		return { group = ms.group, activeSkill = ms.activeSkill }
+	end
+
+	-- The group, once its active skills are checked as set_main_skill checks them.
+	function M.mainSkillGroup(ms)
+		local group = ctx.buildEdit.groupAt(ms.group)
+		local count = ctx.buildEdit.activeSkillCount(group)
+		if count == 0 then
+			userError("mainSkill: skill group " .. ms.group .. " has no enabled active skill gem to use as the main skill")
+		end
+		if ms.activeSkill ~= nil and ms.activeSkill > count then
+			userError("mainSkill: activeSkill " .. ms.activeSkill .. " is out of range: skill group " .. ms.group .. " has " .. count .. " active skill(s)")
+		end
+		return group
+	end
+
+	-- Set the main skill (build.mainSocketGroup, the group's mainActiveSkill)
+	-- for the calculator, which reads both; returns the undo.
+	local function applyMainSkill(ms)
+		local group = M.mainSkillGroup(ms)
+		local main, active = build.mainSocketGroup, group.mainActiveSkill
+		build.mainSocketGroup = ms.group
+		if ms.activeSkill ~= nil then group.mainActiveSkill = ms.activeSkill end
+		return function()
+			build.mainSocketGroup = main
+			group.mainActiveSkill = active
+		end
+	end
+
+	-- Set it for real, as the bridge's setMainSkill does (a full recalc follows).
+	local function commitMainSkill(ms)
+		local group = M.mainSkillGroup(ms)
+		build.mainSocketGroup = ms.group
+		if ms.activeSkill ~= nil then group.mainActiveSkill = ms.activeSkill end
+		build.buildFlag = true
+	end
+
+	-- ------------------------------------------------------------------
 	-- Config
 	-- ------------------------------------------------------------------
 
@@ -584,6 +677,90 @@ return function(ctx)
 			error(err, 0)
 		end
 		return undo, orig
+	end
+
+	-- ------------------------------------------------------------------
+	-- Mod lines (stat_weights)
+	-- ------------------------------------------------------------------
+
+	-- `modLines`: item-style mod lines added to the config mod list as PoB's
+	-- Custom modifiers box adds them (ConfigTab:BuildModList: escapes
+	-- stripped, trimmed, modLib.parseMod; a line with unparsed text left over
+	-- is skipped there, so it is refused here). The committed config mod list
+	-- is never written: the calculator reads a copy with the lines' mods
+	-- appended, after every mod BuildModList adds (the order a line appended
+	-- to the custom modifier text would have), and the original list object
+	-- is put back afterwards. Only for calculator variants: the full-recalc
+	-- fallback and apply_changes have no way to apply them.
+	M.MAX_MOD_LINES = 20
+	M.MAX_PARSE_LINES = 500
+	M.MAX_MOD_LINE_LENGTH = 300
+
+	-- The mods of one line, or nil and why PoB cannot use it.
+	local function parseModLine(line)
+		local stripped = StripEscapes(line):match("^%s*(.-)%s*$")
+		if stripped == "" then return nil, "empty line" end
+		local mods, extra = modLib.parseMod(stripped)
+		if not mods then return nil, "not recognised by Path of Building's mod parser" end
+		if extra then return nil, "only partly recognised by Path of Building's mod parser (left over: \"" .. tostring(extra) .. "\")" end
+		local n = 0
+		for _, mod in pairs(mods) do
+			n = n + 1
+			if type(mod) == "table" and mod.name == "ExtraSkill" then return nil, "grants a skill (not supported)" end
+		end
+		if n == 0 then return nil, "parsed to no modifier" end
+		return mods
+	end
+
+	local function checkModLineText(line, label)
+		if type(line) ~= "string" or line:find("[\r\n]") or #line > M.MAX_MOD_LINE_LENGTH then
+			userError(label .. " must be one line of text of at most " .. M.MAX_MOD_LINE_LENGTH .. " characters")
+		end
+	end
+
+	-- A variant's modLines as one list of mods (copies, so the source can be set).
+	local function checkModLines(variant)
+		local lines = optArray(variant.modLines, "modLines", M.MAX_MOD_LINES)
+		local out = { }
+		for i, line in ipairs(lines) do
+			checkModLineText(line, "modLines[" .. i .. "]")
+			local mods, why = parseModLine(line)
+			if not mods then userError("mod line \"" .. line .. "\" cannot be used: " .. why) end
+			for _, mod in ipairs(mods) do out[#out + 1] = mod end
+		end
+		return out
+	end
+
+	local function applyModLines(mods)
+		local configTab = build.configTab
+		local orig = configTab.modList
+		local copy = ctx.construct("ModList")
+		copy:AddList(orig)
+		for _, mod in ipairs(mods) do copy:AddMod(modLib.setSource(mod, "Custom")) end
+		configTab.modList = copy
+		return function() configTab.modList = orig end
+	end
+
+	-- `probe` with `parseModLines`: whether PoB can use each line (nothing is
+	-- computed or changed).
+	function M.parseModLines(lines)
+		if not isArray(lines) then userError("parseModLines must be an array of mod lines") end
+		if #lines > M.MAX_PARSE_LINES then
+			userError("parseModLines has " .. #lines .. " entries; at most " .. M.MAX_PARSE_LINES .. " are allowed")
+		end
+		local out = { }
+		for i, line in ipairs(lines) do
+			checkModLineText(line, "parseModLines[" .. i .. "]")
+			local mods, why = parseModLine(line)
+			if mods then
+				local n = 0
+				for _ in pairs(mods) do n = n + 1 end
+				out[i] = { ok = true, mods = n }
+			else
+				out[i] = { ok = false, reason = why }
+			end
+		end
+		return { lines = out }
 	end
 
 	-- ------------------------------------------------------------------
@@ -746,26 +923,75 @@ return function(ctx)
 		if type(variant) ~= "table" or (next(variant) ~= nil and isArray(variant)) then
 			userError("each variant must be an object")
 		end
-		local addList, removeList = M.checkNodes(variant)
+		local addList, removeList, masteries = M.checkNodes(variant)
 		local parsedItems, reason = M.checkItems(variant)
+		local itemReason = reason
 		local config = checkConfig(variant)
 		local gems = optArray(variant.gems, "gems", M.MAX_GEM_CHANGES)
 		for i, ch in ipairs(gems) do checkGemChange(ch, i) end
-		local nodeSet, adding = nil, false
-		if #addList + #removeList > 1 then
+		local mainSkill = M.checkMainSkill(variant)
+		-- Mastery choices that change something: allocating a mastery, or a
+		-- new effect on an allocated one (its current effect again is a no-op).
+		local masteryChanges = { }
+		for _, m in ipairs(masteries) do
+			if not m.noop then masteryChanges[#masteryChanges + 1] = m end
+		end
+		local nodeSet, adding, swap = nil, false, nil
+		if #addList + #removeList + #masteryChanges > 1 then
 			reason = reason or "more than one node change (paths are recomputed after each)"
 		elseif #addList == 1 then
 			nodeSet, adding = allocSet(addList[1]), true
 		elseif #removeList == 1 then
 			nodeSet = deallocSet(removeList[1])
+		elseif #masteryChanges == 1 then
+			local m = masteryChanges[1]
+			local effectNode = masteryEffectNode(m.node, m.effect)
+			if m.node.alloc then
+				-- A new effect on an allocated mastery: the calculator reads the
+				-- copy with that effect in place of the node.
+				swap = { add = effectNode, remove = m.node }
+				if m.node.conqueredBy then reason = reason or ("mastery " .. nodeLabel(m.node) .. " is in a timeless jewel's radius") end
+				if grantsSkill(effectNode) then reason = reason or ("mastery effect " .. m.effect .. " grants a skill") end
+				-- The effect it loses is checked as a deallocation is.
+				reason = reason or nodeFallbackReason(build.spec, { [m.node] = true }, false)
+			else
+				nodeSet, adding = allocSet(m.node), true
+				if nodeSet[m.node] then
+					nodeSet[m.node] = nil
+					nodeSet[effectNode] = true
+				end
+				if m.node.conqueredBy then reason = reason or ("mastery " .. nodeLabel(m.node) .. " is in a timeless jewel's radius") end
+			end
 		end
 		if nodeSet and not reason then
 			reason = nodeFallbackReason(build.spec, nodeSet, adding)
 		end
-		-- A fallback that only changes one node set and no skill: the caller
-		-- may snapshot and restore just the passive tree around it.
-		local treeOnly = reason ~= nil and nodeSet ~= nil and #parsedItems == 0 and config == nil and #gems == 0
-			and not touchesSkills(build.spec, nodeSet)
+		if mainSkill then
+			-- Socket groups granted by items or passives exist only after a
+			-- full recalculation, so a change that may add or remove one could
+			-- shift the group the index names: refused rather than guessed.
+			local changed = { }
+			for _, node in ipairs(addList) do
+				for n in pairs(allocSet(node)) do changed[n] = true end
+			end
+			for _, node in ipairs(removeList) do
+				for n in pairs(deallocSet(node)) do changed[n] = true end
+			end
+			for _, m in ipairs(masteryChanges) do
+				changed[m.node] = true
+				changed[masteryEffectNode(m.node, m.effect)] = true
+			end
+			local why = itemReason or (touchesSkills(build.spec, changed) and "a passive node change adds or removes a skill") or nil
+			if why then
+				userError("mainSkill cannot be combined with a change that may add or remove skill groups (" .. why
+					.. "); make that change first, then pick the main skill by its new group index")
+			end
+		end
+		-- A fallback that only changes the passive tree and no skill: the
+		-- caller may snapshot and restore just the passive tree around it.
+		local touched = nodeSet or (swap and { [swap.add] = true, [swap.remove] = true })
+		local treeOnly = reason ~= nil and touched ~= nil and #parsedItems == 0 and config == nil
+			and #gems == 0 and mainSkill == nil and not touchesSkills(build.spec, touched)
 		-- With the party tab's "export buffs" option on, CalcPerform computes
 		-- the MAIN pass differently from the CALCULATOR pass (only MAIN collects
 		-- buff exports, and that branch can apply non-unique flasks to a minion
@@ -775,9 +1001,14 @@ return function(ctx)
 		if build.partyTab and build.partyTab.enableExportBuffs then
 			reason = reason or "the party tab's export-buffs option is on"
 		end
+		local modLines = checkModLines(variant)
+		if #modLines > 0 and reason then
+			userError("modLines cannot be combined with a change that needs a full recalculation (" .. reason .. ")")
+		end
 		return {
 			addList = addList, removeList = removeList, items = parsedItems, config = config, gems = gems,
-			nodeSet = nodeSet, adding = adding, fallbackReason = reason, treeOnly = treeOnly,
+			nodeSet = nodeSet, adding = adding, fallbackReason = reason, treeOnly = treeOnly, modLines = modLines,
+			masteries = masteries, swap = swap, mainSkill = mainSkill,
 		}
 	end
 
@@ -846,11 +1077,16 @@ return function(ctx)
 		local undos = { }
 		local ok, res = pcall(function()
 			if checked.config then undos[#undos + 1] = applyConfig(checked.config) end
+			if #checked.modLines > 0 then undos[#undos + 1] = applyModLines(checked.modLines) end
 			if #checked.gems > 0 then undos[#undos + 1] = applyGems(checked.gems) end
 			if #checked.items > 0 then undos[#undos + 1] = applyItems(checked.items) end
+			if checked.mainSkill then undos[#undos + 1] = applyMainSkill(checked.mainSkill) end
 			local override = { }
 			local result = { }
-			if checked.nodeSet then
+			if checked.swap then
+				override.addNodes = { [checked.swap.add] = true }
+				override.removeNodes = { [checked.swap.remove] = true }
+			elseif checked.nodeSet then
 				local ids, points = describeSet(checked.nodeSet)
 				if checked.adding then
 					override.addNodes = checked.nodeSet
@@ -896,6 +1132,7 @@ return function(ctx)
 		-- the caller compares before and after a fallback variant's restore.
 		if cmd.fingerprint then return { fingerprint = fingerprint(true) } end
 		if cmd.supportsFor ~= nil then return M.listSupports(cmd.supportsFor) end
+		if cmd.parseModLines ~= nil then return M.parseModLines(cmd.parseModLines) end
 		local keys = statKeyList(cmd.stats)
 		local variants = cmd.variants
 		if variants == nil then variants = { } end
@@ -1044,7 +1281,41 @@ return function(ctx)
 			end
 		end
 		table.sort(out, function(a, b) return a.id < b.id end)
+		if adding and cmd.includeMasteries then
+			return { nodes = out, names = names, masteries = M.masteryCandidates(spec, maxPoints, name) }
+		end
 		return { nodes = out, names = names }
+	end
+
+	-- `candidates = "allocate"` with `includeMasteries` (plan_passive_points):
+	-- every unallocated mastery a path of at most `maxPoints` points reaches,
+	-- with that path (tree side first, the mastery last), its points, and the
+	-- effects it offers that no other mastery has chosen (PoB's mastery popup
+	-- offers each effect once). Sorted by id; `name` records the names.
+	function M.masteryCandidates(spec, maxPoints, name)
+		local taken = { }
+		for _, effect in pairs(spec.masterySelections or { }) do taken[effect] = true end
+		local out = { }
+		for _, node in pairs(spec.nodes) do
+			if node.type == "Mastery" and not node.alloc and not node.ascendancyName and node.path and #node.path > 0 then
+				local set = allocSet(node)
+				local points = 0
+				for n in pairs(set) do
+					if countsAsPoint(n) then points = points + 1 end
+				end
+				local effects = { }
+				for _, e in ipairs(ctx.nodeBatch.masteryEffectList(node)) do
+					if not taken[e.effect] then effects[#effects + 1] = e end
+				end
+				if points <= maxPoints and #effects > 0 then
+					local ids = { }
+					for i = #node.path, 1, -1 do ids[#ids + 1] = name(node.path[i]) end
+					out[#out + 1] = { id = node.id, name = node.dn or "", type = node.type, nodes = ids, points = points, effects = effects }
+				end
+			end
+		end
+		table.sort(out, function(a, b) return a.id < b.id end)
+		return out
 	end
 
 	-- ------------------------------------------------------------------
@@ -1116,22 +1387,10 @@ return function(ctx)
 		return { active = activeData.name, supports = out, errors = errors }
 	end
 
-	-- A fallback variant, applied for real: the caller snapshots the whole
-	-- build before and restores it exactly after (BuildSession.probe).
-	function M.probeCommit(cmd)
-		flushPendingRecalc()
-		local keys = statKeyList(cmd.stats)
-		if cmd.useFullDPS ~= nil and type(cmd.useFullDPS) ~= "boolean" then userError("useFullDPS must be a boolean") end
-		local checked = checkVariant(cmd.variant)
-		local beforeIds = { }
-		for id in pairs(build.spec.allocNodes) do beforeIds[id] = true end
-		if checked.config then
-			-- The restore that follows puts the committed tables back.
-			local _, orig = applyConfig(checked.config)
-			ctx.stashCommittedConfigTables(orig, build.configTab.input)
-		end
-		if #checked.gems > 0 then applyGems(checked.gems) end
-		for _, p in ipairs(checked.items) do
+	-- Items of a checked variant equipped (or slots emptied) for real, as
+	-- the bridge's equipItem / unequipItem commands do.
+	local function commitItems(parsed)
+		for _, p in ipairs(parsed) do
 			if p.unequip then
 				-- As the bridge's unequipItem command does.
 				p.slot:SetSelItemId(0)
@@ -1142,13 +1401,35 @@ return function(ctx)
 				ctx.equipItemInSlot(p.slot.slotName, p.itemText)
 			end
 		end
+	end
+
+	-- A fallback variant, applied for real: the caller snapshots the whole
+	-- build before and restores it exactly after (BuildSession.probe).
+	function M.probeCommit(cmd)
+		flushPendingRecalc()
+		local keys = statKeyList(cmd.stats)
+		if cmd.useFullDPS ~= nil and type(cmd.useFullDPS) ~= "boolean" then userError("useFullDPS must be a boolean") end
+		local checked = checkVariant(cmd.variant)
+		if #checked.modLines > 0 then userError("modLines are only evaluated through the calculator") end
+		local beforeIds = { }
+		for id in pairs(build.spec.allocNodes) do beforeIds[id] = true end
+		if checked.config then
+			-- The restore that follows puts the committed tables back.
+			local _, orig = applyConfig(checked.config)
+			ctx.stashCommittedConfigTables(cmd.configToken, orig, build.configTab.input)
+		end
+		if #checked.gems > 0 then applyGems(checked.gems) end
+		commitItems(checked.items)
 		local function ids(list)
 			local out = { }
 			for i, node in ipairs(list) do out[i] = node.id end
 			return out
 		end
 		if #checked.removeList > 0 then ctx.deallocNodesBatch(ids(checked.removeList)) end
-		if #checked.addList > 0 then ctx.allocNodesBatch(ids(checked.addList)) end
+		if #checked.addList > 0 or #checked.masteries > 0 then
+			ctx.allocNodesBatch(ids(checked.addList), false, checked.masteries)
+		end
+		if checked.mainSkill then commitMainSkill(checked.mainSkill) end
 		build.buildFlag = true
 		local output = ctx.pumpAndRead()
 		local added, removed = { }, { }
@@ -1162,6 +1443,138 @@ return function(ctx)
 		local result = { stats = readStats(output, keys, cmd.useFullDPS == false), fallback = true }
 		if next(added) then result.nodesAdded, result.pointsAdded = describeSet(added) end
 		if next(removed) then result.nodesRemoved, result.pointsRemoved = describeSet(removed) end
+		return result
+	end
+
+	-- apply_changes: one variant applied for real and kept (BuildSession
+	-- takes a full snapshot first, for undo and to roll back a change that
+	-- fails part-way). Everything that can be checked against the committed
+	-- build is checked before anything changes: the variant as `probe` checks
+	-- it, and the gem changes by applying them to copies and undoing them.
+	-- Then, in the probe's order: config (as set_config sets it), gems (as
+	-- `probe` changes them; the copies stay), items (as equip_item /
+	-- unequip_item), deallocations, allocations (as the node batches),
+	-- recorded in ctx.buildEdit (see bridge.lua) once started and once
+	-- applied. Returns the nodes added (the allocation's nodes in the order
+	-- they joined the tree first) and removed, as nodeBatch.describe tables,
+	-- plus what a crash replay needs: `allocOrder` (the ids the allocation
+	-- added, in join order) and `gemNames` (each gem change's gem as PoB
+	-- names it, or null).
+	-- With `replay` (a crash replay of a committed apply_changes) the node
+	-- lists are applied as recorded: `deallocate` as requested, `allocate` in
+	-- join order, so every node is next to the tree when it is allocated and
+	-- the replay never depends on which of several equally short paths PoB
+	-- would pick.
+	function M.applyChanges(cmd)
+		flushPendingRecalc()
+		local edit, nodeBatch = ctx.buildEdit, ctx.nodeBatch
+		local variant = cmd.variant
+		if type(variant) ~= "table" or (next(variant) ~= nil and isArray(variant)) then userError("variant must be an object") end
+		if variant.modLines ~= nil then userError("modLines are only available to read-only probes (stat_weights)") end
+		local items, config, gems, allocIds, deallocIds, masteries, mainSkill
+		if cmd.replay == true then
+			items = M.checkItems(variant)
+			config = checkConfig(variant)
+			gems = variant.gems or { }
+			allocIds, deallocIds = variant.allocate or { }, variant.deallocate or { }
+			masteries = ctx.nodeBatch.resolveMasteries(variant.masteries, { replay = true })
+			mainSkill = M.checkMainSkill(variant)
+		else
+			local checked = checkVariant(variant)
+			items, config, gems, masteries, mainSkill = checked.items, checked.config, checked.gems, checked.masteries, checked.mainSkill
+			allocIds, deallocIds = { }, { }
+			for i, node in ipairs(checked.addList) do allocIds[i] = node.id end
+			for i, node in ipairs(checked.removeList) do deallocIds[i] = node.id end
+			if #masteries > 0 and nodeBatch.allNoop(masteries) and #allocIds + #deallocIds + #items + #gems == 0
+				and config == nil and mainSkill == nil then
+				-- Only masteries that already have their effect: nothing changes.
+				return nodeBatch.unchanged(masteries)
+			end
+		end
+		local gemNames = { }
+		if #gems > 0 or mainSkill then
+			-- Gem changes are tried on copies and undone; the main skill's
+			-- active skills are counted with them applied.
+			local ok, err = pcall(function()
+				local undo = #gems > 0 and applyGems(gems) or function() end
+				local cok, cerr = pcall(function()
+					if mainSkill then M.mainSkillGroup(mainSkill) end
+				end)
+				undo()
+				if not cok then error(cerr, 0) end
+			end)
+			if not ok then
+				-- applyGems undoes its own failed changes; anything but a refusal
+				-- may have left the gem lists different: roll back.
+				if not isUserErr(err) then edit.started() end
+				error(err, 0)
+			end
+			for i, ch in ipairs(gems) do
+				gemNames[i] = ch.name ~= nil and lookupGem(ch.name, "gems[" .. i .. "]").name or jsonNull
+			end
+		end
+
+		local before = nodeBatch.captureAllocated()
+		edit.started()
+		if config then
+			-- Options that already hold their value change nothing: no copies.
+			local input, changes = build.configTab.input, false
+			for key, value in pairs(config) do
+				if not ctx.sameConfigValue(input[key], value) then
+					changes = true
+					break
+				end
+			end
+			if not changes then config = nil end
+		end
+		if config then
+			-- As set_config sets the options, but on copies of the config
+			-- tables (as probeCommit does), which stay live once the change is
+			-- committed; the committed tables are remembered unwritten under
+			-- the caller's `configToken` (stashCommittedConfigTables), so the
+			-- rollback or the undo of this change, sent with that token
+			-- (ConfigTables.restoreInput), puts them back with their pairs()
+			-- order. Writing keys into them and deleting them again may not
+			-- keep it (the string hash seed differs per process).
+			local orig = ctx.detachConfigTables(config)
+			ctx.stashCommittedConfigTables(cmd.configToken, orig, build.configTab.input)
+			build.configTab:BuildModList()
+			build.buildFlag = true
+		end
+		if #gems > 0 then
+			applyGems(gems)
+			build.buildFlag = true
+		end
+		edit.testFaultMidway(cmd.replay == true)
+		commitItems(items)
+		if #deallocIds > 0 then ctx.deallocNodesBatch(deallocIds) end
+		local allocOrder, masteryReport = { }, nil
+		if #allocIds > 0 or #masteries > 0 then
+			local res = ctx.allocNodesBatch(allocIds, false, masteries)
+			for i, node in ipairs(res.added) do allocOrder[i] = node.id end
+			masteryReport = res.masteries
+		end
+		if mainSkill then commitMainSkill(mainSkill) end
+		build.buildFlag = true
+
+		local added, listed = { }, { }
+		for _, id in ipairs(allocOrder) do
+			local node = build.spec.allocNodes[id]
+			if node and not before[id] then
+				added[#added + 1] = nodeBatch.describe(node)
+				listed[id] = true
+			end
+		end
+		local extra = { }
+		for id in pairs(build.spec.allocNodes) do
+			if not before[id] and not listed[id] then extra[#extra + 1] = id end
+		end
+		table.sort(extra)
+		for _, id in ipairs(extra) do added[#added + 1] = nodeBatch.describe(build.spec.allocNodes[id]) end
+		local result = { added = added, removed = nodeBatch.lostSince(before), allocOrder = allocOrder, gemNames = gemNames,
+			masteries = masteryReport, mainSkill = mainSkill }
+		edit.applied(result, cmd.replay == true)
+		runCallback("OnFrame")
 		return result
 	end
 

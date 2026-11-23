@@ -57,9 +57,11 @@ interface UpgradeResp {
     dpsContribution: number;
     ehpContribution: number;
     priority: number;
-    suggestedMods: string[];
+    suggestedMods?: Array<{ mod: string; weight: number }>;
+    modsError?: string;
     currentItemName: string | null;
   }>;
+  modsNote?: string;
 }
 
 async function main(): Promise<void> {
@@ -136,7 +138,17 @@ async function main(): Promise<void> {
     for (const s of sugAll.suggestions) {
       assert(typeof s.slot === 'string', 'slot string');
       assert(typeof s.priority === 'number', 'priority number');
-      assert(Array.isArray(s.suggestedMods), 'suggestedMods array');
+      if (s.suggestedMods !== undefined) {
+        assert(s.suggestedMods.every((m) => typeof m.mod === 'string' && typeof m.weight === 'number' && m.weight > 0), 'suggestedMods are {mod, weight}');
+      }
+    }
+    const withMods = sugAll.suggestions.filter((s) => s.suggestedMods !== undefined);
+    assert(withMods.length === 3 && withMods.every((s, i) => s === sugAll.suggestions[i]), 'the 3 highest-priority slots get PoB-weighted mods');
+    assert(typeof sugAll.modsNote === 'string', 'modsNote names the slots without suggested mods');
+    log(`  suggested mods for ${withMods.map((s) => s.slot).join(', ')}`);
+    const sugRanked = sugAll.suggestions.filter((s) => !s.empty);
+    for (let i = 1; i < sugRanked.length; i++) {
+      assert(sugRanked[i - 1].priority >= sugRanked[i].priority, 'suggest_upgrades is not sorted by priority (highest first)');
     }
     const afterSug = await getKeyStats(client);
     assert(approxEq(afterSug.Life, baseline.Life), 'Life restored after suggest_upgrades');
@@ -148,6 +160,7 @@ async function main(): Promise<void> {
     const sugSingle = JSON.parse(extractText(await call(client, 'suggest_upgrades', { slot: 'Body Armour' }))) as UpgradeResp;
     assert(sugSingle.suggestions.length === 1, `expected 1, got ${sugSingle.suggestions.length}`);
     assert(sugSingle.suggestions[0].slot === 'Body Armour', 'slot match');
+    assert((sugSingle.suggestions[0].suggestedMods?.length ?? 0) > 0 && sugSingle.modsNote === undefined, 'the given slot gets suggested mods');
     log(`  Body Armour DPS contribution: ${sugSingle.suggestions[0].dpsContribution}`);
     log('PASS: single-slot suggest works');
 

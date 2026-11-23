@@ -77,6 +77,16 @@
 //  16. On a non-boss build with an explicit enemyDamageType, boss-skill
 //      what-ifs (calculator and fallback; PoB's boss preset writes the damage
 //      type into the config input) leave the committed value.
+//  17. Masteries and the main skill (ConvertTreeMasteries.xml, a 3.24 tree):
+//      every free effect switch of the four allocated masteries and six
+//      unallocated masteries allocated with their path go through the
+//      calculator and equal allocNodes with `masteries` + full recalc; two
+//      mastery changes, or a mastery with a node, take the fallback and equal
+//      it too; a `mainSkill` variant for every socket group, a second active
+//      skill, one with a gem change and one with a mastery switch equal
+//      setMainSkill + full recalc; refusals (a mastery in `allocate`, an
+//      effect not offered or chosen elsewhere, not a mastery, a bad group or
+//      active skill) are per variant; the export stays byte-identical.
 import { mkdtempSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -1001,6 +1011,101 @@ async function main(): Promise<void> {
       assert(normalise(await session.exportXML()) === normalise(xml0), 'export changed (beyond node order)');
       assert(statDiffs(await session.getStats(), stats0b, keys).length === 0, 'get_stats changed');
       log('   enemyDamageType stays Melee after boss-skill what-ifs (calculator and fallback)');
+    }
+
+    // ------------------------------------------------------------------
+    log('17. Masteries and the main skill (ConvertTreeMasteries.xml, a 3.24 tree)');
+    {
+      await session.loadBuild(readFileSync(path.join(path.dirname(fixturePath), 'ConvertTreeMasteries.xml'), 'utf8'));
+      const xml0 = await session.exportXML();
+      const depth0 = undoDepth();
+      const mBase = (await probe([])).base;
+      const mKeys = Object.keys(mBase);
+      const allocatedMasteries = (await session.getPassiveTree()).allocatedNodes.filter((n) => n.type === 'Mastery').map((n) => n.id);
+      assert(allocatedMasteries.length === 4, `4 allocated masteries, got ${allocatedMasteries.length}`);
+      const listed = (await session.getPassiveTree([...allocatedMasteries, 'Life Mastery', 'Mana Mastery', 'Armour Mastery'])).masteryOptions ?? [];
+      const variants: ProbeVariant[] = [];
+      for (const m of listed.filter((x) => x.allocated)) {
+        for (const o of m.options ?? []) if (o.effect !== m.effect && o.takenBy === undefined) variants.push({ masteries: [{ node: m.id!, effect: o.effect }] });
+      }
+      const switches = variants.length;
+      for (const m of listed.filter((x) => !x.allocated && x.points !== undefined && x.points <= 4).slice(0, 6)) {
+        const o = (m.options ?? []).find((x) => x.takenBy === undefined);
+        if (o) variants.push({ masteries: [{ node: m.id!, effect: o.effect }] });
+      }
+      assert(switches >= 8 && variants.length >= switches + 3, `${switches} switches, ${variants.length - switches} allocations`);
+      const res = await probe(variants);
+      const mutate = (v: ProbeVariant) => (b: LuaBridge) => b.send({ cmd: 'allocNodes', nodeIds: [], masteries: v.masteries });
+      for (let i = 0; i < variants.length; i++) {
+        const r = res.results[i];
+        assert(!r.error && !r.fallback, `mastery variant ${JSON.stringify(variants[i])}: ${r.error ?? r.fallbackReason}`);
+        const m = await viaMutate(mutate(variants[i]));
+        const d = statDiffs(r.stats, m.stats, mKeys);
+        assert(d.length === 0, `mastery variant ${JSON.stringify(variants[i])}: probe differs from mutate: ${d.join('; ')}`);
+        if (i >= switches) assert((r.pointsAdded ?? 0) > 0 && r.nodesAdded?.includes(variants[i].masteries![0].node as number), `allocation reports its path: ${JSON.stringify(r)}`);
+      }
+      log(`   ${switches} effect switches and ${variants.length - switches} mastery allocations equal mutate + recalc (calculator)`);
+
+      // Two mastery changes, or a mastery with a node: the fallback, equal to mutate.
+      const notable = (await session.getReachableNodes()).find((n) => n.isNotable);
+      assert(notable, 'a reachable notable');
+      const firstChoice = variants[0].masteries![0];
+      const otherAlloc = variants.slice(switches).find((v) => v.masteries![0].effect !== firstChoice.effect);
+      assert(otherAlloc, 'an allocation with another effect than the first switch');
+      const multi: ProbeVariant[] = [
+        { masteries: [firstChoice, otherAlloc.masteries![0]] },
+        { allocate: [notable.id], masteries: [variants[1].masteries![0]] },
+      ];
+      const mr = await probe(multi);
+      for (let i = 0; i < multi.length; i++) {
+        const r = mr.results[i];
+        assert(!r.error && r.fallback, `multi ${i}: ${r.error ?? 'no fallback'}`);
+        const m = await viaMutate((b) => b.send({ cmd: 'allocNodes', nodeIds: multi[i].allocate ?? [], masteries: multi[i].masteries }));
+        assert(statDiffs(r.stats, m.stats, mKeys).length === 0, `multi ${i}: ${statDiffs(r.stats, m.stats, mKeys).join('; ')}`);
+      }
+
+      // Main skill: every group, a second active skill, with a gem change.
+      const groupCount = (await session.listSkillGroups()).length;
+      const msVariants: ProbeVariant[] = [];
+      for (let g = 1; g <= groupCount; g++) msVariants.push({ mainSkill: { group: g } });
+      msVariants.push({ mainSkill: { group: 2, activeSkill: 2 } });
+      msVariants.push({ gems: [{ op: 'set', group: 2, index: 1, level: 12 }], mainSkill: { group: 2 } });
+      msVariants.push({ masteries: [variants[0].masteries![0]], mainSkill: { group: 2, activeSkill: 2 } });
+      const ms = await probe(msVariants);
+      for (let i = 0; i < msVariants.length; i++) {
+        const v = msVariants[i];
+        const r = ms.results[i];
+        assert(!r.error && !r.fallback, `mainSkill variant ${JSON.stringify(v)}: ${r.error ?? r.fallbackReason}`);
+        const m = await viaMutate(async (b) => {
+          if (v.gems) await b.send({ cmd: 'setGemLevel', groupIndex: 2, gemIndex: 1, level: 12 });
+          if (v.masteries) await b.send({ cmd: 'allocNodes', nodeIds: [], masteries: v.masteries });
+          await b.send({ cmd: 'setMainSkill', group: v.mainSkill!.group, activeSkill: v.mainSkill!.activeSkill });
+        });
+        const d = statDiffs(r.stats, m.stats, mKeys);
+        assert(d.length === 0, `mainSkill variant ${JSON.stringify(v)}: probe differs from setMainSkill: ${d.join('; ')}`);
+      }
+      assert(ms.results[1].stats.CombinedDPS !== mBase.CombinedDPS, 'another main skill changes CombinedDPS');
+      log(`   ${msVariants.length} main skill variants equal setMainSkill + recalc`);
+
+      // Per-variant refusals; siblings still run.
+      const life = listed.find((m) => m.id === 2841)!;
+      const bad: ProbeVariant[] = [
+        { allocate: [variants[switches].masteries![0].node as number] },
+        { masteries: [{ node: 2841, effect: 41322 }] },
+        { masteries: [{ node: 2841, effect: (life.options ?? []).find((o) => o.takenBy !== undefined)!.effect }] },
+        { masteries: [{ node: notable.id, effect: 1 }] },
+        { mainSkill: { group: 99 } },
+        { mainSkill: { group: 2, activeSkill: 3 } },
+        variants[0],
+      ];
+      const br = await probe(bad);
+      const patterns = [/is a mastery/, /does not offer/, /already chosen on mastery/, /is not a mastery/, /not found at index 99/, /out of range/];
+      patterns.forEach((p, i) => assert(br.results[i].userError === true && p.test(br.results[i].error ?? ''), `bad ${i}: ${JSON.stringify(br.results[i])}`));
+      assert(!br.results[6].error && statDiffs(br.results[6].stats, res.results[0].stats, mKeys).length === 0, 'the good sibling still ran');
+
+      assert((await session.exportXML()) === xml0, 'mastery / main skill what-ifs changed the export');
+      assert(undoDepth() === depth0, 'undo depth changed');
+      log('   refusals are per variant; export byte-identical, undo depth unchanged');
     }
 
     log('ALL TESTS PASSED');

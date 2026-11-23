@@ -37,6 +37,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   // Build lifecycle: load_build may fetch a pastebin / pobb.in link.
   load_build: { ...REPLACES, idempotentHint: true, openWorldHint: true },
   reset_build: { ...REPLACES, idempotentHint: true },
+  // Replaces the build with a blank one (same arguments, same build).
+  new_build: { ...REPLACES, idempotentHint: true },
   // Discards the last change; it cannot be redone.
   undo_last_change: { ...UNDOABLE, destructiveHint: true },
   // Committed changes (undo_last_change reverts them)
@@ -44,6 +46,14 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   unequip_item: UNDOABLE,
   set_config: UNDOABLE,
   convert_tree_to_latest: UNDOABLE,
+  allocate_nodes: UNDOABLE,
+  deallocate_nodes: UNDOABLE,
+  apply_changes: UNDOABLE,
+  create_socket_group: UNDOABLE,
+  delete_socket_group: UNDOABLE,
+  set_main_skill: UNDOABLE,
+  set_character_level: { ...UNDOABLE, idempotentHint: true },
+  set_ascendancy: { ...UNDOABLE, idempotentHint: true },
   // Session-scoped stat snapshots only; the build is untouched.
   snapshot_and_compare: { ...UNDOABLE, idempotentHint: true },
   // Reads
@@ -66,6 +76,9 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   simulate_passive_change: READ_ONLY,
   find_best_next_nodes: READ_ONLY,
   find_worst_allocated_nodes: READ_ONLY,
+  // Steps / respec applied to a temporary tree and restored exactly.
+  plan_passive_points: READ_ONLY,
+  plan_respec: READ_ONLY,
   evaluate_keystone: READ_ONLY,
   swap_gem: READ_ONLY,
   compare_supports: READ_ONLY,
@@ -75,6 +88,14 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   compare_scenarios: READ_ONLY,
   toggle_buffs: READ_ONLY,
   suggest_upgrades: READ_ONLY,
+  stat_weights: READ_ONLY,
+  // Reads another build (may fetch a pastebin / pobb.in link) in a short-lived second engine.
+  compare_builds: { ...READ_ONLY, openWorldHint: true },
+  // PoB's item data: items are built in the engine, never added to the build.
+  search_items: READ_ONLY,
+  get_item_text: READ_ONLY,
+  list_item_mods: READ_ONLY,
+  build_item: READ_ONLY,
   // Trade (offline: builds a search link, never contacts the trade site)
   generate_trade_search: READ_ONLY,
   search_trade_mods: READ_ONLY,
