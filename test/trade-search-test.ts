@@ -2,7 +2,8 @@
  * generate_trade_search / search_trade_mods: URL shape, weighted query, weight
  * adjustments surviving the filter cap, required mods, min override, input
  * errors, the bridge's copy of PoB's pseudoMap / ignoredStats still matching
- * the installed TradeQueryGenerator.lua, and the build left unchanged.
+ * the installed TradeQueryGenerator.lua, the build left unchanged, then jewel
+ * sockets (tree sockets by jewelType, abyssal sockets the item has) and refusals.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -17,6 +18,21 @@ const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
 const bridgePath = path.resolve(testDir, '..', 'lua', 'bridge.lua');
 const LEAGUE = 'Settlers of Kalguur';
 const SEARCH_PREFIX = 'https://www.pathofexile.com/trade/search/Settlers%20of%20Kalguur?q=';
+const STANDARD_PREFIX = 'https://www.pathofexile.com/trade/search/Standard?q=';
+const STYGIAN_VISE = `Rarity: RARE
+Test Vise
+Stygian Vise
+Item Level: 80
+Implicits: 1
+Has 1 Abyssal Socket
++80 to maximum Life`;
+const ABYSS_EYE = `Rarity: RARE
+Test Eye
+Murderous Eye Jewel
+Item Level: 80
+Implicits: 0
++40 to maximum Life
++10% to Fire Resistance`;
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -30,7 +46,7 @@ interface Filter { tradeId: string; text: string; weight: number; source: string
 interface Search {
   url: string; filters: Filter[]; minWeightedSum: number; pobDefaultMinWeightedSum: number; itemCategory: string;
   droppedByCap: { count: number }; statWeights: { stat: string; weight: number }[]; calcSeconds: number;
-  filterBudget: number; capLifted: boolean;
+  filterBudget: number; capLifted: boolean; currentItem: string | null;
 }
 interface Query {
   query: {
@@ -120,6 +136,8 @@ function decodeQuery(url: string, prefix = SEARCH_PREFIX): Query {
   return q;
 }
 const search = (args: Record<string, unknown>) => ok<Search>('generate_trade_search', { slot: 'Helmet', league: LEAGUE, ...args });
+/** In Standard, where gear searches include scourge mods by default (jewel searches never do). */
+const jewelSearch = (args: Record<string, unknown>) => ok<Search>('generate_trade_search', { league: 'Standard', ...args });
 
 async function keyState(): Promise<string> {
   const stats = await ok<Record<string, Record<string, number>>>('get_stats');
@@ -324,7 +342,12 @@ async function main(): Promise<void> {
     await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, statWeights: [{ stat: 'NoSuchStat', weight: 1 }] }, /Unknown stat weight.*Valid stats:.*FullDPS/);
     await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, weightAdjustments: [{ tradeId: 'explicit stat"}', weight: 1 }] }, /Invalid trade stat id/);
     await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, requiredMods: [{ tradeId: 'explicit.stat_1' }] }, /Unknown trade stat id/);
-    await userError('generate_trade_search', { slot: 'Jewel 26725', league: LEAGUE }, /Unsupported slot.*Helmet/);
+    await userError('generate_trade_search', { slot: 'Jewel 26725', league: LEAGUE }, /Jewel 26725: the passive tree jewel socket is not allocated.*allocate_nodes/);
+    await userError('search_trade_mods', { slot: 'Jewel 26725', query: 'life' }, /not allocated.*Allocate node 26725/);
+    await userError('generate_trade_search', { slot: 'Jewel 1', league: LEAGUE }, /Unsupported slot.*Helmet.*allocated passive tree jewel sockets/);
+    await userError('generate_trade_search', { slot: 'Belt Abyssal Socket 1', league: LEAGUE }, /the item in Belt has 0 abyssal socket\(s\)/);
+    await userError('generate_trade_search', { slot: 'Helmet', league: LEAGUE, jewelType: 'abyss' }, /jewelType only applies to jewel sockets, not Helmet/);
+    await userError('search_trade_mods', { slot: 'Ring 1', query: 'life', jewelType: 'base' }, /jewelType only applies/);
     await userError('generate_trade_search', { slot: 'Helmet', league: 'a/b' }, /league/);
     await userError('generate_trade_search', { slot: 'Helmet', league: '   ' }, /league/);
     await userError('search_trade_mods', { slot: 'Nope', query: 'life' }, /Unsupported slot/);
@@ -396,6 +419,61 @@ async function main(): Promise<void> {
     assert((await keyState()) === before, 'Life/CombinedDPS/TotalEHP or export changed after trade searches');
     const undo = await call('undo_last_change');
     assert(undo.isError, 'trade searches must not push undo entries');
+    log('PASS');
+
+    // From here on the build is changed (a belt with an abyssal socket, an allocated socket).
+    log('Test 9: passive-tree jewel sockets (jewelType, category, options)');
+    const category = (s: Search) => decodeQuery(s.url, STANDARD_PREFIX).query.filters.type_filters.filters.category.option as string;
+    const weighted = (s: Search) => s.filters.filter((f) => f.weight > 0).length;
+    const treeBase = await jewelSearch({ slot: 'Jewel 36634' }); // a Cobalt (regular) jewel is socketed there
+    assert(category(treeBase) === 'jewel.base' && treeBase.itemCategory === 'BaseJewel', `regular jewel default: ${treeBase.itemCategory}`);
+    assert(weighted(treeBase) >= 5, `tree socket search should weigh mods: ${weighted(treeBase)}`);
+    const treeAbyss = await jewelSearch({ slot: 'Jewel 36634', jewelType: 'abyss' });
+    assert(category(treeAbyss) === 'jewel.abyss' && treeAbyss.itemCategory === 'AbyssJewel' && weighted(treeAbyss) >= 5, 'jewelType abyss');
+    const treeAny = await jewelSearch({ slot: 'Jewel 36634', jewelType: 'any' });
+    assert(category(treeAny) === 'jewel' && treeAny.itemCategory === 'AnyJewel' && weighted(treeAny) >= 5, 'jewelType any');
+    const noScourge = await jewelSearch({ slot: 'Jewel 36634', includeScourge: false });
+    assert(noScourge.url === treeBase.url, 'Standard league: jewel searches never include scourge, so false changes nothing');
+    const baseMods = await ok<{ itemCategory: string; mods: TradeMod[] }>('search_trade_mods', { slot: 'Jewel 36634', query: 'maximum life', limit: 100 });
+    const abyssMods = await ok<{ itemCategory: string; mods: TradeMod[] }>('search_trade_mods', { slot: 'Jewel 36634', query: 'maximum life', limit: 100, jewelType: 'abyss' });
+    assert(baseMods.itemCategory === 'BaseJewel' && abyssMods.itemCategory === 'AbyssJewel', 'search_trade_mods uses the jewel type\'s category');
+    assert(!baseMods.mods.some((m) => m.tradeId === lifeId) && abyssMods.mods.some((m) => m.tradeId === lifeId),
+      'flat maximum Life rolls on abyss jewels only');
+    for (const [extra, expect] of [
+      [{ sockets: 1 }, /sockets is not available for jewel sockets/],
+      [{ links: 2 }, /links is not available for Jewel 36634/],
+      [{ influences: ['shaper'] }, /influences do not apply to jewel sockets/],
+      [{ includeScourge: true }, /includeScourge true does not apply to jewel sockets/],
+      [{ includeEldritch: 'keepRegular' }, /only applies to/],
+    ] as [Record<string, unknown>, RegExp][]) {
+      await userError('generate_trade_search', { slot: 'Jewel 36634', league: 'Standard', ...extra }, expect);
+    }
+    log('PASS');
+
+    log('Test 10: abyssal sockets the item has');
+    const vise = await call('swap_item', { slot: 'Belt', itemText: STYGIAN_VISE });
+    assert(!vise.isError, `swap_item Stygian Vise: ${text(vise)}`);
+    const abyssal = await jewelSearch({ slot: 'Belt Abyssal Socket 1' }); // empty socket
+    assert(category(abyssal) === 'jewel.abyss' && abyssal.itemCategory === 'AbyssJewel' && weighted(abyssal) >= 5,
+      `abyssal socket search: ${abyssal.itemCategory}, ${weighted(abyssal)} weighted`);
+    assert((await jewelSearch({ slot: 'Belt Abyssal Socket 1', jewelType: 'abyss' })).url === abyssal.url, 'jewelType abyss is the abyssal default');
+    await userError('generate_trade_search', { slot: 'Belt Abyssal Socket 1', league: 'Standard', jewelType: 'base' }, /abyssal sockets hold only abyss jewels/);
+    await userError('generate_trade_search', { slot: 'Belt Abyssal Socket 2', league: 'Standard' }, /the item in Belt has 1 abyssal socket\(s\)/);
+    await userError('generate_trade_search', { slot: 'Belt Abyssal Socket 1', league: 'Standard', sockets: 1 }, /sockets is not available for jewel sockets/);
+    const abyssalMods = await ok<{ itemCategory: string; mods: TradeMod[] }>('search_trade_mods', { slot: 'Belt Abyssal Socket 1', query: 'maximum life' });
+    assert(abyssalMods.itemCategory === 'AbyssJewel' && abyssalMods.mods.some((m) => m.tradeId === lifeId), 'abyssal socket mods');
+    log('PASS');
+
+    log('Test 11: a socket allocated for the search; an abyss jewel there defaults to abyss');
+    const alloc = await call('allocate_nodes', { nodes: [26725] });
+    assert(!alloc.isError, `allocate_nodes 26725: ${text(alloc)}`);
+    const emptyTree = await jewelSearch({ slot: 'Jewel 26725' });
+    assert(category(emptyTree) === 'jewel.base' && weighted(emptyTree) >= 5, 'an empty tree socket defaults to base jewels');
+    const eye = await call('swap_item', { slot: 'Jewel 26725', itemText: ABYSS_EYE });
+    assert(!eye.isError && !('note' in JSON.parse(text(eye))), `abyss jewel into the allocated socket (no note): ${text(eye)}`);
+    const eyeSearch = await jewelSearch({ slot: 'Jewel 26725' });
+    assert(category(eyeSearch) === 'jewel.abyss' && eyeSearch.currentItem === 'Test Eye', `socketed abyss jewel defaults to abyss: ${eyeSearch.itemCategory}`);
+    assert(category(await jewelSearch({ slot: 'Jewel 26725', jewelType: 'base' })) === 'jewel.base', 'jewelType overrides the default');
     log('PASS');
     log('ALL TRADE SEARCH TESTS PASSED');
   } finally {

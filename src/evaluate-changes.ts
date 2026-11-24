@@ -379,7 +379,7 @@ export const variantSchema = z.object({
     )
     .max(MAX_VARIANT_ITEMS)
     .optional()
-    .describe('{ slot, itemText } (PoB "Copy item" text; Viscera items copied from the game, first line "Item Class: Viscera", need no Rarity line) equips as swap_item would; { slot, unequip: true } empties the slot.'),
+    .describe('{ slot, itemText } (PoB "Copy item" text; Viscera items copied from the game, first line "Item Class: Viscera", need no Rarity line) equips as swap_item would; { slot, unequip: true } empties the slot. A jewel for a passive-tree socket that is not allocated after the variant\'s node changes is refused (it would count for nothing): allocate the socket first or in the same variant.'),
   gems: z
     .array(gemChange)
     .max(MAX_VARIANT_GEMS)

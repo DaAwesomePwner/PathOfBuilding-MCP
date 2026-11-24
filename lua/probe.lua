@@ -926,6 +926,33 @@ return function(ctx)
 		local addList, removeList, masteries = M.checkNodes(variant)
 		local parsedItems, reason = M.checkItems(variant)
 		local itemReason = reason
+		-- A jewel for a passive-tree socket that is not allocated once this
+		-- variant's changes are made counts for nothing (CalcSetup skips the
+		-- socket): refused rather than reported as no difference. Refused
+		-- here only when nothing in the variant could allocate the socket or
+		-- change its cluster subgraph (no allocations or masteries, no other
+		-- tree-socket item); otherwise checkSocketsApplied decides after the
+		-- variant is applied (such variants always take the fallback path).
+		local socketItems = 0
+		for _, p in ipairs(parsedItems) do
+			if p.slot.nodeId then socketItems = socketItems + 1 end
+		end
+		local mayAllocate = #addList + #masteries > 0
+		for _, p in ipairs(parsedItems) do
+			local nodeId = p.slot.nodeId
+			if nodeId and not p.unequip and not mayAllocate and socketItems == 1 then
+				local node = build.spec.nodes[nodeId]
+				if not build.spec.allocNodes[nodeId] then
+					userError(ctx.unallocatedSocketText(p.slot.slotName, nodeId, true))
+				end
+				for _, removed in ipairs(removeList) do
+					if deallocSet(removed)[node] then
+						userError("Deallocating " .. nodeLabel(removed) .. " in the same variant also deallocates the jewel socket of "
+							.. p.slot.slotName .. ", so the jewel there would count for nothing")
+					end
+				end
+			end
+		end
 		local config = checkConfig(variant)
 		local gems = optArray(variant.gems, "gems", M.MAX_GEM_CHANGES)
 		for i, ch in ipairs(gems) do checkGemChange(ch, i) end
@@ -1387,6 +1414,25 @@ return function(ctx)
 		return { active = activeData.name, supports = out, errors = errors }
 	end
 
+	-- After a variant is applied for real (probeCommit, applyChanges): every
+	-- jewel it put in a passive-tree socket must sit in an allocated socket,
+	-- else it counts for nothing (checkVariant refuses the clear cases first).
+	-- The caller restores or rolls back the build after the user error.
+	local function checkSocketsApplied(parsed)
+		for _, p in ipairs(parsed) do
+			local nodeId = p.slot.nodeId
+			if nodeId and not p.unequip and not build.spec.allocNodes[nodeId] then
+				local parent = ctx.clusterParent(nodeId)
+				if parent then
+					userError("After this variant's changes " .. p.slot.slotName .. " is not on the passive tree: no cluster jewel in Jewel "
+						.. parent .. " adds that socket, so the jewel there would count for nothing")
+				end
+				userError("After this variant's changes " .. p.slot.slotName .. " is not allocated, so the jewel there would count "
+					.. "for nothing; allocate node " .. nodeId .. " in the variant (or first, with allocate_nodes)")
+			end
+		end
+	end
+
 	-- Items of a checked variant equipped (or slots emptied) for real, as
 	-- the bridge's equipItem / unequipItem commands do.
 	local function commitItems(parsed)
@@ -1429,6 +1475,7 @@ return function(ctx)
 		if #checked.addList > 0 or #checked.masteries > 0 then
 			ctx.allocNodesBatch(ids(checked.addList), false, checked.masteries)
 		end
+		checkSocketsApplied(checked.items)
 		if checked.mainSkill then commitMainSkill(checked.mainSkill) end
 		build.buildFlag = true
 		local output = ctx.pumpAndRead()
@@ -1554,6 +1601,8 @@ return function(ctx)
 			for i, node in ipairs(res.added) do allocOrder[i] = node.id end
 			masteryReport = res.masteries
 		end
+		-- A crash replay re-applies a committed change as it was.
+		if cmd.replay ~= true then checkSocketsApplied(items) end
 		if mainSkill then commitMainSkill(mainSkill) end
 		build.buildFlag = true
 

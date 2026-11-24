@@ -302,6 +302,7 @@ tools.engine<{ detail?: 'summary' | 'full'; includeItemText?: boolean }>(
     description:
       'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. ' +
       'An item in a slot Path of Building hides on this passive tree (Wickerman Head/Body/Arm/Leg off 3.30, Graft 1/2 off 3.27) is listed with hidden: true and a note: PoB still counts a hidden Wickerman item in its calculations but ignores a hidden graft; unequip_item removes either. ' +
+      'Abyss jewels in abyssal sockets carry the `parentSlot` of the item that has the socket; a jewel in an unallocated passive-tree socket is listed with `allocated: false` and a note (PoB ignores it). ' +
       'By default each mod is `{ line }` plus only its true flags (e.g. `crafted: true`), false item flags are left out and the item text is not included; ' +
       '`includeItemText: true` adds each item\'s PoB text as `raw`; `detail: "full"` returns every field (all flags and `raw`).',
     inputSchema: {
@@ -333,6 +334,7 @@ function summarizeStatDiff(result: StatDiffResult): unknown {
   return {
     diff: summary,
     keyDeltas: keyDeltas(result.diff),
+    ...(result.note !== undefined ? { note: result.note } : {}),
   };
 }
 
@@ -361,7 +363,8 @@ tools.engine<Record<string, never>>(
   'list_valid_slots',
   {
     description:
-      'List all currently valid equipment slot names (including any active jewel slots) along with whether each slot is occupied. Slots Path of Building hides on this passive tree are left out: the Wickerman slots (Head, Body, Arm, Leg) appear only on 3.30 trees, Graft 1/2 only on 3.27 trees.',
+      'List all currently valid equipment slot names along with whether each slot is occupied. Slots Path of Building hides on this passive tree are left out: the Wickerman slots (Head, Body, Arm, Leg) appear only on 3.30 trees, Graft 1/2 only on 3.27 trees. ' +
+      'Abyssal sockets ("<slot> Abyssal Socket N") are listed only where the item in their `parentSlot` has them. Every passive-tree jewel socket ("Jewel <nodeId>") is listed with `allocated`: a jewel in an unallocated socket counts for nothing (allocate it with allocate_nodes). A socket a cluster jewel adds that is not on the tree yet also has `requiresClusterIn` (the socket where a cluster jewel with jewel sockets must go first).',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -390,7 +393,7 @@ tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
-      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything.',
+      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything. A jewel can go in an unallocated passive-tree socket (PoB\'s UI hides such sockets, but a build can hold a jewel there) and counts for nothing until the socket is allocated; the result then carries a `note` saying what to do (for a socket a cluster jewel adds: socket that cluster jewel first).',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name.'),
       itemText: z
@@ -427,7 +430,7 @@ tools.engine<{ slot: string; items: string[] }>(
   'compare_items',
   {
     description:
-      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused.",
+      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused, and so is an unallocated passive-tree jewel socket (a jewel there counts for nothing; allocate it first with allocate_nodes).",
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot to compare in.'),
       items: z

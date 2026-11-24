@@ -1150,9 +1150,11 @@ export class BuildSession {
     });
   }
 
-  async searchTradeMods(slot: string, query: string, limit: number): Promise<TradeModsResult> {
+  async searchTradeMods(slot: string, query: string, limit: number, jewelType?: string): Promise<TradeModsResult> {
     return this.withLock(async () => {
-      const result = await this.bridge.send<{ ok: true } & TradeModsResult>({ cmd: 'searchTradeMods', slot, query, limit });
+      const result = await this.bridge.send<{ ok: true } & TradeModsResult>({
+        cmd: 'searchTradeMods', slot, query, limit, ...(jewelType !== undefined ? { jewelType } : {}),
+      });
       return { itemCategory: result.itemCategory, total: result.total, mods: result.mods };
     });
   }
@@ -1219,8 +1221,11 @@ export class BuildSession {
     const before = undoSnap.stats;
     const entry: UndoEntry = { kind: 'full', snapshot: undoSnap };
     const journal = this.bridge.committedCount();
+    let note: string | undefined;
     try {
-      await this.bridge.send(command);
+      const reply = await this.bridge.send<{ ok: true; note?: unknown }>(command);
+      // equipItem's note: a jewel put in an unallocated passive-tree socket counts for nothing yet.
+      if (typeof reply.note === 'string') note = reply.note;
     } catch (err) {
       // A refusal changed nothing; any other failure may have (undo reverts it) unless the engine is gone.
       if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
@@ -1228,7 +1233,7 @@ export class BuildSession {
     }
     return this.commitAfterUnlocked(entry, journal, command, async () => {
       const after = await this.bridge.getStats();
-      return { before, after, diff: computeDiff(before, after) };
+      return { before, after, diff: computeDiff(before, after), ...(note !== undefined ? { note } : {}) };
     });
   }
 
@@ -1236,7 +1241,8 @@ export class BuildSession {
     return this.withLock(async () => {
       // An unknown slot, or one PoB hides on this tree, is refused for the
       // whole call rather than once per candidate.
-      await this.bridge.send({ cmd: 'checkSlotUsable', slot });
+      // So is an unallocated passive-tree jewel socket (a jewel there counts for nothing).
+      await this.bridge.send({ cmd: 'checkSlotUsable', slot, whatIf: true });
       // Snapshot the slot's current item — still needed for the result's baseline.item field.
       const baselineItem = await this.snapshotSlotUnlocked(slot);
       const baselineStats = await this.bridge.getStats();
@@ -2948,8 +2954,12 @@ export interface EquippedItem {
   itemId: number;
   /** The slot is hidden by PoB on this passive tree (Wickerman off 3.30, grafts off 3.27). */
   hidden?: boolean;
-  /** For a hidden slot: why, and whether PoB still counts the item. */
+  /** For a hidden slot: why, and whether PoB still counts the item; for an unallocated jewel socket: that PoB ignores the jewel. */
   note?: string;
+  /** Abyssal sockets: the slot of the item that has the socket. */
+  parentSlot?: string;
+  /** false for a jewel in an unallocated passive-tree socket (left out otherwise). */
+  allocated?: false;
   rarity?: string;
   name?: string;
   title?: string;
@@ -2972,6 +2982,10 @@ export interface SlotInfo {
   occupied: boolean;
   itemName?: string | null;
   baseName?: string | null;
+  /** Abyssal sockets (listed only where the parent's item has them): the slot of that item. */
+  parentSlot?: string;
+  /** Passive-tree jewel sockets: whether the socket node is allocated (a jewel in an unallocated one counts for nothing). */
+  allocated?: boolean;
 }
 
 export interface SlotItem {
@@ -2987,6 +3001,8 @@ export interface StatDiffResult {
   before: Stats;
   after: Stats;
   diff: StatDiff;
+  /** swap_item into an unallocated passive-tree jewel socket: the jewel does nothing until it is allocated. */
+  note?: string;
 }
 
 export interface ComparisonCandidate {
