@@ -11,7 +11,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { setupTestEnv } from './_skip.js';
+import { BuildSession } from '../src/build-session.js';
+import { EngineCommandError, LuaBridge } from '../src/lua-bridge.js';
+import { tradeQueryCommand } from '../src/trade-search-command.js';
+import { setupTestEnv, type TestEnv } from './_skip.js';
+
+type TestPaths = TestEnv['paths'];
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
@@ -145,6 +150,143 @@ async function keyState(): Promise<string> {
   assert(!exported.isError, `export_build failed: ${text(exported)}`);
   const xml = text(exported);
   return JSON.stringify([stats.defense?.Life, stats.offense?.CombinedDPS, stats.defense?.TotalEHP, xml]);
+}
+
+interface FlaskSearch extends Search { flaskType?: string; testBase?: string; evaluatedActive?: boolean; activeNote?: string }
+type SlotRow = { slot: string; active?: boolean };
+
+/**
+ * Flask slots (OccVortex: Flask 1 Eternal Life, Flask 2 Granite, Flask 3
+ * Silver, Flask 4 Quicksilver, Flask 5 Divine Mana): every kind is weighed
+ * from PoB's flask mod list in the "flask" category; flaskType picks the flask
+ * the mods are tried on; an inactive slot is evaluated active (build, slot
+ * state and export unchanged); tinctures and misplaced flaskType are refused.
+ */
+async function test12Flasks(category: (s: Search) => string, weighted: (s: Search) => number): Promise<void> {
+  log('Test 12: flask slots (kinds, flaskType, inactive slot, tinctures)');
+  const flaskSearch = (args: Record<string, unknown>) => ok<FlaskSearch>('generate_trade_search', { league: 'Standard', ...args });
+  for (const [slot, kind] of [['Flask 1', 'life'], ['Flask 5', 'mana'], ['Flask 4', 'utility']] as const) {
+    const s = await flaskSearch({ slot });
+    assert(s.flaskType === kind && s.itemCategory === 'Flask' && category(s) === 'flask' && s.testBase === undefined,
+      `${slot}: ${kind} flask in the flask category: ${JSON.stringify({ ...s, url: undefined, filters: undefined })}`);
+    assert(s.evaluatedActive === undefined && weighted(s) > 0, `${slot}: active slot, weighted mods (${weighted(s)})`);
+    assert((await flaskSearch({ slot, flaskType: kind })).url === s.url, `${slot}: flaskType ${kind} is the default`);
+  }
+  // Another kind than the equipped one: the mods are tried on a blank flask of that kind.
+  const asUtility = await flaskSearch({ slot: 'Flask 1', flaskType: 'utility' });
+  assert(asUtility.flaskType === 'utility' && asUtility.testBase === 'Quicksilver Flask' && asUtility.currentItem !== null
+    && asUtility.minWeightedSum === 0 && category(asUtility) === 'flask', `flaskType utility on a life flask: ${JSON.stringify({ ...asUtility, url: undefined, filters: undefined })}`);
+  const mods = await ok<{ itemCategory: string; mods: TradeMod[] }>('search_trade_mods', { slot: 'Flask 1', query: 'during effect', flaskType: 'mana' });
+  assert(mods.itemCategory === 'Flask' && mods.mods.length > 0, 'search_trade_mods with flaskType');
+
+  // An inactive slot: PoB weighs every mod at 0 there, so it is evaluated active; nothing changes.
+  const on = await flaskSearch({ slot: 'Flask 2' });
+  const off = await call('set_flask_active', { slot: 'Flask 2', active: false });
+  assert(!off.isError, `set_flask_active: ${text(off)}`);
+  const inactiveState = await keyState();
+  const inactive = await flaskSearch({ slot: 'Flask 2' });
+  assert(inactive.evaluatedActive === true && /inactive/.test(inactive.activeNote ?? '') && weighted(inactive) > 0,
+    `inactive flask slot evaluated active: ${JSON.stringify({ ...inactive, url: undefined })}`);
+  assert(JSON.stringify(inactive.filters) === JSON.stringify(on.filters), 'an inactive slot gets the weights of the active slot');
+  assert((await keyState()) === inactiveState, 'the inactive flask search changed the build or its export');
+  const rows = await ok<{ slots: SlotRow[] }>('list_valid_slots');
+  assert(rows.slots.find((r) => r.slot === 'Flask 2')?.active === false, 'Flask 2 is still inactive');
+  assert(!(await call('set_flask_active', { slot: 'Flask 2', active: true })).isError, 'Flask 2 back on');
+
+  // An empty slot needs flaskType (search_trade_mods does not: every kind has the same mods).
+  assert(!(await call('unequip_item', { slot: 'Flask 4' })).isError, 'unequip Flask 4');
+  await userError('generate_trade_search', { slot: 'Flask 4', league: 'Standard' }, /the slot is empty, so pass flaskType/);
+  const emptyLife = await flaskSearch({ slot: 'Flask 4', flaskType: 'life' });
+  assert(emptyLife.testBase === 'Divine Life Flask' && emptyLife.currentItem === null && weighted(emptyLife) > 0, `empty slot, flaskType life: ${emptyLife.testBase}`);
+  const hybrid = await flaskSearch({ slot: 'Flask 4', flaskType: 'hybrid' });
+  assert(hybrid.flaskType === 'hybrid' && /Hybrid Flask$/.test(hybrid.testBase ?? ''), `hybrid stand-in: ${hybrid.testBase}`);
+  assert((await ok<{ mods: TradeMod[] }>('search_trade_mods', { slot: 'Flask 4', query: 'duration' })).mods.length > 0, 'mods for an empty flask slot');
+
+  // Tinctures: no tincture category in PoB's generator (equipped, or asked for).
+  const tincture = await ok<{ text: string }>('get_item_text', { base: 'Oakbranch Tincture' });
+  assert(!(await call('swap_item', { slot: 'Flask 4', itemText: tincture.text })).isError, 'tincture into Flask 4');
+  await userError('generate_trade_search', { slot: 'Flask 4', league: 'Standard' }, /holds a tincture.*no tincture category/);
+  await userError('search_trade_mods', { slot: 'Flask 4', query: 'life' }, /holds a tincture.*no tincture category/);
+  await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', flaskType: 'tincture' }, /"tincture" was asked for.*no tincture category/);
+  assert((await flaskSearch({ slot: 'Flask 4', flaskType: 'utility' })).testBase === 'Quicksilver Flask', 'a flask search over a tincture with flaskType');
+  // flaskType is for flask slots only.
+  await userError('generate_trade_search', { slot: 'Helmet', league: 'Standard', flaskType: 'life' }, /flaskType only applies to flask slots/);
+  await userError('search_trade_mods', { slot: 'Ring 1', query: 'life', flaskType: 'mana' }, /flaskType only applies to flask slots/);
+  await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', jewelType: 'base' }, /jewelType only applies to jewel sockets/);
+  log('PASS');
+}
+
+/** A weapon slot of the set the build does not use is refused (PoB weighs every mod at 0); compare_items notes it. */
+async function test13WeaponSwap(): Promise<void> {
+  log('Test 13: weapon swap slots of the set not in use');
+  const before = await keyState();
+  await userError('generate_trade_search', { slot: 'Weapon 1 Swap', league: 'Standard' }, /weapon set 2, which the build does not use.*weighs every mod at 0/);
+  await userError('generate_trade_search', { slot: 'Weapon 2 Swap Abyssal Socket 1', league: 'Standard' }, /weapon set 2, which the build does not use/);
+  // Listing mods does not depend on weights.
+  assert((await ok<{ mods: TradeMod[] }>('search_trade_mods', { slot: 'Weapon 1 Swap', query: 'life' })).mods.length > 0, 'search_trade_mods on a swap slot');
+  const wand = 'Rarity: RARE\nSwap Wand\nImbued Wand\nItem Level: 80\n+30 to maximum Life';
+  const cmp = await ok<{ note?: string; candidates: { error: string | null }[] }>('compare_items', { slot: 'Weapon 1 Swap', items: [wand, wand] });
+  assert(/weapon set 2, which the build does not use/.test(cmp.note ?? '') && cmp.candidates.every((c) => c.error === null),
+    `compare_items into an unused swap slot: ${JSON.stringify(cmp).slice(0, 300)}`);
+  const inUse = await ok<{ note?: string }>('compare_items', { slot: 'Weapon 1', items: [wand, wand] });
+  assert(inUse.note === undefined, 'no note for the weapon set in use');
+  assert((await keyState()) === before, 'refusals and compare_items changed the build');
+  log('PASS');
+}
+
+/**
+ * Faults while an inactive flask slot is activated for a trade search
+ * (bridge test faults): an error there leaves the slot's flags and the export
+ * as they were and stays the search's own error; a restore whose by-value
+ * check differs is an internal error naming reset_build, and suggest_upgrades
+ * fails the call on it instead of keeping it as a per-slot modsError.
+ */
+async function test14FlaskFaults(paths: TestPaths, xml: string): Promise<void> {
+  log('Test 14: faults while a flask slot is activated for a trade search');
+  const query = (slot: string) => tradeQueryCommand({ slot, league: 'Standard' });
+  const rejection = async (p: Promise<unknown>): Promise<Error> => {
+    try {
+      await p;
+    } catch (e) {
+      return e as Error;
+    }
+    throw new Error('expected a rejection');
+  };
+  const flaskActive = async (session: BuildSession, slot: string) => (await session.listEquippedItems()).find((i) => i.slot === slot)?.active;
+
+  const failing = new LuaBridge(paths, 120_000, { testFaults: 'tradeFlaskFailsActivated' });
+  try {
+    const session = new BuildSession(failing);
+    await session.loadBuild(xml);
+    assert((await session.generateTradeQuery(query('Flask 1'))).evaluatedActive === undefined, 'an active slot never reaches the fault');
+    await session.setFlaskActive('Flask 2', false);
+    const before = await session.exportXML();
+    const e = await rejection(session.generateTradeQuery(query('Flask 2')));
+    assert(e instanceof EngineCommandError && /test fault: trade search failed with the flask slot activated/.test(e.message)
+      && !/reset_build/.test(e.message), `the search's own error: ${e.constructor.name}: ${e.message}`);
+    assert((await flaskActive(session, 'Flask 2')) === false, 'Flask 2 is inactive again');
+    assert((await session.exportXML()) === before, 'export unchanged after the failed activated search');
+  } finally {
+    await failing.dispose();
+  }
+
+  const inexact = new LuaBridge(paths, 120_000, { testFaults: 'tradeFlaskRestoreInexact' });
+  try {
+    const session = new BuildSession(inexact);
+    await session.loadBuild(xml);
+    await session.setFlaskActive('Flask 2', false);
+    const e = await rejection(session.generateTradeQuery(query('Flask 2')));
+    assert(e instanceof EngineCommandError && /left the build different from the committed one.*tradeFlaskRestoreInexact.*call reset_build/.test(e.message),
+      `inexact restore: ${e.constructor.name}: ${e.message}`);
+    const viaSuggest = await rejection(session.suggestUpgrades('Flask 2'));
+    assert(viaSuggest instanceof EngineCommandError && /call reset_build/.test(viaSuggest.message),
+      `suggest_upgrades fails the call instead of a modsError: ${viaSuggest.constructor.name}: ${viaSuggest.message}`);
+    // By default the inactive slot is not queried, so the call succeeds.
+    assert((await session.suggestUpgrades()).every((s) => s.slot !== 'Flask 2' || s.suggestedMods === undefined), 'default suggest_upgrades');
+  } finally {
+    await inexact.dispose();
+  }
+  log('PASS');
 }
 
 async function main(): Promise<void> {
@@ -475,6 +617,10 @@ async function main(): Promise<void> {
     assert(category(eyeSearch) === 'jewel.abyss' && eyeSearch.currentItem === 'Test Eye', `socketed abyss jewel defaults to abyss: ${eyeSearch.itemCategory}`);
     assert(category(await jewelSearch({ slot: 'Jewel 26725', jewelType: 'base' })) === 'jewel.base', 'jewelType overrides the default');
     log('PASS');
+
+    await test12Flasks(category, weighted);
+    await test13WeaponSwap();
+    await test14FlaskFaults(paths, readFileSync(fixturePath, 'utf8'));
     log('ALL TRADE SEARCH TESTS PASSED');
   } finally {
     await client.close().catch(() => undefined);

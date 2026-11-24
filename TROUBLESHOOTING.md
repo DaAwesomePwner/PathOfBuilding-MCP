@@ -142,6 +142,18 @@ An item already in a hidden slot is still listed by `list_equipped_items` (with 
 
 **Fix:** turn the slot on with `set_flask_active({ slot, active: true })` (undoable), or evaluate it on without committing: `compare_items` with `activate: true`, or `flasks: [{ slot, active: true }]` in the same `evaluate_changes` / `apply_changes` variant. Equip a flask first (`swap_item`, or the same variant's `items`) before toggling an empty slot. `swap_item` itself still equips into an inactive slot and says so in its `note`. The `flasks` alias of `toggle_buffs` / `set_config` / scenarios is a different thing: it sets the "while using a flask" condition (`conditionUsingFlask`), not a slot's active state.
 
+## "Cannot build a trade search for Flask N: …" (empty slot, tincture) / "flaskType only applies to flask slots"
+
+**Cause:** a weighted trade search tries each mod on the flask in the slot. An empty flask slot has none, so `generate_trade_search` needs `flaskType` (`life`, `mana`, `hybrid` or `utility`) to know which flask to search for (`search_trade_mods` does not: every kind lists the same flask mods). Path of Building's trade query generator has no tincture category, so a slot holding a tincture, or `flaskType: "tincture"`, is refused. `flaskType` on a slot other than `Flask 1`-`Flask 5` is refused.
+
+**Fix:** pass `flaskType`; for a slot holding a tincture, `flaskType` searches flasks for it instead. Every kind is weighed from PoB's flask mod list and searched in the trade site's `flask` category (PoB's data has no life / mana sub-category), so the results can include other kinds of flask. An inactive flask slot is not refused: the weights are computed with it active and the reply says `evaluatedActive: true` (the build is unchanged).
+
+## "Cannot build a trade search for Weapon 1 Swap: Weapon 1 Swap belongs to weapon set 2, which the build does not use"
+
+**Cause:** Path of Building counts only the weapon set in use (`Weapon 1` / `Weapon 2` normally; the `Swap` slots when the build uses the second set). An item in the other set's slots, or in their abyssal sockets, counts for nothing, so every trade weight there would be 0. `compare_items` into such a slot still runs and says so in its `note`; `suggest_upgrades` leaves those slots out.
+
+**Fix:** search the slot of the weapon set in use. Path of Building's weapon-set switch is not exposed as a tool; load a build that uses the other set to search its slots.
+
 ## State drift / unexpected stat values after multiple operations
 
 **Cause:** Should not happen. The what-if tools (`evaluate_changes`, `compare_items`, `find_best_next_nodes`, `simulate_scenario`, etc.) run through PoB's calculator (`lua/probe.lua`) without changing or recalculating the build. The variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored, and the restore is compared with a fingerprint of the build taken before; a mismatch is an internal error naming `reset_build`. If you see drift anyway, a snapshot or fingerprint field is missing.
@@ -206,7 +218,7 @@ Path of Building's mod parser could not use the line (the same check its Custom 
 | `find_worst_allocated_nodes` | 2–3 s |
 | `compare_supports`, `swap_gem`, `evaluate_gem_levels` | milliseconds |
 | `find_optimal_links` (6-link, default topN) | 1–3 s |
-| `suggest_upgrades` (all slots; suggested mods for 3) | ~2 s (`modSlots: 10` ~5 s, `modSlots: 0` <0.1 s) |
+| `suggest_upgrades` (all slots incl. flasks and 3 tree jewels; suggested mods for 3) | ~3 s (`modSlots: 10` ~7 s, `modSlots: 0` ~1 s: each tree jewel socket takes a full recalculation) |
 | `stat_weights` (default 37 lines) | ~0.1 s |
 | `compare_builds` | ~5 s (a second engine boots and loads the other build; with `against` both builds load in that engine) |
 | `simulate_scenario`, `compare_scenarios`, `toggle_buffs` | milliseconds |

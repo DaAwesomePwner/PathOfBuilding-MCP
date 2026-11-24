@@ -63,6 +63,100 @@ const NONSENSE = 'Grants the wielder a pleasant afternoon of llama herding';
 const EXISTING = '20% increased maximum Life';
 const STATS = ['CombinedDPS', 'TotalEHP', 'Life', 'EnergyShield'];
 
+const STYGIAN_VISE = 'Rarity: RARE\nTest Vise\nStygian Vise\nItem Level: 80\nImplicits: 1\nHas 1 Abyssal Socket\n+80 to maximum Life';
+const ABYSS_EYE = 'Rarity: RARE\nTest Eye\nMurderous Eye Jewel\nItem Level: 80\nImplicits: 0\n+40 to maximum Life\n+10% to Fire Resistance';
+
+/**
+ * 9. suggest_upgrades lists every item slot PoB uses (OccVortex: gear, five
+ * flasks, three tree jewels; no unused weapon-swap slots, no Ring 3, no
+ * hidden slots): flasks adding nothing to DPS/EHP and inactive flask slots
+ * are unranked with a note, abyssal sockets the item has are measured, the
+ * `slot` argument takes flask / jewel / abyssal slots, tinctures and empty
+ * flask slots get a modsError. The build is unchanged after undoing the setup.
+ */
+async function test9SlotKinds(session: BuildSession, state: () => Promise<string>): Promise<void> {
+  log('Test 9: suggest_upgrades covers flask, jewel and abyssal slots');
+  const before = await state();
+  const rows = await session.suggestUpgrades(undefined, { modSlots: 0 });
+  const bySlot = new Map(rows.map((r) => [r.slot, r]));
+  for (const slot of ['Weapon 1', 'Weapon 2', 'Helmet', 'Body Armour', 'Gloves', 'Boots', 'Amulet', 'Ring 1', 'Ring 2', 'Belt']) {
+    assert(bySlot.get(slot)?.kind === 'gear', `${slot} listed as gear`);
+  }
+  assert(rows.every((r) => !/Swap|Ring 3|Graft|^(Head|Body|Arm|Leg)$/.test(r.slot)), `unused swap, Ring 3 and hidden slots are left out: ${rows.map((r) => r.slot)}`);
+  const jewels = rows.filter((r) => r.kind === 'treeJewel');
+  assert(jewels.length === 3 && jewels.every((j) => /^Jewel \d+$/.test(j.slot) && typeof j.priority === 'number' && (j.dpsContribution ?? 0) > 0),
+    `tree jewel sockets measured: ${JSON.stringify(jewels.map((j) => [j.slot, j.priority, j.dpsContribution]))}`);
+  const flasks = rows.filter((r) => r.kind === 'flask');
+  assert(flasks.length === 5 && flasks.every((f) => f.active === true), 'five active flask slots');
+  const granite = bySlot.get('Flask 2')!;
+  assert(typeof granite.priority === 'number' && (granite.ehpContribution ?? 0) > 0 && granite.note === undefined,
+    `Granite Flask is ranked: ${JSON.stringify({ ...granite, currentItem: undefined })}`);
+  for (const slot of ['Flask 1', 'Flask 4', 'Flask 5']) {
+    const f = bySlot.get(slot)!;
+    assert(f.priority === null && f.dpsContribution === 0 && f.ehpContribution === 0 && /adds nothing to DPS or EHP/.test(f.note ?? ''),
+      `${slot}: a flask adding nothing is not ranked: ${JSON.stringify({ ...f, currentItem: undefined })}`);
+  }
+
+  // An inactive flask slot: not measured or ranked, with a note; asked for, it still gets PoB-weighted mods (evaluated active).
+  await session.setFlaskActive('Flask 2', false);
+  const off = (await session.suggestUpgrades(undefined, { modSlots: 0 })).find((r) => r.slot === 'Flask 2')!;
+  assert(off.active === false && off.priority === null && off.ehpContribution === 0 && /not active.*set_flask_active/.test(off.note ?? ''),
+    `inactive flask slot: ${JSON.stringify({ ...off, currentItem: undefined })}`);
+  const offOne = await session.suggestUpgrades('Flask 2');
+  assert(offOne.length === 1 && (offOne[0].suggestedMods?.length ?? 0) > 0, `slot Flask 2 (inactive) gets mods: ${JSON.stringify(offOne[0].modsError)}`);
+  await session.undoLastChange();
+
+  // An abyssal socket the item has: measured, and `slot` takes it (and a tree jewel socket).
+  await session.swapItemWithDiff('Belt', STYGIAN_VISE);
+  // Empty jewel / abyssal sockets: listed unranked after the measured slots, no
+  // default suggestedMods (empty gear / flask slots keep their place at the top).
+  await session.allocateNodes([26725]);
+  await session.unequipItemWithDiff('Ring 2');
+  const withEmpty = await session.suggestUpgrades();
+  const emptyRows = withEmpty.filter((r) => r.slot === 'Belt Abyssal Socket 1' || r.slot === 'Jewel 26725');
+  assert(emptyRows.length === 2 && emptyRows.every((r) => r.empty && r.priority === null && /empty socket/.test(r.note ?? '') && r.suggestedMods === undefined
+    && r.modsError === undefined), `empty sockets: ${JSON.stringify(emptyRows)}`);
+  const lastOccupied = Math.max(...withEmpty.map((r, i) => (r.empty ? -1 : i)));
+  assert(withEmpty.findIndex((r) => r.slot === 'Belt Abyssal Socket 1') > lastOccupied && withEmpty.findIndex((r) => r.slot === 'Jewel 26725') > lastOccupied,
+    `empty sockets sort after the measured slots: ${withEmpty.map((r) => r.slot)}`);
+  assert(withEmpty[0].slot === 'Ring 2' && withEmpty[0].priority === 100 && (withEmpty[0].suggestedMods?.length ?? 0) > 0, 'an empty gear slot still leads, with mods');
+  assert(withEmpty.filter((r) => (r.suggestedMods?.length ?? 0) > 0).length === 3, 'three slots with mods by default');
+  for (const slot of ['Belt Abyssal Socket 1', 'Jewel 26725']) {
+    const one = await session.suggestUpgrades(slot);
+    assert(one.length === 1 && one[0].empty && (one[0].suggestedMods?.length ?? 0) > 0, `${slot} asked for: suggestedMods (${one[0].modsError})`);
+  }
+  await session.undoLastChange();
+  await session.undoLastChange();
+  await session.swapItemWithDiff('Belt Abyssal Socket 1', ABYSS_EYE);
+  const withAbyss = await session.suggestUpgrades(undefined, { modSlots: 0 });
+  const abyss = withAbyss.find((r) => r.slot === 'Belt Abyssal Socket 1');
+  assert(abyss?.kind === 'abyssal' && abyss.parentSlot === 'Belt' && (abyss.ehpContribution ?? 0) > 0 && /^Test Eye/.test(abyss.currentItemName ?? ''),
+    `abyssal socket row: ${JSON.stringify(abyss && { ...abyss, currentItem: undefined })}`);
+  assert(!withAbyss.some((r) => r.slot === 'Belt Abyssal Socket 2'), 'only the sockets the belt has');
+  const abyssOne = await session.suggestUpgrades('Belt Abyssal Socket 1');
+  assert(abyssOne.length === 1 && (abyssOne[0].suggestedMods?.length ?? 0) > 0, `slot Belt Abyssal Socket 1 gets mods: ${abyssOne[0].modsError}`);
+  const jewelOne = await session.suggestUpgrades(jewels[0].slot);
+  assert(jewelOne.length === 1 && jewelOne[0].kind === 'treeJewel' && (jewelOne[0].suggestedMods?.length ?? 0) > 0, `slot ${jewels[0].slot} gets mods`);
+  await session.undoLastChange();
+  await session.undoLastChange();
+
+  // Tinctures and empty flask slots get a modsError (and use none of the modSlots budget).
+  const tincture = await session.readItemData<{ text: string }>({ cmd: 'itemText', base: 'Oakbranch Tincture' });
+  await session.swapItemWithDiff('Flask 4', tincture.text);
+  await session.unequipItemWithDiff('Flask 5');
+  const odd = await session.suggestUpgrades(undefined, { modSlots: 3 });
+  const tin = odd.find((r) => r.slot === 'Flask 4')!;
+  const empty = odd.find((r) => r.slot === 'Flask 5')!;
+  assert(tin.suggestedMods === undefined && /no tincture category/.test(tin.modsError ?? ''), `tincture: ${JSON.stringify({ ...tin, currentItem: undefined })}`);
+  assert(empty.empty && empty.kind === 'flask' && empty.suggestedMods === undefined && /Empty flask slot: generate_trade_search with flaskType/.test(empty.modsError ?? ''),
+    `empty flask slot: ${JSON.stringify(empty)}`);
+  assert(odd.filter((r) => (r.suggestedMods?.length ?? 0) > 0).length === 3, 'unsupported slots use none of the 3 mod slots');
+  await session.undoLastChange();
+  await session.undoLastChange();
+  assert((await state()) === before, 'suggest_upgrades slot kinds: build not back after undo');
+  log('PASS: flask / jewel / abyssal rows, unranked flasks, slot argument, unsupported slots');
+}
+
 async function main(): Promise<void> {
   const { paths, fixturePath } = setupTestEnv();
   const bridge = new LuaBridge(paths, 120_000);
@@ -194,8 +288,10 @@ async function main(): Promise<void> {
       }
       assert(new Set(s.suggestedMods.map((m) => m.mod)).size === s.suggestedMods.length, `${s.slot}: duplicate mod texts`);
     }
-    const ranked = measured.filter((s) => !s.empty);
-    for (let i = 1; i < ranked.length; i++) assert(ranked[i - 1].priority >= ranked[i].priority, 'priority order lost');
+    const ranked = measured.filter((s) => !s.empty && s.priority !== null);
+    for (let i = 1; i < ranked.length; i++) assert(ranked[i - 1].priority! >= ranked[i].priority!, 'priority order lost');
+    const firstUnranked = measured.findIndex((s) => s.priority === null);
+    assert(firstUnranked < 0 || measured.slice(firstUnranked).every((s) => s.priority === null), 'unranked slots come after the ranked ones');
     log(`  suggest_upgrades (default, 3 slots with mods): ${ms} ms`);
     log(`  ${withMods.map((s) => `${s.slot}: ${s.suggestedMods!.slice(0, 2).map((m) => `${m.mod} (${m.weight})`).join(', ')}`).join(' | ')}`);
     assert(ms < 15_000, `default suggest_upgrades took ${ms} ms`);
@@ -209,7 +305,10 @@ async function main(): Promise<void> {
     t = Date.now();
     const every = await session.suggestUpgrades(undefined, { modSlots: 10 });
     log(`  modSlots 10: ${Date.now() - t} ms`);
-    assert(every.filter((s) => s.error === undefined).every((s) => s.suggestedMods !== undefined || s.modsError !== undefined), 'modSlots 10 covers every slot');
+    // modSlots 10: the first 10 slots the generator supports, in order (unsupported ones carry a modsError and use none of the budget).
+    const supported = every.filter((s) => s.error === undefined && !(s.suggestedMods === undefined && s.modsError !== undefined));
+    assert(supported.slice(0, 10).every((s) => (s.suggestedMods?.length ?? 0) > 0) && supported.slice(10).every((s) => s.suggestedMods === undefined),
+      `modSlots 10 covers the first 10 supported slots: ${JSON.stringify(every.map((s) => [s.slot, s.suggestedMods?.length, s.modsError]))}`);
     assert((await state()) === before, 'suggest_upgrades changed the build, config, undo depth or fingerprint');
     log('PASS: suggested mods carry PoB weights; build unchanged');
 
@@ -267,6 +366,8 @@ async function main(): Promise<void> {
     }
     assert((await state()) === before, 'build changed');
     log('PASS: engine-reported failures recorded per slot; the call fails once the engine is gone or the protocol failed');
+
+    await test9SlotKinds(session, state);
 
     console.log('\nALL STAT WEIGHTS TESTS PASSED');
   } finally {

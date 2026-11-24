@@ -14,6 +14,12 @@ export interface TradeQueryRaw {
   /** Requested ids whose stat PoB weighs through a pseudo "total" filter (fire res -> pseudo total fire res). */
   pseudoMap: { from: string; to: string }[];
   calcSeconds: number;
+  /** Flask slots: the flask kind searched (flaskType, else the equipped flask's). */
+  flaskType?: string;
+  /** Flask slots holding no flask of that kind: the blank base the mods were tried on. */
+  testBase?: string;
+  /** The flask slot is inactive in the build and was evaluated active for the call. */
+  evaluatedActive?: true;
 }
 
 export interface TradeModsResult {
@@ -39,6 +45,13 @@ const CURRENCIES = ['chaos-equivalent', 'chaos', 'divine', 'alch', 'alt', 'chrom
   'gcp', 'jewellers', 'scour', 'regret', 'fusing', 'chance', 'regal', 'vaal'] as const;
 export const ELDRITCH_SLOTS = new Set(['Body Armour', 'Helmet', 'Gloves', 'Boots']);
 export const JEWEL_TYPES = ['base', 'abyss', 'any'] as const;
+/** "tincture" is accepted only to be refused (PoB's generator has no tincture category); the refusal lives in the bridge. */
+export const FLASK_TYPES = ['life', 'mana', 'hybrid', 'utility', 'tincture'] as const;
+export const FLASK_TYPE_TEXT = 'Flask slots only: which flask to search for, "life", "mana", "hybrid" or "utility" (default: the kind of the ' +
+  'flask equipped there; needed for an empty slot). Every kind is weighed from Path of Building\'s flask mod list and searched in the ' +
+  'trade site\'s "flask" category (PoB has no life/mana sub-category), so results may include other kinds of flask; the kind decides ' +
+  'the flask the mods are tried on (the equipped one, else a blank base of that kind, reported as testBase, with a default minimum ' +
+  'weighted sum of 0). A tincture (equipped, or "tincture") is refused: PoB\'s trade generator has no tincture category.';
 /** Passive-tree jewel sockets ("Jewel <nodeId>") and abyssal sockets ("<slot> Abyssal Socket N"). */
 export const JEWEL_SLOT_RE = /^Jewel \d+$|Abyssal Socket \d+$/;
 export const TRADE_ID_RE = /^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+)?$/;
@@ -66,6 +79,7 @@ export interface TradeSearchArgs {
   sockets?: number;
   links?: number;
   jewelType?: (typeof JEWEL_TYPES)[number];
+  flaskType?: (typeof FLASK_TYPES)[number];
   requiredMods?: { tradeId: string; min?: number }[];
   weightAdjustments?: { tradeId: string; weight: number }[];
   minWeightedSum?: number;
@@ -90,6 +104,7 @@ export const tradeSearchSchema = {
   sockets: z.number().int().min(1).max(6).optional().describe('Exact number of empty sockets (not for flasks or jewel sockets).'),
   links: z.number().int().min(1).max(6).optional().describe('Exact number of links (armour and weapons only).'),
   jewelType: z.enum(JEWEL_TYPES).optional().describe(JEWEL_TYPE_TEXT),
+  flaskType: z.enum(FLASK_TYPES).optional().describe(FLASK_TYPE_TEXT),
   requiredMods: z.array(z.object({ tradeId, min: z.number().optional() })).max(10).optional()
     .describe('Hard requirements: every listed mod must be present (with at least `min` when given).'),
   weightAdjustments: z.array(z.object({ tradeId, weight: z.number().min(-1000).max(1000) })).max(MAX_FILTERS).optional()
