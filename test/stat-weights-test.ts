@@ -108,6 +108,25 @@ async function test9SlotKinds(session: BuildSession, state: () => Promise<string
 
   // An abyssal socket the item has: measured, and `slot` takes it (and a tree jewel socket).
   await session.swapItemWithDiff('Belt', STYGIAN_VISE);
+  // Empty jewel / abyssal sockets: listed unranked after the measured slots, no
+  // default suggestedMods (empty gear / flask slots keep their place at the top).
+  await session.allocateNodes([26725]);
+  await session.unequipItemWithDiff('Ring 2');
+  const withEmpty = await session.suggestUpgrades();
+  const emptyRows = withEmpty.filter((r) => r.slot === 'Belt Abyssal Socket 1' || r.slot === 'Jewel 26725');
+  assert(emptyRows.length === 2 && emptyRows.every((r) => r.empty && r.priority === null && /empty socket/.test(r.note ?? '') && r.suggestedMods === undefined
+    && r.modsError === undefined), `empty sockets: ${JSON.stringify(emptyRows)}`);
+  const lastOccupied = Math.max(...withEmpty.map((r, i) => (r.empty ? -1 : i)));
+  assert(withEmpty.findIndex((r) => r.slot === 'Belt Abyssal Socket 1') > lastOccupied && withEmpty.findIndex((r) => r.slot === 'Jewel 26725') > lastOccupied,
+    `empty sockets sort after the measured slots: ${withEmpty.map((r) => r.slot)}`);
+  assert(withEmpty[0].slot === 'Ring 2' && withEmpty[0].priority === 100 && (withEmpty[0].suggestedMods?.length ?? 0) > 0, 'an empty gear slot still leads, with mods');
+  assert(withEmpty.filter((r) => (r.suggestedMods?.length ?? 0) > 0).length === 3, 'three slots with mods by default');
+  for (const slot of ['Belt Abyssal Socket 1', 'Jewel 26725']) {
+    const one = await session.suggestUpgrades(slot);
+    assert(one.length === 1 && one[0].empty && (one[0].suggestedMods?.length ?? 0) > 0, `${slot} asked for: suggestedMods (${one[0].modsError})`);
+  }
+  await session.undoLastChange();
+  await session.undoLastChange();
   await session.swapItemWithDiff('Belt Abyssal Socket 1', ABYSS_EYE);
   const withAbyss = await session.suggestUpgrades(undefined, { modSlots: 0 });
   const abyss = withAbyss.find((r) => r.slot === 'Belt Abyssal Socket 1');

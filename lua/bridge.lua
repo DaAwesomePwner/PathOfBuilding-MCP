@@ -4741,6 +4741,16 @@ local function runTradeQuery(cmd)
 	end
 	if slot.slotName == "Amulet" then options.includeTalisman = o.includeTalisman == true end
 
+	-- An inactive flask slot counts for nothing in PoB's calculations (every
+	-- weight would be 0): it is evaluated active for the call (with a
+	-- calculator built for that state, as PoB builds one after every full
+	-- recalculation, so the base output includes the flask), then its exact
+	-- flags, the committed calculator and the calculator cache are put back
+	-- and the committed state is checked by value. The fingerprint is read
+	-- first (it runs a pending recalculation), before anything is replaced
+	-- or captured.
+	local activate = flask ~= nil and not slot.active
+	local fpBefore = activate and tradeCompat.fingerprint() or nil
 	local gen = st.gen
 	gen.itemsTab = queryItemsTab
 	gen.queryTab = { itemsTab = queryItemsTab }
@@ -4765,16 +4775,9 @@ local function runTradeQuery(cmd)
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
 	local capLifted = false
-	-- An inactive flask slot counts for nothing in PoB's calculations (every
-	-- weight would be 0): it is evaluated active for the call (with a
-	-- calculator built for that state, as PoB builds one after every full
-	-- recalculation, so the base output includes the flask), then its exact
-	-- flags, the committed calculator and the calculator cache are put back
-	-- and the committed state is checked by value.
-	local activated, unactivate, fpBefore, savedCache = false, nil, nil, nil
+	local activated, unactivate, savedCache = false, nil, nil
 	local savedMisc = build.calcsTab.miscCalculator
-	if flask and not slot.active then
-		fpBefore = tradeCompat.fingerprint()
+	if activate then
 		local cache = GlobalCache.cachedData.CALCULATOR
 		savedCache = { }
 		for k, v in pairs(cache) do savedCache[k] = v end
@@ -4784,7 +4787,11 @@ local function runTradeQuery(cmd)
 	end
 	local started = os.clock()
 	local ok, err = pcall(function()
-		if activated then build.calcsTab.miscCalculator = { build.calcsTab.calcs.getMiscCalculator(build) } end
+		if activated then
+			build.calcsTab.miscCalculator = { build.calcsTab.calcs.getMiscCalculator(build) }
+			-- Test fault: the search fails while the slot is activated.
+			if TEST_FAULTS.tradeFlaskFailsActivated then error("test fault: trade search failed with the flask slot activated", 0) end
+		end
 		gen:StartQuery(querySlot, options)
 		local co = gen.calcContext.co
 		if not co then
@@ -4813,7 +4820,10 @@ local function runTradeQuery(cmd)
 		local cache = GlobalCache.cachedData.CALCULATOR
 		wipeTable(cache)
 		for k, v in pairs(savedCache) do cache[k] = v end
-		local diff = tradeCompat.fingerprintDiff(fpBefore, tradeCompat.fingerprint())
+		local after = tradeCompat.fingerprint()
+		-- Test fault (rollback check): this read alone comes back different.
+		if TEST_FAULTS.tradeFlaskRestoreInexact then after[#after + 1] = "testFault|tradeFlaskRestoreInexact" end
+		local diff = tradeCompat.fingerprintDiff(fpBefore, after)
 		if diff then
 			error("the trade search left the build different from the committed one (" .. diff .. ")"
 				.. (ok and "" or ("; the search itself failed: " .. tostring(err):gsub("^" .. USER_ERROR_PREFIX, "")))

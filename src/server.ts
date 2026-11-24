@@ -1057,10 +1057,10 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   {
     description:
       "Rank item slots by upgrade priority: gear of the weapon set in use (Ring 3 while Path of Building shows it), flask slots, allocated passive-tree jewel sockets, abyssal sockets the item in their slot has, and the tree-gated slots (Wickerman, grafts) while shown. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
-      `An inactive flask slot, or a flask that adds nothing to DPS or EHP (recovery and movement speed are part of neither), is listed unranked (priority null, with a note); at most ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured per call (each takes a full recalculation, ~0.3-0.5 s), the others are listed unmeasured (priority and contributions null, with a note). ` +
+      `An inactive flask slot, or a flask that adds nothing to DPS or EHP (recovery and movement speed are part of neither), is listed unranked (priority null, with a note); at most ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured per call (each takes a full recalculation, ~0.3-0.5 s), the others are listed unmeasured (priority and contributions null, with a note). Empty jewel and abyssal sockets are listed unranked after the measured slots (priority null, with a note) and get suggestedMods only when asked for with \`slot\`; empty gear and flask slots lead the ranking. ` +
       `The first modSlots slots Path of Building's trade query generator supports (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods it weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
       'Slots it does not support (Wickerman, grafts, tinctures, empty flask slots) get a modsError instead. ' +
-      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (ranked slots first, highest priority first, empty slots before equipped ones; then unranked slots; then errors): slot, kind (gear / flask / treeJewel / abyssal / treeGated), parentSlot (abyssal), active (flask), currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), note, suggestedMods / modsError; ' +
+      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (ranked slots first, highest priority first, empty gear / flask slots before equipped ones; then unranked equipped slots; then empty jewel / abyssal sockets; then errors): slot, kind (gear / flask / treeJewel / abyssal / treeGated), parentSlot (abyssal), active (flask), currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), note, suggestedMods / modsError; ' +
       'list_equipped_items / get_item_in_slot give the items themselves, generate_trade_search the full weighted search, stat_weights the worth of any mod line.',
     inputSchema: {
       slot: z.string().optional().describe('Focus on one slot (e.g. "Body Armour", "Flask 2", "Jewel 26725", "Belt Abyssal Socket 1"). Omit for all slots.'),
@@ -1070,19 +1070,20 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   },
   async ({ slot, modSlots }, session) => {
     const suggestions = await session.suggestUpgrades(slot, { modSlots });
-    const tried = suggestions.filter((s) => s.suggestedMods !== undefined).length +
-      suggestions.filter((s) => s.modsError !== undefined && s.error === undefined).length;
-    const measured = suggestions.filter((s) => s.error === undefined).length;
+    // Slots the trade generator was run for, and supported slots it was not
+    // (unsupported ones carry their modsError without a query).
+    const queried = suggestions.filter((s) => s.modsQueried).length;
+    const notQueried = suggestions.filter((s) => s.error === undefined && !s.modsQueried && s.modsError === undefined).length;
     let modsNote: string | undefined;
-    if (measured < suggestions.length) {
+    if (suggestions.some((s) => s.error !== undefined)) {
       modsNote = 'slots that could not be measured (error) get no suggestedMods';
     }
-    if (tried < measured) {
-      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for the first ` +
-        `${suggestions.filter((s) => s.suggestedMods !== undefined).length} supported slot(s) only; pass slot, or a larger modSlots, for the others`;
+    if (notQueried > 0) {
+      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for ${queried} supported slot(s) only; ` +
+        'pass slot, or a larger modSlots, for the others';
     }
     return {
-      suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest),
+      suggestions: suggestions.map(({ currentItem: _item, modsQueried: _queried, ...rest }) => rest),
       ...(modsNote ? { modsNote } : {}),
     };
   },

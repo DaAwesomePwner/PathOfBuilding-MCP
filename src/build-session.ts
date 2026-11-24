@@ -2729,9 +2729,12 @@ export class BuildSession {
    * Building's own weighted trade query generator weighs highest for that slot
    * (topTradeMods; ~0.4-1 s a slot on the OccVortex fixture, so not every slot
    * by default); slots it cannot weigh (tree-gated slots, tinctures, empty
-   * flask slots) get a `modsError` instead. Order: measured slots (empty ones
-   * first, then by priority), unmeasured ones, then slots that could not be
-   * measured (error). Changes nothing.
+   * flask slots) get a `modsError` instead. Order: ranked slots (empty gear
+   * and flask slots first, then by priority), unranked occupied ones, empty
+   * jewel / abyssal sockets (unranked, no suggestedMods unless asked for with
+   * `slot`), then slots that could not be measured (error). An engine error
+   * saying the build may differ ("call reset_build") fails the call. Changes
+   * nothing.
    */
   async suggestUpgrades(
     targetSlot?: string,
@@ -2785,6 +2788,10 @@ export class BuildSession {
           ...(row.active !== undefined ? { active: row.active } : {}),
         };
         if (!item) {
+          // Empty gear and flask slots lead the ranking; an empty jewel or
+          // abyssal socket is listed unranked, after the measured slots, and
+          // gets suggestedMods only when asked for with `slot`.
+          const socket = row.kind === 'treeJewel' || row.kind === 'abyssal';
           out.push({
             slot,
             ...extra,
@@ -2793,7 +2800,8 @@ export class BuildSession {
             empty: true,
             dpsContribution: 0,
             ehpContribution: 0,
-            priority: 100,
+            priority: socket ? null : 100,
+            ...(socket ? { note: 'empty socket: listed after the measured slots, not ranked; pass slot for its suggestedMods' } : {}),
           });
           continue;
         }
@@ -2839,9 +2847,11 @@ export class BuildSession {
         });
       }
 
-      // Measured slots first (empty ones first, then by priority), then the
-      // unranked ones (priority null), then the ones that failed (error).
-      const group = (s: UpgradeSuggestion): number => (s.error !== undefined ? 2 : s.priority === null ? 1 : 0);
+      // Ranked slots first (empty gear / flask slots first, then by priority),
+      // then the unranked occupied ones (priority null), then empty jewel and
+      // abyssal sockets, then the ones that failed (error).
+      const group = (s: UpgradeSuggestion): number =>
+        (s.error !== undefined ? 3 : s.priority !== null ? 0 : s.empty ? 2 : 1);
       out.sort((a, b) => {
         if (group(a) !== group(b)) return group(a) - group(b);
         if (a.empty && !b.empty) return -1;
@@ -2851,28 +2861,31 @@ export class BuildSession {
       });
 
       // Slots PoB's trade query generator cannot weigh get that as modsError
-      // and use none of the modSlots budget; unmeasured jewel sockets get no
-      // query either.
+      // and use none of the modSlots budget; unmeasured and empty jewel /
+      // abyssal sockets get no query either unless asked for with `slot`.
       const byRow = new Map(rows.map((r) => [r.slot, r]));
       const eligible: UpgradeSuggestion[] = [];
       for (const s of out) {
         if (s.error !== undefined) continue;
         const why = modsUnsupported(byRow.get(s.slot)!, s.empty);
         if (why !== undefined) s.modsError = why;
-        else if (!(s.priority === null && s.kind === 'treeJewel')) eligible.push(s);
+        else if (targetSlot || !(s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal'))) eligible.push(s);
       }
       // Suggested mods: PoB's weighted trade query for the highest-priority slots it supports.
       const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, eligible.length));
       const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
       // A failure the engine reported for its query (a UserError or an
       // EngineCommandError: the engine answered in step) is recorded on its
-      // slot and the measurements are kept. Anything else fails the call and
+      // slot and the measurements are kept, unless it says the build may now
+      // differ from the committed one ("call reset_build": a flask slot's
+      // activation was not undone exactly), which fails the call. Anything else fails the call and
       // no further slot is queried: a query that ended the engine (a bridge
       // timeout kills it and counts as a crash strike), as a crash part-way
       // through any operation does, and a transport or protocol failure (a
       // stdin write error, a reply that is not JSON), after which the next
       // reply may not belong to the next query.
       for (const s of eligible.slice(0, modSlots)) {
+        s.modsQueried = true;
         try {
           const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
           const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
@@ -2880,8 +2893,9 @@ export class BuildSession {
         } catch (e) {
           if (!this.bridge.isRunning()) throw e;
           if (e instanceof UserError) s.modsError = e.message;
-          else if (e instanceof EngineCommandError) s.modsError = `Path of Building's trade query generator failed: ${e.message}`;
-          else throw e;
+          else if (e instanceof EngineCommandError && !e.message.includes('call reset_build')) {
+            s.modsError = `Path of Building's trade query generator failed: ${e.message}`;
+          } else throw e;
         }
       }
       return out;
@@ -3723,14 +3737,16 @@ export interface UpgradeSuggestion {
   /** null: not measured (see note). */
   dpsContribution: number | null;
   ehpContribution: number | null;
-  /** 0-100, higher = upgrade first; null for a slot that is not ranked (an inactive flask slot, a flask adding nothing to DPS or EHP, an unmeasured jewel socket; see note). */
+  /** 0-100, higher = upgrade first; null for a slot that is not ranked (an inactive flask slot, a flask adding nothing to DPS or EHP, an unmeasured or empty jewel / abyssal socket; see note). */
   priority: number | null;
-  /** Why the slot is not ranked (an inactive flask slot, a flask adding nothing to DPS or EHP, an unmeasured jewel socket). */
+  /** Why the slot is not ranked (an inactive flask slot, a flask adding nothing to DPS or EHP, an unmeasured or empty jewel / abyssal socket). */
   note?: string;
   /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
   suggestedMods?: SuggestedMod[];
   /** PoB's trade query generator could not weigh mods for the slot (a slot or item it does not support, a refusal, or a failure of the generator). */
   modsError?: string;
+  /** Internal (left out of the tool reply): the trade query generator was run for the slot. */
+  modsQueried?: true;
   /** The slot could not be measured (refused as input); its contributions are 0. */
   error?: string;
 }

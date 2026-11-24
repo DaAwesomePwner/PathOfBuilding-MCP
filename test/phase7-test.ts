@@ -167,6 +167,20 @@ async function main(): Promise<void> {
     log(`  Body Armour DPS contribution: ${sugSingle.suggestions[0].dpsContribution}`);
     log('PASS: single-slot suggest works');
 
+    // Test 5b: modsNote counts only the slots the trade generator was run for
+    // (an empty flask slot carries its own modsError and is not one of them).
+    log('Test 5b: suggest_upgrades modsNote with an unsupported slot');
+    assert(!(await call(client, 'unequip_item', { slot: 'Flask 5' }) as { isError?: boolean }).isError, 'unequip Flask 5');
+    const sugTen = JSON.parse(extractText(await call(client, 'suggest_upgrades', { modSlots: 10 }))) as UpgradeResp;
+    const emptyFlask = sugTen.suggestions.find((s) => s.slot === 'Flask 5');
+    assert(emptyFlask?.empty && /Empty flask slot/.test(emptyFlask.modsError ?? '') && emptyFlask.suggestedMods === undefined, 'empty flask slot: modsError, no query');
+    const queried = sugTen.suggestions.filter((s) => s.suggestedMods !== undefined || (s.modsError !== undefined && !/Empty flask slot/.test(s.modsError))).length;
+    assert(queried === 10, `10 slots queried, got ${queried}`);
+    assert(/suggestedMods were computed for 10 supported slot\(s\) only/.test(sugTen.modsNote ?? ''), `modsNote counts queried slots only: ${sugTen.modsNote}`);
+    assert(sugTen.suggestions.every((s) => !('modsQueried' in s)), 'the internal modsQueried marker is left out');
+    assert(!(await call(client, 'undo_last_change') as { isError?: boolean }).isError, 'undo the unequip');
+    log('PASS: modsNote counts queried slots only');
+
     // Test 6: export_build (summary)
     log('Test 6: export_build (summary)');
     const summary = extractText(await call(client, 'export_build'));

@@ -11,7 +11,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { setupTestEnv } from './_skip.js';
+import { BuildSession } from '../src/build-session.js';
+import { EngineCommandError, LuaBridge } from '../src/lua-bridge.js';
+import { tradeQueryCommand } from '../src/trade-search-command.js';
+import { setupTestEnv, type TestEnv } from './_skip.js';
+
+type TestPaths = TestEnv['paths'];
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.resolve(testDir, '..', 'src', 'server.ts');
@@ -226,6 +231,61 @@ async function test13WeaponSwap(): Promise<void> {
   const inUse = await ok<{ note?: string }>('compare_items', { slot: 'Weapon 1', items: [wand, wand] });
   assert(inUse.note === undefined, 'no note for the weapon set in use');
   assert((await keyState()) === before, 'refusals and compare_items changed the build');
+  log('PASS');
+}
+
+/**
+ * Faults while an inactive flask slot is activated for a trade search
+ * (bridge test faults): an error there leaves the slot's flags and the export
+ * as they were and stays the search's own error; a restore whose by-value
+ * check differs is an internal error naming reset_build, and suggest_upgrades
+ * fails the call on it instead of keeping it as a per-slot modsError.
+ */
+async function test14FlaskFaults(paths: TestPaths, xml: string): Promise<void> {
+  log('Test 14: faults while a flask slot is activated for a trade search');
+  const query = (slot: string) => tradeQueryCommand({ slot, league: 'Standard' });
+  const rejection = async (p: Promise<unknown>): Promise<Error> => {
+    try {
+      await p;
+    } catch (e) {
+      return e as Error;
+    }
+    throw new Error('expected a rejection');
+  };
+  const flaskActive = async (session: BuildSession, slot: string) => (await session.listEquippedItems()).find((i) => i.slot === slot)?.active;
+
+  const failing = new LuaBridge(paths, 120_000, { testFaults: 'tradeFlaskFailsActivated' });
+  try {
+    const session = new BuildSession(failing);
+    await session.loadBuild(xml);
+    assert((await session.generateTradeQuery(query('Flask 1'))).evaluatedActive === undefined, 'an active slot never reaches the fault');
+    await session.setFlaskActive('Flask 2', false);
+    const before = await session.exportXML();
+    const e = await rejection(session.generateTradeQuery(query('Flask 2')));
+    assert(e instanceof EngineCommandError && /test fault: trade search failed with the flask slot activated/.test(e.message)
+      && !/reset_build/.test(e.message), `the search's own error: ${e.constructor.name}: ${e.message}`);
+    assert((await flaskActive(session, 'Flask 2')) === false, 'Flask 2 is inactive again');
+    assert((await session.exportXML()) === before, 'export unchanged after the failed activated search');
+  } finally {
+    await failing.dispose();
+  }
+
+  const inexact = new LuaBridge(paths, 120_000, { testFaults: 'tradeFlaskRestoreInexact' });
+  try {
+    const session = new BuildSession(inexact);
+    await session.loadBuild(xml);
+    await session.setFlaskActive('Flask 2', false);
+    const e = await rejection(session.generateTradeQuery(query('Flask 2')));
+    assert(e instanceof EngineCommandError && /left the build different from the committed one.*tradeFlaskRestoreInexact.*call reset_build/.test(e.message),
+      `inexact restore: ${e.constructor.name}: ${e.message}`);
+    const viaSuggest = await rejection(session.suggestUpgrades('Flask 2'));
+    assert(viaSuggest instanceof EngineCommandError && /call reset_build/.test(viaSuggest.message),
+      `suggest_upgrades fails the call instead of a modsError: ${viaSuggest.constructor.name}: ${viaSuggest.message}`);
+    // By default the inactive slot is not queried, so the call succeeds.
+    assert((await session.suggestUpgrades()).every((s) => s.slot !== 'Flask 2' || s.suggestedMods === undefined), 'default suggest_upgrades');
+  } finally {
+    await inexact.dispose();
+  }
   log('PASS');
 }
 
@@ -560,6 +620,7 @@ async function main(): Promise<void> {
 
     await test12Flasks(category, weighted);
     await test13WeaponSwap();
+    await test14FlaskFaults(paths, readFileSync(fixturePath, 'utf8'));
     log('ALL TRADE SEARCH TESTS PASSED');
   } finally {
     await client.close().catch(() => undefined);
