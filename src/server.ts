@@ -6,6 +6,7 @@ import {
   BuildSession,
   ComparisonResult,
   DEFAULT_MOD_SLOTS,
+  MAX_SUGGEST_TREE_JEWELS,
   computeDiff,
   EquippedItem,
   ItemModLine,
@@ -15,6 +16,7 @@ import {
   StatDiffResult,
   TreeEditNode,
   TreeEditResult,
+  unrankedSlotOnly,
 } from './build-session.js';
 import { registerBuildEditTools } from './build-edit-tools.js';
 import { registerCompareBuilds } from './compare-builds.js';
@@ -300,8 +302,9 @@ tools.engine<{ detail?: 'summary' | 'full'; includeItemText?: boolean }>(
   'list_equipped_items',
   {
     description:
-      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. ' +
+      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. Flask slots carry `active` (an inactive one also a note: PoB does not apply that flask or tincture; set_flask_active turns it on). ' +
       'An item in a slot Path of Building hides on this passive tree (Wickerman Head/Body/Arm/Leg off 3.30, Graft 1/2 off 3.27) is listed with hidden: true and a note: PoB still counts a hidden Wickerman item in its calculations but ignores a hidden graft; unequip_item removes either. ' +
+      'Abyss jewels in abyssal sockets carry the `parentSlot` of the item that has the socket; a jewel in an unallocated passive-tree socket is listed with `allocated: false` and a note (PoB ignores it). ' +
       'By default each mod is `{ line }` plus only its true flags (e.g. `crafted: true`), false item flags are left out and the item text is not included; ' +
       '`includeItemText: true` adds each item\'s PoB text as `raw`; `detail: "full"` returns every field (all flags and `raw`).',
     inputSchema: {
@@ -333,6 +336,7 @@ function summarizeStatDiff(result: StatDiffResult): unknown {
   return {
     diff: summary,
     keyDeltas: keyDeltas(result.diff),
+    ...(result.note !== undefined ? { note: result.note } : {}),
   };
 }
 
@@ -343,7 +347,10 @@ function summarizeComparison(result: ComparisonResult): unknown {
       itemId: result.baseline.item.itemId,
       hasItem: result.baseline.item.itemText !== null,
       keyStats: keyStats(result.baseline.stats),
+      ...(result.flaskSlotActive !== undefined ? { slotActive: result.flaskSlotActive } : {}),
     },
+    ...(result.activated ? { activated: true, note: 'The slot is inactive in the build; the candidates were evaluated with it active (the baseline is the build as it is).' } : {}),
+    ...(result.note !== undefined ? { note: result.note } : {}),
     candidates: result.candidates.map((c) => ({
       index: c.index,
       error: c.error,
@@ -361,7 +368,8 @@ tools.engine<Record<string, never>>(
   'list_valid_slots',
   {
     description:
-      'List all currently valid equipment slot names (including any active jewel slots) along with whether each slot is occupied. Slots Path of Building hides on this passive tree are left out: the Wickerman slots (Head, Body, Arm, Leg) appear only on 3.30 trees, Graft 1/2 only on 3.27 trees.',
+      'List all currently valid equipment slot names along with whether each slot is occupied. Slots Path of Building hides on this passive tree are left out: the Wickerman slots (Head, Body, Arm, Leg) appear only on 3.30 trees, Graft 1/2 only on 3.27 trees. ' +
+      'Flask slots carry `active` (Path of Building applies a flask or tincture only while its slot is active; set_flask_active changes it). Abyssal sockets ("<slot> Abyssal Socket N") are listed only where the item in their `parentSlot` has them. Every passive-tree jewel socket ("Jewel <nodeId>") is listed with `allocated`: a jewel in an unallocated socket counts for nothing (allocate it with allocate_nodes). A socket a cluster jewel adds that is not on the tree yet also has `requiresClusterIn` (the socket where a cluster jewel with jewel sockets must go first).',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -390,7 +398,7 @@ tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
-      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything.',
+      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything. A jewel can go in an unallocated passive-tree socket (PoB\'s UI hides such sockets, but a build can hold a jewel there) and counts for nothing until the socket is allocated; the result then carries a `note` saying what to do (for a socket a cluster jewel adds: socket that cluster jewel first). Likewise a flask or tincture equipped in an inactive flask slot does nothing until the slot is turned on (set_flask_active); the `note` says so.',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name.'),
       itemText: z
@@ -423,11 +431,11 @@ tools.engine<{ slot: string }>(
   },
 );
 
-tools.engine<{ slot: string; items: string[] }>(
+tools.engine<{ slot: string; items: string[]; activate?: boolean }>(
   'compare_items',
   {
     description:
-      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused.",
+      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused, and so is an unallocated passive-tree jewel socket (a jewel there counts for nothing; allocate it first with allocate_nodes). An inactive flask slot is refused too (PoB would not apply the flask or tincture) unless `activate: true`, which evaluates the candidates with the slot turned on (the result then has `activated: true`; the baseline is the build as it is); flask slots report `slotActive`.",
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot to compare in.'),
       items: z
@@ -435,14 +443,18 @@ tools.engine<{ slot: string; items: string[] }>(
         .min(2)
         .max(5)
         .describe('Array of 2-5 item texts to compare (PoB format). Viscera items copied from the game (first line "Item Class: Viscera") need no Rarity line.'),
+      activate: z
+        .boolean()
+        .optional()
+        .describe('Flask slots only: evaluate the candidates with the slot active (needed when it is inactive; set_flask_active commits it).'),
     },
   },
-  async ({ slot, items }, session) => {
+  async ({ slot, items, activate }, session) => {
     validateSlot(slot);
     // Per-item validation is deliberately not run here; compareItems
     // captures per-candidate failures into its results, which lets a
     // partially-bad batch still surface useful diffs for the good entries.
-    const result = await session.compareItems(slot, items);
+    const result = await session.compareItems(slot, items, activate);
     return summarizeComparison(result);
   },
 );
@@ -451,7 +463,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill, set_character_level, set_ascendancy or convert_tree_to_latest). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill, set_character_level, set_ascendancy, set_flask_active or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -1006,7 +1018,7 @@ tools.engine<{ buffs: Record<string, boolean | number | string> }>(
   'toggle_buffs',
   {
     description:
-      "Toggle individual buffs / charges (as config options) and return the stat impact, evaluated through Path of Building's own calculator in milliseconds; the build never changes. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks, unholyMight; raw PoB config keys also accepted.",
+      "Toggle individual buffs / charges (as config options) and return the stat impact, evaluated through Path of Building's own calculator in milliseconds; the build never changes. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks (the \"while using a flask\" condition, not which flask slots are active: see set_flask_active / evaluate_changes `flasks`), unholyMight; raw PoB config keys also accepted.",
     inputSchema: {
       buffs: z
         .record(z.string(), z.union([z.boolean(), z.number(), z.string()]))
@@ -1045,30 +1057,45 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   'suggest_upgrades',
   {
     description:
-      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
-      `The first modSlots slots (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods Path of Building's own weighted trade query generator weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
-      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (highest priority first; empty slots come first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods / modsError; ' +
+      "Rank item slots by upgrade priority: gear of the weapon set in use (Ring 3 while Path of Building shows it), flask slots, allocated passive-tree jewel sockets, abyssal sockets the item in their slot has, and the tree-gated slots (Wickerman, grafts) while shown. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
+      `An inactive flask slot, or a flask that adds nothing to DPS or EHP (recovery and movement speed are part of neither), is listed unranked (priority null, with a note); at most ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured per call (each takes a full recalculation, ~0.3-0.5 s), the others are listed unmeasured (priority and contributions null, with a note). Empty jewel and abyssal sockets and empty Wickerman slots are listed unranked after the measured slots (priority null, with a note) and get suggestedMods / suggestedViscera only when asked for with \`slot\`; empty gear and flask slots lead the ranking. ` +
+      `The first modSlots slots Path of Building's trade query generator supports (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods it weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
+      'Grafts and tinctures are weighed from Path of Building\'s graft / tincture mods (its trade data has no category for them); Wickerman slots get suggestedViscera instead ({name, score}: the best Viscera parts for the slot, as generate_trade_search ranks them, about 2 s). Empty flask and graft slots get a modsError instead. ' +
+      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (ranked slots first, highest priority first, empty gear / flask slots before equipped ones; then unranked equipped slots; then empty jewel / abyssal sockets; then errors): slot, kind (gear / flask / treeJewel / abyssal / treeGated), parentSlot (abyssal), active (flask), currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), note, suggestedMods / suggestedViscera / modsError; ' +
       'list_equipped_items / get_item_in_slot give the items themselves, generate_trade_search the full weighted search, stat_weights the worth of any mod line.',
     inputSchema: {
-      slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
+      slot: z.string().optional().describe('Focus on one slot (e.g. "Body Armour", "Flask 2", "Jewel 26725", "Belt Abyssal Socket 1"). Omit for all slots.'),
       modSlots: z.number().int().min(0).max(10).optional()
-        .describe(`How many of the highest-priority slots get suggestedMods (default ${DEFAULT_MOD_SLOTS}, 0 for none, 10 for all; each takes about 0.5-1 s).`),
+        .describe(`How many of the highest-priority supported slots get suggestedMods (default ${DEFAULT_MOD_SLOTS}, 0 for none, at most 10; each takes about 0.5-1 s).`),
     },
   },
   async ({ slot, modSlots }, session) => {
     const suggestions = await session.suggestUpgrades(slot, { modSlots });
-    const tried = suggestions.filter((s) => s.suggestedMods !== undefined || s.modsError !== undefined).length;
-    const measured = suggestions.filter((s) => s.error === undefined).length;
+    // Slots the trade generator was run for, and supported slots it was not
+    // (unsupported ones carry their modsError without a query): the ones a
+    // larger modSlots reaches, and empty or unmeasured jewel / abyssal sockets
+    // and empty Wickerman slots (priority null), which get suggestedMods /
+    // suggestedViscera only when asked for with `slot`.
+    const queried = suggestions.filter((s) => s.modsQueried).length;
+    const notQueried = suggestions.filter((s) => s.error === undefined && !s.modsQueried && s.modsError === undefined);
+    const slotOnly = notQueried.filter(unrankedSlotOnly);
+    const wickermanOnly = slotOnly.filter((s) => s.kind === 'treeGated').length;
+    const socketsOnly = slotOnly.length - wickermanOnly;
+    const reachable = notQueried.length - slotOnly.length;
     let modsNote: string | undefined;
-    if (measured < suggestions.length) {
+    if (suggestions.some((s) => s.error !== undefined)) {
       modsNote = 'slots that could not be measured (error) get no suggestedMods';
     }
-    if (tried < measured) {
-      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for the first ${tried} measured slot(s) only; ` +
-        'pass slot, or a larger modSlots, for the others';
+    if (notQueried.length > 0) {
+      const how = [
+        ...(reachable > 0 ? [`pass a larger modSlots (or slot) for the other ${reachable} ranked or listed slot(s)`] : []),
+        ...(socketsOnly > 0 ? [`pass slot for the ${socketsOnly} empty or unmeasured jewel / abyssal socket(s), which modSlots never reaches`] : []),
+        ...(wickermanOnly > 0 ? [`pass slot for the ${wickermanOnly} empty Wickerman slot(s) (suggestedViscera), which modSlots never reaches`] : []),
+      ];
+      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for ${queried} supported slot(s) only; ${how.join('; ')}`;
     }
     return {
-      suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest),
+      suggestions: suggestions.map(({ currentItem: _item, modsQueried: _queried, ...rest }) => rest),
       ...(modsNote ? { modsNote } : {}),
     };
   },

@@ -365,6 +365,20 @@ export const mainSkillSchema = z
     'The main skill to use, as set_main_skill sets it (applied after every other change of the variant; group indices as list_skill_groups shows them now). Refused with an item or node change that may add or remove item- or passive-granted skill groups: make that change first.',
   );
 
+export const flasksSchema = z
+  .array(
+    z.object({
+      slot: z.string().min(1).describe('"Flask 1" to "Flask 5".'),
+      active: z.boolean().describe('true: the flask or tincture there is in use (PoB\'s "Activate this flask" box); false: it is not.'),
+    }),
+  )
+  .max(5)
+  .describe(
+    'Flask slots to turn on or off (applied after `items`), as set_flask_active does: Path of Building applies a flask or tincture only while its slot is active. ' +
+      'The slot must hold a flask or tincture once the variant\'s items are in. An item put in a flask slot that is inactive after the variant is refused (it would count for nothing): add {slot, active: true} here. ' +
+      'Not the `flasks` config alias (conditionUsingFlask), which only sets "while using a flask" conditions.',
+  );
+
 export const variantSchema = z.object({
   label: z.string().max(MAX_LABEL).optional().describe('Your name for the variant, echoed back.'),
   allocate: z.array(nodeRef).max(MAX_VARIANT_NODES).optional().describe('Passive nodes to allocate (names or ids), each with its path from the allocated tree.'),
@@ -379,7 +393,7 @@ export const variantSchema = z.object({
     )
     .max(MAX_VARIANT_ITEMS)
     .optional()
-    .describe('{ slot, itemText } (PoB "Copy item" text; Viscera items copied from the game, first line "Item Class: Viscera", need no Rarity line) equips as swap_item would; { slot, unequip: true } empties the slot.'),
+    .describe('{ slot, itemText } (PoB "Copy item" text; Viscera items copied from the game, first line "Item Class: Viscera", need no Rarity line) equips as swap_item would; { slot, unequip: true } empties the slot. A jewel for a passive-tree socket that is not allocated after the variant\'s node changes is refused (it would count for nothing): allocate the socket first or in the same variant.'),
   gems: z
     .array(gemChange)
     .max(MAX_VARIANT_GEMS)
@@ -397,6 +411,7 @@ export const variantSchema = z.object({
     .describe('Config options as set_config takes them (e.g. {"enemyIsBoss":"Pinnacle"}).'),
   masteries: masteriesSchema.optional(),
   mainSkill: mainSkillSchema.optional(),
+  flasks: flasksSchema.optional(),
 });
 
 export function registerEvaluateChanges(tools: ToolRegistrar): void {
@@ -405,8 +420,8 @@ export function registerEvaluateChanges(tools: ToolRegistrar): void {
     {
       description:
         `Try up to ${MAX_PROBE_VARIANTS} what-if variants of the build in one call and get a compact table ranked by one stat. ` +
-        'Each variant may combine passive nodes to allocate/deallocate (names or ids), mastery effects (`masteries` [{node, effect}]: allocate a mastery with that effect, or switch an allocated mastery to it), items to equip or unequip, gem changes, config options, and `mainSkill` {group, activeSkill?} (the stats are computed with that socket group as the main skill, e.g. "what does this tree do for my other skill?"); ' +
-        "they apply in the order config, gems, items, nodes and masteries, main skill. Every variant is evaluated through Path of Building's own calculator (a few ms each); " +
+        'Each variant may combine passive nodes to allocate/deallocate (names or ids), mastery effects (`masteries` [{node, effect}]: allocate a mastery with that effect, or switch an allocated mastery to it), items to equip or unequip, flask slots to turn on or off (`flasks` [{slot, active}]), gem changes, config options, and `mainSkill` {group, activeSkill?} (the stats are computed with that socket group as the main skill, e.g. "what does this tree do for my other skill?"); ' +
+        "they apply in the order config, gems, items, flasks, nodes and masteries, main skill. Every variant is evaluated through Path of Building's own calculator (a few ms each); " +
         `variants it cannot reproduce exactly (several node or mastery changes in one variant, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored instead (~0.3-0.5 s each, at most ${MAX_FALLBACK_VARIANTS} per call) and marked \`fallback\`. ` +
         'NOTHING IS APPLIED TO THE BUILD and nothing is pushed to undo. To keep a winner, pass the same variant to apply_changes (one undoable step). ' +
         'Returns `base` (the requested stats now), then `results` sorted by the change of `rankBy` (default CombinedDPS, `order` desc): ' +

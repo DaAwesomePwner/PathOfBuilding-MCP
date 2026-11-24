@@ -119,6 +119,12 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 Not covered: essences, eldritch implicits (pass them as `implicits` lines), fossils, harvest and veiled mods.
 
+## "Cannot build a trade search for Graft 1: the slot is empty" / "… Viscera parts have fixed implicits and no affixes"
+
+**Cause:** Path of Building's trade data has no graft or Viscera category. A graft search weighs the graft mods that can roll on the base of the graft in the slot (the base decides its skill and its mods) and filters the search by that base type, so it needs a graft there; `sockets`, `links` and `influences` do not apply to grafts. Viscera parts (Wickerman slots) have fixed implicits and no mods, so there is nothing to weigh: `generate_trade_search` on `Head`/`Body`/`Arm`/`Leg` ranks the Viscera parts that fit the slot instead (no trade link; options that would shape a trade query are refused), and `search_trade_mods` has no mods to list there.
+
+**Fix:** equip the graft you want to improve (`get_item_text` / `build_item` make one) and search again; for Wickerman slots read the ranked `candidates` (`compare_items` / `swap_item` take their `itemText`) and look the part up on the trade site by name.
+
 ## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
 
 The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
@@ -127,6 +133,43 @@ The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passiv
 - **Graft:** only a 3.27 tree shows them; no conversion helps (`convert_tree_to_latest` goes to the latest tree, not 3.27).
 
 An item already in a hidden slot is still listed by `list_equipped_items` (with `hidden: true` and a note) and `unequip_item` removes it. PoB still counts a hidden Wickerman item in its calculations; a hidden graft is ignored.
+
+## "Jewel … is an unallocated passive tree jewel socket" / "Cannot build a trade search for …"
+
+**Cause:** Path of Building ignores a jewel in a passive-tree socket (`Jewel <nodeId>`) whose node is not allocated, so a what-if or trade search there would show nothing at all. `compare_items`, `evaluate_changes` (and the other probe tools), `apply_changes`, `generate_trade_search` and `search_trade_mods` refuse such a socket; `list_valid_slots` shows each socket's `allocated` flag. A variant whose own deallocations remove the socket is refused the same way ("Deallocating … also deallocates the jewel socket of …").
+
+**Fix:** allocate the socket first (`allocate_nodes` with the node id from the slot name), or, in `evaluate_changes` / `apply_changes`, add the node to the same variant's `allocate`. Sockets inside a cluster jewel work once the cluster jewel is socketed and the inner socket is allocated; while no cluster jewel in the parent socket adds the socket, `list_valid_slots` shows `requiresClusterIn` and the refusal says to socket one there first. A variant that also changes the cluster jewel in the parent socket is checked after it is applied ("After this variant's changes … is not on the passive tree"). `swap_item` still puts a jewel in an unallocated socket (PoB's UI hides such sockets) and says in its `note` that the jewel does nothing yet.
+
+**Abyssal sockets:** `<slot> Abyssal Socket N` exists only while the item in `<slot>` has at least N abyssal sockets (`list_valid_slots` lists only those, with `parentSlot`); otherwise equipping or searching there is refused with "the item in <slot> has K abyssal socket(s)". Trade searches for jewel sockets take `jewelType` (`base` / `abyss` / `any` (both) on tree sockets; only `abyss` on abyssal sockets; none on other slots) and refuse `sockets`, `links`, `influences` and `includeScourge: true`.
+
+## "Flask … is not active, so Path of Building does not apply the flask or tincture there" / "Flask … is empty" / "… is not a flask slot"
+
+**Cause:** Path of Building applies a flask or tincture only while its slot's "Activate this flask" box is ticked (`list_equipped_items` / `list_valid_slots` show `active` on `Flask 1`-`Flask 5`). An item what-if into an inactive flask slot would show next to no difference, so `compare_items`, `evaluate_changes` (and the other probe tools) and `apply_changes` refuse it. Only a flask slot holding a flask or tincture can be turned on or off (PoB disables the box on an empty slot), and only `Flask 1`-`Flask 5` are flask slots.
+
+**Fix:** turn the slot on with `set_flask_active({ slot, active: true })` (undoable), or evaluate it on without committing: `compare_items` with `activate: true`, or `flasks: [{ slot, active: true }]` in the same `evaluate_changes` / `apply_changes` variant. Equip a flask first (`swap_item`, or the same variant's `items`) before toggling an empty slot. `swap_item` itself still equips into an inactive slot and says so in its `note`. The `flasks` alias of `toggle_buffs` / `set_config` / scenarios is a different thing: it sets the "while using a flask" condition (`conditionUsingFlask`), not a slot's active state.
+
+## "Cannot build a trade search for Flask N: …" (empty slot) / "Cannot build a tincture trade search …" / "flaskType only applies to flask slots"
+
+**Cause:** a weighted trade search tries each mod on the flask in the slot. An empty flask slot has none, so `generate_trade_search` needs `flaskType` (`life`, `mana`, `hybrid` or `utility`) to know which flask to search for (`search_trade_mods` does not: every kind lists the same flask mods). A tincture search (`flaskType: "tincture"`, the default when a tincture is equipped) weighs the tincture in the slot: Path of Building's trade data has no tincture category, so the search is filtered by that tincture's base type and its mods come from PoB's tincture mods that can roll on it; `flaskType: "tincture"` on a slot holding a flask or nothing is refused. `flaskType` on a slot other than `Flask 1`-`Flask 5` is refused.
+
+**Fix:** pass `flaskType`; equip the tincture you want to improve before a tincture search; for a slot holding a tincture, another `flaskType` searches flasks for it instead. Every kind is weighed from PoB's flask mod list and searched in the trade site's `flask` category (PoB's data has no life / mana sub-category), so the results can include other kinds of flask. An inactive flask slot is not refused: the weights are computed with it active and the reply says `evaluatedActive: true` (the build is unchanged).
+
+## "Cannot build a trade search for Weapon 1 Swap: Weapon 1 Swap belongs to weapon set 2, which the build does not use"
+
+**Cause:** Path of Building counts only the weapon set in use (`Weapon 1` / `Weapon 2` normally; the `Swap` slots when the build uses the second set). An item in the other set's slots, or in their abyssal sockets, counts for nothing, so every trade weight there would be 0. `compare_items` into such a slot still runs and says so in its `note`; `suggest_upgrades` leaves those slots out.
+
+**Fix:** search the slot of the weapon set in use. Path of Building's weapon-set switch is not exposed as a tool; load a build that uses the other set to search its slots.
+
+## "Watcher's Eye searches need slot = ..." / "Pearl of Tsoatha searches need slot = ..." / "... does not apply to ... searches" / "Path of Building cannot weigh Megalomaniac on this build's passive tree"
+
+**Cause:** `generate_trade_search` `unique` runs Path of Building's own searches for its special uniques, with the slots and options its trade tab offers for them:
+- **Watcher's Eye** needs `slot` = an allocated passive-tree jewel socket (`Jewel <nodeId>`). A socket holding a cluster jewel is refused: PoB weighs every mod against the build without the jewel in that socket, so every weight would carry the loss of the cluster's passives.
+- **Pearl of Tsoatha** needs `slot` = a ring slot PoB shows (`Ring 1`, `Ring 2`; `Ring 3` only when the build shows it).
+- **Megalomaniac** takes `slot` optionally (by default PoB's own pick, the allocated socket with the lowest node id, skipping sockets that hold a cluster jewel; refused when every allocated socket holds one). PoB weighs each cluster notable on the build's passive tree, and its search fails on a tree that lacks some of them (older trees such as 3.13), so that is refused, naming the missing notables.
+- Unique searches always exclude mirrored items and refuse `influences`, `sockets`, `links`, `includeMirrored: true`, `includeTalisman: true`, `includeEldritch` "keep...", `flaskType` and `jewelType` (Watcher's Eye accepts `"any"`, which changes nothing). Pearl of Tsoatha's filter ids (`explicit.stat_4089743927|<skill-group slot>|<support>`) work in `weightAdjustments` / `requiredMods`; `search_trade_mods` with `unique: "Pearl of Tsoatha"` lists them.
+- "This Path of Building version's trade query generator has no ... search": the installed PoB predates that search; update Path of Building.
+
+**Fix:** pass a slot as above (allocate a socket with `allocate_nodes`, or choose a socket without a cluster jewel); for Megalomaniac on an old tree, `convert_tree_to_latest` (undoable) and search again; drop the options the search does not take.
 
 ## State drift / unexpected stat values after multiple operations
 
@@ -158,7 +201,7 @@ A mastery is always allocated together with the effect chosen on it, so it canno
 
 ## "Nothing to undo"
 
-The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only the committed edits (`swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, `create_socket_group`, `delete_socket_group`, `set_main_skill`, `set_character_level`, `set_ascendancy`, `convert_tree_to_latest`) push an entry, and only when the change succeeded (a `new_build` clears the stack, like `load_build`); the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
+The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only the committed edits (`swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, `create_socket_group`, `delete_socket_group`, `set_main_skill`, `set_character_level`, `set_ascendancy`, `set_flask_active`, `convert_tree_to_latest`) push an entry, and only when the change succeeded (a `new_build` clears the stack, like `load_build`); the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
 
 ## "The Path of Building engine was restarted … Retry the call"
 
@@ -192,7 +235,7 @@ Path of Building's mod parser could not use the line (the same check its Custom 
 | `find_worst_allocated_nodes` | 2–3 s |
 | `compare_supports`, `swap_gem`, `evaluate_gem_levels` | milliseconds |
 | `find_optimal_links` (6-link, default topN) | 1–3 s |
-| `suggest_upgrades` (all slots; suggested mods for 3) | ~2 s (`modSlots: 10` ~5 s, `modSlots: 0` <0.1 s) |
+| `suggest_upgrades` (all slots incl. flasks and 3 tree jewels; suggested mods for 3) | ~3 s (`modSlots: 10` ~7 s, `modSlots: 0` ~1 s: each tree jewel socket takes a full recalculation) |
 | `stat_weights` (default 37 lines) | ~0.1 s |
 | `compare_builds` | ~5 s (a second engine boots and loads the other build; with `against` both builds load in that engine) |
 | `simulate_scenario`, `compare_scenarios`, `toggle_buffs` | milliseconds |

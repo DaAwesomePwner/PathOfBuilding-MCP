@@ -43,7 +43,8 @@ export const influenceTradeId = (influence: string) => `pseudo.pseudo_has_${infl
  * each distinct influence / required mod id).
  */
 function weightFilterBudget(args: TradeSearchArgs): number {
-  const optionFilters = (args.includeMirrored === false ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
+  // Unique searches always carry PoB's "not mirrored" filter.
+  const optionFilters = (args.includeMirrored === false || args.unique !== undefined ? 1 : 0) + (args.maxPrice ? 1 : 0) + (args.maxLevel ? 1 : 0)
     + (args.sockets ? 1 : 0) + (args.links ? 1 : 0);
   // Distinct "and" ids: a required pseudo_has_<influence>_influence also named in influences is emitted once.
   const andFilters = new Set([...(args.influences ?? []).map(influenceTradeId), ...(args.requiredMods ?? []).map((m) => m.tradeId)]).size;
@@ -80,7 +81,9 @@ export function applyWeightFilters(args: TradeSearchArgs, raw: TradeQueryRaw): W
   const kept = [...pinned, ...unpinned.slice(0, budget - pinned.length)].sort((a, b) => b.weight - a.weight);
   const dropped = unpinned.slice(budget - pinned.length);
   if (kept.length === 0) {
-    throw new UserError(`Path of Building found no mods that raise the chosen stat weights for ${args.slot}; change statWeights or add weightAdjustments.`);
+    const what = args.unique === 'Megalomaniac' ? 'no cluster notables' : 'no mods';
+    throw new UserError(`Path of Building found ${what} that raise the chosen stat weights for ${args.unique ?? args.slot}; ` +
+      `change statWeights or add weightAdjustments.${args.unique === "Watcher's Eye" ? ' Watcher\'s Eye mods count only while the build uses the aura they name.' : ''}`);
   }
 
   const minWeightedSum = args.minWeightedSum ?? round(pobDefaultMin, 6);

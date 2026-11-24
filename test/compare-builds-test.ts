@@ -444,6 +444,25 @@ async function main(): Promise<void> {
     await allTempDead('after jewel tests');
     log('PASS');
 
+    log('Test 9: a flask slot that is on in one build only is a changed slot (flaskActive)');
+    const codeFlask = await run(async (s) => {
+      await s.setFlaskActive('Flask 2', false);
+      const code = await s.exportBuild('code');
+      await s.undoLastChange();
+      return code;
+    });
+    assert((await liveState()) === stateBefore, 'the flask edit was not undone');
+    const flaskDiff = await compare({ source: codeFlask });
+    const flaskChanged = flaskDiff.items.changed as Array<Record<string, unknown>>;
+    assert(flaskChanged.length === 1 && flaskChanged[0].slot === 'Flask 2'
+      && JSON.stringify(flaskChanged[0].flaskActive) === JSON.stringify({ a: true, b: false })
+      && flaskChanged[0].modsOnlyA === undefined && flaskChanged[0].modsOnlyB === undefined,
+      `flask slot diff: ${JSON.stringify(flaskDiff.items.changed)}`);
+    assert(!flaskDiff.items.same.includes('Flask 2') && flaskDiff.items.same.includes('Flask 3'), 'only Flask 2 differs');
+    assert((flaskDiff.stats.TotalEHP?.delta ?? 0) < 0, `turning the Granite Flask off lowers defences: ${JSON.stringify(flaskDiff.stats.TotalEHP)}`);
+    await allTempDead('after the flask test');
+    log('PASS');
+
     console.log('\nALL COMPARE BUILDS TESTS PASSED');
   } finally {
     await engine.shutdown();

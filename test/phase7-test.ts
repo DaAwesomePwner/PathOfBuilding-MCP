@@ -56,9 +56,12 @@ interface UpgradeResp {
     empty: boolean;
     dpsContribution: number;
     ehpContribution: number;
-    priority: number;
+    priority: number | null;
+    note?: string;
+    kind?: string;
     suggestedMods?: Array<{ mod: string; weight: number }>;
     modsError?: string;
+    error?: string;
     currentItemName: string | null;
   }>;
   modsNote?: string;
@@ -137,7 +140,7 @@ async function main(): Promise<void> {
     assert(sugAll.suggestions.some((s) => s.dpsContribution > 0), 'no slot contributes DPS');
     for (const s of sugAll.suggestions) {
       assert(typeof s.slot === 'string', 'slot string');
-      assert(typeof s.priority === 'number', 'priority number');
+      assert(typeof s.priority === 'number' || (s.priority === null && typeof s.note === 'string'), 'priority number, or null with a note');
       if (s.suggestedMods !== undefined) {
         assert(s.suggestedMods.every((m) => typeof m.mod === 'string' && typeof m.weight === 'number' && m.weight > 0), 'suggestedMods are {mod, weight}');
       }
@@ -146,9 +149,10 @@ async function main(): Promise<void> {
     assert(withMods.length === 3 && withMods.every((s, i) => s === sugAll.suggestions[i]), 'the 3 highest-priority slots get PoB-weighted mods');
     assert(typeof sugAll.modsNote === 'string', 'modsNote names the slots without suggested mods');
     log(`  suggested mods for ${withMods.map((s) => s.slot).join(', ')}`);
-    const sugRanked = sugAll.suggestions.filter((s) => !s.empty);
+    const sugRanked = sugAll.suggestions.filter((s) => !s.empty && s.priority !== null);
+    assert(['gear', 'flask', 'treeJewel'].every((k) => sugAll.suggestions.some((s) => s.kind === k)), 'gear, flask and tree jewel slots are listed');
     for (let i = 1; i < sugRanked.length; i++) {
-      assert(sugRanked[i - 1].priority >= sugRanked[i].priority, 'suggest_upgrades is not sorted by priority (highest first)');
+      assert(sugRanked[i - 1].priority! >= sugRanked[i].priority!, 'suggest_upgrades is not sorted by priority (highest first)');
     }
     const afterSug = await getKeyStats(client);
     assert(approxEq(afterSug.Life, baseline.Life), 'Life restored after suggest_upgrades');
@@ -163,6 +167,42 @@ async function main(): Promise<void> {
     assert((sugSingle.suggestions[0].suggestedMods?.length ?? 0) > 0 && sugSingle.modsNote === undefined, 'the given slot gets suggested mods');
     log(`  Body Armour DPS contribution: ${sugSingle.suggestions[0].dpsContribution}`);
     log('PASS: single-slot suggest works');
+
+    // Test 5b: modsNote counts only the slots the trade generator was run for
+    // (an empty flask slot carries its own modsError and is not one of them).
+    log('Test 5b: suggest_upgrades modsNote with an unsupported slot');
+    assert(!(await call(client, 'unequip_item', { slot: 'Flask 5' }) as { isError?: boolean }).isError, 'unequip Flask 5');
+    const sugTen = JSON.parse(extractText(await call(client, 'suggest_upgrades', { modSlots: 10 }))) as UpgradeResp;
+    const emptyFlask = sugTen.suggestions.find((s) => s.slot === 'Flask 5');
+    assert(emptyFlask?.empty && /Empty flask slot/.test(emptyFlask.modsError ?? '') && emptyFlask.suggestedMods === undefined, 'empty flask slot: modsError, no query');
+    const queried = sugTen.suggestions.filter((s) => s.suggestedMods !== undefined || (s.modsError !== undefined && !/Empty flask slot/.test(s.modsError))).length;
+    assert(queried === 10, `10 slots queried, got ${queried}`);
+    assert(/suggestedMods were computed for 10 supported slot\(s\) only/.test(sugTen.modsNote ?? ''), `modsNote counts queried slots only: ${sugTen.modsNote}`);
+    assert(sugTen.suggestions.every((s) => !('modsQueried' in s)), 'the internal modsQueried marker is left out');
+    assert(!(await call(client, 'undo_last_change') as { isError?: boolean }).isError, 'undo the unequip');
+    log('PASS: modsNote counts queried slots only');
+
+    // Test 5c: modsNote says which slots a larger modSlots reaches and which
+    // only `slot` reaches (empty or unmeasured jewel / abyssal sockets).
+    log('Test 5c: suggest_upgrades modsNote with an empty jewel socket');
+    const noteParts = (r: UpgradeResp) => {
+      const open = r.suggestions.filter((s) => s.error === undefined && s.suggestedMods === undefined && s.modsError === undefined);
+      const sockets = open.filter((s) => s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal')).length;
+      return { reachable: open.length - sockets, sockets };
+    };
+    const def = noteParts(sugAll);
+    assert(def.reachable > 0 && new RegExp(`pass a larger modSlots \\(or slot\\) for the other ${def.reachable} ranked or listed slot\\(s\\)`).test(sugAll.modsNote ?? ''),
+      `default modsNote names the slots a larger modSlots reaches: ${sugAll.modsNote}`);
+    assert(!(await call(client, 'allocate_nodes', { nodes: [26725] }) as { isError?: boolean }).isError, 'allocate the empty socket 26725');
+    const sugSocket = JSON.parse(extractText(await call(client, 'suggest_upgrades', { modSlots: 10 }))) as UpgradeResp;
+    const emptySocket = sugSocket.suggestions.find((s) => s.slot === 'Jewel 26725');
+    assert(emptySocket?.empty && emptySocket.priority === null && emptySocket.suggestedMods === undefined, 'the empty socket is listed without a query');
+    const withSocket = noteParts(sugSocket);
+    assert(withSocket.sockets >= 1 && new RegExp(`pass slot for the ${withSocket.sockets} empty or unmeasured jewel / abyssal socket\\(s\\), which modSlots never reaches`)
+      .test(sugSocket.modsNote ?? ''), `modsNote names the sockets only slot reaches: ${sugSocket.modsNote}`);
+    assert(withSocket.reachable > 0 || !/larger modSlots/.test(sugSocket.modsNote ?? ''), 'no larger-modSlots advice when nothing is left for it');
+    assert(!(await call(client, 'undo_last_change') as { isError?: boolean }).isError, 'undo the allocation');
+    log('PASS: modsNote separates modSlots and slot');
 
     // Test 6: export_build (summary)
     log('Test 6: export_build (summary)');

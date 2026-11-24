@@ -21,7 +21,9 @@
 // Masteries: one mastery change (allocating a mastery with an effect, or a
 // new effect on an allocated one) goes through the calculator with a copy of
 // the mastery node carrying that effect in place of the node; a main skill
-// (`mainSkill`) is set on the build for the calculator and put back.
+// (`mainSkill`) is set on the build for the calculator and put back, as are
+// flask slots' active flags (`flasks`), which PoB's calculator reads from the
+// slots when it builds its env, as a full recalculation does.
 
 import type { Stats } from './lua-bridge.js';
 import { UserError, normalizeItemText, validateItemText, validateSlot } from './validation.js';
@@ -38,6 +40,16 @@ export type ProbeGemChange =
   | { op: 'clear'; group: number };
 
 export type ProbeItemChange = { slot: string; itemText: string } | { slot: string; unequip: true };
+
+/**
+ * A flask slot (Flask 1-5) turned on or off, as PoB's activate check box
+ * does: CalcSetup counts a flask or tincture only while its slot is active.
+ * The slot must hold a flask or tincture once the variant's items are in.
+ */
+export interface ProbeFlaskChange {
+  slot: string;
+  active: boolean;
+}
 
 /**
  * A mastery and the effect to choose on it. `node` is a node id or a mastery
@@ -83,6 +95,12 @@ export interface ProbeVariant {
   masteries?: ProbeMasteryChoice[];
   /** Evaluate the variant with this socket group (and active skill) as the main skill. */
   mainSkill?: ProbeMainSkill;
+  /**
+   * Flask slots to turn on or off (applied after the items). An item put in a
+   * flask slot that is inactive after the variant is refused (PoB would not
+   * apply it).
+   */
+  flasks?: ProbeFlaskChange[];
 }
 
 export interface ProbeRequest {

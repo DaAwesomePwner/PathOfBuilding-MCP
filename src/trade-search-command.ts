@@ -1,6 +1,8 @@
 /** generate_trade_search: checks the bridge cannot do and the bridge's `tradeQuery` command. */
 import { UserError } from './validation.js';
-import { DEFAULT_STAT_WEIGHTS, ELDRITCH, ELDRITCH_SLOTS, TRADE_ID_RE, type TradeSearchArgs } from './trade-search-schema.js';
+import {
+  DEFAULT_STAT_WEIGHTS, ELDRITCH, ELDRITCH_SLOTS, GRAFT_SLOT_RE, JEWEL_SLOT_RE, TRADE_ID_RE, WICKERMAN_SLOTS, type TradeSearchArgs,
+} from './trade-search-schema.js';
 
 export function validateLeague(raw: string): string {
   const league = raw.trim();
@@ -20,33 +22,112 @@ function checkTradeIds(ids: string[], what: string): void {
   }
 }
 
+/**
+ * A special unique search (PoB's "Other trades" rows): options its popup does not offer are refused when they
+ * would change the search (influences, socket / link filters, mirrored items, talisman or eldritch weights);
+ * the slot, jewelType and flaskType are checked by the bridge.
+ */
+function checkUniqueOptions(args: TradeSearchArgs, unique: NonNullable<TradeSearchArgs['unique']>): void {
+  if (args.slot === undefined && unique !== 'Megalomaniac') {
+    throw new UserError(`slot is required for ${unique}: ${unique === 'Pearl of Tsoatha'
+      ? 'a ring slot Path of Building shows ("Ring 1")'
+      : 'an allocated passive-tree jewel socket not holding a cluster jewel ("Jewel <nodeId>", see list_valid_slots)'}`);
+  }
+  const refuse = (what: string) => {
+    throw new UserError(`${what} does not apply to ${unique} searches (Path of Building's unique search does not offer it)`);
+  };
+  if ((args.influences?.length ?? 0) > 0) refuse('influences');
+  if (args.sockets !== undefined) refuse('sockets');
+  if (args.links !== undefined) refuse('links');
+  if (args.includeMirrored === true) {
+    throw new UserError(`includeMirrored true does not apply to ${unique} searches: Path of Building's unique searches always exclude ` +
+      'mirrored items (false is accepted and changes nothing)');
+  }
+  if (args.includeTalisman === true) refuse('includeTalisman true');
+  if (args.includeEldritch?.startsWith('keep')) refuse(`includeEldritch "${args.includeEldritch}"`);
+}
+
+/**
+ * A Wickerman slot ranks Viscera parts instead of building a search: the options that would shape a trade query
+ * are refused (they would change nothing); league, realm, tradeType and the include* defaults are accepted.
+ * Returns the stat weights to rank by.
+ */
+export function visceraRankArgs(args: TradeSearchArgs): { slot: string; statWeights: { stat: string; weight: number }[] } {
+  validateLeague(args.league);
+  const slot = args.slot ?? '';
+  const refused = ([
+    ['unique', args.unique !== undefined], ['jewelType', args.jewelType !== undefined], ['flaskType', args.flaskType !== undefined],
+    ['requiredMods', (args.requiredMods?.length ?? 0) > 0], ['weightAdjustments', (args.weightAdjustments?.length ?? 0) > 0],
+    ['minWeightedSum', args.minWeightedSum !== undefined], ['influences', (args.influences?.length ?? 0) > 0],
+    ['sockets', args.sockets !== undefined], ['links', args.links !== undefined], ['maxPrice', args.maxPrice !== undefined],
+    ['maxLevel', args.maxLevel !== undefined], ['includeTalisman true', args.includeTalisman === true],
+    ['includeEldritch "keep..."', args.includeEldritch?.startsWith('keep') === true],
+  ] as const).filter(([, given]) => given).map(([name]) => name);
+  if (refused.length > 0) {
+    throw new UserError(`${refused.join(', ')} ${refused.length > 1 ? 'do' : 'does'} not apply to ${slot}: Viscera parts have fixed ` +
+      'implicits and no affixes, so generate_trade_search ranks the Viscera parts that fit the slot (by statWeights) instead of building a trade search');
+  }
+  const statWeights = args.statWeights ?? DEFAULT_STAT_WEIGHTS;
+  if (new Set(statWeights.map((w) => w.stat)).size !== statWeights.length) throw new UserError('statWeights lists a stat more than once');
+  return { slot, statWeights };
+}
+
+/** True for a Wickerman slot (Viscera parts: ranked, not searched). */
+export const isWickermanSlot = (slot: string | undefined): boolean => slot !== undefined && WICKERMAN_SLOTS.has(slot);
+
 /** Validates arguments the bridge cannot check and builds the bridge command. */
 export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown> {
   const league = validateLeague(args.league);
+  if (args.unique !== undefined) checkUniqueOptions(args, args.unique);
+  else if (args.slot === undefined) throw new UserError('slot is required (except for unique "Megalomaniac"); see list_valid_slots');
+  const slot = args.slot ?? '';
   const weights = args.statWeights ?? DEFAULT_STAT_WEIGHTS;
   if (new Set(weights.map((w) => w.stat)).size !== weights.length) throw new UserError('statWeights lists a stat more than once');
   if (new Set(args.influences ?? []).size !== (args.influences ?? []).length) throw new UserError('influences lists an influence twice');
   checkTradeIds((args.requiredMods ?? []).map((m) => m.tradeId), 'requiredMods');
   checkTradeIds((args.weightAdjustments ?? []).map((m) => m.tradeId), 'weightAdjustments');
-  if (args.sockets !== undefined && /Flask/.test(args.slot)) throw new UserError('sockets is not available for flask slots');
-  if (args.links !== undefined && /Flask|Belt|Ring|Amulet/.test(args.slot)) throw new UserError(`links is not available for ${args.slot}`);
+  const jewelSlot = JEWEL_SLOT_RE.test(slot);
+  // Grafts have no sockets and cannot be influenced.
+  if (GRAFT_SLOT_RE.test(slot)) {
+    for (const [name, given] of [['sockets', args.sockets !== undefined], ['links', args.links !== undefined],
+      ['influences', (args.influences?.length ?? 0) > 0]] as const) {
+      if (given) {
+        throw new UserError(`${name} ${name === 'influences' ? 'do' : 'does'} not apply to graft slots like ${slot}: grafts have no sockets and cannot be influenced`);
+      }
+    }
+  }
+  if (args.sockets !== undefined && /Flask/.test(slot)) throw new UserError('sockets is not available for flask slots');
+  if (args.sockets !== undefined && jewelSlot) throw new UserError('sockets is not available for jewel sockets');
+  if (args.links !== undefined && (jewelSlot || /Flask|Belt|Ring|Amulet/.test(slot))) throw new UserError(`links is not available for ${slot}`);
+  // PoB's popup offers neither scourge mods nor influences for jewel sockets (jewels have neither); its unique
+  // searches never weigh scourge mods, so any value changes nothing there.
+  if (jewelSlot && args.unique === undefined && args.includeScourge === true) {
+    throw new UserError(`includeScourge true does not apply to jewel sockets like ${slot} (false is accepted and changes nothing)`);
+  }
+  if (jewelSlot && (args.influences?.length ?? 0) > 0) throw new UserError(`influences do not apply to jewel sockets like ${slot}: jewels cannot be influenced`);
   // PoB only offers these options on their slots. Elsewhere a value that changes nothing there is accepted
   // (eldritch weights come only from "keep..."; talisman mods only from includeTalisman true); the rest
   // is refused instead of being dropped silently.
-  if (args.includeEldritch?.startsWith('keep') && !ELDRITCH_SLOTS.has(args.slot)) {
-    throw new UserError(`includeEldritch "${args.includeEldritch}" only applies to ${[...ELDRITCH_SLOTS].join(', ')}, not ${args.slot} ` +
+  if (args.includeEldritch?.startsWith('keep') && !ELDRITCH_SLOTS.has(slot)) {
+    throw new UserError(`includeEldritch "${args.includeEldritch}" only applies to ${[...ELDRITCH_SLOTS].join(', ')}, not ${slot} ` +
       '(there "copyCurrent" and "remove" are accepted and change nothing)');
   }
   if (args.includeEldritch?.startsWith('keep') && (args.influences?.length ?? 0) > 0) {
     throw new UserError('includeEldritch "keep..." cannot be combined with influences: influenced items have no eldritch implicits, so PoB skips those weights');
   }
-  if (args.includeTalisman === true && args.slot !== 'Amulet') {
-    throw new UserError(`includeTalisman true only applies to Amulet, not ${args.slot} (false is accepted and changes nothing)`);
+  if (args.includeTalisman === true && slot !== 'Amulet') {
+    throw new UserError(`includeTalisman true only applies to Amulet, not ${slot} (false is accepted and changes nothing)`);
   }
   const currency = args.maxPrice?.currency ?? 'chaos-equivalent';
   return {
     cmd: 'tradeQuery',
-    slot: args.slot,
+    ...(args.slot !== undefined ? { slot: args.slot } : {}),
+    // The bridge checks the slot against it and runs PoB's special search.
+    ...(args.unique !== undefined ? { unique: args.unique } : {}),
+    // The bridge checks it against the slot (tree socket / abyssal socket / other) and picks the default.
+    ...(args.jewelType !== undefined ? { jewelType: args.jewelType } : {}),
+    // The bridge checks it against the slot (flask slots only) and the item there.
+    ...(args.flaskType !== undefined ? { flaskType: args.flaskType } : {}),
     statWeights: weights,
     tradeIds: [...(args.requiredMods ?? []), ...(args.weightAdjustments ?? [])].map((m) => m.tradeId),
     // The bridge refuses weights on stats PoB leaves out of the weights; weight 0 adds no filter, so it is a no-op there.
@@ -54,8 +135,10 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
     options: {
       tradeType: args.tradeType ?? 'available',
       includeCorrupted: args.includeCorrupted,
-      includeMirrored: args.includeMirrored ?? true,
-      includeScourge: args.includeScourge ?? /^(Standard|Hardcore)$/.test(league),
+      includeMirrored: args.unique !== undefined ? false : args.includeMirrored ?? true,
+      includeScourge: !jewelSlot && (args.includeScourge ?? /^(Standard|Hardcore)$/.test(league)),
+      // Asked for explicitly: the bridge refuses it for grafts and tinctures (no scourge mods), where the default is ignored.
+      scourgeRequested: args.includeScourge === true,
       includeTalisman: args.includeTalisman ?? false,
       eldritchIndex: ELDRITCH.indexOf(args.includeEldritch ?? 'copyCurrent') + 1,
       influences: args.influences ?? [],
