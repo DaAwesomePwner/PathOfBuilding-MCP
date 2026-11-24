@@ -1307,6 +1307,20 @@ local function checkItemsState(state)
 		error("Item snapshot is malformed; nothing was restored; call reset_build to return to the loaded build", 0)
 	end
 	local tab = build.itemsTab
+	-- Flask slots' active flags (captureItemsState): every entry must name a
+	-- flask slot of this build with valid flag codes.
+	if state.flasks ~= nil then
+		local valid = type(state.flasks) == "table"
+		for _, f in ipairs(valid and state.flasks or { }) do
+			local slot = type(f) == "table" and type(f[1]) == "string" and tab.slots[f[1]]
+			local function isCode(c) return c == 1 or c == 0 or c == -1 end
+			if not (slotChecks.isFlaskSlot(slot) and isCode(f[2]) and isCode(f[3])) then valid = false end
+		end
+		if not valid then
+			error("Item snapshot has malformed or unknown flask slot states; nothing was restored; call reset_build to return "
+				.. "to the loaded build", 0)
+		end
+	end
 	for i, id in ipairs(state.itemOrder) do
 		local item = tab.items[id]
 		if not item or itemTokens[item] ~= state.itemTokens[i] then
@@ -1384,20 +1398,14 @@ local function restoreItemsState(state)
 	end
 
 	-- Flask slots' active flags, exactly as captured (nil and false apart).
-	if state.flasks ~= nil then
-		if type(state.flasks) ~= "table" then error("restoreItemsState: malformed flask states") end
-		for _, f in ipairs(state.flasks) do
-			local slot = type(f) == "table" and type(f[1]) == "string" and tab.slots[f[1]]
-			if not slotChecks.isFlaskSlot(slot) then
-				mismatches[#mismatches + 1] = "flask slot " .. tostring(type(f) == "table" and f[1]) .. " does not exist"
-			else
-				local entry = tab.activeItemSet[slot.slotName]
-				local slotActive, entryActive = slotChecks.flagValue(f[2]), slotChecks.flagValue(f[3])
-				if slot.active ~= slotActive or (entry and entry.active ~= entryActive) then
-					slotChecks.setFlaskFlags(slot, slotActive, entryActive)
-					changed = true
-				end
-			end
+	-- (checkItemsState checked every entry before anything changed.)
+	for _, f in ipairs(state.flasks or { }) do
+		local slot = tab.slots[f[1]]
+		local entry = tab.activeItemSet[slot.slotName]
+		local slotActive, entryActive = slotChecks.flagValue(f[2]), slotChecks.flagValue(f[3])
+		if slot.active ~= slotActive or (entry and entry.active ~= entryActive) then
+			slotChecks.setFlaskFlags(slot, slotActive, entryActive)
+			changed = true
 		end
 	end
 
@@ -1452,13 +1460,11 @@ local function restoreItemsState(state)
 			end
 		end
 	end
-	for _, f in ipairs(type(state.flasks) == "table" and state.flasks or { }) do
-		local slot = type(f) == "table" and type(f[1]) == "string" and tab.slots[f[1]]
-		if slotChecks.isFlaskSlot(slot) then
-			local entry = tab.activeItemSet[slot.slotName]
-			if slotChecks.flagCode(slot.active) ~= f[2] or (entry and slotChecks.flagCode(entry.active) ~= f[3]) then
-				mismatches[#mismatches + 1] = slot.slotName .. " active state differs from the snapshot"
-			end
+	for _, f in ipairs(state.flasks or { }) do
+		local slot = tab.slots[f[1]]
+		local entry = tab.activeItemSet[slot.slotName]
+		if slotChecks.flagCode(slot.active) ~= f[2] or (entry and slotChecks.flagCode(entry.active) ~= f[3]) then
+			mismatches[#mismatches + 1] = slot.slotName .. " active state differs from the snapshot"
 		end
 	end
 	local report = { exact = #mismatches == 0 }
@@ -5062,6 +5068,11 @@ local DISPATCH = {
 			end
 			slotChecks.setFlaskFlags(slot, cmd.active, cmd.active)
 			build.buildFlag = true
+			-- Test fault: the command fails after the change is in, before PoB
+			-- recalculates (never on a replay).
+			if TEST_FAULTS.flaskFailsAfterChange and cmd.replay ~= true then
+				error("test fault: set_flask_active failed after changing the build", 0)
+			end
 			runCallback("OnFrame")
 			return result
 		end,
@@ -5528,6 +5539,7 @@ do
 					hidden = flags.hidden,
 					swap = flags.swap,
 					inactive = flags.inactive,
+					flaskActive = flags.flaskActive,
 					mods = modLines(item),
 				}
 			end
@@ -5546,10 +5558,15 @@ do
 						local parent = parentId ~= 0 and tab.items[parentId] or nil
 						if not parent or (parent.abyssalSocketCount or 0) < (slot.slotNum or 0) then inactive = true end
 					end
+					-- Flask slots: PoB applies the flask or tincture only while
+					-- the slot is active (its "Activate this flask" box).
+					local flaskActive = nil
+					if slotChecks.isFlaskSlot(slot) then flaskActive = slot.active == true end
 					addItem(slot.slotName, slot.selItemId, {
 						hidden = slotChecks.hiddenGate(slot) and true or nil,
 						swap = slot.weaponSet == 2 or nil,
 						inactive = inactive,
+						flaskActive = flaskActive,
 					})
 				end
 			end

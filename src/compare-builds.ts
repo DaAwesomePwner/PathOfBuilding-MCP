@@ -41,6 +41,8 @@ export interface SnapshotItem {
   swap?: boolean;
   /** PoB ignores this item: the weapon set not in use, or an abyss jewel in a socket its parent item does not have. */
   inactive?: boolean;
+  /** Flask slots: whether the slot is active (PoB applies the flask or tincture only then). */
+  flaskActive?: boolean;
   /** Active mod lines: {enchant}, {scourge}, {implicit}, then explicits ({crafted} / {fractured} marked). */
   mods: string[];
 }
@@ -236,7 +238,7 @@ function itemChange(slot: string, a: SnapshotItem, b: SnapshotItem): Record<stri
   const removed = multisetMinus(a.mods, b.mods).map((m) => clip(m, MAX_MOD_CHARS));
   const added = multisetMinus(b.mods, a.mods).map((m) => clip(m, MAX_MOD_CHARS));
   const fields: Record<string, unknown> = {};
-  for (const key of ['rarity', 'quality', 'sockets', 'corrupted', 'inactive'] as const) {
+  for (const key of ['rarity', 'quality', 'sockets', 'corrupted', 'inactive', 'flaskActive'] as const) {
     if ((a[key] ?? null) !== (b[key] ?? null)) fields[key] = { a: a[key] ?? null, b: b[key] ?? null };
   }
   const sameLabel = itemLabel(a) === itemLabel(b);
@@ -256,7 +258,13 @@ function itemChange(slot: string, a: SnapshotItem, b: SnapshotItem): Record<stri
 }
 
 function oneSide(slot: string, item: SnapshotItem): Record<string, unknown> {
-  return { slot, item: itemLabel(item), ...(item.swap ? { swap: true } : {}), ...(item.inactive ? { inactive: true } : {}) };
+  return {
+    slot,
+    item: itemLabel(item),
+    ...(item.swap ? { swap: true } : {}),
+    ...(item.inactive ? { inactive: true } : {}),
+    ...(item.flaskActive === false ? { flaskActive: false } : {}),
+  };
 }
 
 function diffItems(a: SnapshotItem[], b: SnapshotItem[]): Record<string, unknown> {
@@ -625,7 +633,7 @@ export function registerCompareBuilds(tools: ToolRegistrar, engine: EngineManage
         'the loaded build, its undo history and its config are never changed. Returns `meta` (class, ascendancy, level, main skill, tree version of each side), ' +
         `\`stats\` (a, b, delta = b - a, pct = delta in % of a: ${KEY_STATS.join(', ')} always, other stats only when they differ, largest change first), ` +
         '`tree` (points; nodes only in a / only in b: keystones, notables, masteries with their effect and ascendancy nodes named with ids, normal nodes and jewel sockets counted; mastery effect changes), ' +
-        '`items` (slots holding the same item; changed slots with the mod lines only in a / only in b; slots filled on one side only), ' +
+        '`items` (slots holding the same item; changed slots with the mod lines only in a / only in b, and `flaskActive` {a, b} when a flask slot is on in one build only; slots filled on one side only), ' +
         '`gems` (socket groups matched by their active skills: supports and other active gems added / removed, level / quality / enabled changes; groups on one side only) and `config` (options that differ). ' +
         'Long lists are cut; `more` says how many entries were left out.',
       inputSchema: {

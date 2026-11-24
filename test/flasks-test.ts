@@ -38,8 +38,8 @@ function assert(cond: unknown, msg: string): asserts cond {
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
-function newBridge(): LuaBridge {
-  const b = new LuaBridge(paths, 120_000);
+function newBridge(testFaults?: string): LuaBridge {
+  const b = new LuaBridge(paths, 120_000, testFaults ? { testFaults } : {});
   bridges.push(b);
   return b;
 }
@@ -82,6 +82,16 @@ function diffAt(a: string, b: string): string {
 async function sameExport(label: string, session: BuildSession, expected: string): Promise<void> {
   const xml = await session.exportXML();
   assert(xml === expected, `${label}: export differs: ${diffAt(xml, expected)}`);
+}
+
+/** The `active` attribute of every exported <Slot> element of `slot` (attributes parsed, whatever their order). */
+function slotActiveAttrs(xml: string, slot: string): Array<string | undefined> {
+  const out: Array<string | undefined> = [];
+  for (const m of xml.matchAll(/<Slot\s([^>]*?)\/?>/g)) {
+    const attrs = Object.fromEntries([...m[1].matchAll(/(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]]));
+    if (attrs.name === slot) out.push(attrs.active);
+  }
+  return out;
 }
 
 async function itemText(session: BuildSession, slot: string): Promise<string> {
@@ -271,6 +281,44 @@ async function test4Refusals(session: BuildSession): Promise<void> {
   log('PASS 4');
 }
 
+async function test4bErrorAfterApply(session: BuildSession): Promise<void> {
+  log('Test 4b: a calculator variant that fails after its flask toggle is applied leaves the flags as they were');
+  const xml = await baseExport(session);
+  const base = await committed(session);
+  const groups = await session.listSkillGroups();
+  const main = groups.findIndex((g) => g.isMainGroup) + 1;
+  assert(main > 0, 'the build has a main group');
+  // mainSkill's activeSkill is checked when it is applied, after the flask toggle.
+  const [failed, after] = (await session.probe({
+    stats: STATS,
+    variants: [
+      { flasks: [{ slot: 'Flask 2', active: false }, { slot: 'Flask 3', active: false }], mainSkill: { group: main, activeSkill: 99 } },
+      { flasks: [{ slot: 'Flask 4', active: false }] },
+    ],
+  })).results;
+  assert(failed.userError === true && /activeSkill 99 is out of range/.test(failed.error ?? ''), `variant failed after applying: ${JSON.stringify(failed)}`);
+  assert(after.error === undefined && (after.stats.Armour as number) === (base.Armour as number) && (after.stats.CombinedDPS as number) === (base.CombinedDPS as number),
+    `the next variant sees Flask 2 and 3 back on: ${JSON.stringify(after.stats)}`);
+  const states = await flaskStates(session);
+  assert(FLASKS.every((f) => states[f] === true), `flags put back: ${JSON.stringify(states)}`);
+  await sameExport('after the failed variant', session, xml);
+  sameStats('after the failed variant', await committed(session), base);
+
+  // An item state naming a slot that is not a flask slot is refused before anything is restored.
+  const bridge = (session as unknown as { bridge: LuaBridge }).bridge;
+  const { state } = await bridge.send<{ ok: true; state: { flasks: unknown[] } & Record<string, unknown> }>({ cmd: 'captureItemsState' });
+  await session.setFlaskActive('Flask 2', false);
+  const offXml = await session.exportXML();
+  for (const bad of [[...state.flasks, ['Helmet', 1, 1]], [...state.flasks, ['Flask 3', 2, 1]], 'nope']) {
+    const e = await rejection(bridge.send({ cmd: 'restoreItemsState', state: { ...state, flasks: bad } }));
+    assert(!(e instanceof UserError) && /malformed or unknown flask slot states; nothing was restored/.test(e.message), `bad flask state: ${e.message}`);
+    await sameExport('after a refused item restore', session, offXml);
+  }
+  await session.undoLastChange();
+  await sameExport('undo after the refused restores', session, xml);
+  log('PASS 4b');
+}
+
 async function test5CommitUndo(session: BuildSession): Promise<void> {
   log('Test 5: set_flask_active / apply_changes flasks: undo exact, unchanged pushes nothing, full snapshots keep the flags');
   const xml = await baseExport(session);
@@ -281,8 +329,10 @@ async function test5CommitUndo(session: BuildSession): Promise<void> {
   const off = await session.setFlaskActive('Flask 3', false);
   assert(off.previous === true && off.active === false && (off.diff.CombinedDPS?.delta ?? 0) < 0, `off: ${JSON.stringify(off).slice(0, 300)}`);
   assert(session.undoStackDepth() === depth + 1, 'one undo entry');
-  assert(/<Slot[^>]*name="Flask 3"/.test(await session.exportXML()) && !/<Slot active="true" name="Flask 3"/.test(await session.exportXML()),
-    'the export has Flask 3 inactive');
+  const onAttrs = slotActiveAttrs(xml, 'Flask 3');
+  assert(onAttrs.length > 0 && onAttrs.every((a) => a === 'true'), `the base export has Flask 3 active: ${JSON.stringify(onAttrs)}`);
+  const offAttrs = slotActiveAttrs(await session.exportXML(), 'Flask 3');
+  assert(offAttrs.length === onAttrs.length && offAttrs.every((a) => a !== 'true'), `the export has Flask 3 inactive: ${JSON.stringify(offAttrs)}`);
   const again = await session.setFlaskActive('Flask 3', false);
   assert(again.unchanged === true && session.undoStackDepth() === depth + 1, 'already inactive: unchanged');
 
@@ -308,6 +358,38 @@ async function test5CommitUndo(session: BuildSession): Promise<void> {
   sameStats('after the undos', await committed(session), base);
   assert(session.undoStackDepth() === depth, 'back to the starting depth');
   log('PASS 5');
+}
+
+async function test5bMeleeTincture(session: BuildSession): Promise<void> {
+  log('Test 5b: a tincture that changes DPS (Rosethorn on a blank Duelist with a foil): calculator, fallback and commit agree');
+  await session.newBuild({ className: 'Duelist', level: 90 });
+  const foil = (await session.readItemData<{ text: string }>({ cmd: 'itemText', base: 'Jewelled Foil' })).text;
+  const rosethorn = (await session.readItemData<{ text: string }>({ cmd: 'itemText', base: 'Rosethorn Tincture' })).text;
+  await session.swapItemWithDiff('Weapon 1', foil);
+  const swap = await session.swapItemWithDiff('Flask 1', rosethorn);
+  // A blank build's flask slots start inactive.
+  assert(/Flask 1 is not active/.test(swap.note ?? ''), `swap note: ${swap.note}`);
+  const xml = await session.exportXML();
+  const base = await committed(session);
+  const reachable = (await session.getReachableNodes()).filter((n) => !n.isJewelSocket && !n.isMastery).slice(0, 2).map((n) => n.id);
+  const [on, onFallback] = (await session.probe({
+    stats: STATS,
+    variants: [{ flasks: [{ slot: 'Flask 1', active: true }] }, { allocate: reachable, flasks: [{ slot: 'Flask 1', active: true }] }],
+  })).results;
+  assert(on.error === undefined && on.fallback === undefined && (on.stats.CombinedDPS as number) > (base.CombinedDPS as number),
+    `the tincture raises DPS when active: ${JSON.stringify(on)} vs ${JSON.stringify(base.CombinedDPS)}`);
+  assert(onFallback.error === undefined && onFallback.fallback === true, `fallback: ${JSON.stringify(onFallback)}`);
+  await sameExport('after the tincture probes', session, xml);
+  const commit = await session.setFlaskActive('Flask 1', true);
+  assert(commit.itemType === 'Tincture' && (commit.diff.CombinedDPS?.delta ?? 0) > 0, `set_flask_active: ${JSON.stringify(commit.diff.CombinedDPS)}`);
+  sameStats('tincture on: probe vs commit', on.stats, await committed(session));
+  await session.undoLastChange();
+  await sameExport('undo the tincture toggle', session, xml);
+  await session.applyChanges({ allocate: reachable, flasks: [{ slot: 'Flask 1', active: true }] });
+  sameStats('tincture fallback vs apply_changes', onFallback.stats, await committed(session));
+  await session.undoLastChange();
+  await sameExport('undo apply_changes', session, xml);
+  log('PASS 5b');
 }
 
 async function test6CrashReplay(): Promise<void> {
@@ -337,6 +419,42 @@ async function test6CrashReplay(): Promise<void> {
   const states = await flaskStates(session);
   assert(states['Flask 2'] === true && states['Flask 3'] === true && states['Flask 4'] === false, `replayed states: ${JSON.stringify(states)}`);
   log('PASS 6');
+}
+
+async function test6bAppliedButFailed(): Promise<void> {
+  log('Test 6b: set_flask_active that fails after the change is in: committed (undo entry + replay), with the applied wording');
+  const bridge = newBridge('flaskFailsAfterChange');
+  const session = new BuildSession(bridge);
+  await session.loadBuild(occXml);
+  const xml = await session.exportXML();
+  const base = await committed(session);
+  const e = await rejection(session.setFlaskActive('Flask 2', false));
+  assert(!(e instanceof UserError) && /test fault: set_flask_active failed/.test(e.message) && /WAS applied/.test(e.message),
+    `applied-but-failed error: ${e.message}`);
+  assert(session.undoStackDepth() === 1, 'the applied change pushed its undo entry');
+  assert((await flaskStates(session))['Flask 2'] === false, 'the change is in the build');
+  assert(((await committed(session)).Armour as number) < (base.Armour as number), 'and recalculated');
+  await session.undoLastChange();
+  await sameExport('undo the applied-but-failed change', session, xml);
+
+  // Replayed after a crash (the replay is not faulted).
+  await rejection(session.setFlaskActive('Flask 3', false));
+  const changed = await session.exportXML();
+  const stats = await committed(session);
+  const pid = bridge.getPid();
+  assert(pid !== undefined, 'engine running');
+  process.kill(pid, 'SIGKILL');
+  const end = Date.now() + 10_000;
+  while (bridge.isRunning()) {
+    if (Date.now() > end) throw new Error('engine did not exit');
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const restart = await rejection(session.getStats());
+  assert(restart instanceof EngineRestartedError, `restart notice: ${restart.message}`);
+  await sameExport('replayed applied-but-failed change', session, changed);
+  sameStats('replayed applied-but-failed change', await committed(session), stats);
+  assert((await flaskStates(session))['Flask 3'] === false, 'Flask 3 stays off after the replay');
+  log('PASS 6b');
 }
 
 async function test7Mcp(): Promise<void> {
@@ -408,8 +526,11 @@ async function main(): Promise<void> {
     await test2CalculatorParity(session);
     await test3FallbackParity(session);
     await test4Refusals(session);
+    await test4bErrorAfterApply(session);
     await test5CommitUndo(session);
+    await test5bMeleeTincture(session);
     await test6CrashReplay();
+    await test6bAppliedButFailed();
   } finally {
     for (const b of bridges) await b.dispose().catch(() => undefined);
   }

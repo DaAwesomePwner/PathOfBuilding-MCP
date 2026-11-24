@@ -1453,9 +1453,26 @@ export class BuildSession {
       try {
         res = await this.bridge.send<RawFlaskChange>({ cmd: 'setFlaskActive', slot, active });
       } catch (err) {
-        // The flags may be set (PoB's recalculation failed): undo can revert it, but it is never replayed, as for set_config.
-        if (!(err instanceof UserError) && this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
-        throw err;
+        // A refusal changed nothing; with the engine gone nothing is committed.
+        if (err instanceof UserError || !this.bridge.isRunning()) throw err;
+        // Otherwise the flags may be set (e.g. PoB's recalculation failed). Applied:
+        // commit it (undo entry + replay record) with the applied-but-failed error.
+        // Not applied: nothing to commit. Unknown: undo can revert it, never replayed.
+        let applied: boolean | null = null;
+        try {
+          const now = await this.bridge.send<{ ok: true; flags: [number, number] }>({ cmd: 'getFlaskState', slot });
+          applied = now.flags[0] !== state.flags[0] || now.flags[1] !== state.flags[1];
+        } catch (readError) {
+          console.error('[pob-mcp] could not read the flask slot after a failed set_flask_active:', (readError as Error).message);
+        }
+        if (applied === false) throw err;
+        if (applied === null || !this.bridge.isRunning()) {
+          if (this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+          throw err;
+        }
+        return this.commitAfterUnlocked(entry, journal, command, async () => {
+          throw await this.recalcAfterAppliedFailureUnlocked(err);
+        });
       }
       const base = { slot, active, previous: res.previous === true, item: res.item ?? null, itemType: res.itemType ?? null };
       if (res.unchanged === true) return { ...base, unchanged: true, before, after: before, diff: {} };
