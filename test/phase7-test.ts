@@ -61,6 +61,7 @@ interface UpgradeResp {
     kind?: string;
     suggestedMods?: Array<{ mod: string; weight: number }>;
     modsError?: string;
+    error?: string;
     currentItemName: string | null;
   }>;
   modsNote?: string;
@@ -180,6 +181,28 @@ async function main(): Promise<void> {
     assert(sugTen.suggestions.every((s) => !('modsQueried' in s)), 'the internal modsQueried marker is left out');
     assert(!(await call(client, 'undo_last_change') as { isError?: boolean }).isError, 'undo the unequip');
     log('PASS: modsNote counts queried slots only');
+
+    // Test 5c: modsNote says which slots a larger modSlots reaches and which
+    // only `slot` reaches (empty or unmeasured jewel / abyssal sockets).
+    log('Test 5c: suggest_upgrades modsNote with an empty jewel socket');
+    const noteParts = (r: UpgradeResp) => {
+      const open = r.suggestions.filter((s) => s.error === undefined && s.suggestedMods === undefined && s.modsError === undefined);
+      const sockets = open.filter((s) => s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal')).length;
+      return { reachable: open.length - sockets, sockets };
+    };
+    const def = noteParts(sugAll);
+    assert(def.reachable > 0 && new RegExp(`pass a larger modSlots \\(or slot\\) for the other ${def.reachable} ranked or listed slot\\(s\\)`).test(sugAll.modsNote ?? ''),
+      `default modsNote names the slots a larger modSlots reaches: ${sugAll.modsNote}`);
+    assert(!(await call(client, 'allocate_nodes', { nodes: [26725] }) as { isError?: boolean }).isError, 'allocate the empty socket 26725');
+    const sugSocket = JSON.parse(extractText(await call(client, 'suggest_upgrades', { modSlots: 10 }))) as UpgradeResp;
+    const emptySocket = sugSocket.suggestions.find((s) => s.slot === 'Jewel 26725');
+    assert(emptySocket?.empty && emptySocket.priority === null && emptySocket.suggestedMods === undefined, 'the empty socket is listed without a query');
+    const withSocket = noteParts(sugSocket);
+    assert(withSocket.sockets >= 1 && new RegExp(`pass slot for the ${withSocket.sockets} empty or unmeasured jewel / abyssal socket\\(s\\), which modSlots never reaches`)
+      .test(sugSocket.modsNote ?? ''), `modsNote names the sockets only slot reaches: ${sugSocket.modsNote}`);
+    assert(withSocket.reachable > 0 || !/larger modSlots/.test(sugSocket.modsNote ?? ''), 'no larger-modSlots advice when nothing is left for it');
+    assert(!(await call(client, 'undo_last_change') as { isError?: boolean }).isError, 'undo the allocation');
+    log('PASS: modsNote separates modSlots and slot');
 
     // Test 6: export_build (summary)
     log('Test 6: export_build (summary)');
