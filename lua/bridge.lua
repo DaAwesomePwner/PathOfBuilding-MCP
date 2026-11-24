@@ -4897,6 +4897,8 @@ function tradeCompat.customModData(gen, category, item)
 	-- ProcessMod reports a line it cannot weigh (no trade stat matches it, or
 	-- its numbers do not fit the stat) only through ConPrintf: collect those
 	-- lines (numbers as #, each text once) so the search can report them.
+	-- Every line, those included, still goes to the original ConPrintf
+	-- (stderr), so the diagnostics are unchanged.
 	local unmatched, seen = { }, { }
 	local conPrintf = ConPrintf
 	ConPrintf = function(fmt, ...)
@@ -4906,6 +4908,7 @@ function tradeCompat.customModData(gen, category, item)
 			line = line:gsub("%(?%d+%.?%d*%-?%d*%.?%d*%)?", "#")
 			if not seen[line] then seen[line] = true unmatched[#unmatched + 1] = line end
 		end
+		return conPrintf(fmt, ...)
 	end
 	local saved = gen.modData
 	gen.modData = md
