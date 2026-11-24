@@ -1,6 +1,6 @@
 /** generate_trade_search: checks the bridge cannot do and the bridge's `tradeQuery` command. */
 import { UserError } from './validation.js';
-import { DEFAULT_STAT_WEIGHTS, ELDRITCH, ELDRITCH_SLOTS, TRADE_ID_RE, type TradeSearchArgs } from './trade-search-schema.js';
+import { DEFAULT_STAT_WEIGHTS, ELDRITCH, ELDRITCH_SLOTS, JEWEL_SLOT_RE, TRADE_ID_RE, type TradeSearchArgs } from './trade-search-schema.js';
 
 export function validateLeague(raw: string): string {
   const league = raw.trim();
@@ -28,8 +28,15 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
   if (new Set(args.influences ?? []).size !== (args.influences ?? []).length) throw new UserError('influences lists an influence twice');
   checkTradeIds((args.requiredMods ?? []).map((m) => m.tradeId), 'requiredMods');
   checkTradeIds((args.weightAdjustments ?? []).map((m) => m.tradeId), 'weightAdjustments');
+  const jewelSlot = JEWEL_SLOT_RE.test(args.slot);
   if (args.sockets !== undefined && /Flask/.test(args.slot)) throw new UserError('sockets is not available for flask slots');
-  if (args.links !== undefined && /Flask|Belt|Ring|Amulet/.test(args.slot)) throw new UserError(`links is not available for ${args.slot}`);
+  if (args.sockets !== undefined && jewelSlot) throw new UserError('sockets is not available for jewel sockets');
+  if (args.links !== undefined && (jewelSlot || /Flask|Belt|Ring|Amulet/.test(args.slot))) throw new UserError(`links is not available for ${args.slot}`);
+  // PoB's popup offers neither scourge mods nor influences for jewel sockets (jewels have neither).
+  if (jewelSlot && args.includeScourge === true) {
+    throw new UserError(`includeScourge true does not apply to jewel sockets like ${args.slot} (false is accepted and changes nothing)`);
+  }
+  if (jewelSlot && (args.influences?.length ?? 0) > 0) throw new UserError(`influences do not apply to jewel sockets like ${args.slot}: jewels cannot be influenced`);
   // PoB only offers these options on their slots. Elsewhere a value that changes nothing there is accepted
   // (eldritch weights come only from "keep..."; talisman mods only from includeTalisman true); the rest
   // is refused instead of being dropped silently.
@@ -47,6 +54,8 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
   return {
     cmd: 'tradeQuery',
     slot: args.slot,
+    // The bridge checks it against the slot (tree socket / abyssal socket / other) and picks the default.
+    ...(args.jewelType !== undefined ? { jewelType: args.jewelType } : {}),
     statWeights: weights,
     tradeIds: [...(args.requiredMods ?? []), ...(args.weightAdjustments ?? [])].map((m) => m.tradeId),
     // The bridge refuses weights on stats PoB leaves out of the weights; weight 0 adds no filter, so it is a no-op there.
@@ -55,7 +64,7 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
       tradeType: args.tradeType ?? 'available',
       includeCorrupted: args.includeCorrupted,
       includeMirrored: args.includeMirrored ?? true,
-      includeScourge: args.includeScourge ?? /^(Standard|Hardcore)$/.test(league),
+      includeScourge: !jewelSlot && (args.includeScourge ?? /^(Standard|Hardcore)$/.test(league)),
       includeTalisman: args.includeTalisman ?? false,
       eldritchIndex: ELDRITCH.indexOf(args.includeEldritch ?? 'copyCurrent') + 1,
       influences: args.influences ?? [],

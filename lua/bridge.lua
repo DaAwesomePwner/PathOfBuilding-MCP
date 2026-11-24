@@ -966,6 +966,32 @@ function slotChecks.usableSlot(slotName, equipping)
 	return slot
 end
 
+-- For an abyssal socket slot: its index on the parent slot, the abyssal
+-- socket count of the parent's item (0 when empty) and the parent slot; nil
+-- for any other slot. PoB's ItemSlot:Populate empties sockets beyond the count.
+function slotChecks.abyssalSocket(slot)
+	local parent = slot.parentSlot
+	if not parent then return nil end
+	local index = 0
+	for i, s in ipairs(parent.abyssalSocketList or { }) do
+		if s == slot then index = i end
+	end
+	local parentItem = build.itemsTab.items[parent.selItemId or 0]
+	return index, parentItem and parentItem.abyssalSocketCount or 0, parent
+end
+
+-- The node id of a passive-tree jewel socket that is not allocated, else nil.
+-- PoB's CalcSetup skips such a socket: a jewel there counts for nothing.
+function slotChecks.unallocatedSocket(slot)
+	if slot.nodeId and not (build.spec and build.spec.allocNodes[slot.nodeId]) then return slot.nodeId end
+	return nil
+end
+
+function slotChecks.unallocatedText(slotName, nodeId)
+	return string.format("%s is an unallocated passive tree jewel socket: a jewel there counts for nothing in "
+		.. "Path of Building's calculations. Allocate node %d first (allocate_nodes)", slotName, nodeId)
+end
+
 -- Why ItemsTab:IsItemValidForSlot refused `item` for `slotName`.
 function slotChecks.refusalReason(tab, item, slotName)
 	local kind = item.type or (item.base and item.base.type) or "unknown"
@@ -1030,14 +1056,8 @@ local function assertItemFitsSlot(tab, slot, item)
 		userError(string.format("%s cannot be equipped in %s: %s", tostring(item.name or "This item"), slotName,
 			slotChecks.refusalReason(tab, item, slotName)))
 	end
-	local parent = slot.parentSlot
+	local index, count, parent = slotChecks.abyssalSocket(slot)
 	if parent then
-		local index = 0
-		for i, s in ipairs(parent.abyssalSocketList or { }) do
-			if s == slot then index = i end
-		end
-		local parentItem = tab.items[parent.selItemId or 0]
-		local count = parentItem and parentItem.abyssalSocketCount or 0
 		if index > count then
 			userError(string.format("%s cannot be equipped in %s: the item in %s has %d abyssal socket(s)",
 				tostring(item.name or "This item"), slotName, parent.slotName, count))
@@ -3303,15 +3323,22 @@ local function getValidSlots()
 	if not (build.itemsTab and build.itemsTab.orderedSlots) then
 		return result
 	end
+	-- Abyssal sockets are listed only where the parent's item has them (with
+	-- `parentSlot`); passive-tree jewel sockets say whether they are allocated.
 	for _, slot in ipairs(build.itemsTab.orderedSlots) do
-		if slot.slotName and not slot.slotName:find("Abyssal Socket") and not slotChecks.hiddenReason(slot) then
+		local index, count, parent = slotChecks.abyssalSocket(slot)
+		if slot.slotName and not slotChecks.hiddenReason(slot) and not (parent and index > count) then
 			local itemId = slot.selItemId or 0
 			local item = (itemId ~= 0) and build.itemsTab.items[itemId] or nil
+			local allocated = nil
+			if slot.nodeId then allocated = slotChecks.unallocatedSocket(slot) == nil end
 			table.insert(result, {
 				slot = slot.slotName,
 				occupied = itemId ~= 0,
 				itemName = item and (item.title or item.name) or nil,
 				baseName = item and item.baseName or nil,
+				parentSlot = parent and parent.slotName or nil,
+				allocated = allocated,
 			})
 		end
 	end
@@ -3341,9 +3368,10 @@ local function listEquippedItems()
 		return result
 	end
 	for _, slot in ipairs(build.itemsTab.orderedSlots) do
-		-- Skip abyssal sockets. A slot PoB hides on this tree (Wickerman, grafts)
-		-- is listed only when it holds an item, marked hidden.
-		if slot.slotName and not slot.slotName:find("Abyssal Socket") then
+		-- A slot PoB hides on this tree (Wickerman, grafts) is listed only when
+		-- it holds an item, marked hidden. An abyssal socket carries its
+		-- `parentSlot`; a jewel in an unallocated tree socket is marked.
+		if slot.slotName then
 			local itemId = slot.selItemId or 0
 			if itemId ~= 0 then
 				local item = build.itemsTab.items[itemId]
@@ -3355,10 +3383,20 @@ local function listEquippedItems()
 							and "; Path of Building still counts this item in its calculations. unequip_item removes it"
 							or "; Path of Building ignores this item in its calculations on this tree. unequip_item removes it")
 					end
+					local _, _, parent = slotChecks.abyssalSocket(slot)
+					local unallocated = slotChecks.unallocatedSocket(slot)
+					local allocated = nil
+					if unallocated then
+						allocated = false
+						note = "the socket is not allocated, so Path of Building ignores this jewel; allocate node "
+							.. unallocated .. " (allocate_nodes) to use it"
+					end
 					table.insert(result, {
 						hidden = gate and true or nil,
 						note = note,
 						slot = slot.slotName,
+						parentSlot = parent and parent.slotName or nil,
+						allocated = allocated,
 						itemId = itemId,
 						rarity = item.rarity,
 						name = item.name,
@@ -4219,21 +4257,61 @@ local function tradeStateOrError()
 	return tradeState
 end
 
--- Gear and flask slots PoB can build a weighted search for (no jewel sockets).
-local function tradeSlotOrError(slotName, helpers)
+-- Slots PoB can build a weighted search for: gear and flask slots, abyssal
+-- sockets the parent's item has, and allocated passive-tree jewel sockets
+-- (PoB's trade tab lists the same). Returns the slot, the trade category
+-- query string and PoB's item category (the mod lists' key), and for a jewel
+-- slot PoB's jewel type ("Base" / "Abyss" / "Any", TradeQueryGenerator's
+-- options.jewelType). `jewelType` ("base" / "abyss" / "any" or nil) applies
+-- to passive-tree sockets (default: "abyss" when an abyss jewel is socketed
+-- there, else "base"); abyssal sockets take only "abyss"; other slots none.
+local function tradeSlotOrError(slotName, helpers, jewelType)
+	local slot = type(slotName) == "string" and build.itemsTab.slots[slotName] or nil
+	local index, count, parent = nil, 0, nil
+	if slot then index, count, parent = slotChecks.abyssalSocket(slot) end
+	local item = slot and build.itemsTab.items[slot.selItemId or 0]
+	local what = "Cannot build a trade search for " .. tostring(slotName) .. ": "
+	if slot and slot.nodeId then
+		local nodeId = slotChecks.unallocatedSocket(slot)
+		if nodeId then
+			userError(what .. "the passive tree jewel socket is not allocated, so Path of Building weighs every mod at 0. "
+				.. "Allocate node " .. nodeId .. " first (allocate_nodes)")
+		end
+		local kind = jewelType or ((item and item.base and item.base.subType == "Abyss") and "abyss" or "base")
+		local pobType = ({ base = "Base", abyss = "Abyss", any = "Any" })[kind]
+		if not pobType then userError("jewelType must be \"base\", \"abyss\" or \"any\"") end
+		-- As TradeQueryGenerator:StartQuery maps options.jewelType.
+		local queries = { Base = "jewel.base", Abyss = "jewel.abyss", Any = "jewel" }
+		return slot, queries[pobType], pobType .. "Jewel", pobType
+	end
+	if parent then
+		if index > count then
+			userError(what .. "the item in " .. parent.slotName .. " has " .. count .. " abyssal socket(s)")
+		end
+		if jewelType ~= nil and jewelType ~= "abyss" then
+			userError("jewelType \"" .. tostring(jewelType) .. "\" does not apply to " .. slotName
+				.. ": abyssal sockets hold only abyss jewels (\"abyss\" is accepted)")
+		end
+		local queryStr, category = helpers.getTradeCategory(slotName, item)
+		return slot, queryStr, category, "Abyss"
+	end
 	local supported = { }
-	for _, slot in ipairs(build.itemsTab.orderedSlots or { }) do
-		local name = slot.slotName
-		if name and not name:find("Jewel") and not name:find("Abyssal") and not name:find("Socket")
-			and helpers.getTradeCategory(name, nil) then
+	for _, s in ipairs(build.itemsTab.orderedSlots or { }) do
+		local name = s.slotName
+		if name and not s.nodeId and not s.parentSlot and helpers.getTradeCategory(name, nil) then
 			supported[#supported + 1] = name
 		end
 	end
-	if type(slotName) ~= "string" or not listContains(supported, slotName) then
+	if not slot or not listContains(supported, slotName) then
 		userError("Unsupported slot for a trade search: " .. tostring(slotName)
-			.. ". Supported slots: " .. table.concat(supported, ", "))
+			.. ". Supported slots: " .. table.concat(supported, ", ")
+			.. ", abyssal sockets the item in their slot has and allocated passive tree jewel sockets (see list_valid_slots)")
 	end
-	return build.itemsTab.slots[slotName]
+	if jewelType ~= nil then
+		userError("jewelType only applies to jewel sockets, not " .. slotName)
+	end
+	local queryStr, category = helpers.getTradeCategory(slotName, item)
+	return slot, queryStr, category, nil
 end
 
 local function tradeStatWeights(requested)
@@ -4356,7 +4434,7 @@ end
 
 local function runTradeQuery(cmd)
 	local st = tradeStateOrError()
-	local slot = tradeSlotOrError(cmd.slot, st.helpers)
+	local slot, queryStr, category, jewelType = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType)
 	local statWeights = tradeStatWeights(cmd.statWeights)
 	local idTexts = tradeIdTexts(st, cmd.tradeIds)
 	-- A weight on a stat PoB leaves out of the weights would count it twice
@@ -4375,13 +4453,14 @@ local function runTradeQuery(cmd)
 	for i, t in ipairs(TRADE_TYPES) do if t == o.tradeType then tradeTypeIndex = i end end
 	if not tradeTypeIndex then userError("Unknown tradeType '" .. tostring(o.tradeType) .. "'") end
 	local item = build.itemsTab.items[slot.selItemId]
-	local queryStr, category = st.helpers.getTradeCategory(slot.slotName, item)
 	local influences = o.influences or { }
 	local options = {
 		statWeights = statWeights,
 		includeCorrupted = o.includeCorrupted,
 		includeMirrored = o.includeMirrored ~= false,
-		includeScourge = o.includeScourge == true,
+		-- PoB's popup has no scourge option for jewel slots.
+		includeScourge = o.includeScourge == true and jewelType == nil,
+		jewelType = jewelType,
 		influence1 = influenceIndex(influences[1]),
 		influence2 = influenceIndex(influences[2]),
 		maxPrice = tonumber(o.maxPrice),
@@ -4480,9 +4559,8 @@ end
 
 local function searchTradeMods(cmd)
 	local st = tradeStateOrError()
-	local slot = tradeSlotOrError(cmd.slot, st.helpers)
-	local item = build.itemsTab.items[slot.selItemId]
-	local _, category = st.helpers.getTradeCategory(slot.slotName, item)
+	-- The category as PoB's popup lists mods (jewel sockets: by jewel type).
+	local _, _, category = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType)
 	local needle = tostring(cmd.query or ""):lower()
 	local found, seen = { }, { }
 	local preferredPseudo = { }
@@ -4759,7 +4837,16 @@ local DISPATCH = {
 		handler = function(_cmd) return { slots = getValidSlots() } end,
 	},
 	equipItem = {
-		handler = function(cmd) equipItemInSlot(cmd.slot, cmd.itemText or "") return { } end,
+		handler = function(cmd)
+			equipItemInSlot(cmd.slot, cmd.itemText or "")
+			-- Allowed, as in PoB's UI, but the jewel does nothing there yet.
+			local nodeId = slotChecks.unallocatedSocket(build.itemsTab.slots[cmd.slot])
+			if nodeId then
+				return { note = "The jewel is equipped, but the socket is not allocated, so Path of Building ignores it "
+					.. "until node " .. nodeId .. " is allocated (allocate_nodes)" }
+			end
+			return { }
+		end,
 		mutating = true,
 	},
 	unequipItem = {
@@ -4769,7 +4856,14 @@ local DISPATCH = {
 	checkSlotUsable = {
 		-- The same refusal equipItem gives for an unknown or hidden slot,
 		-- without changing anything (compare_items checks before probing).
-		handler = function(cmd) slotChecks.usableSlot(cmd.slot, true) return { } end,
+		-- With `whatIf`, an unallocated passive-tree jewel socket is refused
+		-- too: a jewel compared there would show no difference at all.
+		handler = function(cmd)
+			local slot = slotChecks.usableSlot(cmd.slot, true)
+			local nodeId = cmd.whatIf and slotChecks.unallocatedSocket(slot)
+			if nodeId then userError(slotChecks.unallocatedText(cmd.slot, nodeId)) end
+			return { }
+		end,
 	},
 	selectItem = {
 		-- Re-select an item the build already holds; `selected` is false (nothing
@@ -5127,6 +5221,7 @@ do
 		parseItemText = parseItemText,
 		assertItemFitsSlot = assertItemFitsSlot,
 		usableSlot = slotChecks.usableSlot,
+		unallocatedSocketText = slotChecks.unallocatedText,
 		construct = construct,
 		findGemByName = findGemByName,
 		getConfigMetadata = getConfigMetadata,

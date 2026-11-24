@@ -128,6 +128,14 @@ The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passiv
 
 An item already in a hidden slot is still listed by `list_equipped_items` (with `hidden: true` and a note) and `unequip_item` removes it. PoB still counts a hidden Wickerman item in its calculations; a hidden graft is ignored.
 
+## "Jewel … is an unallocated passive tree jewel socket" / "Cannot build a trade search for …"
+
+**Cause:** Path of Building ignores a jewel in a passive-tree socket (`Jewel <nodeId>`) whose node is not allocated, so a what-if or trade search there would show nothing at all. `compare_items`, `evaluate_changes` (and the other probe tools), `apply_changes`, `generate_trade_search` and `search_trade_mods` refuse such a socket; `list_valid_slots` shows each socket's `allocated` flag. A variant whose own deallocations remove the socket is refused the same way ("Deallocating … also deallocates the jewel socket of …").
+
+**Fix:** allocate the socket first (`allocate_nodes` with the node id from the slot name), or, in `evaluate_changes` / `apply_changes`, add the node to the same variant's `allocate`. Sockets inside a cluster jewel work once the cluster jewel is socketed and the inner socket is allocated. `swap_item` still puts a jewel in an unallocated socket, as PoB's UI does, and says in its `note` that the jewel does nothing yet.
+
+**Abyssal sockets:** `<slot> Abyssal Socket N` exists only while the item in `<slot>` has at least N abyssal sockets (`list_valid_slots` lists only those, with `parentSlot`); otherwise equipping or searching there is refused with "the item in <slot> has K abyssal socket(s)". Trade searches for jewel sockets take `jewelType` (`base` / `abyss` / `any` on tree sockets; only `abyss` on abyssal sockets; none on other slots) and refuse `sockets`, `links`, `influences` and `includeScourge: true`.
+
 ## State drift / unexpected stat values after multiple operations
 
 **Cause:** Should not happen. The what-if tools (`evaluate_changes`, `compare_items`, `find_best_next_nodes`, `simulate_scenario`, etc.) run through PoB's calculator (`lua/probe.lua`) without changing or recalculating the build. The variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored, and the restore is compared with a fingerprint of the build taken before; a mismatch is an internal error naming `reset_build`. If you see drift anyway, a snapshot or fingerprint field is missing.

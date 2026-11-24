@@ -926,6 +926,28 @@ return function(ctx)
 		local addList, removeList, masteries = M.checkNodes(variant)
 		local parsedItems, reason = M.checkItems(variant)
 		local itemReason = reason
+		-- A jewel for a passive-tree socket that is not allocated once this
+		-- variant's node changes are made counts for nothing (CalcSetup skips
+		-- the socket): refused rather than reported as no difference.
+		for _, p in ipairs(parsedItems) do
+			local nodeId = p.slot.nodeId
+			if nodeId and not p.unequip then
+				local node = build.spec.nodes[nodeId]
+				local allocated, removedBy = build.spec.allocNodes[nodeId] ~= nil, nil
+				for _, removed in ipairs(removeList) do
+					if allocated and deallocSet(removed)[node] then allocated, removedBy = false, removed end
+				end
+				for _, added in ipairs(addList) do
+					if node and allocSet(added)[node] then allocated = true end
+				end
+				if removedBy and not allocated then
+					userError("Deallocating " .. nodeLabel(removedBy) .. " in the same variant also deallocates the jewel socket of "
+						.. p.slot.slotName .. ", so the jewel there would count for nothing")
+				elseif not allocated then
+					userError(ctx.unallocatedSocketText(p.slot.slotName, nodeId) .. ", or allocate it in the same variant")
+				end
+			end
+		end
 		local config = checkConfig(variant)
 		local gems = optArray(variant.gems, "gems", M.MAX_GEM_CHANGES)
 		for i, ch in ipairs(gems) do checkGemChange(ch, i) end

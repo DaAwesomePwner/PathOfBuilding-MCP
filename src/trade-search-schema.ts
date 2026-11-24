@@ -38,7 +38,13 @@ const INFLUENCES = ['shaper', 'elder', 'warlord', 'hunter', 'crusader', 'redeeme
 const CURRENCIES = ['chaos-equivalent', 'chaos', 'divine', 'alch', 'alt', 'chrome', 'exalted', 'blessed', 'chisel',
   'gcp', 'jewellers', 'scour', 'regret', 'fusing', 'chance', 'regal', 'vaal'] as const;
 export const ELDRITCH_SLOTS = new Set(['Body Armour', 'Helmet', 'Gloves', 'Boots']);
+export const JEWEL_TYPES = ['base', 'abyss', 'any'] as const;
+/** Passive-tree jewel sockets ("Jewel <nodeId>") and abyssal sockets ("<slot> Abyssal Socket N"). */
+export const JEWEL_SLOT_RE = /^Jewel \d+$|Abyssal Socket \d+$/;
 export const TRADE_ID_RE = /^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+)?$/;
+
+export const JEWEL_TYPE_TEXT = 'Passive-tree jewel sockets: which jewels to search and weigh, "base" (regular jewels), "abyss" or "any" (PoB\'s Jewel Type; ' +
+  'default "abyss" when an abyss jewel is socketed there, else "base"). Abyssal sockets accept only "abyss"; other slots take none.';
 
 const tradeId = z.string().max(80).describe('Trade stat id, e.g. "explicit.stat_3299347043" or "pseudo.pseudo_total_life" (find ids with search_trade_mods).');
 
@@ -58,13 +64,14 @@ export interface TradeSearchArgs {
   maxLevel?: number;
   sockets?: number;
   links?: number;
+  jewelType?: (typeof JEWEL_TYPES)[number];
   requiredMods?: { tradeId: string; min?: number }[];
   weightAdjustments?: { tradeId: string; weight: number }[];
   minWeightedSum?: number;
 }
 
 export const tradeSearchSchema = {
-  slot: z.string().min(1).describe('Gear or flask slot, e.g. "Helmet", "Ring 1", "Weapon 1", "Flask 1" (jewel sockets are not supported).'),
+  slot: z.string().min(1).describe('Gear or flask slot ("Helmet", "Ring 1", "Weapon 1", "Flask 1"), an abyssal socket the item in its slot has ("Belt Abyssal Socket 1") or an allocated passive-tree jewel socket ("Jewel 26725"); see list_valid_slots.'),
   league: z.string().describe('Trade league name exactly as on the trade site, e.g. "Standard" or the current challenge league.'),
   realm: z.enum(['pc', 'xbox', 'sony']).optional().describe('Platform (default "pc").'),
   statWeights: z.array(z.object({ stat: z.string().min(1).max(64), weight: z.number().gt(0).lte(10) })).min(1).max(20).optional()
@@ -72,15 +79,16 @@ export const tradeSearchSchema = {
   tradeType: z.enum(TRADE_TYPES).optional().describe('Listing status filter (default "available" = instant buyout and in-person).'),
   includeCorrupted: z.boolean().optional().describe('Weigh corrupted implicits (default: true unless the current item is corrupted).'),
   includeEldritch: z.enum(ELDRITCH).optional().describe('Body/helmet/gloves/boots: eldritch implicit handling (default "copyCurrent" = no eldritch weights; "keep..." weighs them). Other slots accept only "copyCurrent" / "remove", which change nothing there.'),
-  includeScourge: z.boolean().optional().describe('Weigh scourge mods (default: true only in Standard/Hardcore).'),
+  includeScourge: z.boolean().optional().describe('Weigh scourge mods (default: true only in Standard/Hardcore; never for jewel sockets, which accept only false).'),
   includeTalisman: z.boolean().optional().describe('Amulet: weigh talisman implicits (default false). Other slots accept only false.'),
   includeMirrored: z.boolean().optional().describe('Allow mirrored items (default true).'),
   influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences (PoB 2.68+ no longer weighs mods on an influenced copy of the item; the influence is still required).'),
   maxPrice: z.object({ amount: z.number().int().positive().max(1_000_000), currency: z.enum(CURRENCIES).optional() }).optional()
     .describe('Maximum price (currency default "chaos-equivalent").'),
   maxLevel: z.number().int().min(1).max(100).optional().describe('Maximum required level.'),
-  sockets: z.number().int().min(1).max(6).optional().describe('Exact number of empty sockets (not for flasks).'),
+  sockets: z.number().int().min(1).max(6).optional().describe('Exact number of empty sockets (not for flasks or jewel sockets).'),
   links: z.number().int().min(1).max(6).optional().describe('Exact number of links (armour and weapons only).'),
+  jewelType: z.enum(JEWEL_TYPES).optional().describe(JEWEL_TYPE_TEXT),
   requiredMods: z.array(z.object({ tradeId, min: z.number().optional() })).max(10).optional()
     .describe('Hard requirements: every listed mod must be present (with at least `min` when given).'),
   weightAdjustments: z.array(z.object({ tradeId, weight: z.number().min(-1000).max(1000) })).max(MAX_FILTERS).optional()
