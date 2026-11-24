@@ -1154,12 +1154,16 @@ export class BuildSession {
     });
   }
 
-  async searchTradeMods(slot: string, query: string, limit: number, jewelType?: string, flaskType?: string): Promise<TradeModsResult> {
+  async searchTradeMods(
+    slot: string | undefined, query: string, limit: number, jewelType?: string, flaskType?: string, unique?: string,
+  ): Promise<TradeModsResult> {
     return this.withLock(async () => {
       const result = await this.bridge.send<{ ok: true } & TradeModsResult>({
-        cmd: 'searchTradeMods', slot, query, limit,
+        cmd: 'searchTradeMods', query, limit,
+        ...(slot !== undefined ? { slot } : {}),
         ...(jewelType !== undefined ? { jewelType } : {}),
         ...(flaskType !== undefined ? { flaskType } : {}),
+        ...(unique !== undefined ? { unique } : {}),
       });
       return { itemCategory: result.itemCategory, total: result.total, mods: result.mods };
     });

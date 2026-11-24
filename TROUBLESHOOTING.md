@@ -154,6 +154,17 @@ An item already in a hidden slot is still listed by `list_equipped_items` (with 
 
 **Fix:** search the slot of the weapon set in use. Path of Building's weapon-set switch is not exposed as a tool; load a build that uses the other set to search its slots.
 
+## "Watcher's Eye searches need slot = ..." / "Pearl of Tsoatha searches need slot = ..." / "... does not apply to ... searches" / "Path of Building cannot weigh Megalomaniac on this build's passive tree"
+
+**Cause:** `generate_trade_search` `unique` runs Path of Building's own searches for its special uniques, with the slots and options its trade tab offers for them:
+- **Watcher's Eye** needs `slot` = an allocated passive-tree jewel socket (`Jewel <nodeId>`). A socket holding a cluster jewel is refused: PoB weighs every mod against the build without the jewel in that socket, so every weight would carry the loss of the cluster's passives.
+- **Pearl of Tsoatha** needs `slot` = a ring slot PoB shows (`Ring 1`, `Ring 2`; `Ring 3` only when the build shows it).
+- **Megalomaniac** takes `slot` optionally (by default PoB's own pick, the allocated socket with the lowest node id). PoB weighs each cluster notable on the build's passive tree, and its search fails on a tree that lacks some of them (older trees such as 3.13), so that is refused, naming the missing notables.
+- Unique searches always exclude mirrored items and refuse `influences`, `sockets`, `links`, `includeMirrored: true`, `includeTalisman: true`, `includeEldritch` "keep...", `flaskType` and `jewelType` (Watcher's Eye accepts `"any"`, which changes nothing). `search_trade_mods` with `unique: "Pearl of Tsoatha"` is refused: PoB has no mod list for it (its filters, one per support gem and skill-group slot, come from the search itself).
+- "This Path of Building version's trade query generator has no ... search": the installed PoB predates that search; update Path of Building.
+
+**Fix:** pass a slot as above (allocate a socket with `allocate_nodes`, or choose a socket without a cluster jewel); for Megalomaniac on an old tree, `convert_tree_to_latest` (undoable) and search again; drop the options the search does not take.
+
 ## State drift / unexpected stat values after multiple operations
 
 **Cause:** Should not happen. The what-if tools (`evaluate_changes`, `compare_items`, `find_best_next_nodes`, `simulate_scenario`, etc.) run through PoB's calculator (`lua/probe.lua`) without changing or recalculating the build. The variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored, and the restore is compared with a fingerprint of the build taken before; a mismatch is an internal error naming `reset_build`. If you see drift anyway, a snapshot or fingerprint field is missing.

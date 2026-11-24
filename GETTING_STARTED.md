@@ -111,8 +111,8 @@ Three layers, three responsibilities:
 - `reset_build` — discard everything, return to the originally loaded state.
 
 ### Trade searches (2)
-- `generate_trade_search` — PoB's "weighted search" for a gear or flask slot (`flaskType` picks the kind of flask; an inactive flask slot is evaluated active), a jewel or abyssal socket: every candidate mod is simulated on the build to get a weight, and you get a pathofexile.com trade URL sorted by weighted sum (highest first). Options mirror PoB's dialog (trade type, corrupted/eldritch/scourge/talisman mods, influences, max price/level, sockets/links); `weightAdjustments` replace/add/remove weights (pinned against the 36-filter cap), `requiredMods` are hard minimums, `minWeightedSum` overrides PoB's default. Read-only, takes a few seconds.
-- `search_trade_mods` — find trade stat ids for a slot by text (`"life"`, `"fire resistance"`), for use in `requiredMods` / `weightAdjustments`.
+- `generate_trade_search` — PoB's "weighted search" for a gear or flask slot (`flaskType` picks the kind of flask; an inactive flask slot is evaluated active), a jewel or abyssal socket: every candidate mod is simulated on the build to get a weight, and you get a pathofexile.com trade URL sorted by weighted sum (highest first). Options mirror PoB's dialog (trade type, corrupted/eldritch/scourge/talisman mods, influences, max price/level, sockets/links); `weightAdjustments` replace/add/remove weights (pinned against the 36-filter cap), `requiredMods` are hard minimums, `minWeightedSum` overrides PoB's default. `unique: "Watcher's Eye" | "Pearl of Tsoatha" | "Megalomaniac"` searches those uniques as PoB's "Other trades" rows do (Megalomaniac weighs cluster notables as passive nodes). Read-only, takes a few seconds.
+- `search_trade_mods` — find trade stat ids for a slot by text (`"life"`, `"fire resistance"`), for use in `requiredMods` / `weightAdjustments`; with `unique` it lists Watcher's Eye mods or Megalomaniac notables.
 
 ## Setup
 

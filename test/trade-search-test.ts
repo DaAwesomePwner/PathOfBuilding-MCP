@@ -3,7 +3,9 @@
  * adjustments surviving the filter cap, required mods, min override, input
  * errors, the bridge's copy of PoB's pseudoMap / ignoredStats still matching
  * the installed TradeQueryGenerator.lua, the build left unchanged, then jewel
- * sockets (tree sockets by jewelType, abyssal sockets the item has) and refusals.
+ * sockets (tree sockets by jewelType, abyssal sockets the item has) and refusals,
+ * flask slots, weapon swap slots, the special uniques (Watcher's Eye, Pearl of
+ * Tsoatha, Megalomaniac) and the faults around a flask slot's activation.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -14,6 +16,7 @@ import { fileURLToPath } from 'url';
 import { BuildSession } from '../src/build-session.js';
 import { EngineCommandError, LuaBridge } from '../src/lua-bridge.js';
 import { tradeQueryCommand } from '../src/trade-search-command.js';
+import { buildTradeSearch } from '../src/trade-search-response.js';
 import { setupTestEnv, type TestEnv } from './_skip.js';
 
 type TestPaths = TestEnv['paths'];
@@ -234,6 +237,149 @@ async function test13WeaponSwap(): Promise<void> {
   log('PASS');
 }
 
+interface UniqueSearch extends Search { unique?: string; slot: string | null; filters: (Filter & { notable?: string })[] }
+const PEARL_PREFIX = 'explicit.stat_4089743927|';
+/** Voices: a Large Cluster Jewel (for the "holds a cluster jewel" refusal). */
+const VOICES = `Rarity: UNIQUE
+Voices
+Large Cluster Jewel
+Variant: Adds 1 Small Passive Skill
+Variant: Adds 3 Small Passive Skills
+Variant: Adds 5 Small Passive Skills
+Variant: Adds 7 Small Passive Skills
+Selected Variant: 1
+Implicits: 0
+Adds 3 Jewel Socket Passive Skills
+{variant:1}Adds 1 Small Passive Skill which grants nothing
+{variant:2}Adds 3 Small Passive Skills which grant nothing
+{variant:3}Adds 5 Small Passive Skills which grant nothing
+{variant:4}Adds 7 Small Passive Skills which grant nothing`;
+
+/**
+ * Special uniques (PoB's "Other trades" rows): Watcher's Eye in an allocated
+ * socket (aura mods, unique name filter, no mirrored items), Pearl of Tsoatha
+ * in a shown ring slot (one filter per support gem and skill-group slot), the
+ * slot and option refusals, the mod pools of search_trade_mods, Megalomaniac
+ * refused on the fixture's 3.13 tree (PoB's search fails on notables it lacks);
+ * the build and its export unchanged.
+ */
+async function test15Uniques(): Promise<void> {
+  log('Test 15: special uniques (Watcher\'s Eye, Pearl of Tsoatha, Megalomaniac refusals)');
+  const before = await keyState();
+  const uniqueSearch = (args: Record<string, unknown>) => ok<UniqueSearch>('generate_trade_search', { league: 'Standard', ...args });
+  const WE = "Watcher's Eye";
+  const we = await uniqueSearch({ unique: WE, slot: 'Jewel 36634' });
+  const weQuery = decodeQuery(we.url, STANDARD_PREFIX) as Query & { query: { name?: string; type?: string } };
+  assert(weQuery.query.name === WE && we.unique === WE && we.slot === 'Jewel 36634' && we.itemCategory === 'AnyJewel', `unique name filter: ${weQuery.query.name}`);
+  assert(weQuery.query.filters.type_filters.filters.category.option === 'jewel' && weQuery.query.filters.type_filters.filters.rarity.option === 'unique',
+    `jewel category, unique rarity: ${JSON.stringify(weQuery.query.filters.type_filters)}`);
+  assert(weQuery.query.filters.misc_filters?.filters?.mirrored === false && we.filterBudget === 33, 'unique searches exclude mirrored items (one filter less)');
+  const auraMods = we.filters.filter((f) => /while affected by/.test(f.text) && f.weight > 0);
+  assert(auraMods.length > 0, `Watcher's Eye aura mods weighed: ${JSON.stringify(we.filters.map((f) => f.text))}`);
+  // Corrupted jewel implicits are weighed unless includeCorrupted is false (as PoB's popup).
+  const noCorrupt = await uniqueSearch({ unique: WE, slot: 'Jewel 36634', includeCorrupted: false });
+  assert(we.filters.some((f) => f.tradeId.startsWith('implicit.')) && noCorrupt.filters.every((f) => !f.tradeId.startsWith('implicit.')),
+    'includeCorrupted false leaves out the corrupted implicits');
+  // Options that change nothing are accepted.
+  for (const extra of [{ includeMirrored: false }, { jewelType: 'any' }, { includeScourge: true }, { includeEldritch: 'remove' }, { includeTalisman: false }]) {
+    assert((await uniqueSearch({ unique: WE, slot: 'Jewel 36634', ...extra })).url === we.url, `${JSON.stringify(extra)} changes nothing`);
+  }
+  // Ids from the Watcher's Eye pool work as required mods.
+  const pool = await ok<{ unique: string; itemCategory: string; mods: TradeMod[] }>('search_trade_mods', { unique: WE, query: 'while affected by Clarity' });
+  assert(pool.unique === WE && pool.itemCategory === 'AnyJewel' && pool.mods.length >= 3 && pool.mods.every((m) => /Clarity/.test(m.text)),
+    `Watcher's Eye pool: ${JSON.stringify(pool.mods.map((m) => m.text))}`);
+  const required = await uniqueSearch({ unique: WE, slot: 'Jewel 36634', requiredMods: [{ tradeId: pool.mods[0].tradeId }] });
+  assert(decodeQuery(required.url, STANDARD_PREFIX).query.stats.some((g) => g.type === 'and' && g.filters.some((f) => f.id === pool.mods[0].tradeId)),
+    'a Watcher\'s Eye mod as a required mod');
+
+  // Slot refusals.
+  await userError('generate_trade_search', { league: 'Standard', unique: WE }, /slot is required for Watcher's Eye/);
+  await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Jewel 61834' }, /Jewel 61834 is not allocated.*Allocate node 61834 first/);
+  await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Helmet' }, /need slot = an allocated passive-tree jewel socket that is not a cluster jewel socket/);
+  await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Belt Abyssal Socket 1' }, /need slot = an allocated passive-tree jewel socket/);
+  // Option refusals.
+  for (const [extra, expect] of [
+    [{ influences: ['shaper'] }, /influences does not apply to Watcher's Eye searches/],
+    [{ sockets: 1 }, /sockets does not apply to Watcher's Eye searches/],
+    [{ links: 2 }, /links does not apply/],
+    [{ includeMirrored: true }, /always exclude mirrored items/],
+    [{ includeTalisman: true }, /includeTalisman true does not apply/],
+    [{ includeEldritch: 'keepRegular' }, /includeEldritch "keepRegular" does not apply/],
+    [{ jewelType: 'base' }, /jewelType does not apply to Watcher's Eye searches.*"any" is accepted/],
+    [{ flaskType: 'life' }, /flaskType does not apply to Watcher's Eye searches/],
+  ] as [Record<string, unknown>, RegExp][]) {
+    await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Jewel 36634', ...extra }, expect);
+  }
+
+  // Pearl of Tsoatha: a ring slot PoB shows, tried on a Prismatic Ring.
+  const pearl = await uniqueSearch({ unique: 'Pearl of Tsoatha', slot: 'Ring 1' });
+  const pearlQuery = decodeQuery(pearl.url, STANDARD_PREFIX) as Query & { query: { name?: string } };
+  assert(pearlQuery.query.name === 'Pearl of Tsoatha' && pearl.itemCategory === 'Ring' && pearl.currentItem !== null, `Pearl name filter: ${pearlQuery.query.name}`);
+  assert(pearl.filters.length > 0 && pearl.filters.every((f) => f.tradeId.startsWith(PEARL_PREFIX) && f.weight > 0 && /Supported by/.test(f.text)),
+    `Pearl support filters: ${JSON.stringify(pearl.filters.slice(0, 3))}`);
+  // list_valid_slots lists Ring 3 regardless; PoB's Pearl popup offers only the ring slots it shows.
+  await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha', slot: 'Ring 3' }, /a ring slot Path of Building shows \(Ring 1, Ring 2\).*Ring 3 is hidden/);
+  await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha', slot: 'Amulet' }, /a ring slot Path of Building shows/);
+  await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha' }, /slot is required for Pearl of Tsoatha/);
+  await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha', slot: 'Ring 1', sockets: 1 }, /sockets does not apply to Pearl/);
+  await userError('search_trade_mods', { unique: 'Pearl of Tsoatha', query: 'support' }, /Pearl of Tsoatha has no mod list/);
+
+  // Megalomaniac: PoB's search fails on notables the 3.13 tree lacks; its pool is listed.
+  await userError('generate_trade_search', { league: 'Standard', unique: 'Megalomaniac' },
+    /cannot weigh Megalomaniac on this build's passive tree \(version 3\.13\).*convert_tree_to_latest/);
+  const notables = await ok<{ mods: TradeMod[]; total: number }>('search_trade_mods', { unique: 'Megalomaniac', query: 'added passive skill is', limit: 100 });
+  assert(notables.total > 100 && notables.mods.every((m) => /^1 Added Passive Skill is /.test(m.text)), `Megalomaniac notables: ${notables.total}`);
+  await userError('search_trade_mods', { query: 'life' }, /slot is required unless unique is given/);
+  await userError('generate_trade_search', { league: 'Standard' }, /slot is required \(except for unique "Megalomaniac"\)/);
+
+  // A socket holding a cluster jewel is refused (PoB would weigh against the build without its passives).
+  assert(!(await call('allocate_nodes', { nodes: [2491] })).isError, 'allocate the large cluster socket 2491');
+  assert(!(await call('swap_item', { slot: 'Jewel 2491', itemText: VOICES })).isError, 'Voices into Jewel 2491');
+  await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Jewel 2491' }, /Jewel 2491 holds a cluster jewel \(Voices\)/);
+  assert(!(await call('undo_last_change')).isError && !(await call('undo_last_change')).isError, 'undo the cluster jewel and the allocation');
+  assert((await keyState()) === before, 'special unique searches and refusals changed the build or its export');
+  log('PASS');
+}
+
+/**
+ * Megalomaniac on the latest tree (its own engine: the build is converted):
+ * cluster notables weighed as passive nodes, PoB's default socket, an explicit
+ * socket whose jewel counts as replaced (every weight shifts by the jewel's
+ * worth), the export unchanged.
+ */
+async function test16Megalomaniac(paths: TestPaths, xml: string): Promise<void> {
+  log('Test 16: Megalomaniac on the latest tree');
+  const bridge = new LuaBridge(paths, 120_000);
+  try {
+    const session = new BuildSession(bridge);
+    await session.loadBuild(xml);
+    await session.convertTreeToLatest();
+    const before = await session.exportXML();
+    const megaSearch = async (slot?: string) => {
+      const args = { league: 'Standard', unique: 'Megalomaniac' as const, ...(slot ? { slot } : {}) };
+      return buildTradeSearch(args, await session.generateTradeQuery(tradeQueryCommand(args))) as unknown as UniqueSearch;
+    };
+    const mega = await megaSearch();
+    const q = decodeQuery(mega.url, STANDARD_PREFIX) as Query & { query: { name?: string; type?: string } };
+    assert(q.query.name === 'Megalomaniac' && q.query.type === 'Medium Cluster Jewel' && q.query.filters.type_filters === undefined,
+      `name and base filters: ${JSON.stringify({ name: q.query.name, type: q.query.type })}`);
+    assert(mega.unique === 'Megalomaniac' && typeof mega.slot === 'string' && /^Jewel \d+$/.test(mega.slot) && mega.currentItem === null,
+      `PoB's default socket (empty): ${mega.slot} ${mega.currentItem}`);
+    assert(mega.filters.length >= 10 && mega.filters.every((f) => f.weight > 0 && f.notable !== undefined && f.text === `1 Added Passive Skill is ${f.notable}`),
+      `notables weighed: ${JSON.stringify(mega.filters.slice(0, 3))}`);
+    assert(mega.minWeightedSum === 0, `no jewel in the default socket: min 0, got ${mega.minWeightedSum}`);
+    // A socket holding a jewel: PoB measures from the build without it, so every weight includes its worth.
+    const held = await megaSearch('Jewel 36634');
+    assert(held.slot === 'Jewel 36634' && held.currentItem !== null && held.minWeightedSum > 0, `explicit socket: ${held.currentItem} min ${held.minWeightedSum}`);
+    const shifts = mega.filters.slice(0, 5).map((f) => held.filters.find((h) => h.tradeId === f.tradeId)!.weight - f.weight);
+    assert(shifts.every((d) => d > 0 && Math.abs(d - shifts[0]) <= Math.max(0.05, shifts[0] * 0.02)), `every weight shifts by the jewel's worth: ${shifts}`);
+    assert((await session.exportXML()) === before, 'Megalomaniac searches changed the export');
+  } finally {
+    await bridge.dispose();
+  }
+  log('PASS');
+}
+
 /**
  * Faults while an inactive flask slot is activated for a trade search
  * (bridge test faults): an error there leaves the slot's flags and the export
@@ -268,6 +414,24 @@ async function test14FlaskFaults(paths: TestPaths, xml: string): Promise<void> {
     assert((await session.exportXML()) === before, 'export unchanged after the failed activated search');
   } finally {
     await failing.dispose();
+  }
+
+  // The activation itself fails (after the flags are set): the protected path still puts everything back.
+  const activation = new LuaBridge(paths, 120_000, { testFaults: 'tradeFlaskActivationFails' });
+  try {
+    const session = new BuildSession(activation);
+    await session.loadBuild(xml);
+    await session.setFlaskActive('Flask 2', false);
+    const before = await session.exportXML();
+    const e = await rejection(session.generateTradeQuery(query('Flask 2')));
+    assert(e instanceof EngineCommandError && /test fault: activating the flask slot for the trade search failed/.test(e.message)
+      && !/reset_build/.test(e.message), `the activation's own error: ${e.constructor.name}: ${e.message}`);
+    assert((await flaskActive(session, 'Flask 2')) === false, 'Flask 2 is inactive again after the failed activation');
+    assert((await session.exportXML()) === before, 'export unchanged after the failed activation');
+    // The generator and the popup stubs were put back: searches keep working on that engine.
+    assert((await session.generateTradeQuery(query('Helmet'))).capLifted === true, 'a search after the failed activation');
+  } finally {
+    await activation.dispose();
   }
 
   const inexact = new LuaBridge(paths, 120_000, { testFaults: 'tradeFlaskRestoreInexact' });
@@ -620,7 +784,9 @@ async function main(): Promise<void> {
 
     await test12Flasks(category, weighted);
     await test13WeaponSwap();
+    await test15Uniques();
     await test14FlaskFaults(paths, readFileSync(fixturePath, 'utf8'));
+    await test16Megalomaniac(paths, readFileSync(fixturePath, 'utf8'));
     log('ALL TRADE SEARCH TESTS PASSED');
   } finally {
     await client.close().catch(() => undefined);

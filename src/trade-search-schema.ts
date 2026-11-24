@@ -20,6 +20,10 @@ export interface TradeQueryRaw {
   testBase?: string;
   /** The flask slot is inactive in the build and was evaluated active for the call. */
   evaluatedActive?: true;
+  /** A special unique search (`unique`): its name. */
+  unique?: (typeof UNIQUES)[number];
+  /** The slot the search ran against (null: a Megalomaniac search on a build without a usable socket). */
+  slot?: string | null;
 }
 
 export interface TradeModsResult {
@@ -45,6 +49,16 @@ const CURRENCIES = ['chaos-equivalent', 'chaos', 'divine', 'alch', 'alt', 'chrom
   'gcp', 'jewellers', 'scour', 'regret', 'fusing', 'chance', 'regal', 'vaal'] as const;
 export const ELDRITCH_SLOTS = new Set(['Body Armour', 'Helmet', 'Gloves', 'Boots']);
 export const JEWEL_TYPES = ['base', 'abyss', 'any'] as const;
+/** The special uniques of PoB's trade tab ("Other trades"), searched with the generator's options.special. */
+export const UNIQUES = ["Watcher's Eye", 'Megalomaniac', 'Pearl of Tsoatha'] as const;
+export const UNIQUE_TEXT = 'Search for one of the uniques Path of Building\'s trade tab searches by weight ("Other trades"), as it does: ' +
+  '"Watcher\'s Eye" weighs its aura mods (and corrupted jewel implicits unless includeCorrupted is false) with `slot` = an allocated ' +
+  'passive-tree jewel socket that is not a cluster jewel socket; "Pearl of Tsoatha" weighs each support gem it can grant per skill-group ' +
+  'slot, tried on a Prismatic Ring in `slot` = a ring slot Path of Building shows; "Megalomaniac" weighs each cluster notable it can add ' +
+  'as a passive node (weight = stat-score gain of the notable; `slot` is optional: an allocated non-cluster jewel socket whose jewel ' +
+  'counts as replaced, by default Path of Building\'s own pick, the lowest such node id; none when there is none). The search requires ' +
+  'the unique by name and always excludes mirrored items (as PoB). Not with influences, sockets, links, jewelType (Watcher\'s Eye: ' +
+  'only "any"), flaskType, includeMirrored true, includeTalisman true or includeEldritch "keep...".';
 /** "tincture" is accepted only to be refused (PoB's generator has no tincture category); the refusal lives in the bridge. */
 export const FLASK_TYPES = ['life', 'mana', 'hybrid', 'utility', 'tincture'] as const;
 export const FLASK_TYPE_TEXT = 'Flask slots only: which flask to search for, "life", "mana", "hybrid" or "utility" (default: the kind of the ' +
@@ -63,7 +77,8 @@ export const JEWEL_TYPE_TEXT = 'Passive-tree jewel sockets: which jewels to sear
 const tradeId = z.string().max(80).describe('Trade stat id, e.g. "explicit.stat_3299347043" or "pseudo.pseudo_total_life" (find ids with search_trade_mods).');
 
 export interface TradeSearchArgs {
-  slot: string;
+  /** Required except for a Megalomaniac search (`unique`). */
+  slot?: string;
   league: string;
   realm?: 'pc' | 'xbox' | 'sony';
   statWeights?: { stat: string; weight: number }[];
@@ -80,13 +95,14 @@ export interface TradeSearchArgs {
   links?: number;
   jewelType?: (typeof JEWEL_TYPES)[number];
   flaskType?: (typeof FLASK_TYPES)[number];
+  unique?: (typeof UNIQUES)[number];
   requiredMods?: { tradeId: string; min?: number }[];
   weightAdjustments?: { tradeId: string; weight: number }[];
   minWeightedSum?: number;
 }
 
 export const tradeSearchSchema = {
-  slot: z.string().min(1).describe('Gear or flask slot ("Helmet", "Ring 1", "Weapon 1", "Flask 1"), an abyssal socket the item in its slot has ("Belt Abyssal Socket 1") or an allocated passive-tree jewel socket ("Jewel 26725"); see list_valid_slots.'),
+  slot: z.string().min(1).optional().describe('Gear or flask slot ("Helmet", "Ring 1", "Weapon 1", "Flask 1"), an abyssal socket the item in its slot has ("Belt Abyssal Socket 1") or an allocated passive-tree jewel socket ("Jewel 26725"); see list_valid_slots. Required, except for unique "Megalomaniac".'),
   league: z.string().describe('Trade league name exactly as on the trade site, e.g. "Standard" or the current challenge league.'),
   realm: z.enum(['pc', 'xbox', 'sony']).optional().describe('Platform (default "pc").'),
   statWeights: z.array(z.object({ stat: z.string().min(1).max(64), weight: z.number().gt(0).lte(10) })).min(1).max(20).optional()
@@ -96,7 +112,7 @@ export const tradeSearchSchema = {
   includeEldritch: z.enum(ELDRITCH).optional().describe('Body/helmet/gloves/boots: eldritch implicit handling (default "copyCurrent" = no eldritch weights; "keep..." weighs them). Other slots accept only "copyCurrent" / "remove", which change nothing there.'),
   includeScourge: z.boolean().optional().describe('Weigh scourge mods (default: true only in Standard/Hardcore; never for jewel sockets, which accept only false).'),
   includeTalisman: z.boolean().optional().describe('Amulet: weigh talisman implicits (default false). Other slots accept only false.'),
-  includeMirrored: z.boolean().optional().describe('Allow mirrored items (default true).'),
+  includeMirrored: z.boolean().optional().describe('Allow mirrored items (default true; unique searches always exclude them and accept only false).'),
   influences: z.array(z.enum(INFLUENCES)).max(2).optional().describe('Up to two required influences (PoB 2.68+ no longer weighs mods on an influenced copy of the item; the influence is still required).'),
   maxPrice: z.object({ amount: z.number().int().positive().max(1_000_000), currency: z.enum(CURRENCIES).optional() }).optional()
     .describe('Maximum price (currency default "chaos-equivalent").'),
@@ -105,6 +121,7 @@ export const tradeSearchSchema = {
   links: z.number().int().min(1).max(6).optional().describe('Exact number of links (armour and weapons only).'),
   jewelType: z.enum(JEWEL_TYPES).optional().describe(JEWEL_TYPE_TEXT),
   flaskType: z.enum(FLASK_TYPES).optional().describe(FLASK_TYPE_TEXT),
+  unique: z.enum(UNIQUES).optional().describe(UNIQUE_TEXT),
   requiredMods: z.array(z.object({ tradeId, min: z.number().optional() })).max(10).optional()
     .describe('Hard requirements: every listed mod must be present (with at least `min` when given).'),
   weightAdjustments: z.array(z.object({ tradeId, weight: z.number().min(-1000).max(1000) })).max(MAX_FILTERS).optional()

@@ -1071,16 +1071,23 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   async ({ slot, modSlots }, session) => {
     const suggestions = await session.suggestUpgrades(slot, { modSlots });
     // Slots the trade generator was run for, and supported slots it was not
-    // (unsupported ones carry their modsError without a query).
+    // (unsupported ones carry their modsError without a query): the ones a
+    // larger modSlots reaches, and empty or unmeasured jewel / abyssal sockets
+    // (priority null), which get suggestedMods only when asked for with `slot`.
     const queried = suggestions.filter((s) => s.modsQueried).length;
-    const notQueried = suggestions.filter((s) => s.error === undefined && !s.modsQueried && s.modsError === undefined).length;
+    const notQueried = suggestions.filter((s) => s.error === undefined && !s.modsQueried && s.modsError === undefined);
+    const socketsOnly = notQueried.filter((s) => s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal')).length;
+    const reachable = notQueried.length - socketsOnly;
     let modsNote: string | undefined;
     if (suggestions.some((s) => s.error !== undefined)) {
       modsNote = 'slots that could not be measured (error) get no suggestedMods';
     }
-    if (notQueried > 0) {
-      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for ${queried} supported slot(s) only; ` +
-        'pass slot, or a larger modSlots, for the others';
+    if (notQueried.length > 0) {
+      const how = [
+        ...(reachable > 0 ? [`pass a larger modSlots (or slot) for the other ${reachable} ranked or listed slot(s)`] : []),
+        ...(socketsOnly > 0 ? [`pass slot for the ${socketsOnly} empty or unmeasured jewel / abyssal socket(s), which modSlots never reaches`] : []),
+      ];
+      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for ${queried} supported slot(s) only; ${how.join('; ')}`;
     }
     return {
       suggestions: suggestions.map(({ currentItem: _item, modsQueried: _queried, ...rest }) => rest),
