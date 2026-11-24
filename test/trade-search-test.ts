@@ -434,6 +434,7 @@ async function rejectsWith(p: Promise<unknown>, expect: RegExp): Promise<void> {
 }
 
 const MIRROR_PREFIX = 'pob-mcp-nospecial-';
+const STALE_MIRROR_MS = 60 * 60 * 1000;
 
 /**
  * Removes a mirror made by test17 without ever following a link: each link
@@ -465,14 +466,21 @@ function removeMirror(dir: string): boolean {
  * copied, the large data folders linked, nothing written into the install)
  * whose TradeQueryGenerator.lua lacks the special searches. Each unique is a
  * user error naming the missing search; a normal search still works. Mirrors
- * a killed earlier run left behind are swept first.
+ * a killed earlier run left behind (over an hour old) are swept first.
  */
 async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<void> {
   log('Test 17: a trade generator without the special unique searches');
+  // Only mirrors older than an hour: other worktrees may be running this test right now, and a live
+  // bridge's working directory cannot be removed on Windows (EBUSY).
   for (const name of readdirSync(os.tmpdir())) {
-    if (name.startsWith(MIRROR_PREFIX)) {
-      const stale = path.join(os.tmpdir(), name);
-      if (lstatSync(stale).isDirectory() && !removeMirror(stale)) console.error(`left ${stale} in place: a link could not be removed safely`);
+    if (!name.startsWith(MIRROR_PREFIX)) continue;
+    const stale = path.join(os.tmpdir(), name);
+    try {
+      const stat = lstatSync(stale);
+      if (!stat.isDirectory() || Date.now() - stat.mtimeMs < STALE_MIRROR_MS) continue;
+      if (!removeMirror(stale)) console.error(`left ${stale} in place: a link could not be removed safely`);
+    } catch (e) {
+      console.error(`left ${stale} in place: ${(e as Error).message}`);
     }
   }
   const mirror = mkdtempSync(path.join(os.tmpdir(), MIRROR_PREFIX));
@@ -526,7 +534,12 @@ async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<vo
       await bridge.dispose();
     }
   } finally {
-    if (!removeMirror(mirror)) console.error(`left ${mirror} in place: a link could not be removed safely`);
+    // A cleanup failure never masks the test's own error.
+    try {
+      if (!removeMirror(mirror)) console.error(`left ${mirror} in place: a link could not be removed safely`);
+    } catch (e) {
+      console.error(`left ${mirror} in place: ${(e as Error).message}`);
+    }
   }
   log('PASS');
 }
