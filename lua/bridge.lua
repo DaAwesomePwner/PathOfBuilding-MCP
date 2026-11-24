@@ -4812,9 +4812,6 @@ function tradeCompat.uniqueSlot(gen, unique, slotName, jewelType, flaskType)
 	return slot, category, queryStr
 end
 
--- PoB's GeneratePassiveNodeWeights looks every Megalomaniac notable of its
--- trade data up on the build's tree (clusterNodeMap, then notableMap) and
--- fails on one the tree does not have (older trees): the names it would miss.
 -- Pearl of Tsoatha's filters as ExecuteQuery builds them (stat hash
 -- 4089743927 | skill-group slot 1-4 | support index into
 -- Data/PearlSupports.lua), with their texts from PoB's trade stat list.
@@ -4830,6 +4827,9 @@ function tradeCompat.pearlPool(texts)
 	return pool
 end
 
+-- PoB's GeneratePassiveNodeWeights looks every Megalomaniac notable of its
+-- trade data up on the build's tree (clusterNodeMap, then notableMap) and
+-- fails on one the tree does not have (older trees): the names it would miss.
 function tradeCompat.megalomaniacMissing(gen)
 	local tree = build.spec.tree
 	local missing = { }
