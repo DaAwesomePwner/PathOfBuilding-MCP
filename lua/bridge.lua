@@ -1038,6 +1038,63 @@ function slotChecks.refusalReason(tab, item, slotName)
 	return "a " .. kind .. " item does not go in that slot"
 end
 
+-- Flask slots (Flask 1-5; tinctures go there too). PoB's ItemSlot gives them
+-- an "Activate this flask" check box that sets slot.active and the active
+-- item set's entry (`active`, what ItemsTab saves); CalcSetup counts a flask
+-- or tincture (env.flasks / env.tinctures) only while slot.active is on.
+-- That per-slot state is not the `conditionUsingFlask` config option (the
+-- `flasks` alias), which only says whether the character counts as using a
+-- flask for "while using a flask" modifiers.
+function slotChecks.isFlaskSlot(slot)
+	return type(slot) == "table" and not slot.nodeId and not slot.parentSlot and type(slot.slotName) == "string"
+		and slot.slotName:match("^Flask %d+$") ~= nil
+end
+
+-- The flask slot named `slotName`; anything else is refused.
+function slotChecks.flaskSlot(slotName)
+	local slot = build.itemsTab.slots[slotName]
+	if not slot then userError("Unknown slot: " .. tostring(slotName)) end
+	if not slotChecks.isFlaskSlot(slot) then
+		userError(tostring(slotName) .. " is not a flask slot: only Flask 1 to Flask 5 can be set active or inactive")
+	end
+	return slot
+end
+
+-- A flag that may be nil, as a JSON-safe code (item states keep nil and
+-- false apart so a restore puts back exactly what was there): 1, 0, -1.
+function slotChecks.flagCode(v)
+	if v == nil then return -1 end
+	return v and 1 or 0
+end
+
+function slotChecks.flagValue(code)
+	if code == 1 then return true elseif code == 0 then return false end
+	return nil
+end
+
+-- What PoB's check box sets (without PoB's own undo state): slot.active, the
+-- active item set's entry and the box's state. Returns a function putting
+-- back exactly what was there.
+function slotChecks.setFlaskFlags(slot, slotActive, entryActive)
+	local entry = build.itemsTab.activeItemSet[slot.slotName]
+	local box = slot.controls and slot.controls.activate
+	local was = { slot.active, entry and entry.active, box and box.state }
+	slot.active = slotActive
+	if entry then entry.active = entryActive end
+	if box then box.state = slotActive end
+	return function()
+		slot.active = was[1]
+		if entry then entry.active = was[2] end
+		if box then box.state = was[3] end
+	end
+end
+
+-- An item what-if into an inactive flask slot would count for nothing.
+function slotChecks.inactiveFlaskText(slotName, remedy)
+	return string.format("%s is not active, so Path of Building does not apply the flask or tincture there (its effects "
+		.. "and charges-related stats stay off) and the comparison would show next to no difference. %s", slotName, remedy)
+end
+
 -- PoB 2.68 split object construction into `new("X"):X(args)` and rejects
 -- `new("X", args)`; older PoB only has the latter. Detected once by asking `new`
 -- about a class that does not exist: only the new `new` complains about the
@@ -1228,7 +1285,15 @@ local function captureItemsState()
 		order[i] = id
 		tokens[i] = itemToken(tab.items[id])
 	end
-	return { slots = slots, itemOrder = order, itemTokens = tokens }
+	-- Flask slots' active flags (slot and item set entry, as flag codes).
+	local flasks = { }
+	for _, slot in ipairs(tab.orderedSlots) do
+		if slotChecks.isFlaskSlot(slot) then
+			local entry = tab.activeItemSet[slot.slotName]
+			flasks[#flasks + 1] = { slot.slotName, slotChecks.flagCode(slot.active), slotChecks.flagCode(entry and entry.active) }
+		end
+	end
+	return { slots = slots, itemOrder = order, itemTokens = tokens, flasks = flasks }
 end
 
 -- Refuse (internal error, before anything changes) a captured item state
@@ -1318,6 +1383,24 @@ local function restoreItemsState(state)
 		end
 	end
 
+	-- Flask slots' active flags, exactly as captured (nil and false apart).
+	if state.flasks ~= nil then
+		if type(state.flasks) ~= "table" then error("restoreItemsState: malformed flask states") end
+		for _, f in ipairs(state.flasks) do
+			local slot = type(f) == "table" and type(f[1]) == "string" and tab.slots[f[1]]
+			if not slotChecks.isFlaskSlot(slot) then
+				mismatches[#mismatches + 1] = "flask slot " .. tostring(type(f) == "table" and f[1]) .. " does not exist"
+			else
+				local entry = tab.activeItemSet[slot.slotName]
+				local slotActive, entryActive = slotChecks.flagValue(f[2]), slotChecks.flagValue(f[3])
+				if slot.active ~= slotActive or (entry and entry.active ~= entryActive) then
+					slotChecks.setFlaskFlags(slot, slotActive, entryActive)
+					changed = true
+				end
+			end
+		end
+	end
+
 	local extra = { }
 	for id in pairs(tab.items) do
 		if not keep[id] then extra[#extra + 1] = id end
@@ -1366,6 +1449,15 @@ local function restoreItemsState(state)
 			local id = want[slot.slotName] or 0
 			if tab.items[id] and (slot.selItemId or 0) ~= id then
 				mismatches[#mismatches + 1] = slot.slotName .. " holds item " .. tostring(slot.selItemId) .. ", expected " .. id
+			end
+		end
+	end
+	for _, f in ipairs(type(state.flasks) == "table" and state.flasks or { }) do
+		local slot = type(f) == "table" and type(f[1]) == "string" and tab.slots[f[1]]
+		if slotChecks.isFlaskSlot(slot) then
+			local entry = tab.activeItemSet[slot.slotName]
+			if slotChecks.flagCode(slot.active) ~= f[2] or (entry and slotChecks.flagCode(entry.active) ~= f[3]) then
+				mismatches[#mismatches + 1] = slot.slotName .. " active state differs from the snapshot"
 			end
 		end
 	end
@@ -3354,14 +3446,18 @@ local function getValidSlots()
 		if slot.slotName and not slotChecks.hiddenReason(slot) and not (parent and index > count) then
 			local itemId = slot.selItemId or 0
 			local item = (itemId ~= 0) and build.itemsTab.items[itemId] or nil
-			local allocated, clusterParent = nil, nil
+			local allocated, clusterParent, active = nil, nil, nil
 			if slot.nodeId then
 				allocated = slotChecks.unallocatedSocket(slot) == nil
 				clusterParent = slotChecks.clusterParent(slot.nodeId)
 			end
+			-- Flask slots: PoB's activate check box (also kept for an empty slot,
+			-- where it applies to the next flask equipped).
+			if slotChecks.isFlaskSlot(slot) then active = slot.active == true end
 			table.insert(result, {
 				slot = slot.slotName,
 				occupied = itemId ~= 0,
+				active = active,
 				itemName = item and (item.title or item.name) or nil,
 				baseName = item and item.baseName or nil,
 				parentSlot = parent and parent.slotName or nil,
@@ -3420,12 +3516,21 @@ local function listEquippedItems()
 						note = "The socket is not allocated, so Path of Building ignores this jewel. "
 							.. slotChecks.socketRemedy(unallocated)
 					end
+					local active = nil
+					if slotChecks.isFlaskSlot(slot) then
+						active = slot.active == true
+						if not active then
+							note = "The flask slot is not active, so Path of Building does not apply this "
+								.. (item.type == "Tincture" and "tincture" or "flask") .. ". set_flask_active turns it on"
+						end
+					end
 					table.insert(result, {
 						hidden = gate and true or nil,
 						note = note,
 						slot = slot.slotName,
 						parentSlot = parent and parent.slotName or nil,
 						allocated = allocated,
+						active = active,
 						itemId = itemId,
 						rarity = item.rarity,
 						name = item.name,
@@ -4871,10 +4976,17 @@ local DISPATCH = {
 			-- Allowed (PoB's build keeps a jewel in a socket that is later
 			-- deallocated; its UI only hides such sockets), but the jewel does
 			-- nothing there yet.
-			local nodeId = slotChecks.unallocatedSocket(build.itemsTab.slots[cmd.slot])
+			local slot = build.itemsTab.slots[cmd.slot]
+			local nodeId = slotChecks.unallocatedSocket(slot)
 			if nodeId then
 				return { note = "The jewel is equipped, but the socket is not allocated, so Path of Building ignores it. "
 					.. slotChecks.socketRemedy(nodeId) }
+			end
+			-- Allowed too (PoB's UI equips into an inactive flask slot), but the
+			-- flask or tincture does nothing until the slot is activated.
+			if slotChecks.isFlaskSlot(slot) and not slot.active then
+				return { note = "The item is equipped, but " .. cmd.slot .. " is not active, so Path of Building does not "
+					.. "apply it. set_flask_active turns the slot on" }
 			end
 			return { }
 		end,
@@ -4889,11 +5001,69 @@ local DISPATCH = {
 		-- without changing anything (compare_items checks before probing).
 		-- With `whatIf`, an unallocated passive-tree jewel socket is refused
 		-- too: a jewel compared there would show no difference at all.
+		-- With `whatIf`, so is an inactive flask slot unless `activate` (the
+		-- candidates are then evaluated with the slot active); `activate` is
+		-- for flask slots only. `flaskActive`: the flask slot's state now.
 		handler = function(cmd)
 			local slot = slotChecks.usableSlot(cmd.slot, true)
 			local nodeId = cmd.whatIf and slotChecks.unallocatedSocket(slot)
 			if nodeId then userError(slotChecks.unallocatedText(cmd.slot, nodeId)) end
+			local isFlask = slotChecks.isFlaskSlot(slot)
+			if cmd.activate ~= nil and not isFlask then
+				userError("activate only applies to flask slots (Flask 1 to Flask 5); " .. tostring(cmd.slot) .. " is not one")
+			end
+			if cmd.whatIf and isFlask and not slot.active and cmd.activate ~= true then
+				userError(slotChecks.inactiveFlaskText(cmd.slot, "Pass activate: true to compare the candidates with the slot "
+					.. "active, or turn the slot on first with set_flask_active"))
+			end
+			if isFlask then return { flaskActive = slot.active == true } end
 			return { }
+		end,
+	},
+	-- set_flask_active: PoB's "Activate this flask" check box on a flask slot
+	-- holding a flask or tincture (PoB disables the box on an empty slot).
+	-- `unchanged` when the slot already has that state. `restore` (undo only)
+	-- puts back the exact flags getFlaskState returned, with no other check.
+	getFlaskState = {
+		handler = function(cmd)
+			local slot = slotChecks.flaskSlot(cmd.slot)
+			local entry = build.itemsTab.activeItemSet[slot.slotName]
+			local item = build.itemsTab.items[slot.selItemId or 0]
+			return { active = slot.active == true, occupied = item ~= nil,
+				flags = { slotChecks.flagCode(slot.active), slotChecks.flagCode(entry and entry.active) } }
+		end,
+	},
+	setFlaskActive = {
+		handler = function(cmd)
+			local slot = slotChecks.flaskSlot(cmd.slot)
+			local tab = build.itemsTab
+			if cmd.restore ~= nil then
+				local r = cmd.restore
+				if type(r) ~= "table" or type(r[1]) ~= "number" or type(r[2]) ~= "number" then
+					error("setFlaskActive: malformed restore flags", 0)
+				end
+				slotChecks.setFlaskFlags(slot, slotChecks.flagValue(r[1]), slotChecks.flagValue(r[2]))
+				build.buildFlag = true
+				runCallback("OnFrame")
+				return { slot = slot.slotName, active = slot.active == true }
+			end
+			if type(cmd.active) ~= "boolean" then userError("active must be true or false") end
+			local item = tab.items[slot.selItemId or 0]
+			if not item then
+				userError(slot.slotName .. " is empty: Path of Building only lets a flask slot holding a flask or tincture be "
+					.. "turned on or off. Equip one first (swap_item)")
+			end
+			local entry = tab.activeItemSet[slot.slotName]
+			local result = { slot = slot.slotName, active = cmd.active, previous = slot.active == true,
+				item = item.title or item.name, itemType = item.type }
+			if (slot.active == true) == cmd.active and (entry == nil or (entry.active == true) == cmd.active) then
+				result.unchanged = true
+				return result
+			end
+			slotChecks.setFlaskFlags(slot, cmd.active, cmd.active)
+			build.buildFlag = true
+			runCallback("OnFrame")
+			return result
 		end,
 	},
 	selectItem = {
@@ -5253,6 +5423,10 @@ do
 		assertItemFitsSlot = assertItemFitsSlot,
 		usableSlot = slotChecks.usableSlot,
 		unallocatedSocketText = slotChecks.unallocatedText,
+		isFlaskSlot = slotChecks.isFlaskSlot,
+		flaskSlot = slotChecks.flaskSlot,
+		setFlaskFlags = slotChecks.setFlaskFlags,
+		inactiveFlaskText = slotChecks.inactiveFlaskText,
 		clusterParent = slotChecks.clusterParent,
 		construct = construct,
 		findGemByName = findGemByName,

@@ -52,6 +52,7 @@
     "test:crash-recovery": "tsx test/crash-recovery-test.ts",
     "test:trade": "tsx test/trade-search-test.ts",
     "test:jewel-sockets": "tsx test/jewel-sockets-test.ts",
+    "test:flasks": "tsx test/flasks-test.ts",
     "test:lua-compat": "tsx test/lua-compat-test.ts",
     "test:probe": "tsx test/probe-test.ts",
     "test:evaluate": "tsx test/evaluate-changes-test.ts",

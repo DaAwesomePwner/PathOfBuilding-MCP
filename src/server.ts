@@ -300,7 +300,7 @@ tools.engine<{ detail?: 'summary' | 'full'; includeItemText?: boolean }>(
   'list_equipped_items',
   {
     description:
-      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. ' +
+      'List all currently equipped items by slot, including rarity, base type, mods (implicit/explicit/crafted/fractured/enchant), quality, item level, and sockets. Flask slots carry `active` (an inactive one also a note: PoB does not apply that flask or tincture; set_flask_active turns it on). ' +
       'An item in a slot Path of Building hides on this passive tree (Wickerman Head/Body/Arm/Leg off 3.30, Graft 1/2 off 3.27) is listed with hidden: true and a note: PoB still counts a hidden Wickerman item in its calculations but ignores a hidden graft; unequip_item removes either. ' +
       'Abyss jewels in abyssal sockets carry the `parentSlot` of the item that has the socket; a jewel in an unallocated passive-tree socket is listed with `allocated: false` and a note (PoB ignores it). ' +
       'By default each mod is `{ line }` plus only its true flags (e.g. `crafted: true`), false item flags are left out and the item text is not included; ' +
@@ -345,7 +345,9 @@ function summarizeComparison(result: ComparisonResult): unknown {
       itemId: result.baseline.item.itemId,
       hasItem: result.baseline.item.itemText !== null,
       keyStats: keyStats(result.baseline.stats),
+      ...(result.flaskSlotActive !== undefined ? { slotActive: result.flaskSlotActive } : {}),
     },
+    ...(result.activated ? { activated: true, note: 'The slot is inactive in the build; the candidates were evaluated with it active (the baseline is the build as it is).' } : {}),
     candidates: result.candidates.map((c) => ({
       index: c.index,
       error: c.error,
@@ -364,7 +366,7 @@ tools.engine<Record<string, never>>(
   {
     description:
       'List all currently valid equipment slot names along with whether each slot is occupied. Slots Path of Building hides on this passive tree are left out: the Wickerman slots (Head, Body, Arm, Leg) appear only on 3.30 trees, Graft 1/2 only on 3.27 trees. ' +
-      'Abyssal sockets ("<slot> Abyssal Socket N") are listed only where the item in their `parentSlot` has them. Every passive-tree jewel socket ("Jewel <nodeId>") is listed with `allocated`: a jewel in an unallocated socket counts for nothing (allocate it with allocate_nodes). A socket a cluster jewel adds that is not on the tree yet also has `requiresClusterIn` (the socket where a cluster jewel with jewel sockets must go first).',
+      'Flask slots carry `active` (Path of Building applies a flask or tincture only while its slot is active; set_flask_active changes it). Abyssal sockets ("<slot> Abyssal Socket N") are listed only where the item in their `parentSlot` has them. Every passive-tree jewel socket ("Jewel <nodeId>") is listed with `allocated`: a jewel in an unallocated socket counts for nothing (allocate it with allocate_nodes). A socket a cluster jewel adds that is not on the tree yet also has `requiresClusterIn` (the socket where a cluster jewel with jewel sockets must go first).',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -393,7 +395,7 @@ tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
-      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything. A jewel can go in an unallocated passive-tree socket (PoB\'s UI hides such sockets, but a build can hold a jewel there) and counts for nothing until the socket is allocated; the result then carries a `note` saying what to do (for a socket a cluster jewel adds: socket that cluster jewel first).',
+      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything. A jewel can go in an unallocated passive-tree socket (PoB\'s UI hides such sockets, but a build can hold a jewel there) and counts for nothing until the socket is allocated; the result then carries a `note` saying what to do (for a socket a cluster jewel adds: socket that cluster jewel first). Likewise a flask or tincture equipped in an inactive flask slot does nothing until the slot is turned on (set_flask_active); the `note` says so.',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name.'),
       itemText: z
@@ -426,11 +428,11 @@ tools.engine<{ slot: string }>(
   },
 );
 
-tools.engine<{ slot: string; items: string[] }>(
+tools.engine<{ slot: string; items: string[]; activate?: boolean }>(
   'compare_items',
   {
     description:
-      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused, and so is an unallocated passive-tree jewel socket (a jewel there counts for nothing; allocate it first with allocate_nodes).",
+      "Compare 2-5 candidate items in a slot against the currently equipped item. Each candidate is equipped as swap_item would (an off-hand or abyss jewels it cannot keep are emptied) and evaluated through Path of Building's own calculator without changing the build (a passive-tree jewel socket or a skill-granting item takes a full recalculation instead). A candidate that does not fit the slot or cannot be parsed gets an `error`; the others are still compared. Read-only: nothing is pushed to undo. A slot Path of Building hides on this passive tree (see list_valid_slots) is refused, and so is an unallocated passive-tree jewel socket (a jewel there counts for nothing; allocate it first with allocate_nodes). An inactive flask slot is refused too (PoB would not apply the flask or tincture) unless `activate: true`, which evaluates the candidates with the slot turned on (the result then has `activated: true`; the baseline is the build as it is); flask slots report `slotActive`.",
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot to compare in.'),
       items: z
@@ -438,14 +440,18 @@ tools.engine<{ slot: string; items: string[] }>(
         .min(2)
         .max(5)
         .describe('Array of 2-5 item texts to compare (PoB format). Viscera items copied from the game (first line "Item Class: Viscera") need no Rarity line.'),
+      activate: z
+        .boolean()
+        .optional()
+        .describe('Flask slots only: evaluate the candidates with the slot active (needed when it is inactive; set_flask_active commits it).'),
     },
   },
-  async ({ slot, items }, session) => {
+  async ({ slot, items, activate }, session) => {
     validateSlot(slot);
     // Per-item validation is deliberately not run here; compareItems
     // captures per-candidate failures into its results, which lets a
     // partially-bad batch still surface useful diffs for the good entries.
-    const result = await session.compareItems(slot, items);
+    const result = await session.compareItems(slot, items, activate);
     return summarizeComparison(result);
   },
 );
@@ -454,7 +460,7 @@ tools.engine<Record<string, never>>(
   'undo_last_change',
   {
     description:
-      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill, set_character_level, set_ascendancy or convert_tree_to_latest). Returns the stats after undo.',
+      'Undo the most recent build mutation (swap_item, unequip_item, set_config, allocate_nodes, deallocate_nodes, apply_changes, create_socket_group, delete_socket_group, set_main_skill, set_character_level, set_ascendancy, set_flask_active or convert_tree_to_latest). Returns the stats after undo.',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -1009,7 +1015,7 @@ tools.engine<{ buffs: Record<string, boolean | number | string> }>(
   'toggle_buffs',
   {
     description:
-      "Toggle individual buffs / charges (as config options) and return the stat impact, evaluated through Path of Building's own calculator in milliseconds; the build never changes. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks, unholyMight; raw PoB config keys also accepted.",
+      "Toggle individual buffs / charges (as config options) and return the stat impact, evaluated through Path of Building's own calculator in milliseconds; the build never changes. Friendly aliases: powerCharges, frenzyCharges, enduranceCharges, onslaught, fortify, flasks (the \"while using a flask\" condition, not which flask slots are active: see set_flask_active / evaluate_changes `flasks`), unholyMight; raw PoB config keys also accepted.",
     inputSchema: {
       buffs: z
         .record(z.string(), z.union([z.boolean(), z.number(), z.string()]))

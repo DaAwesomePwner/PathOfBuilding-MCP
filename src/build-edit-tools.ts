@@ -1,8 +1,8 @@
 // Committed build edits beyond items, config and the passive tree:
 // apply_changes (keep an evaluate_changes variant as one undoable step), the
 // socket group edits create_socket_group, delete_socket_group and
-// set_main_skill, and the build's fundamentals set_character_level and
-// set_ascendancy. Each pushes one undo entry and records one command for
+// set_main_skill, the build's fundamentals set_character_level and
+// set_ascendancy, and set_flask_active. Each pushes one undo entry and records one command for
 // crash replay (BuildSession).
 
 import { z } from 'zod';
@@ -10,6 +10,7 @@ import type {
   ApplyChangesResult,
   AscendancyChangeResult,
   ClassChoice,
+  FlaskActiveResult,
   LevelChangeResult,
   SkillEditResult,
   StatDiffResult,
@@ -44,7 +45,9 @@ function applyResponse(result: ApplyChangesResult, label: string | undefined, su
       status: 'unchanged',
       ...(label !== undefined ? { label } : {}),
       masteries: result.masteries ?? [],
-      message: 'Every mastery already has that effect; nothing was changed or pushed to undo.',
+      message: result.flasksUnchanged
+        ? 'Every mastery already has that effect and every flask slot is already in that state; nothing was changed or pushed to undo.'
+        : 'Every mastery already has that effect; nothing was changed or pushed to undo.',
     };
   }
   return {
@@ -86,6 +89,14 @@ function levelResponse(result: LevelChangeResult, summarize: SummarizeStatDiff):
   return { status: 'set', level: result.level, ...previous, ...(summarize(result) as object), undo: UNDO };
 }
 
+function flaskResponse(result: FlaskActiveResult, summarize: SummarizeStatDiff): unknown {
+  const fields = { slot: result.slot, active: result.active, item: result.item, ...(result.itemType ? { itemType: result.itemType } : {}) };
+  if (result.unchanged) {
+    return { status: 'unchanged', ...fields, message: `${result.slot} is already ${result.active ? 'active' : 'inactive'}; nothing was changed or pushed to undo.` };
+  }
+  return { status: result.active ? 'activated' : 'deactivated', ...fields, ...(summarize(result) as object), undo: UNDO };
+}
+
 function ascendancyResponse(result: AscendancyChangeResult, summarize: SummarizeStatDiff): unknown {
   if (result.unchanged) {
     return { status: 'unchanged', ...classChoice(result.to), message: 'The build already has that class and ascendancy; nothing was changed or pushed to undo.' };
@@ -119,9 +130,9 @@ export function registerBuildEditTools(tools: ToolRegistrar, summarize: Summariz
     'apply_changes',
     {
       description:
-        'Apply one what-if variant to the build and keep it: exactly the variant format evaluate_changes takes (passive nodes to allocate / deallocate by name or id, `masteries` [{node, effect}], items to equip or unequip, gem changes, config options, `mainSkill` {group, activeSkill?}; `label` is optional and echoed back), ' +
-        'applied in the same order (config, gems, items, nodes and masteries, main skill) and as ONE undo step, so a winning evaluate_changes variant can be committed as-is with the stats evaluate_changes reported for it. PERMANENTLY mutates the build (undo_last_change reverts the whole variant; export_build includes it). ' +
-        'The whole variant is checked first and refused with an error (nothing changes) if any node is unknown, ambiguous, already allocated, unreachable or a mastery listed in `allocate` (masteries go in `masteries`), a mastery effect is not offered by that mastery or already chosen on another one, an item does not fit its slot or cannot be parsed, a gem name or group / gem index is wrong (indices refer to the group as it is when that change applies), a gem change targets a group granted by an item or the passive tree, a config key is unknown, or the main skill group has no such active skill. ' +
+        'Apply one what-if variant to the build and keep it: exactly the variant format evaluate_changes takes (passive nodes to allocate / deallocate by name or id, `masteries` [{node, effect}], items to equip or unequip, flask slots to turn on or off (`flasks` [{slot, active}]), gem changes, config options, `mainSkill` {group, activeSkill?}; `label` is optional and echoed back), ' +
+        'applied in the same order (config, gems, items, flasks, nodes and masteries, main skill) and as ONE undo step, so a winning evaluate_changes variant can be committed as-is with the stats evaluate_changes reported for it. PERMANENTLY mutates the build (undo_last_change reverts the whole variant; export_build includes it). ' +
+        'The whole variant is checked first and refused with an error (nothing changes) if any node is unknown, ambiguous, already allocated, unreachable or a mastery listed in `allocate` (masteries go in `masteries`), a mastery effect is not offered by that mastery or already chosen on another one, an item does not fit its slot or cannot be parsed, an item would go in a flask slot left inactive or a `flasks` slot is empty or not a flask slot, a gem name or group / gem index is wrong (indices refer to the group as it is when that change applies), a gem change targets a group granted by an item or the passive tree, a config key is unknown, or the main skill group has no such active skill. ' +
         "Returns the nodes `added` (each allocation with its path, tree side first) and `removed`, the `masteries` given an effect, the `mainSkill` when set, the points used / refunded and the tree's point totals when nodes changed, and the before/after stat diff (as swap_item).",
       inputSchema: {
         variant: variantSchema.describe('One variant, as in evaluate_changes `variants`.'),
@@ -218,6 +229,23 @@ export function registerBuildEditTools(tools: ToolRegistrar, summarize: Summariz
       },
     },
     async ({ level }, session) => levelResponse(await session.setCharacterLevel(level), summarize),
+  );
+
+  tools.engine<{ slot: string; active: boolean }>(
+    'set_flask_active',
+    {
+      description:
+        "Turn a flask slot (Flask 1-5) on or off, as the \"Activate this flask\" check box beside it in Path of Building's Items tab does, and return the before/after stat diff. " +
+        'Path of Building applies a flask or tincture (its effect, and modifiers that need it in use) only while its slot is active; list_equipped_items / list_valid_slots show each flask slot\'s `active` state. ' +
+        'PERMANENTLY mutates the build (use undo_last_change to revert; export_build includes it). A slot already in that state is reported `unchanged` (nothing pushed to undo). ' +
+        'A slot that is not a flask slot, or an empty flask slot (PoB disables the box there), is refused without changing anything. ' +
+        'This is not set_config\'s `flasks` alias (conditionUsingFlask), which only sets the "while using a flask" condition; to try it without committing, use evaluate_changes `flasks` [{slot, active}] or compare_items `activate: true`.',
+      inputSchema: {
+        slot: z.string().min(1).describe('"Flask 1" to "Flask 5".'),
+        active: z.boolean().describe('true to turn the flask or tincture in the slot on, false to turn it off.'),
+      },
+    },
+    async ({ slot, active }, session) => flaskResponse(await session.setFlaskActive(slot, active), summarize),
   );
 
   tools.engine<{ ascendancy?: string; secondaryAscendancy?: string; className?: string; allowTreeReset?: boolean }>(
