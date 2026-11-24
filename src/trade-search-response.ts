@@ -46,6 +46,11 @@ export function buildTradeSearch(args: TradeSearchArgs, raw: TradeQueryRaw): Rec
           ? 'graft mods that can roll on that base (graft base implicits have no mod data in Path of Building and are not weighed).'
           : 'tincture mods that can roll on that base and the base\'s implicit.'),
     } : {}),
+    ...(Array.isArray(raw.unmatchedMods) && raw.unmatchedMods.length > 0 ? {
+      unmatchedMods: { count: raw.unmatchedMods.length, lines: raw.unmatchedMods.slice(0, 10) },
+      unmatchedNote: `${raw.unmatchedMods.length} mod line(s) that can roll on this base have no matching stat in Path of Building's ` +
+        'trade data, so the search cannot weigh them (lines lists up to 10, numbers as #).',
+    } : {}),
     ...(raw.evaluatedActive ? {
       evaluatedActive: true,
       activeNote: 'The flask slot is inactive in the build (Path of Building would weigh every mod at 0 there), so the weights were ' +

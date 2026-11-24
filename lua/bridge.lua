@@ -4890,9 +4890,23 @@ function tradeCompat.customModData(gen, category, item)
 	end
 	local base = item and item.base
 	local key = category .. "|" .. (base and item.baseName or "")
-	if tradeCompat.customCache[key] then return tradeCompat.customCache[key] end
+	local cached = tradeCompat.customCache[key]
+	if cached then return cached.md, cached.unmatched end
 	local md = { Explicit = { }, Implicit = { }, Corrupted = { }, Enchant = { }, Scourge = { }, Eater = { }, Exarch = { } }
 	local tester = base and construct("Item", "Rarity: RARE\nStat Tester\n" .. item.baseName)
+	-- ProcessMod reports a line it cannot weigh (no trade stat matches it, or
+	-- its numbers do not fit the stat) only through ConPrintf: collect those
+	-- lines (numbers as #, each text once) so the search can report them.
+	local unmatched, seen = { }, { }
+	local conPrintf = ConPrintf
+	ConPrintf = function(fmt, ...)
+		local ok, text = pcall(string.format, fmt, ...)
+		local line = ok and (text:match("^Unable to match %S+ mod: (.*)$") or text:match("^%[GMD%] Error extracting tokens from '(.-)'"))
+		if line then
+			line = line:gsub("%(?%d+%.?%d*%-?%d*%.?%d*%)?", "#")
+			if not seen[line] then seen[line] = true unmatched[#unmatched + 1] = line end
+		end
+	end
 	local saved = gen.modData
 	gen.modData = md
 	local ok, err = pcall(function()
@@ -4910,9 +4924,11 @@ function tradeCompat.customModData(gen, category, item)
 		end
 	end)
 	gen.modData = saved
+	ConPrintf = conPrintf
 	if not ok then error(err, 0) end
-	tradeCompat.customCache[key] = md
-	return md
+	table.sort(unmatched)
+	tradeCompat.customCache[key] = { md = md, unmatched = unmatched }
+	return md, unmatched
 end
 
 local function runTradeQuery(cmd)
@@ -4950,8 +4966,14 @@ local function runTradeQuery(cmd)
 	end
 	-- Grafts and tinctures: the mods of the item in the slot, filtered by its base type.
 	local custom = (category == "Graft" or category == "Tincture") and slot and build.itemsTab.items[slot.selItemId or 0]
-	local customMd = custom and tradeCompat.customModData(st.gen, category, custom) or nil
+	local customMd, unmatched = nil, nil
+	if custom then customMd, unmatched = tradeCompat.customModData(st.gen, category, custom) end
 	local o = cmd.options or { }
+	-- PoB has no scourge mods for grafts or tinctures (their scourge list is empty): refused as for jewels.
+	if customMd and o.scourgeRequested == true then
+		userError("includeScourge true does not apply to " .. category:lower() .. "s like the one in " .. slot.slotName
+			.. ": they have no scourge mods (false is accepted and changes nothing)")
+	end
 	local tradeTypeIndex = nil
 	for i, t in ipairs(TRADE_TYPES) do if t == o.tradeType then tradeTypeIndex = i end end
 	if not tradeTypeIndex then userError("Unknown tradeType '" .. tostring(o.tradeType) .. "'") end
@@ -4975,7 +4997,7 @@ local function runTradeQuery(cmd)
 		includeCorrupted = o.includeCorrupted,
 		includeMirrored = o.includeMirrored ~= false,
 		-- PoB's popup has no scourge option for jewel slots.
-		includeScourge = o.includeScourge == true and jewelType == nil,
+		includeScourge = o.includeScourge == true and jewelType == nil and not customMd,
 		jewelType = jewelType,
 		influence1 = influenceIndex(influences[1]),
 		influence2 = influenceIndex(influences[2]),
@@ -5140,6 +5162,7 @@ local function runTradeQuery(cmd)
 		slot = slot and slot.slotName or dkjson.null,
 		flaskType = flask and flask.kind or nil,
 		baseType = customMd and custom.baseName or nil,
+		unmatchedMods = customMd and unmatched or nil,
 		testBase = flask and flask.standIn or nil,
 		evaluatedActive = activated or nil,
 		statWeights = used,

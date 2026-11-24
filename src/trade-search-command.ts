@@ -137,6 +137,8 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
       includeCorrupted: args.includeCorrupted,
       includeMirrored: args.unique !== undefined ? false : args.includeMirrored ?? true,
       includeScourge: !jewelSlot && (args.includeScourge ?? /^(Standard|Hardcore)$/.test(league)),
+      // Asked for explicitly: the bridge refuses it for grafts and tinctures (no scourge mods), where the default is ignored.
+      scourgeRequested: args.includeScourge === true,
       includeTalisman: args.includeTalisman ?? false,
       eldritchIndex: ELDRITCH.indexOf(args.includeEldritch ?? 'copyCurrent') + 1,
       influences: args.influences ?? [],

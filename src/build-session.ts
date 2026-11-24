@@ -1179,7 +1179,10 @@ export class BuildSession {
     probed.results.forEach((r, i) => {
       if (r.error === undefined) evaluated.push(i);
       else if (r.userError) errors.push({ name: list.candidates[i].name, error: r.error });
-      else throw new Error(`Viscera ranking: ${list.candidates[i].name}: ${r.error}`);
+      // An engine-reported failure of one part: the probe has already checked the committed build by value
+      // (a difference would have thrown, naming reset_build), so it is an EngineCommandError, which
+      // suggest_upgrades records as the slot's modsError.
+      else throw new EngineCommandError(`Viscera ranking: ${list.candidates[i].name}: ${r.error}`);
     });
     const { scores } = await this.bridge.send<{ ok: true; scores: number[] }>({
       cmd: 'tradeScores', statWeights, base: probed.base, results: evaluated.map((i) => probed.results[i].stats),
@@ -2845,9 +2848,11 @@ export class BuildSession {
         };
         if (!item) {
           // Empty gear and flask slots lead the ranking; an empty jewel or
-          // abyssal socket is listed unranked, after the measured slots, and
-          // gets suggestedMods only when asked for with `slot`.
-          const socket = row.kind === 'treeJewel' || row.kind === 'abyssal';
+          // abyssal socket or Wickerman slot is listed unranked, after the
+          // measured slots, and gets suggestedMods / suggestedViscera only
+          // when asked for with `slot` (none spends the default budget).
+          const wickerman = WICKERMAN_SLOTS.has(slot) && row.kind === 'treeGated';
+          const socket = row.kind === 'treeJewel' || row.kind === 'abyssal' || wickerman;
           out.push({
             slot,
             ...extra,
@@ -2857,7 +2862,11 @@ export class BuildSession {
             dpsContribution: 0,
             ehpContribution: 0,
             priority: socket ? null : 100,
-            ...(socket ? { note: 'empty socket: listed after the measured slots, not ranked; pass slot for its suggestedMods' } : {}),
+            ...(socket ? {
+              note: wickerman
+                ? 'empty Wickerman slot: listed after the measured slots, not ranked; pass slot for its suggestedViscera'
+                : 'empty socket: listed after the measured slots, not ranked; pass slot for its suggestedMods',
+            } : {}),
           });
           continue;
         }
@@ -2925,7 +2934,7 @@ export class BuildSession {
         if (s.error !== undefined) continue;
         const why = modsUnsupported(byRow.get(s.slot)!, s.empty);
         if (why !== undefined) s.modsError = why;
-        else if (targetSlot || !(s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal'))) eligible.push(s);
+        else if (targetSlot || !unrankedSlotOnly(s)) eligible.push(s);
       }
       // Suggested mods: PoB's weighted trade query for the highest-priority slots it supports.
       const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, eligible.length));
@@ -2952,10 +2961,14 @@ export class BuildSession {
           const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
           s.suggestedMods = topTradeMods(raw, modsPerSlot);
         } catch (e) {
+          // The same rule for a Viscera ranking: a failure the engine reported (one part's probe, its
+          // candidate list, its scores) becomes the slot's modsError; one saying the build may differ
+          // ("call reset_build", e.g. an inexact fallback restore) or any other failure fails the call.
           if (!this.bridge.isRunning()) throw e;
           if (e instanceof UserError) s.modsError = e.message;
           else if (e instanceof EngineCommandError && !e.message.includes('call reset_build')) {
-            s.modsError = `Path of Building's trade query generator failed: ${e.message}`;
+            s.modsError = WICKERMAN_SLOTS.has(s.slot) ? `Viscera ranking failed: ${e.message}`
+              : `Path of Building's trade query generator failed: ${e.message}`;
           } else throw e;
         }
       }
@@ -3819,6 +3832,14 @@ export const DEFAULT_MOD_SLOTS = 3;
 export const DEFAULT_MODS_PER_SLOT = 6;
 /** Passive-tree jewel sockets suggest_upgrades measures per call (each is a probe fallback, ~0.3-0.5 s). */
 export const MAX_SUGGEST_TREE_JEWELS = 16;
+
+/**
+ * A suggest_upgrades row the default modSlots budget skips (suggestedMods / suggestedViscera only with `slot`):
+ * an empty or unmeasured jewel / abyssal socket, or an empty Wickerman slot.
+ */
+export function unrankedSlotOnly(s: Pick<UpgradeSuggestion, 'priority' | 'kind' | 'empty'>): boolean {
+  return s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal' || (s.kind === 'treeGated' && s.empty));
+}
 
 /** Why PoB's trade query generator gives a suggest_upgrades slot no suggested mods, or undefined when it can. */
 function modsUnsupported(row: UpgradeSlot, empty: boolean): string | undefined {

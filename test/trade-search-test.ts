@@ -227,7 +227,10 @@ async function test12Flasks(category: (s: Search) => string, weighted: (s: Searc
   log('PASS');
 }
 
-interface CustomSearch extends Search { baseType?: string; baseTypeNote?: string; flaskType?: string; evaluatedActive?: boolean }
+interface CustomSearch extends Search {
+  baseType?: string; baseTypeNote?: string; flaskType?: string; evaluatedActive?: boolean;
+  unmatchedMods?: { count: number; lines: string[] }; unmatchedNote?: string;
+}
 const GRAFT = 'Rarity: NORMAL\nBattering Uulgraft\nItem Level: 80\nImplicits: 1\n8% reduced Enemy Stun Threshold';
 
 /**
@@ -261,7 +264,18 @@ async function test18Grafts(xml: string): Promise<void> {
   for (const [opt, value] of [['sockets', 2], ['links', 2], ['influences', ['shaper']]] as const) {
     await userError('generate_trade_search', { slot: 'Graft 1', league: 'Standard', [opt]: value }, /not apply to graft slots like Graft 1/);
   }
+  // Grafts have no scourge mods: true is refused, false (and the Standard default) accepted.
+  await userError('generate_trade_search', { slot: 'Graft 1', league: 'Standard', includeScourge: true }, /includeScourge true does not apply to grafts.*Graft 1/);
+  assert((await ok<CustomSearch>('generate_trade_search', { slot: 'Graft 1', league: 'Standard', includeScourge: false })).url === graft.url, 'includeScourge false changes nothing');
   assert((await keyState()) === before, 'graft searches changed the build');
+  // Mod lines PoB's processing found no trade stat for are reported, never dropped silently (Xophgraft's skill mods have none).
+  const xoph = await ok<{ text: string }>('get_item_text', { base: 'Molten Xophgraft' });
+  assert(!(await call('swap_item', { slot: 'Graft 2', itemText: xoph.text })).isError, 'Xophgraft into Graft 2');
+  const xophSearch = await ok<CustomSearch>('generate_trade_search', { slot: 'Graft 2', league: 'Standard', statWeights: [{ stat: 'TotalEHP', weight: 1 }] });
+  const unmatched = xophSearch.unmatchedMods;
+  assert(unmatched !== undefined && unmatched.count > 0 && unmatched.lines.length === Math.min(10, unmatched.count)
+    && unmatched.lines.every((l) => !/\d/.test(l)) && /cannot weigh them/.test(xophSearch.unmatchedNote ?? ''),
+  `unmatched graft lines reported: ${JSON.stringify({ unmatched, note: xophSearch.unmatchedNote })}`);
   log('PASS');
 }
 
@@ -285,6 +299,7 @@ async function test19Tinctures(): Promise<void> {
   `tincture search: ${JSON.stringify({ ...t, url: undefined })}`);
   assert(t.filters.some((f) => /Melee Weapon Attack Speed/.test(f.text)) && t.filters.every((f) => f.weight > 0), `tincture mods weighed: ${JSON.stringify(t.filters)}`);
   assert((await ok<CustomSearch>('generate_trade_search', { slot: 'Flask 1', league: 'Standard', flaskType: 'tincture' })).url === t.url, 'flaskType tincture is the default');
+  await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', includeScourge: true }, /includeScourge true does not apply to tinctures.*Flask 1/);
   const up = await ok<{ suggestions: { slot: string; suggestedMods?: { mod: string }[]; modsError?: string }[] }>('suggest_upgrades', { slot: 'Flask 1' });
   const row = up.suggestions.find((s) => s.slot === 'Flask 1');
   assert(row && row.modsError === undefined && (row.suggestedMods?.length ?? 0) > 0, `suggest_upgrades tincture row: ${JSON.stringify(row)}`);

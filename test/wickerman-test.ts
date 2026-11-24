@@ -237,6 +237,21 @@ async function main(): Promise<void> {
       const s = slots330.find((x) => x.slot === w);
       assert(s && !s.occupied, `${w} should be listed and empty: ${JSON.stringify(s)}`);
     }
+    // A geared 3.30 build without Viscera: the empty Wickerman slots are listed unranked and never spend the
+    // default modSlots budget, which goes to the ranked slots.
+    const upEmpty = await session.suggestUpgrades();
+    for (const w of WICKERMAN) {
+      const row = upEmpty.find((s) => s.slot === w);
+      assert(row && row.empty && row.priority === null && /empty Wickerman slot/.test(row.note ?? '') && row.suggestedViscera === undefined
+        && row.modsQueried === undefined && row.modsError === undefined, `empty ${w} row: ${JSON.stringify(row)}`);
+    }
+    const queried = upEmpty.filter((s) => s.modsQueried);
+    assert(queried.length === 3 && queried.every((s) => s.kind !== 'treeGated' && (s.suggestedMods?.length ?? 0) > 0),
+      `default budget spent on ranked slots: ${JSON.stringify(queried.map((s) => [s.slot, s.kind, s.suggestedMods?.length, s.modsError]))}`);
+    const lastRanked = Math.max(...upEmpty.map((s, i) => (s.priority !== null ? i : -1)));
+    assert(WICKERMAN.every((w) => upEmpty.findIndex((s) => s.slot === w) > lastRanked), 'empty Wickerman slots sort after the ranked slots');
+    const headAsked = (await session.suggestUpgrades('Head'))[0];
+    assert(headAsked.empty && (headAsked.suggestedViscera?.length ?? 0) > 0, `an empty Wickerman slot asked for with slot: ${JSON.stringify(headAsked)}`);
     const xmlConverted = await session.exportBuild('xml');
     const before = await session.getStats();
     // evaluate_changes / probe variants take Viscera game text too, BOM or not, with swap_item's numbers.

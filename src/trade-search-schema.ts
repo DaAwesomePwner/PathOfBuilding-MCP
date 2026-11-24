@@ -18,6 +18,8 @@ export interface TradeQueryRaw {
   flaskType?: string;
   /** Grafts and tinctures (no trade category in PoB's data): the base type the search is filtered by. */
   baseType?: string;
+  /** Grafts and tinctures: mod lines (numbers as #) PoB's mod processing found no trade stat for, so they are not weighed (an empty list may come as {}). */
+  unmatchedMods?: string[] | Record<string, never>;
   /** Flask slots holding no flask of that kind: the blank base the mods were tried on. */
   testBase?: string;
   /** The flask slot is inactive in the build and was evaluated active for the call. */
