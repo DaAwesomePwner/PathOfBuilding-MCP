@@ -413,9 +413,10 @@ async function test16Megalomaniac(paths: TestPaths, xml: string): Promise<void> 
     await rejectsWith(megaSearch(), /every allocated passive-tree jewel socket holds a cluster jewel/);
     // No allocated socket at all: PoB's nil slot.
     await session.newBuild({ className: 'Witch' });
-    const blank = await megaSearch().catch((e: Error) => e);
-    assert(blank instanceof Error ? /found no cluster notables/.test(blank.message) : blank.slot === null,
-      `no socket: slot null (${blank instanceof Error ? blank.message : blank.slot})`);
+    const blank = await megaSearch();
+    assert(blank.slot === null && blank.currentItem === null && blank.minWeightedSum === 0 && blank.filters.length > 0
+      && blank.filters.every((f) => f.weight > 0 && f.notable !== undefined),
+      `no socket: PoB's nil slot, notables weighed against the whole build: ${JSON.stringify({ ...blank, url: undefined }).slice(0, 300)}`);
   } finally {
     await bridge.dispose();
   }
@@ -432,34 +433,66 @@ async function rejectsWith(p: Promise<unknown>, expect: RegExp): Promise<void> {
   throw new Error(`expected a rejection matching ${expect}`);
 }
 
+const MIRROR_PREFIX = 'pob-mcp-nospecial-';
+
+/**
+ * Removes a mirror made by test17 without ever following a link: each link
+ * (junction / symlink) is removed itself, folders are emptied entry by entry.
+ * Returns false (and leaves the rest in place) when a link cannot be removed.
+ */
+function removeMirror(dir: string): boolean {
+  for (const name of readdirSync(dir)) {
+    const entry = path.join(dir, name);
+    const stat = lstatSync(entry);
+    if (stat.isSymbolicLink()) {
+      try {
+        unlinkSync(entry);
+      } catch {
+        try { rmdirSync(entry); } catch { return false; }
+      }
+    } else if (stat.isDirectory()) {
+      if (!removeMirror(entry)) return false;
+    } else {
+      unlinkSync(entry);
+    }
+  }
+  rmdirSync(dir);
+  return true;
+}
+
 /**
  * Feature detection: a temporary mirror of the PoB install (small folders
  * copied, the large data folders linked, nothing written into the install)
  * whose TradeQueryGenerator.lua lacks the special searches. Each unique is a
- * user error naming the missing search; a normal search still works.
+ * user error naming the missing search; a normal search still works. Mirrors
+ * a killed earlier run left behind are swept first.
  */
 async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<void> {
   log('Test 17: a trade generator without the special unique searches');
-  const mirror = mkdtempSync(path.join(os.tmpdir(), 'pob-mcp-nospecial-'));
-  const links: string[] = [];
-  // Mirrors `from` into `to`, descending along `into` (the folders holding the generator); other folders are linked.
+  for (const name of readdirSync(os.tmpdir())) {
+    if (name.startsWith(MIRROR_PREFIX)) {
+      const stale = path.join(os.tmpdir(), name);
+      if (lstatSync(stale).isDirectory() && !removeMirror(stale)) console.error(`left ${stale} in place: a link could not be removed safely`);
+    }
+  }
+  const mirror = mkdtempSync(path.join(os.tmpdir(), MIRROR_PREFIX));
+  // Mirrors `from` into `to`, descending along `into` (the folders holding the generator, copied with links
+  // dereferenced); other folders are linked, files copied.
   const build = (from: string, to: string, into: string[]): void => {
     mkdirSync(to, { recursive: true });
     for (const entry of readdirSync(from, { withFileTypes: true })) {
       const src = path.join(from, entry.name);
       const dst = path.join(to, entry.name);
       if (entry.isDirectory() && entry.name === into[0]) {
-        if (into.length === 1) cpSync(src, dst, { recursive: true });
+        if (into.length === 1) cpSync(src, dst, { recursive: true, dereference: true });
         else build(src, dst, into.slice(1));
       } else if (entry.isDirectory()) {
         symlinkSync(src, dst, 'junction');
-        links.push(dst);
       } else if (entry.isFile()) {
         copyFileSync(src, dst);
       }
     }
   };
-  let removable = true;
   try {
     const into = existsSync(path.join(paths.pobPath, 'src', 'Classes', 'TradeQueryGenerator.lua')) ? ['src', 'Classes'] : ['Classes'];
     build(paths.pobPath, mirror, into);
@@ -473,7 +506,9 @@ async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<vo
       assert(source.includes(from), `the installed generator no longer has: ${from}`);
       source = source.replace(from, to);
     }
-    writeFileSync(genFile, source);
+    // A new file in the mirror: never a write through a link into the install.
+    unlinkSync(genFile);
+    writeFileSync(genFile, source, { flag: 'wx' });
 
     const bridge = new LuaBridge({ ...paths, pobPath: mirror }, 120_000);
     try {
@@ -491,17 +526,7 @@ async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<vo
       await bridge.dispose();
     }
   } finally {
-    // Remove each link itself (never what it points at) before the copied files.
-    for (const link of links) {
-      try {
-        if (!lstatSync(link).isSymbolicLink()) { removable = false; continue; }
-        try { unlinkSync(link); } catch { rmdirSync(link); }
-      } catch {
-        removable = false;
-      }
-    }
-    if (removable) rmSync(mirror, { recursive: true, force: true });
-    else console.error(`left ${mirror} in place: a link could not be removed safely`);
+    if (!removeMirror(mirror)) console.error(`left ${mirror} in place: a link could not be removed safely`);
   }
   log('PASS');
 }
