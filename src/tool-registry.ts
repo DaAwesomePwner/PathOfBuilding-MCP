@@ -54,6 +54,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   set_main_skill: UNDOABLE,
   set_character_level: { ...UNDOABLE, idempotentHint: true },
   set_ascendancy: { ...UNDOABLE, idempotentHint: true },
+  set_flask_active: { ...UNDOABLE, idempotentHint: true },
   // Session-scoped stat snapshots only; the build is untouched.
   snapshot_and_compare: { ...UNDOABLE, idempotentHint: true },
   // Reads

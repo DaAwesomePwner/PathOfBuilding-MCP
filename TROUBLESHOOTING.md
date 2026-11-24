@@ -136,6 +136,12 @@ An item already in a hidden slot is still listed by `list_equipped_items` (with 
 
 **Abyssal sockets:** `<slot> Abyssal Socket N` exists only while the item in `<slot>` has at least N abyssal sockets (`list_valid_slots` lists only those, with `parentSlot`); otherwise equipping or searching there is refused with "the item in <slot> has K abyssal socket(s)". Trade searches for jewel sockets take `jewelType` (`base` / `abyss` / `any` (both) on tree sockets; only `abyss` on abyssal sockets; none on other slots) and refuse `sockets`, `links`, `influences` and `includeScourge: true`.
 
+## "Flask … is not active, so Path of Building does not apply the flask or tincture there" / "Flask … is empty" / "… is not a flask slot"
+
+**Cause:** Path of Building applies a flask or tincture only while its slot's "Activate this flask" box is ticked (`list_equipped_items` / `list_valid_slots` show `active` on `Flask 1`-`Flask 5`). An item what-if into an inactive flask slot would show next to no difference, so `compare_items`, `evaluate_changes` (and the other probe tools) and `apply_changes` refuse it. Only a flask slot holding a flask or tincture can be turned on or off (PoB disables the box on an empty slot), and only `Flask 1`-`Flask 5` are flask slots.
+
+**Fix:** turn the slot on with `set_flask_active({ slot, active: true })` (undoable), or evaluate it on without committing: `compare_items` with `activate: true`, or `flasks: [{ slot, active: true }]` in the same `evaluate_changes` / `apply_changes` variant. Equip a flask first (`swap_item`, or the same variant's `items`) before toggling an empty slot. `swap_item` itself still equips into an inactive slot and says so in its `note`. The `flasks` alias of `toggle_buffs` / `set_config` / scenarios is a different thing: it sets the "while using a flask" condition (`conditionUsingFlask`), not a slot's active state.
+
 ## State drift / unexpected stat values after multiple operations
 
 **Cause:** Should not happen. The what-if tools (`evaluate_changes`, `compare_items`, `find_best_next_nodes`, `simulate_scenario`, etc.) run through PoB's calculator (`lua/probe.lua`) without changing or recalculating the build. The variants it cannot reproduce exactly (several node changes at once, jewel sockets, skill-granting nodes or items) are applied, recalculated and restored, and the restore is compared with a fingerprint of the build taken before; a mismatch is an internal error naming `reset_build`. If you see drift anyway, a snapshot or fingerprint field is missing.
@@ -166,7 +172,7 @@ A mastery is always allocated together with the effect chosen on it, so it canno
 
 ## "Nothing to undo"
 
-The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only the committed edits (`swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, `create_socket_group`, `delete_socket_group`, `set_main_skill`, `set_character_level`, `set_ascendancy`, `convert_tree_to_latest`) push an entry, and only when the change succeeded (a `new_build` clears the stack, like `load_build`); the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
+The undo stack is empty. Either nothing has been mutated yet, or a previous `reset_build` (or `load_build`, `reload_engine`, an engine restart) cleared the stack. Only the committed edits (`swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, `create_socket_group`, `delete_socket_group`, `set_main_skill`, `set_character_level`, `set_ascendancy`, `set_flask_active`, `convert_tree_to_latest`) push an entry, and only when the change succeeded (a `new_build` clears the stack, like `load_build`); the what-if tools (`evaluate_changes`, `simulate_*`, `compare_*`, `find_*`, `swap_gem`, ...) never do.
 
 ## "The Path of Building engine was restarted … Retry the call"
 

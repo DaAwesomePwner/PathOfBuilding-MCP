@@ -36,7 +36,7 @@ Three layers, three responsibilities:
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 57 tools
+## The 58 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -51,12 +51,13 @@ Three layers, three responsibilities:
 - `list_equipped_items` — every equipped item with rarity, base, mods (implicit/explicit/enchant lists, each line with its `crafted` / `fractured` flag when set), quality, item level, sockets. `includeItemText: true` adds each item's PoB text; `detail: "full"` returns every field.
 - `export_build` — `summary` (human-readable text), `xml` (raw PoB XML), or `code` (round-trippable base64 build code).
 
-### Item manipulation (5)
-- `list_valid_slots` — every slot with `occupied: true/false`.
+### Item manipulation (6)
+- `list_valid_slots` — every slot with `occupied: true/false`; flask slots also carry `active` (PoB applies a flask or tincture only while its slot is active).
 - `get_item_in_slot` — full item text and metadata for one slot, or `{empty: true}`.
 - `swap_item` — equip an item from PoB-format text, **mutates** the build, returns before/after diff.
 - `unequip_item` — remove an item from a slot, **mutates**, returns diff.
-- `compare_items` — test 2-5 candidate items in a slot non-destructively (tens of milliseconds). Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`; a candidate that does not fit or parse gets its own `error`.
+- `compare_items` — test 2-5 candidate items in a slot non-destructively (tens of milliseconds). Returns ranked results plus `bestForDPS`/`bestForEHP`/`bestForLife`; a candidate that does not fit or parse gets its own `error`. An inactive flask slot is refused unless `activate: true` (the candidates are then evaluated with the slot turned on).
+- `set_flask_active` — `{ slot: "Flask 3", active: false }`: turn a flask slot on or off, as PoB's "Activate this flask" box does; returns the stat diff (`unchanged` when already so). **Mutates** (undoable). Not the `flasks` config alias, which only sets the "while using a flask" condition.
 
 ### Item data (4)
 - `search_items` — `{ query?, kind?: "unique" | "base" | "any", slot?, modQuery?, limit? }`: PoB's uniques and item bases by name, base or item type (case-insensitive, exact names first), optionally only those for a slot (`"Body Armour"`, `"Ring 1"`, `"Weapon 2"`) or with a mod text (`modQuery: "maximum power charges"`). Each result has its base, type, slot, level requirement, variant names (uniques) and first mod lines.
@@ -99,14 +100,14 @@ Three layers, three responsibilities:
 - `toggle_buffs` — friendly-named on/off for buffs (`onslaught`, `fortify`, etc.).
 
 ### Optimization advisor (8)
-- `evaluate_changes` — try up to 500 what-if variants in one call (each mixing node allocations/deallocations by name or id, mastery effects, item swaps or unequips, gem ops, config and the main skill) and get one short row per variant ranked by `rankBy` (default CombinedDPS). Read-only; see the example below.
+- `evaluate_changes` — try up to 500 what-if variants in one call (each mixing node allocations/deallocations by name or id, mastery effects, item swaps or unequips, flask slots turned on or off (`flasks`), gem ops, config and the main skill) and get one short row per variant ranked by `rankBy` (default CombinedDPS). Read-only; see the example below.
 - `apply_changes` — `{ variant }`: commit one `evaluate_changes` variant exactly as written (nodes by name or id, masteries, items, gem ops, config, main skill) as a single undoable step; its stats are the ones `evaluate_changes` reported. The whole variant is checked first (unknown or unreachable node, bad gem name or index, item that does not fit, unknown config key → refused, nothing changes). **Mutates** (undoable; kept by `export_build`; replayed after an engine crash). Returns the nodes added / removed, points and the stat diff.
 - `diagnose_build` — read-only sweep: uncapped resists, low EHP, mana sustain, missing crit/accuracy, low-level main gem, etc. Filterable by `defense`/`offense`/`qol`/`balance`. Returns `{ checks }`.
 - `stat_weights` — what each mod line is worth to this build: every line (default: a generic pack of 37 single-roll offence/defence/sustain mods) is added on its own as a custom modifier (PoB's Custom modifiers box; existing custom modifiers kept) and each requested stat's change is measured through PoB's calculator. Returns `weights` ranked by `rankBy` (default CombinedDPS) with `delta` and `pct` per stat, and `unparsed` for lines PoB's mod parser cannot use. Lines act as global modifiers. Read-only, ~5 ms a line.
 - `suggest_upgrades` — measures each slot's DPS+EHP contribution by emptying it (read-only), ranks by upgrade priority; the first `modSlots` slots (default 3, up to 10; or the given `slot`) get `suggestedMods` from PoB's own weighted trade query generator (`{ mod, weight }`, weight = stat-score gain per point, listed by a typical roll's gain), about 0.5-1 s a slot. Returns `{ suggestions, modsNote? }`.
 - `snapshot_and_compare` — `take` / `list` / `compare` named stat snapshots across a session.
 - `compare_builds` — `{ source, against? }`: the loaded build (a) against another build (b; anything `load_build` takes), or `against` (a) against `source` (b). The other build runs in a short-lived second engine (a few seconds); the loaded build is untouched. Returns `meta`, `stats` (a, b, delta, pct), `tree` (nodes only in a / only in b), `items` by slot (mod lines only in a / b), `gems` (supports added / removed, level changes, main skill) and differing `config`. Read-only.
-- `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/allocate_nodes/deallocate_nodes/apply_changes/create_socket_group/delete_socket_group/set_main_skill/convert_tree_to_latest; what-if tools push nothing).
+- `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/allocate_nodes/deallocate_nodes/apply_changes/create_socket_group/delete_socket_group/set_main_skill/set_character_level/set_ascendancy/set_flask_active/convert_tree_to_latest; what-if tools push nothing).
 - `reset_build` — discard everything, return to the originally loaded state.
 
 ### Trade searches (2)
@@ -288,7 +289,7 @@ export_build({ format: "code" })               // paste into PoB, or back into l
 ## Important behavior to know
 
 - **All work is serial.** If you ask Claude to compare 5 items and find optimal links at the same time, the second tool call waits. This is intentional — PoB cannot run concurrent calculations.
-- **Mutations require explicit undo or reset.** `swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, the socket group edits, `set_character_level`, `set_ascendancy` and `convert_tree_to_latest` push to the undo stack; `simulate_passive_change` and the other what-if tools never do. `undo_last_change` reverts one step; `reset_build` reverts everything.
+- **Mutations require explicit undo or reset.** `swap_item`, `unequip_item`, `set_config`, `allocate_nodes`, `deallocate_nodes`, `apply_changes`, the socket group edits, `set_character_level`, `set_ascendancy`, `set_flask_active` and `convert_tree_to_latest` push to the undo stack; `simulate_passive_change` and the other what-if tools never do. `undo_last_change` reverts one step; `reset_build` reverts everything.
 - **Simulation tools never persist.** `simulate_*`, `compare_*`, `evaluate_*`, `find_*` run through PoB's calculator without changing the build; the few variants that need a real recalculation are restored exactly in `finally`, even if the operation throws, and checked against a fingerprint of the build.
 - **Build code round-trip is lossless.** `export_build({ format: "code" })` produces a string you can paste back into PoB-the-app or back into `load_build`. Same for `format: "xml"`.
 - **First call is slow, subsequent calls are fast.** ~2s engine warm + ~1s first build load. After that most ops are 50-300 ms; node searches (`find_best_next_nodes`, `find_worst_allocated_nodes`) a few seconds.

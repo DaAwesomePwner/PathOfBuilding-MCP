@@ -295,6 +295,8 @@ export type UndoEntry = (
   | { kind: 'treeSkills'; tree: TreeSnapshot; skills: SkillsSnapshot }
   /** set_character_level: the level and PoB's auto level mode before the change. */
   | { kind: 'level'; level: number; autoMode: boolean }
+  /** set_flask_active: the slot's exact active flags before the change (slot, item set entry; bridge flag codes). */
+  | { kind: 'flask'; slot: string; flags: [number, number] }
 ) & {
   /** Committed commands the bridge had recorded when the entry was taken; undoing it truncates back to that. */
   journal?: number;
@@ -1069,6 +1071,8 @@ export class BuildSession {
       } else if (entry.kind === 'level') {
         await this.bridge.send({ cmd: 'setCharacterLevel', level: entry.level, autoMode: entry.autoMode });
         await this.refreshBuildInfoUnlocked();
+      } else if (entry.kind === 'flask') {
+        await this.bridge.send({ cmd: 'setFlaskActive', slot: entry.slot, restore: entry.flags });
       } else {
         await this.restoreConfigUnlocked(entry.snapshot);
       }
@@ -1237,12 +1241,20 @@ export class BuildSession {
     });
   }
 
-  async compareItems(slot: string, candidates: string[]): Promise<ComparisonResult> {
+  async compareItems(slot: string, candidates: string[], activate?: boolean): Promise<ComparisonResult> {
     return this.withLock(async () => {
       // An unknown slot, or one PoB hides on this tree, is refused for the
       // whole call rather than once per candidate.
-      // So is an unallocated passive-tree jewel socket (a jewel there counts for nothing).
-      await this.bridge.send({ cmd: 'checkSlotUsable', slot, whatIf: true });
+      // So is an unallocated passive-tree jewel socket (a jewel there counts for nothing),
+      // and an inactive flask slot unless `activate` (the candidates are then
+      // evaluated with the slot turned on); `activate` is for flask slots only.
+      const check = await this.bridge.send<{ ok: true; flaskActive?: boolean }>({
+        cmd: 'checkSlotUsable',
+        slot,
+        whatIf: true,
+        ...(activate !== undefined ? { activate } : {}),
+      });
+      const activated = activate === true && check.flaskActive === false;
       // Snapshot the slot's current item — still needed for the result's baseline.item field.
       const baselineItem = await this.snapshotSlotUnlocked(slot);
       const baselineStats = await this.bridge.getStats();
@@ -1253,7 +1265,10 @@ export class BuildSession {
       // fit, cannot be parsed) gets its error; any other failure fails the call.
       const texts = candidates.map(normalizeItemText);
       const probed = await this.probeUnlocked({
-        variants: texts.map((itemText) => ({ items: [{ slot, itemText }] })),
+        variants: texts.map((itemText) => ({
+          items: [{ slot, itemText }],
+          ...(activated ? { flasks: [{ slot, active: true }] } : {}),
+        })),
       });
       const results: ComparisonCandidate[] = texts.map((itemText, i) => {
         const r = probed.results[i];
@@ -1278,6 +1293,7 @@ export class BuildSession {
 
       return {
         baseline: { item: baselineItem, stats: baselineStats },
+        ...(check.flaskActive !== undefined ? { flaskSlotActive: check.flaskActive, activated } : {}),
         candidates: results,
         bestForDPS: bestForKey('CombinedDPS'),
         bestForEHP: bestForKey('TotalEHP'),
@@ -1410,6 +1426,59 @@ export class BuildSession {
         const after = await this.bridge.getStats();
         await this.refreshBuildInfoUnlocked();
         return { previous, level, before, after, diff: computeDiff(before, after) };
+      });
+    });
+  }
+
+  /**
+   * Turn a flask slot on or off (set_flask_active), as PoB's "Activate this
+   * flask" check box does: Path of Building applies a flask or tincture only
+   * while its slot is active. Pushes a flask undo entry (the slot's exact
+   * flags before) and records the command for crash replay. A slot already in
+   * that state is `unchanged`: nothing pushed or recorded. A slot that is not
+   * a flask slot, or holds nothing, is refused before any change.
+   */
+  async setFlaskActive(slot: string, active: boolean): Promise<FlaskActiveResult> {
+    if (!this.buildInfo) throw new UserError('No build loaded — call load_build or new_build first');
+    return this.withLock(async () => {
+      const state = await this.bridge.send<{ ok: true; active: boolean; occupied: boolean; flags: [number, number] }>({
+        cmd: 'getFlaskState',
+        slot,
+      });
+      const entry: UndoEntry = { kind: 'flask', slot, flags: state.flags };
+      const journal = this.bridge.committedCount();
+      const before = await this.bridge.getStats();
+      const command = { cmd: 'setFlaskActive', slot, active, replay: true };
+      let res: RawFlaskChange;
+      try {
+        res = await this.bridge.send<RawFlaskChange>({ cmd: 'setFlaskActive', slot, active });
+      } catch (err) {
+        // A refusal changed nothing; with the engine gone nothing is committed.
+        if (err instanceof UserError || !this.bridge.isRunning()) throw err;
+        // Otherwise the flags may be set (e.g. PoB's recalculation failed). Applied:
+        // commit it (undo entry + replay record) with the applied-but-failed error.
+        // Not applied: nothing to commit. Unknown: undo can revert it, never replayed.
+        let applied: boolean | null = null;
+        try {
+          const now = await this.bridge.send<{ ok: true; flags: [number, number] }>({ cmd: 'getFlaskState', slot });
+          applied = now.flags[0] !== state.flags[0] || now.flags[1] !== state.flags[1];
+        } catch (readError) {
+          console.error('[pob-mcp] could not read the flask slot after a failed set_flask_active:', (readError as Error).message);
+        }
+        if (applied === false) throw err;
+        if (applied === null || !this.bridge.isRunning()) {
+          if (this.bridge.isRunning()) this.pushUndoEntryUnlocked(entry, journal);
+          throw err;
+        }
+        return this.commitAfterUnlocked(entry, journal, command, async () => {
+          throw await this.recalcAfterAppliedFailureUnlocked(err);
+        });
+      }
+      const base = { slot, active, previous: res.previous === true, item: res.item ?? null, itemType: res.itemType ?? null };
+      if (res.unchanged === true) return { ...base, unchanged: true, before, after: before, diff: {} };
+      return this.commitAfterUnlocked(entry, journal, command, async () => {
+        const after = await this.bridge.getStats();
+        return { ...base, before, after, diff: computeDiff(before, after) };
       });
     });
   }
@@ -1631,9 +1700,9 @@ export class BuildSession {
   async applyChanges(variant: NamedProbeVariant): Promise<ApplyChangesResult> {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build first');
     const hasConfig = variant.config !== undefined && Object.keys(variant.config).length > 0;
-    const lists = [variant.allocate, variant.deallocate, variant.items, variant.gems, variant.masteries];
+    const lists = [variant.allocate, variant.deallocate, variant.items, variant.gems, variant.masteries, variant.flasks];
     if (!hasConfig && variant.mainSkill === undefined && lists.every((list) => list === undefined || list.length === 0)) {
-      throw new UserError('The variant changes nothing: give at least one of allocate, deallocate, masteries, items, gems, config or mainSkill');
+      throw new UserError('The variant changes nothing: give at least one of allocate, deallocate, masteries, items, flasks, gems, config or mainSkill');
     }
     return this.withLock(async () => {
       const resolver = new NodeNameResolver((command) => this.bridge.send(command));
@@ -1657,8 +1726,17 @@ export class BuildSession {
       const added = treeEditNodes(res.added);
       const removed = treeEditNodes(res.removed);
       if (res.unchanged === true && failure === undefined) {
-        // Only masteries that already had their effect: no undo entry, no journal record.
-        return { added, removed, masteries: masteryChoices(res.masteries), unchanged: true, before, after: before, diff: {} };
+        // Only masteries that already had their effect (and flask slots already in that state): no undo entry, no journal record.
+        return {
+          added,
+          removed,
+          masteries: masteryChoices(res.masteries),
+          unchanged: true,
+          ...(res.flasks === true ? { flasksUnchanged: true } : {}),
+          before,
+          after: before,
+          diff: {},
+        };
       }
       // The replay: gem names as PoB names them, allocations in join order.
       const gemNames = Array.isArray(res.gemNames) ? res.gemNames : [];
@@ -2960,6 +3038,8 @@ export interface EquippedItem {
   parentSlot?: string;
   /** false for a jewel in an unallocated passive-tree socket (left out otherwise). */
   allocated?: false;
+  /** Flask slots: whether the slot is active (PoB applies a flask or tincture only then). */
+  active?: boolean;
   rarity?: string;
   name?: string;
   title?: string;
@@ -2986,6 +3066,8 @@ export interface SlotInfo {
   parentSlot?: string;
   /** Passive-tree jewel sockets: whether the socket node is allocated (a jewel in an unallocated one counts for nothing). */
   allocated?: boolean;
+  /** Flask slots: whether the slot is active (PoB applies a flask or tincture only then; kept for an empty slot too). */
+  active?: boolean;
 }
 
 export interface SlotItem {
@@ -3015,6 +3097,10 @@ export interface ComparisonCandidate {
 
 export interface ComparisonResult {
   baseline: { item: ItemSnapshot; stats: Stats };
+  /** Flask slots: whether the slot is active in the build. */
+  flaskSlotActive?: boolean;
+  /** Flask slots: the candidates were evaluated with the (inactive) slot turned on (compare_items `activate`). */
+  activated?: boolean;
   candidates: ComparisonCandidate[];
   bestForDPS: number | null;
   bestForEHP: number | null;
@@ -3118,8 +3204,10 @@ interface RawApplyChanges {
   gemNames?: Array<string | null>;
   /** The masteries given an effect, by id. */
   masteries?: unknown;
-  /** Nothing changed (only masteries that already had their effect). */
+  /** Nothing changed (only masteries that already had their effect, flask slots already in that state). */
   unchanged?: boolean;
+  /** With `unchanged`: the variant listed flask slots. */
+  flasks?: boolean;
 }
 
 /** A mastery a committed change gave an effect (allocate_nodes, apply_changes). */
@@ -3171,6 +3259,8 @@ export interface ApplyChangesResult extends StatDiffResult {
   masteries?: MasteryChoice[];
   /** True when nothing changed (every mastery already had its effect); nothing was pushed or journaled. */
   unchanged?: boolean;
+  /** With `unchanged`: the variant also listed flask slots, all already in that state. */
+  flasksUnchanged?: boolean;
   /** The build's main skill after the change, when the variant set one. */
   mainSkill?: string | null;
   /** The tree after the change (point counts), when nodes changed. */
@@ -3207,6 +3297,27 @@ interface NewBuildExpected {
   secondaryAscendancy?: string;
   level: number;
   treeVersion: string;
+}
+
+/** The bridge's setFlaskActive reply. */
+interface RawFlaskChange {
+  ok: true;
+  previous?: boolean;
+  item?: string;
+  itemType?: string;
+  unchanged?: boolean;
+}
+
+export interface FlaskActiveResult extends StatDiffResult {
+  slot: string;
+  active: boolean;
+  /** Whether the slot was active before. */
+  previous: boolean;
+  /** The flask or tincture in the slot. */
+  item: string | null;
+  itemType: string | null;
+  /** True when the slot was already in that state: nothing was pushed or journaled. */
+  unchanged?: true;
 }
 
 export interface LevelChangeResult extends StatDiffResult {

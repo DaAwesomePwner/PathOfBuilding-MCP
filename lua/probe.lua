@@ -13,6 +13,9 @@
 --      lines read from a copy of the config mod list; see applyModLines);
 --      `mainSkill` (build.mainSocketGroup and the group's mainActiveSkill,
 --      which the calculator reads, set after every other change);
+--      `flasks` (a flask slot's active flag, what PoB's activate check box
+--      sets: slot.active, which CalcSetup reads when it builds the
+--      calculator's env, and the item set entry; set after the items);
 --   2. calcFunc({ addNodes / removeNodes }, useFullDPS) runs on that data;
 --      one mastery change (`masteries`: allocating a mastery with an effect,
 --      or a new effect on an allocated one) passes a copy of the mastery
@@ -366,6 +369,68 @@ return function(ctx)
 			end
 		end
 		return parsed, reason
+	end
+
+	-- `flasks` [{ slot, active }]: flask slots to turn on or off (PoB's
+	-- activate check box). The slot must hold a flask or tincture once the
+	-- variant's items are in (PoB disables the box on an empty slot). Unless
+	-- `replay`, an item put in a flask slot that is inactive after the
+	-- variant is refused: PoB would not apply it, so it would compare as next
+	-- to no difference. Returns { { slot, active } ... }.
+	M.MAX_FLASK_CHANGES = 5
+	function M.checkFlasks(variant, parsedItems, replay)
+		local list = optArray(variant.flasks, "flasks", M.MAX_FLASK_CHANGES)
+		local tab = build.itemsTab
+		local itemFor, out, activeAfter = { }, { }, { }
+		for _, p in ipairs(parsedItems) do itemFor[p.slot.slotName] = p end
+		for i, entry in ipairs(list) do
+			if type(entry) ~= "table" or type(entry.slot) ~= "string" or type(entry.active) ~= "boolean" then
+				userError("flasks[" .. i .. "] must be { slot, active } with active true or false")
+			end
+			local slot = ctx.flaskSlot(entry.slot)
+			if activeAfter[slot.slotName] ~= nil then userError("Flask slot " .. entry.slot .. " is listed twice in flasks") end
+			local p = itemFor[slot.slotName]
+			local occupied
+			if p then occupied = not p.unequip else occupied = tab.items[slot.selItemId or 0] ~= nil end
+			if not occupied then
+				userError(entry.slot .. " is empty" .. (p and " after this variant's items" or "") .. ": only a flask slot holding "
+					.. "a flask or tincture can be turned on or off (equip one in the same variant's items, or with swap_item)")
+			end
+			activeAfter[slot.slotName] = entry.active
+			out[#out + 1] = { slot = slot, active = entry.active }
+		end
+		if not replay then
+			for _, p in ipairs(parsedItems) do
+				if not p.unequip and ctx.isFlaskSlot(p.slot) then
+					local active = activeAfter[p.slot.slotName]
+					if active == nil then active = p.slot.active == true end
+					if not active then
+						userError(ctx.inactiveFlaskText(p.slot.slotName, "Add flasks: [{ slot: \"" .. p.slot.slotName
+							.. "\", active: true }] to the same variant to evaluate it active (compare_items: activate: true), "
+							.. "or turn the slot on first with set_flask_active"))
+					end
+				end
+			end
+		end
+		return out
+	end
+
+	-- Set the flask flags for the calculator; returns the undo function.
+	local function applyFlasks(flasks)
+		local undos = { }
+		for i, f in ipairs(flasks) do undos[i] = ctx.setFlaskFlags(f.slot, f.active, f.active) end
+		return function()
+			for i = #undos, 1, -1 do undos[i]() end
+		end
+	end
+
+	-- As set_flask_active sets them (the caller's restore or undo puts them back).
+	local function commitFlasks(flasks)
+		for _, f in ipairs(flasks) do ctx.setFlaskFlags(f.slot, f.active, f.active) end
+		if #flasks > 0 then
+			build.buildFlag = true
+			runCallback("OnFrame")
+		end
 	end
 
 	local function freeItemId(tab)
@@ -824,7 +889,7 @@ return function(ctx)
 		local tab = build.itemsTab
 		for _, slot in ipairs(tab.orderedSlots) do
 			local entry = tab.activeItemSet[slot.slotName]
-			add("slot", slot.slotName, slot.selItemId, entry and entry.selItemId)
+			add("slot", slot.slotName, slot.selItemId, entry and entry.selItemId, slot.active, entry and entry.active)
 		end
 		local itemIds = { }
 		for itemId, item in pairs(tab.items) do
@@ -953,6 +1018,7 @@ return function(ctx)
 				end
 			end
 		end
+		local flasks = M.checkFlasks(variant, parsedItems)
 		local config = checkConfig(variant)
 		local gems = optArray(variant.gems, "gems", M.MAX_GEM_CHANGES)
 		for i, ch in ipairs(gems) do checkGemChange(ch, i) end
@@ -1017,7 +1083,7 @@ return function(ctx)
 		-- A fallback that only changes the passive tree and no skill: the
 		-- caller may snapshot and restore just the passive tree around it.
 		local touched = nodeSet or (swap and { [swap.add] = true, [swap.remove] = true })
-		local treeOnly = reason ~= nil and touched ~= nil and #parsedItems == 0 and config == nil
+		local treeOnly = reason ~= nil and touched ~= nil and #parsedItems == 0 and #flasks == 0 and config == nil
 			and #gems == 0 and mainSkill == nil and not touchesSkills(build.spec, touched)
 		-- With the party tab's "export buffs" option on, CalcPerform computes
 		-- the MAIN pass differently from the CALCULATOR pass (only MAIN collects
@@ -1035,7 +1101,7 @@ return function(ctx)
 		return {
 			addList = addList, removeList = removeList, items = parsedItems, config = config, gems = gems,
 			nodeSet = nodeSet, adding = adding, fallbackReason = reason, treeOnly = treeOnly, modLines = modLines,
-			masteries = masteries, swap = swap, mainSkill = mainSkill,
+			masteries = masteries, swap = swap, mainSkill = mainSkill, flasks = flasks,
 		}
 	end
 
@@ -1107,6 +1173,7 @@ return function(ctx)
 			if #checked.modLines > 0 then undos[#undos + 1] = applyModLines(checked.modLines) end
 			if #checked.gems > 0 then undos[#undos + 1] = applyGems(checked.gems) end
 			if #checked.items > 0 then undos[#undos + 1] = applyItems(checked.items) end
+			if #checked.flasks > 0 then undos[#undos + 1] = applyFlasks(checked.flasks) end
 			if checked.mainSkill then undos[#undos + 1] = applyMainSkill(checked.mainSkill) end
 			local override = { }
 			local result = { }
@@ -1466,6 +1533,7 @@ return function(ctx)
 		end
 		if #checked.gems > 0 then applyGems(checked.gems) end
 		commitItems(checked.items)
+		commitFlasks(checked.flasks)
 		local function ids(list)
 			local out = { }
 			for i, node in ipairs(list) do out[i] = node.id end
@@ -1518,9 +1586,10 @@ return function(ctx)
 		local variant = cmd.variant
 		if type(variant) ~= "table" or (next(variant) ~= nil and isArray(variant)) then userError("variant must be an object") end
 		if variant.modLines ~= nil then userError("modLines are only available to read-only probes (stat_weights)") end
-		local items, config, gems, allocIds, deallocIds, masteries, mainSkill
+		local items, config, gems, allocIds, deallocIds, masteries, mainSkill, flasks
 		if cmd.replay == true then
 			items = M.checkItems(variant)
+			flasks = M.checkFlasks(variant, items, true)
 			config = checkConfig(variant)
 			gems = variant.gems or { }
 			allocIds, deallocIds = variant.allocate or { }, variant.deallocate or { }
@@ -1529,13 +1598,22 @@ return function(ctx)
 		else
 			local checked = checkVariant(variant)
 			items, config, gems, masteries, mainSkill = checked.items, checked.config, checked.gems, checked.masteries, checked.mainSkill
+			flasks = checked.flasks
 			allocIds, deallocIds = { }, { }
 			for i, node in ipairs(checked.addList) do allocIds[i] = node.id end
 			for i, node in ipairs(checked.removeList) do deallocIds[i] = node.id end
-			if #masteries > 0 and nodeBatch.allNoop(masteries) and #allocIds + #deallocIds + #items + #gems == 0
-				and config == nil and mainSkill == nil then
-				-- Only masteries that already have their effect: nothing changes.
-				return nodeBatch.unchanged(masteries)
+			local flasksNoop = true
+			for _, f in ipairs(flasks) do
+				local entry = build.itemsTab.activeItemSet[f.slot.slotName]
+				if (f.slot.active == true) ~= f.active or (entry and (entry.active == true) ~= f.active) then flasksNoop = false end
+			end
+			if #masteries + #flasks > 0 and nodeBatch.allNoop(masteries) and flasksNoop
+				and #allocIds + #deallocIds + #items + #gems == 0 and config == nil and mainSkill == nil then
+				-- Only masteries that already have their effect and flask slots
+				-- already in that state: nothing changes.
+				local res = nodeBatch.unchanged(masteries)
+				if #flasks > 0 then res.flasks = true end
+				return res
 			end
 		end
 		local gemNames = { }
@@ -1594,6 +1672,7 @@ return function(ctx)
 		end
 		edit.testFaultMidway(cmd.replay == true)
 		commitItems(items)
+		commitFlasks(flasks)
 		if #deallocIds > 0 then ctx.deallocNodesBatch(deallocIds) end
 		local allocOrder, masteryReport = { }, nil
 		if #allocIds > 0 or #masteries > 0 then
