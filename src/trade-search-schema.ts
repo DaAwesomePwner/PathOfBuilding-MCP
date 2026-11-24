@@ -53,10 +53,11 @@ export const JEWEL_TYPES = ['base', 'abyss', 'any'] as const;
 export const UNIQUES = ["Watcher's Eye", 'Megalomaniac', 'Pearl of Tsoatha'] as const;
 export const UNIQUE_TEXT = 'Search for one of the uniques Path of Building\'s trade tab searches by weight ("Other trades"), as it does: ' +
   '"Watcher\'s Eye" weighs its aura mods (and corrupted jewel implicits unless includeCorrupted is false) with `slot` = an allocated ' +
-  'passive-tree jewel socket that is not a cluster jewel socket; "Pearl of Tsoatha" weighs each support gem it can grant per skill-group ' +
+  'passive-tree jewel socket not holding a cluster jewel; "Pearl of Tsoatha" weighs each support gem it can grant per skill-group ' +
   'slot, tried on a Prismatic Ring in `slot` = a ring slot Path of Building shows; "Megalomaniac" weighs each cluster notable it can add ' +
-  'as a passive node (weight = stat-score gain of the notable; `slot` is optional: an allocated non-cluster jewel socket whose jewel ' +
-  'counts as replaced, by default Path of Building\'s own pick, the lowest such node id; none when there is none). The search requires ' +
+  'as a passive node (weight = stat-score gain of the notable; `slot` is optional: such a socket, whose jewel counts as replaced, by ' +
+  'default Path of Building\'s own pick, the lowest allocated socket node id, skipping sockets that hold a cluster jewel; none when no ' +
+  'socket is allocated). The search requires ' +
   'the unique by name and always excludes mirrored items (as PoB). Not with influences, sockets, links, jewelType (Watcher\'s Eye: ' +
   'only "any"), flaskType, includeMirrored true, includeTalisman true or includeEldritch "keep...".';
 /** "tincture" is accepted only to be refused (PoB's generator has no tincture category); the refusal lives in the bridge. */
@@ -68,7 +69,8 @@ export const FLASK_TYPE_TEXT = 'Flask slots only: which flask to search for, "li
   'weighted sum of 0). A tincture (equipped, or "tincture") is refused: PoB\'s trade generator has no tincture category.';
 /** Passive-tree jewel sockets ("Jewel <nodeId>") and abyssal sockets ("<slot> Abyssal Socket N"). */
 export const JEWEL_SLOT_RE = /^Jewel \d+$|Abyssal Socket \d+$/;
-export const TRADE_ID_RE = /^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+)?$/;
+/** Up to two `|` suffixes: option stats (one) and Pearl of Tsoatha's support filters (`explicit.stat_4089743927|<slot>|<support>`). */
+export const TRADE_ID_RE = /^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+){0,2}$/;
 
 export const JEWEL_TYPE_TEXT = 'Passive-tree jewel sockets: which jewels to search and weigh, "base" (regular jewels), "abyss" (abyss jewels) or "any" (both; ' +
   'PoB\'s trade popup offers only Base / Abyss, its query generator also takes Any). Default "abyss" when an abyss jewel is socketed there, ' +

@@ -23,7 +23,7 @@ export function registerTradeTools(tools: ToolRegistrar): void {
         'Jewel sockets search jewels of `jewelType` (tree sockets; abyssal sockets search abyss jewels); an unallocated tree socket is refused (its weights would all be 0: allocate it first with allocate_nodes). ' +
         'Flask slots search flasks of `flaskType` (default: the equipped flask\'s kind; required for an empty slot); an inactive flask slot is evaluated active for the call (evaluatedActive: true; the build is unchanged); tinctures are refused (no tincture category in PoB\'s generator). ' +
         'A weapon slot of the weapon set the build does not use (e.g. "Weapon 1 Swap" while the first set is in use), or an abyssal socket on one, is refused: PoB ignores it, so every weight would be 0. ' +
-        '`unique` searches for Watcher\'s Eye (aura mods, slot = an allocated non-cluster tree socket), Pearl of Tsoatha (support gems, slot = a ring slot) or Megalomaniac (cluster notables weighed as passive nodes, slot optional) as PoB\'s "Other trades" rows do. ' +
+        '`unique` searches for Watcher\'s Eye (aura mods, slot = an allocated tree socket not holding a cluster jewel), Pearl of Tsoatha (support gems, slot = a ring slot) or Megalomaniac (cluster notables weighed as passive nodes, slot optional) as PoB\'s "Other trades" rows do. ' +
         'Read-only: the build is unchanged. Takes a few seconds (longer on heavy builds). No network access.',
       inputSchema: tradeSearchSchema,
     },
@@ -46,8 +46,8 @@ export function registerTradeTools(tools: ToolRegistrar): void {
         'All/hybrid resistances and attributes are marked weightable: false (PoB counts them in the pseudo totals named in preferredTradeIds; ' +
         'weight those instead) but are valid in requiredMods. ' +
         'With `unique`, lists the pool that unique\'s search weighs instead: Watcher\'s Eye its mods (plus corrupted jewel implicits and pseudo stats), ' +
-        'Megalomaniac the cluster notables it can add ("1 Added Passive Skill is ..."); Pearl of Tsoatha is refused (Path of Building has no mod list for it: ' +
-        'its search weighs one filter per support gem and skill-group slot, generated per search).',
+        'Megalomaniac the cluster notables it can add ("1 Added Passive Skill is ..."), Pearl of Tsoatha its support filters (one per support gem ' +
+        'and skill-group slot, ids like "explicit.stat_4089743927|1|5", as its search returns them).',
       inputSchema: {
         slot: z.string().min(1).optional().describe('Slot as for generate_trade_search: gear or flask slot ("Helmet", "Ring 1"), an abyssal socket the item in its slot has or an allocated passive-tree jewel socket ("Jewel 26725"). Required unless `unique` is given (then optional and checked as for that unique\'s search).'),
         query: z.string().trim().min(1).max(100).describe('Text to look for, e.g. "life" or "fire resistance".'),

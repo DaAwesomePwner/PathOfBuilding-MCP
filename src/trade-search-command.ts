@@ -29,7 +29,7 @@ function checkUniqueOptions(args: TradeSearchArgs, unique: NonNullable<TradeSear
   if (args.slot === undefined && unique !== 'Megalomaniac') {
     throw new UserError(`slot is required for ${unique}: ${unique === 'Pearl of Tsoatha'
       ? 'a ring slot Path of Building shows ("Ring 1")'
-      : 'an allocated passive-tree jewel socket that is not a cluster jewel socket ("Jewel <nodeId>", see list_valid_slots)'}`);
+      : 'an allocated passive-tree jewel socket not holding a cluster jewel ("Jewel <nodeId>", see list_valid_slots)'}`);
   }
   const refuse = (what: string) => {
     throw new UserError(`${what} does not apply to ${unique} searches (Path of Building's unique search does not offer it)`);

@@ -9,7 +9,9 @@
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import {
+  copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+} from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -295,7 +297,7 @@ async function test15Uniques(): Promise<void> {
   // Slot refusals.
   await userError('generate_trade_search', { league: 'Standard', unique: WE }, /slot is required for Watcher's Eye/);
   await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Jewel 61834' }, /Jewel 61834 is not allocated.*Allocate node 61834 first/);
-  await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Helmet' }, /need slot = an allocated passive-tree jewel socket that is not a cluster jewel socket/);
+  await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Helmet' }, /need slot = an allocated passive-tree jewel socket not holding a cluster jewel/);
   await userError('generate_trade_search', { league: 'Standard', unique: WE, slot: 'Belt Abyssal Socket 1' }, /need slot = an allocated passive-tree jewel socket/);
   // Option refusals.
   for (const [extra, expect] of [
@@ -317,12 +319,31 @@ async function test15Uniques(): Promise<void> {
   assert(pearlQuery.query.name === 'Pearl of Tsoatha' && pearl.itemCategory === 'Ring' && pearl.currentItem !== null, `Pearl name filter: ${pearlQuery.query.name}`);
   assert(pearl.filters.length > 0 && pearl.filters.every((f) => f.tradeId.startsWith(PEARL_PREFIX) && f.weight > 0 && /Supported by/.test(f.text)),
     `Pearl support filters: ${JSON.stringify(pearl.filters.slice(0, 3))}`);
+  // Its filter ids (two "|" suffixes) go back in weightAdjustments (replace, drop with 0) and requiredMods.
+  assert(pearl.filters.length >= 2, `two Pearl filters to adjust: ${pearl.filters.length}`);
+  const [firstPearl, secondPearl] = pearl.filters;
+  const adjusted = await uniqueSearch({
+    unique: 'Pearl of Tsoatha', slot: 'Ring 1',
+    weightAdjustments: [{ tradeId: firstPearl.tradeId, weight: 0 }, { tradeId: secondPearl.tradeId, weight: 7 }],
+  });
+  assert(!adjusted.filters.some((f) => f.tradeId === firstPearl.tradeId), `weight 0 drops ${firstPearl.tradeId}`);
+  const replaced = adjusted.filters.find((f) => f.tradeId === secondPearl.tradeId);
+  assert(replaced?.source === 'adjusted' && replaced.weight === 7 && replaced.text === secondPearl.text, `adjusted Pearl filter: ${JSON.stringify(replaced)}`);
+  const pearlRequired = await uniqueSearch({ unique: 'Pearl of Tsoatha', slot: 'Ring 1', requiredMods: [{ tradeId: secondPearl.tradeId }] });
+  assert(decodeQuery(pearlRequired.url, STANDARD_PREFIX).query.stats.some((g) => g.type === 'and' && g.filters.some((f) => f.id === secondPearl.tradeId)),
+    'a Pearl filter as a required mod');
   // list_valid_slots lists Ring 3 regardless; PoB's Pearl popup offers only the ring slots it shows.
   await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha', slot: 'Ring 3' }, /a ring slot Path of Building shows \(Ring 1, Ring 2\).*Ring 3 is hidden/);
   await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha', slot: 'Amulet' }, /a ring slot Path of Building shows/);
   await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha' }, /slot is required for Pearl of Tsoatha/);
   await userError('generate_trade_search', { league: 'Standard', unique: 'Pearl of Tsoatha', slot: 'Ring 1', sockets: 1 }, /sockets does not apply to Pearl/);
-  await userError('search_trade_mods', { unique: 'Pearl of Tsoatha', query: 'support' }, /Pearl of Tsoatha has no mod list/);
+  // search_trade_mods lists Pearl's pool: the same ids its search returns.
+  const pearlPool = await ok<{ itemCategory: string; total: number; mods: TradeMod[] }>('search_trade_mods', { unique: 'Pearl of Tsoatha', query: 'supported by', limit: 100 });
+  assert(pearlPool.itemCategory === 'Ring' && pearlPool.total > 100 && pearlPool.mods.every((m) => m.tradeId.startsWith(PEARL_PREFIX) && /Supported by/.test(m.text)),
+    `Pearl pool: ${pearlPool.total} ${JSON.stringify(pearlPool.mods.slice(0, 2))}`);
+  const named = await ok<{ mods: TradeMod[] }>('search_trade_mods', { unique: 'Pearl of Tsoatha', query: firstPearl.text, limit: 5 });
+  assert(named.mods.some((m) => m.tradeId === firstPearl.tradeId), `the pool holds the search's ids: ${firstPearl.tradeId}`);
+  await userError('search_trade_mods', { unique: 'Pearl of Tsoatha', slot: 'Amulet', query: 'support' }, /a ring slot Path of Building shows/);
 
   // Megalomaniac: PoB's search fails on notables the 3.13 tree lacks; its pool is listed.
   await userError('generate_trade_search', { league: 'Standard', unique: 'Megalomaniac' },
@@ -343,9 +364,11 @@ async function test15Uniques(): Promise<void> {
 
 /**
  * Megalomaniac on the latest tree (its own engine: the build is converted):
- * cluster notables weighed as passive nodes, PoB's default socket, an explicit
- * socket whose jewel counts as replaced (every weight shifts by the jewel's
- * worth), the export unchanged.
+ * cluster notables weighed as passive nodes; PoB's default socket (the lowest
+ * allocated one: Jewel 36634, holding a jewel, whose worth then shifts every
+ * weight compared with an empty socket); the export unchanged by searches; a
+ * default socket holding a cluster jewel skipped (refused when it is the only
+ * one); no allocated socket at all is PoB's nil slot.
  */
 async function test16Megalomaniac(paths: TestPaths, xml: string): Promise<void> {
   log('Test 16: Megalomaniac on the latest tree');
@@ -363,19 +386,122 @@ async function test16Megalomaniac(paths: TestPaths, xml: string): Promise<void> 
     const q = decodeQuery(mega.url, STANDARD_PREFIX) as Query & { query: { name?: string; type?: string } };
     assert(q.query.name === 'Megalomaniac' && q.query.type === 'Medium Cluster Jewel' && q.query.filters.type_filters === undefined,
       `name and base filters: ${JSON.stringify({ name: q.query.name, type: q.query.type })}`);
-    assert(mega.unique === 'Megalomaniac' && typeof mega.slot === 'string' && /^Jewel \d+$/.test(mega.slot) && mega.currentItem === null,
-      `PoB's default socket (empty): ${mega.slot} ${mega.currentItem}`);
+    assert(mega.unique === 'Megalomaniac' && mega.slot === 'Jewel 36634' && mega.currentItem !== null && mega.minWeightedSum > 0,
+      `PoB's default socket, the lowest allocated one: ${mega.slot} ${mega.currentItem} min ${mega.minWeightedSum}`);
     assert(mega.filters.length >= 10 && mega.filters.every((f) => f.weight > 0 && f.notable !== undefined && f.text === `1 Added Passive Skill is ${f.notable}`),
       `notables weighed: ${JSON.stringify(mega.filters.slice(0, 3))}`);
-    assert(mega.minWeightedSum === 0, `no jewel in the default socket: min 0, got ${mega.minWeightedSum}`);
-    // A socket holding a jewel: PoB measures from the build without it, so every weight includes its worth.
-    const held = await megaSearch('Jewel 36634');
-    assert(held.slot === 'Jewel 36634' && held.currentItem !== null && held.minWeightedSum > 0, `explicit socket: ${held.currentItem} min ${held.minWeightedSum}`);
-    const shifts = mega.filters.slice(0, 5).map((f) => held.filters.find((h) => h.tradeId === f.tradeId)!.weight - f.weight);
-    assert(shifts.every((d) => d > 0 && Math.abs(d - shifts[0]) <= Math.max(0.05, shifts[0] * 0.02)), `every weight shifts by the jewel's worth: ${shifts}`);
     assert((await session.exportXML()) === before, 'Megalomaniac searches changed the export');
+
+    // An empty socket: pure notable gains and min 0; the jewel in 36634 shifts every weight by its worth.
+    await session.allocateNodes([26725]);
+    const empty = await megaSearch('Jewel 26725');
+    assert(empty.currentItem === null && empty.minWeightedSum === 0, `empty socket: ${empty.currentItem} min ${empty.minWeightedSum}`);
+    const shifts = empty.filters.slice(0, 5).map((f) => mega.filters.find((h) => h.tradeId === f.tradeId)!.weight - f.weight);
+    assert(shifts.every((d) => d > 0 && Math.abs(d - shifts[0]) <= Math.max(0.05, shifts[0] * 0.02)), `every weight shifts by the jewel's worth: ${shifts}`);
+    assert((await megaSearch()).slot === 'Jewel 26725', 'the default follows the lowest allocated socket');
+
+    // A default socket holding a cluster jewel is skipped (an explicit one is refused).
+    await session.allocateNodes([2491]);
+    await session.swapItemWithDiff('Jewel 2491', VOICES);
+    assert((await megaSearch()).slot === 'Jewel 26725', 'the default skips Jewel 2491 holding a cluster jewel');
+    await rejectsWith(megaSearch('Jewel 2491'), /Jewel 2491 holds a cluster jewel \(Voices\)/);
+
+    // A build whose only allocated socket holds a cluster jewel: the default refuses.
+    await session.newBuild({ className: 'Witch' });
+    await session.allocateNodes([2491]);
+    await session.swapItemWithDiff('Jewel 2491', VOICES);
+    await rejectsWith(megaSearch(), /every allocated passive-tree jewel socket holds a cluster jewel/);
+    // No allocated socket at all: PoB's nil slot.
+    await session.newBuild({ className: 'Witch' });
+    const blank = await megaSearch().catch((e: Error) => e);
+    assert(blank instanceof Error ? /found no cluster notables/.test(blank.message) : blank.slot === null,
+      `no socket: slot null (${blank instanceof Error ? blank.message : blank.slot})`);
   } finally {
     await bridge.dispose();
+  }
+  log('PASS');
+}
+
+async function rejectsWith(p: Promise<unknown>, expect: RegExp): Promise<void> {
+  try {
+    await p;
+  } catch (e) {
+    assert(expect.test((e as Error).message), `error ${JSON.stringify((e as Error).message)} should match ${expect}`);
+    return;
+  }
+  throw new Error(`expected a rejection matching ${expect}`);
+}
+
+/**
+ * Feature detection: a temporary mirror of the PoB install (small folders
+ * copied, the large data folders linked, nothing written into the install)
+ * whose TradeQueryGenerator.lua lacks the special searches. Each unique is a
+ * user error naming the missing search; a normal search still works.
+ */
+async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<void> {
+  log('Test 17: a trade generator without the special unique searches');
+  const mirror = mkdtempSync(path.join(os.tmpdir(), 'pob-mcp-nospecial-'));
+  const links: string[] = [];
+  // Mirrors `from` into `to`, descending along `into` (the folders holding the generator); other folders are linked.
+  const build = (from: string, to: string, into: string[]): void => {
+    mkdirSync(to, { recursive: true });
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      const src = path.join(from, entry.name);
+      const dst = path.join(to, entry.name);
+      if (entry.isDirectory() && entry.name === into[0]) {
+        if (into.length === 1) cpSync(src, dst, { recursive: true });
+        else build(src, dst, into.slice(1));
+      } else if (entry.isDirectory()) {
+        symlinkSync(src, dst, 'junction');
+        links.push(dst);
+      } else if (entry.isFile()) {
+        copyFileSync(src, dst);
+      }
+    }
+  };
+  let removable = true;
+  try {
+    const into = existsSync(path.join(paths.pobPath, 'src', 'Classes', 'TradeQueryGenerator.lua')) ? ['src', 'Classes'] : ['Classes'];
+    build(paths.pobPath, mirror, into);
+    const genFile = path.join(mirror, ...into, 'TradeQueryGenerator.lua');
+    let source = readFileSync(genFile, 'utf8');
+    for (const [from, to] of [
+      ['if options.special.itemName == "Watcher\'s Eye" then', 'if false then'],
+      ['if options.special.itemName == "Pearl of Tsoatha" then', 'if false then'],
+      ['function TradeQueryGeneratorClass:GeneratePassiveNodeWeights(', 'function TradeQueryGeneratorClass:GeneratePassiveNodeWeightsGone('],
+    ]) {
+      assert(source.includes(from), `the installed generator no longer has: ${from}`);
+      source = source.replace(from, to);
+    }
+    writeFileSync(genFile, source);
+
+    const bridge = new LuaBridge({ ...paths, pobPath: mirror }, 120_000);
+    try {
+      const session = new BuildSession(bridge);
+      await session.loadBuild(xml);
+      const before = await session.exportXML();
+      for (const [unique, slot] of [["Watcher's Eye", 'Jewel 36634'], ['Pearl of Tsoatha', 'Ring 1'], ['Megalomaniac', undefined]] as const) {
+        const args = { league: 'Standard', unique, ...(slot ? { slot } : {}) };
+        await rejectsWith(session.generateTradeQuery(tradeQueryCommand(args)),
+          new RegExp(`This Path of Building version's trade query generator has no ${unique} search; update Path of Building`));
+      }
+      assert((await session.generateTradeQuery(tradeQueryCommand({ slot: 'Helmet', league: 'Standard' }))).capLifted === true, 'a normal search still works');
+      assert((await session.exportXML()) === before, 'refused unique searches changed the export');
+    } finally {
+      await bridge.dispose();
+    }
+  } finally {
+    // Remove each link itself (never what it points at) before the copied files.
+    for (const link of links) {
+      try {
+        if (!lstatSync(link).isSymbolicLink()) { removable = false; continue; }
+        try { unlinkSync(link); } catch { rmdirSync(link); }
+      } catch {
+        removable = false;
+      }
+    }
+    if (removable) rmSync(mirror, { recursive: true, force: true });
+    else console.error(`left ${mirror} in place: a link could not be removed safely`);
   }
   log('PASS');
 }
@@ -787,6 +913,7 @@ async function main(): Promise<void> {
     await test15Uniques();
     await test14FlaskFaults(paths, readFileSync(fixturePath, 'utf8'));
     await test16Megalomaniac(paths, readFileSync(fixturePath, 'utf8'));
+    await test17FeatureDetection(paths, readFileSync(fixturePath, 'utf8'));
     log('ALL TRADE SEARCH TESTS PASSED');
   } finally {
     await client.close().catch(() => undefined);
