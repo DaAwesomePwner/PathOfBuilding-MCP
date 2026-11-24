@@ -43,8 +43,9 @@ export const JEWEL_TYPES = ['base', 'abyss', 'any'] as const;
 export const JEWEL_SLOT_RE = /^Jewel \d+$|Abyssal Socket \d+$/;
 export const TRADE_ID_RE = /^[a-z]+\.[a-z0-9_]+(?:\|[a-z0-9_]+)?$/;
 
-export const JEWEL_TYPE_TEXT = 'Passive-tree jewel sockets: which jewels to search and weigh, "base" (regular jewels), "abyss" or "any" (PoB\'s Jewel Type; ' +
-  'default "abyss" when an abyss jewel is socketed there, else "base"). Abyssal sockets accept only "abyss"; other slots take none.';
+export const JEWEL_TYPE_TEXT = 'Passive-tree jewel sockets: which jewels to search and weigh, "base" (regular jewels), "abyss" (abyss jewels) or "any" (both; ' +
+  'PoB\'s trade popup offers only Base / Abyss, its query generator also takes Any). Default "abyss" when an abyss jewel is socketed there, ' +
+  'else "base". Abyssal sockets accept only "abyss"; other slots take none.';
 
 const tradeId = z.string().max(80).describe('Trade stat id, e.g. "explicit.stat_3299347043" or "pseudo.pseudo_total_life" (find ids with search_trade_mods).');
 

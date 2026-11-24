@@ -364,7 +364,7 @@ tools.engine<Record<string, never>>(
   {
     description:
       'List all currently valid equipment slot names along with whether each slot is occupied. Slots Path of Building hides on this passive tree are left out: the Wickerman slots (Head, Body, Arm, Leg) appear only on 3.30 trees, Graft 1/2 only on 3.27 trees. ' +
-      'Abyssal sockets ("<slot> Abyssal Socket N") are listed only where the item in their `parentSlot` has them. Every passive-tree jewel socket ("Jewel <nodeId>") is listed with `allocated`: a jewel in an unallocated socket counts for nothing (allocate it with allocate_nodes).',
+      'Abyssal sockets ("<slot> Abyssal Socket N") are listed only where the item in their `parentSlot` has them. Every passive-tree jewel socket ("Jewel <nodeId>") is listed with `allocated`: a jewel in an unallocated socket counts for nothing (allocate it with allocate_nodes). A socket a cluster jewel adds that is not on the tree yet also has `requiresClusterIn` (the socket where a cluster jewel with jewel sockets must go first).',
     inputSchema: {},
   },
   async (_args, session) => {
@@ -393,7 +393,7 @@ tools.engine<{ slot: string; itemText: string }>(
   'swap_item',
   {
     description:
-      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything. A jewel can go in an unallocated passive-tree socket (as in PoB) but counts for nothing until the socket is allocated; the result then carries a `note`.',
+      'Equip an item in a slot and return the before/after stat diff. PERMANENTLY mutates the build (use undo_last_change to revert). The replaced item stays in the build\'s item list, unequipped (as in PoB\'s UI), until undo_last_change, reset_build or a new load_build. An item that cannot go in the slot, a slot Path of Building hides on this passive tree (see list_valid_slots), or text Path of Building cannot parse, is refused without changing anything. A jewel can go in an unallocated passive-tree socket (PoB\'s UI hides such sockets, but a build can hold a jewel there) and counts for nothing until the socket is allocated; the result then carries a `note` saying what to do (for a socket a cluster jewel adds: socket that cluster jewel first).',
     inputSchema: {
       slot: z.string().min(1).describe('Equipment slot name.'),
       itemText: z

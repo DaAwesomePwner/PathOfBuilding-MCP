@@ -987,9 +987,33 @@ function slotChecks.unallocatedSocket(slot)
 	return nil
 end
 
-function slotChecks.unallocatedText(slotName, nodeId)
+-- For a socket a cluster jewel adds that does not exist on the tree yet
+-- (PassiveSpec keeps such sockets out of spec.nodes until a cluster jewel in
+-- the parent socket builds them): the parent socket's node id; else nil.
+function slotChecks.clusterParent(nodeId)
+	local spec = build.spec
+	if not spec or spec.nodes[nodeId] ~= nil then return nil end
+	local treeNode = spec.tree and spec.tree.nodes[nodeId]
+	local parent = treeNode and treeNode.expansionJewel and treeNode.expansionJewel.parent
+	return parent and tonumber(parent) or nil
+end
+
+-- What makes a jewel in passive-tree socket `nodeId` count, as a sentence.
+function slotChecks.socketRemedy(nodeId)
+	local parent = slotChecks.clusterParent(nodeId)
+	if parent then
+		return string.format("It is a socket a cluster jewel adds, and no cluster jewel in Jewel %d adds it: socket a cluster "
+			.. "jewel with jewel sockets in Jewel %d (swap_item), then allocate node %d (allocate_nodes)", parent, parent, nodeId)
+	end
+	return string.format("Allocate node %d first (allocate_nodes)", nodeId)
+end
+
+-- With `inVariant` (probe and apply_changes variants), an existing socket
+-- may also be allocated by the same variant.
+function slotChecks.unallocatedText(slotName, nodeId, inVariant)
 	return string.format("%s is an unallocated passive tree jewel socket: a jewel there counts for nothing in "
-		.. "Path of Building's calculations. Allocate node %d first (allocate_nodes)", slotName, nodeId)
+		.. "Path of Building's calculations. %s%s", slotName, slotChecks.socketRemedy(nodeId),
+		(inVariant and not slotChecks.clusterParent(nodeId)) and ", or allocate it in the same variant" or "")
 end
 
 -- Why ItemsTab:IsItemValidForSlot refused `item` for `slotName`.
@@ -3330,8 +3354,11 @@ local function getValidSlots()
 		if slot.slotName and not slotChecks.hiddenReason(slot) and not (parent and index > count) then
 			local itemId = slot.selItemId or 0
 			local item = (itemId ~= 0) and build.itemsTab.items[itemId] or nil
-			local allocated = nil
-			if slot.nodeId then allocated = slotChecks.unallocatedSocket(slot) == nil end
+			local allocated, clusterParent = nil, nil
+			if slot.nodeId then
+				allocated = slotChecks.unallocatedSocket(slot) == nil
+				clusterParent = slotChecks.clusterParent(slot.nodeId)
+			end
 			table.insert(result, {
 				slot = slot.slotName,
 				occupied = itemId ~= 0,
@@ -3339,6 +3366,8 @@ local function getValidSlots()
 				baseName = item and item.baseName or nil,
 				parentSlot = parent and parent.slotName or nil,
 				allocated = allocated,
+				-- A socket a cluster jewel in that socket would add; not on the tree yet.
+				requiresClusterIn = clusterParent and ("Jewel " .. clusterParent) or nil,
 			})
 		end
 	end
@@ -3388,8 +3417,8 @@ local function listEquippedItems()
 					local allocated = nil
 					if unallocated then
 						allocated = false
-						note = "the socket is not allocated, so Path of Building ignores this jewel; allocate node "
-							.. unallocated .. " (allocate_nodes) to use it"
+						note = "The socket is not allocated, so Path of Building ignores this jewel. "
+							.. slotChecks.socketRemedy(unallocated)
 					end
 					table.insert(result, {
 						hidden = gate and true or nil,
@@ -4275,7 +4304,7 @@ local function tradeSlotOrError(slotName, helpers, jewelType)
 		local nodeId = slotChecks.unallocatedSocket(slot)
 		if nodeId then
 			userError(what .. "the passive tree jewel socket is not allocated, so Path of Building weighs every mod at 0. "
-				.. "Allocate node " .. nodeId .. " first (allocate_nodes)")
+				.. slotChecks.socketRemedy(nodeId))
 		end
 		local kind = jewelType or ((item and item.base and item.base.subType == "Abyss") and "abyss" or "base")
 		local pobType = ({ base = "Base", abyss = "Abyss", any = "Any" })[kind]
@@ -4839,11 +4868,13 @@ local DISPATCH = {
 	equipItem = {
 		handler = function(cmd)
 			equipItemInSlot(cmd.slot, cmd.itemText or "")
-			-- Allowed, as in PoB's UI, but the jewel does nothing there yet.
+			-- Allowed (PoB's build keeps a jewel in a socket that is later
+			-- deallocated; its UI only hides such sockets), but the jewel does
+			-- nothing there yet.
 			local nodeId = slotChecks.unallocatedSocket(build.itemsTab.slots[cmd.slot])
 			if nodeId then
-				return { note = "The jewel is equipped, but the socket is not allocated, so Path of Building ignores it "
-					.. "until node " .. nodeId .. " is allocated (allocate_nodes)" }
+				return { note = "The jewel is equipped, but the socket is not allocated, so Path of Building ignores it. "
+					.. slotChecks.socketRemedy(nodeId) }
 			end
 			return { }
 		end,
@@ -5222,6 +5253,7 @@ do
 		assertItemFitsSlot = assertItemFitsSlot,
 		usableSlot = slotChecks.usableSlot,
 		unallocatedSocketText = slotChecks.unallocatedText,
+		clusterParent = slotChecks.clusterParent,
 		construct = construct,
 		findGemByName = findGemByName,
 		getConfigMetadata = getConfigMetadata,

@@ -7,7 +7,10 @@
  * refused before any change unless the variant allocates the socket, and a
  * variant whose deallocation removes the socket is refused; swap_item still
  * equips there with a note. A socket inside a cluster jewel's subgraph behaves
- * the same once allocated (compare, evaluate, trade search).
+ * the same once allocated (compare, evaluate, trade search); before a cluster
+ * jewel adds it, it is marked requiresClusterIn and refusals say to socket one.
+ * Variants that change the cluster jewel or several nodes are checked after
+ * applying; suggest_upgrades gets weighted mods for a tree socket.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -81,7 +84,7 @@ function log(msg: string): void {
 }
 
 interface ToolResp { content?: Array<{ type: string; text: string }>; isError?: boolean }
-interface SlotInfo { slot: string; occupied: boolean; itemName?: string; parentSlot?: string; allocated?: boolean }
+interface SlotInfo { slot: string; occupied: boolean; itemName?: string; parentSlot?: string; allocated?: boolean; requiresClusterIn?: string }
 interface Equipped { slot: string; title?: string; parentSlot?: string; allocated?: boolean; note?: string }
 interface Candidate { index: number; error: string | null; keyDeltas: Record<string, number> | null }
 interface EvalResult { index: number; error?: string; userError?: boolean; delta?: Record<string, number>; fallback?: boolean }
@@ -137,6 +140,19 @@ async function main(): Promise<void> {
     assert(!initial.some((s) => /Abyssal Socket/.test(s.slot)), 'no item of the fixture has an abyssal socket');
     log('PASS');
 
+    log('Test 1b: a socket a cluster jewel would add (no cluster jewel in its parent socket yet)');
+    const inner = `Jewel ${INNER_SOCKET}`;
+    const absent = initial.find((s) => s.slot === inner);
+    assert(absent?.allocated === false && absent.requiresClusterIn === `Jewel ${LARGE_SOCKET}`, `marked: ${JSON.stringify(absent)}`);
+    assert(jewels.find((s) => s.slot === UNALLOCATED)?.requiresClusterIn === undefined, 'base tree sockets carry no requiresClusterIn');
+    const clusterFirst = /no cluster jewel in Jewel 2491 adds it: socket a cluster jewel with jewel sockets in Jewel 2491 \(swap_item\), then allocate node 10532 \(allocate_nodes\)/;
+    await userError('compare_items', { slot: inner, items: [COBALT_A, COBALT_B] }, clusterFirst);
+    await userError('generate_trade_search', { slot: inner, league: 'Standard' }, clusterFirst);
+    const [absentVariant] = await evaluate([{ items: [{ slot: inner, itemText: COBALT_A }] }]);
+    assert(absentVariant.userError === true && clusterFirst.test(absentVariant.error ?? '') && !/same variant/.test(absentVariant.error ?? ''),
+      `variant into a socket not on the tree: ${JSON.stringify(absentVariant)}`);
+    log('PASS');
+
     log('Test 2: an abyssal socket appears with its item, and its abyss jewel is listed with parentSlot');
     await ok('swap_item', { slot: 'Belt', itemText: STYGIAN_VISE });
     const withVise = await slots();
@@ -183,10 +199,10 @@ async function main(): Promise<void> {
 
     log('Test 4: swap_item into an unallocated socket equips with a note');
     const noted = await ok<{ keyDeltas: Record<string, number>; note?: string }>('swap_item', { slot: UNALLOCATED, itemText: COBALT_A });
-    assert(/socket is not allocated.*node 26725 is allocated \(allocate_nodes\)/.test(noted.note ?? ''), `note: ${noted.note}`);
+    assert(/socket is not allocated.*Allocate node 26725 first \(allocate_nodes\)/.test(noted.note ?? ''), `note: ${noted.note}`);
     assert(noted.keyDeltas.Life === 0 && noted.keyDeltas.CombinedDPS === 0, 'the jewel counts for nothing');
     const idle = (await equipped()).find((i) => i.slot === UNALLOCATED);
-    assert(idle?.allocated === false && /not allocated.*allocate node 26725/.test(idle.note ?? ''), `listed as unallocated: ${JSON.stringify(idle)?.slice(0, 300)}`);
+    assert(idle?.allocated === false && /not allocated.*Allocate node 26725 first/.test(idle.note ?? ''), `listed as unallocated: ${JSON.stringify(idle)?.slice(0, 300)}`);
     assert((await equipped()).find((i) => i.slot === ALLOCATED)?.allocated === undefined, 'jewels in allocated sockets carry no flag');
     const allocate = await ok<{ keyDeltas: Record<string, number> }>('allocate_nodes', { nodes: [26725] });
     assert(allocate.keyDeltas.Life > 0, 'allocating the socket turns the jewel on');
@@ -197,8 +213,9 @@ async function main(): Promise<void> {
     log('Test 5: a socket inside a cluster jewel subgraph');
     await ok('allocate_nodes', { nodes: [LARGE_SOCKET] });
     await ok('swap_item', { slot: `Jewel ${LARGE_SOCKET}`, itemText: VOICES });
-    const inner = `Jewel ${INNER_SOCKET}`;
-    assert((await slots()).find((s) => s.slot === inner)?.allocated === false, 'the cluster\'s socket starts unallocated');
+    const builtInner = (await slots()).find((s) => s.slot === inner);
+    assert(builtInner?.allocated === false && builtInner.requiresClusterIn === undefined,
+      `the cluster's socket is on the tree, unallocated: ${JSON.stringify(builtInner)}`);
     await userError('compare_items', { slot: inner, items: [COBALT_A, COBALT_B] }, /unallocated passive tree jewel socket/);
     const [viaVariant] = await evaluate([{ allocate: [INNER_SOCKET], items: [{ slot: inner, itemText: COBALT_A }] }]);
     assert(viaVariant.error === undefined && (viaVariant.delta?.Life ?? 0) > 0, `allocated in the variant: ${JSON.stringify(viaVariant)}`);
@@ -213,6 +230,29 @@ async function main(): Promise<void> {
     assert(cut.userError === true && /Deallocating 2491/.test(cut.error ?? ''), `removing the cluster's socket: ${JSON.stringify(cut)}`);
     const trade = await ok<{ itemCategory: string; filters: { weight: number }[] }>('generate_trade_search', { slot: inner, league: 'Standard' });
     assert(trade.itemCategory === 'BaseJewel' && trade.filters.filter((f) => f.weight > 0).length >= 5, `trade search in the cluster socket: ${trade.itemCategory}`);
+    log('PASS');
+
+    log('Test 6: variants decided after applying (another cluster jewel in the parent socket, deallocation + allocation)');
+    const beforeSwap = await exportXml();
+    const swapOut = { items: [{ slot: `Jewel ${LARGE_SOCKET}`, itemText: COBALT_B }, { slot: inner, itemText: COBALT_A }] };
+    const [swapped] = await evaluate([swapOut]);
+    assert(swapped.userError === true
+      && /After this variant's changes Jewel 10532 is not on the passive tree: no cluster jewel in Jewel 2491 adds that socket/.test(swapped.error ?? ''),
+      `replacing the cluster jewel while filling its socket: ${JSON.stringify(swapped)}`);
+    await userError('apply_changes', { variant: swapOut }, /After this variant's changes Jewel 10532 is not on the passive tree/);
+    assert((await exportXml()) === beforeSwap, 'the refused apply_changes was rolled back');
+    // Deallocating one socket and allocating another (two node changes) is decided after applying; the inner socket stays allocated.
+    const [mixed] = await evaluate([{ deallocate: [26725], allocate: [23756], items: [{ slot: inner, itemText: COBALT_B }] }]);
+    assert(mixed.error === undefined && mixed.fallback === true, `a deallocation + allocation variant keeping the socket: ${JSON.stringify(mixed)}`);
+    assert((await exportXml()) === beforeSwap, 'evaluate_changes changed the build');
+    log('PASS');
+
+    log('Test 7: suggest_upgrades for a tree socket gets PoB-weighted mods');
+    const upgrades = await ok<{ suggestions: { slot: string; suggestedMods?: { mod: string; weight: number }[]; modsError?: string }[] }>(
+      'suggest_upgrades', { slot: ALLOCATED });
+    const forJewel = upgrades.suggestions.find((s) => s.slot === ALLOCATED);
+    assert(forJewel && forJewel.modsError === undefined && (forJewel.suggestedMods?.length ?? 0) > 0 && forJewel.suggestedMods!.every((m) => m.weight > 0),
+      `suggestedMods for ${ALLOCATED}: ${JSON.stringify(forJewel)?.slice(0, 300)}`);
     log('PASS');
     log('ALL JEWEL SOCKET TESTS PASSED');
   } finally {
