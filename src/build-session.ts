@@ -1154,10 +1154,12 @@ export class BuildSession {
     });
   }
 
-  async searchTradeMods(slot: string, query: string, limit: number, jewelType?: string): Promise<TradeModsResult> {
+  async searchTradeMods(slot: string, query: string, limit: number, jewelType?: string, flaskType?: string): Promise<TradeModsResult> {
     return this.withLock(async () => {
       const result = await this.bridge.send<{ ok: true } & TradeModsResult>({
-        cmd: 'searchTradeMods', slot, query, limit, ...(jewelType !== undefined ? { jewelType } : {}),
+        cmd: 'searchTradeMods', slot, query, limit,
+        ...(jewelType !== undefined ? { jewelType } : {}),
+        ...(flaskType !== undefined ? { flaskType } : {}),
       });
       return { itemCategory: result.itemCategory, total: result.total, mods: result.mods };
     });
@@ -1248,7 +1250,7 @@ export class BuildSession {
       // So is an unallocated passive-tree jewel socket (a jewel there counts for nothing),
       // and an inactive flask slot unless `activate` (the candidates are then
       // evaluated with the slot turned on); `activate` is for flask slots only.
-      const check = await this.bridge.send<{ ok: true; flaskActive?: boolean }>({
+      const check = await this.bridge.send<{ ok: true; flaskActive?: boolean; note?: string }>({
         cmd: 'checkSlotUsable',
         slot,
         whatIf: true,
@@ -1294,6 +1296,7 @@ export class BuildSession {
       return {
         baseline: { item: baselineItem, stats: baselineStats },
         ...(check.flaskActive !== undefined ? { flaskSlotActive: check.flaskActive, activated } : {}),
+        ...(check.note !== undefined ? { note: check.note } : {}),
         candidates: results,
         bestForDPS: bestForKey('CombinedDPS'),
         bestForEHP: bestForKey('TotalEHP'),
@@ -2710,14 +2713,25 @@ export class BuildSession {
   }
 
   /**
-   * suggest_upgrades. Each equipped slot's DPS / EHP contribution is measured
-   * by emptying it as unequip_item would (one probe variant per slot); slots
-   * are sorted by upgrade priority. The first `modSlots` measured slots (the
+   * suggest_upgrades. Every item slot PoB's calculations use is listed (the
+   * bridge's `upgradeSlots`: gear of the weapon set in use, `Ring 3` while
+   * PoB shows it, flask slots, allocated passive-tree jewel sockets, abyssal
+   * sockets the parent's item has, tree-gated slots while shown); each
+   * occupied one's DPS / EHP contribution is measured by emptying it as
+   * unequip_item would (one probe variant per slot). An inactive flask slot
+   * contributes nothing in PoB and is not measured or ranked (listed after the
+   * ranked slots with a note), nor is a flask that adds nothing to DPS or EHP
+   * (priority null, a note); passive-tree jewel sockets take the probe's
+   * full-recalculation fallback (~0.3-0.5 s each), so at most
+   * MAX_SUGGEST_TREE_JEWELS of them are measured, the rest listed unmeasured
+   * with a note. The first `modSlots` slots the trade generator supports (the
    * target slot when one is given) get `suggestedMods`: the mods Path of
-   * Building's own weighted trade query generator weighs highest for that
-   * slot (topTradeMods; ~0.4-1 s a slot on the OccVortex fixture, so not
-   * every slot by default). Highest priority first: measured slots (empty
-   * ones first), then slots that could not be measured. Changes nothing.
+   * Building's own weighted trade query generator weighs highest for that slot
+   * (topTradeMods; ~0.4-1 s a slot on the OccVortex fixture, so not every slot
+   * by default); slots it cannot weigh (tree-gated slots, tinctures, empty
+   * flask slots) get a `modsError` instead. Order: measured slots (empty ones
+   * first, then by priority), unmeasured ones, then slots that could not be
+   * measured (error). Changes nothing.
    */
   async suggestUpgrades(
     targetSlot?: string,
@@ -2725,30 +2739,55 @@ export class BuildSession {
   ): Promise<UpgradeSuggestion[]> {
     return this.withLock(async () => {
       const baseline = await this.bridge.getStats();
-      const focusSlots = targetSlot
-        ? [targetSlot]
-        : ['Weapon 1', 'Weapon 2', 'Helmet', 'Body Armour', 'Gloves', 'Boots', 'Amulet', 'Ring 1', 'Ring 2', 'Belt'];
-
+      const slotsRes = await this.bridge.send<{ ok: true; slots: UpgradeSlot[] }>({ cmd: 'upgradeSlots' });
       const itemsRes = await this.bridge.send<{ ok: true; items: EquippedItem[] }>({
         cmd: 'listEquippedItems',
       });
       const itemsBySlot = new Map<string, EquippedItem>();
       for (const item of itemsRes.items) itemsBySlot.set(item.slot, item);
+      // A target slot not listed (unknown, hidden, unused weapon set) is measured
+      // as before: the probe or the trade generator says what is wrong with it.
+      const rows: UpgradeSlot[] = targetSlot
+        ? [slotsRes.slots.find((r) => r.slot === targetSlot) ?? { slot: targetSlot, kind: 'gear', occupied: itemsBySlot.has(targetSlot) }]
+        : slotsRes.slots;
 
-      // One probe variant per equipped slot: the slot emptied as unequip_item
+      // Occupied slots that are not measured: an inactive flask slot (PoB
+      // ignores it) and tree jewel sockets past MAX_SUGGEST_TREE_JEWELS
+      // (fallback variants) unless the slot was asked for.
+      let treeJewels = 0;
+      const skipped = new Map<string, string>();
+      for (const r of rows) {
+        if (!itemsBySlot.has(r.slot)) continue;
+        if (r.kind === 'flask' && r.active === false) {
+          skipped.set(r.slot, `${r.slot} is not active, so Path of Building does not apply the ${r.tincture ? 'tincture' : 'flask'} ` +
+            'there (it contributes nothing and is not ranked); set_flask_active turns it on');
+        } else if (r.kind === 'treeJewel' && !targetSlot && ++treeJewels > MAX_SUGGEST_TREE_JEWELS) {
+          skipped.set(r.slot, `not measured: only the first ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured ` +
+            'per call (each takes a full recalculation); pass slot to measure this one');
+        }
+      }
+
+      // One probe variant per measured slot: the slot emptied as unequip_item
       // would, then undone (a jewel socket or a skill-granting item takes the
       // probe's full-recalculation fallback). A slot refused as input gets its
       // error in the result; any other failure fails the call.
-      const equipped = focusSlots.filter((slot) => itemsBySlot.has(slot));
+      const equipped = rows.filter((r) => itemsBySlot.has(r.slot) && !skipped.has(r.slot)).map((r) => r.slot);
       const probed = equipped.length > 0
         ? await this.probeUnlocked({ variants: equipped.map((slot) => ({ items: [{ slot, unequip: true as const }] })) })
         : { base: {}, results: [] };
       const out: UpgradeSuggestion[] = [];
-      for (const slot of focusSlots) {
+      for (const row of rows) {
+        const { slot } = row;
         const item = itemsBySlot.get(slot) ?? null;
+        const extra = {
+          kind: row.kind,
+          ...(row.parentSlot !== undefined ? { parentSlot: row.parentSlot } : {}),
+          ...(row.active !== undefined ? { active: row.active } : {}),
+        };
         if (!item) {
           out.push({
             slot,
+            ...extra,
             currentItem: null,
             currentItemName: null,
             empty: true,
@@ -2758,33 +2797,72 @@ export class BuildSession {
           });
           continue;
         }
+        const skip = skipped.get(slot);
+        if (skip !== undefined) {
+          // An inactive flask truly contributes nothing; an unmeasured jewel is unknown.
+          const inactive = row.kind === 'flask';
+          out.push({
+            slot,
+            ...extra,
+            currentItem: item,
+            currentItemName: item.name ?? item.baseName ?? null,
+            empty: false,
+            dpsContribution: inactive ? 0 : null,
+            ehpContribution: inactive ? 0 : null,
+            priority: null,
+            note: skip,
+          });
+          continue;
+        }
         const r = probed.results[equipped.indexOf(slot)];
         if (r.error !== undefined && !r.userError) throw new Error(`suggest_upgrades: ${slot}: ${r.error}`);
         const without = r.error === undefined ? withoutNulls(r.stats) : null;
         const dpsLoss = without ? toNumber(baseline.CombinedDPS) - toNumber(without.CombinedDPS) : 0;
         const ehpLoss = without ? toNumber(baseline.TotalEHP) - toNumber(without.TotalEHP) : 0;
+        // A flask adding nothing to DPS or EHP (recovery, movement speed, ...
+        // are part of neither) is listed but not ranked as a top upgrade.
+        const flaskWithoutEffect = without !== null && row.kind === 'flask' && Math.abs(dpsLoss) < 1e-6 && Math.abs(ehpLoss) < 1e-6;
         out.push({
           slot,
+          ...extra,
           currentItem: item,
           currentItemName: item.name ?? item.baseName ?? null,
           empty: false,
           dpsContribution: dpsLoss,
           ehpContribution: ehpLoss,
-          priority: without ? computeUpgradePriority(dpsLoss, ehpLoss, baseline) : 0,
+          priority: flaskWithoutEffect ? null : without ? computeUpgradePriority(dpsLoss, ehpLoss, baseline) : 0,
+          ...(flaskWithoutEffect ? {
+            note: `the ${row.tincture ? 'tincture' : 'flask'} adds nothing to DPS or EHP in Path of Building's calculations ` +
+              '(recovery and movement speed are part of neither), so it is not ranked',
+          } : {}),
           ...(r.error !== undefined ? { error: r.error } : {}),
         });
       }
 
+      // Measured slots first (empty ones first, then by priority), then the
+      // unranked ones (priority null), then the ones that failed (error).
+      const group = (s: UpgradeSuggestion): number => (s.error !== undefined ? 2 : s.priority === null ? 1 : 0);
       out.sort((a, b) => {
-        if ((a.error === undefined) !== (b.error === undefined)) return a.error === undefined ? -1 : 1;
+        if (group(a) !== group(b)) return group(a) - group(b);
         if (a.empty && !b.empty) return -1;
         if (!a.empty && b.empty) return 1;
         // Higher priority = the slot matters less relative to the build (upgrade it first).
-        return b.priority - a.priority;
+        return (b.priority ?? 0) - (a.priority ?? 0);
       });
 
-      // Suggested mods: PoB's weighted trade query for the highest-priority slots.
-      const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, focusSlots.length));
+      // Slots PoB's trade query generator cannot weigh get that as modsError
+      // and use none of the modSlots budget; unmeasured jewel sockets get no
+      // query either.
+      const byRow = new Map(rows.map((r) => [r.slot, r]));
+      const eligible: UpgradeSuggestion[] = [];
+      for (const s of out) {
+        if (s.error !== undefined) continue;
+        const why = modsUnsupported(byRow.get(s.slot)!, s.empty);
+        if (why !== undefined) s.modsError = why;
+        else if (!(s.priority === null && s.kind === 'treeJewel')) eligible.push(s);
+      }
+      // Suggested mods: PoB's weighted trade query for the highest-priority slots it supports.
+      const modSlots = targetSlot ? 1 : Math.max(0, Math.min(options.modSlots ?? DEFAULT_MOD_SLOTS, eligible.length));
       const modsPerSlot = options.modsPerSlot ?? DEFAULT_MODS_PER_SLOT;
       // A failure the engine reported for its query (a UserError or an
       // EngineCommandError: the engine answered in step) is recorded on its
@@ -2794,7 +2872,7 @@ export class BuildSession {
       // through any operation does, and a transport or protocol failure (a
       // stdin write error, a reply that is not JSON), after which the next
       // reply may not belong to the next query.
-      for (const s of out.filter((x) => x.error === undefined).slice(0, modSlots)) {
+      for (const s of eligible.slice(0, modSlots)) {
         try {
           const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
           const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
@@ -3101,6 +3179,8 @@ export interface ComparisonResult {
   flaskSlotActive?: boolean;
   /** Flask slots: the candidates were evaluated with the (inactive) slot turned on (compare_items `activate`). */
   activated?: boolean;
+  /** A weapon slot (or abyssal socket on one) of the weapon set the build does not use: PoB ignores an item there. */
+  note?: string;
   candidates: ComparisonCandidate[];
   bestForDPS: number | null;
   bestForEHP: number | null;
@@ -3618,17 +3698,38 @@ export interface DiagnosticCheck {
   suggestion: string;
 }
 
+/** One row of the bridge's `upgradeSlots`: an item slot PoB's calculations use. */
+export interface UpgradeSlot {
+  slot: string;
+  kind: 'gear' | 'flask' | 'treeJewel' | 'abyssal' | 'treeGated';
+  occupied: boolean;
+  /** Abyssal sockets: the slot of the item that has the socket. */
+  parentSlot?: string;
+  /** Flask slots: whether the slot is active. */
+  active?: boolean;
+  /** Flask slots holding a tincture. */
+  tincture?: true;
+}
+
 export interface UpgradeSuggestion {
   slot: string;
+  kind: UpgradeSlot['kind'];
+  parentSlot?: string;
+  /** Flask slots: whether the slot is active (an inactive one is not measured or ranked). */
+  active?: boolean;
   currentItem: EquippedItem | null;
   currentItemName: string | null;
   empty: boolean;
-  dpsContribution: number;
-  ehpContribution: number;
-  priority: number;
+  /** null: not measured (see note). */
+  dpsContribution: number | null;
+  ehpContribution: number | null;
+  /** 0-100, higher = upgrade first; null for a slot that is not ranked (an inactive flask slot, a flask adding nothing to DPS or EHP, an unmeasured jewel socket; see note). */
+  priority: number | null;
+  /** Why the slot is not ranked (an inactive flask slot, a flask adding nothing to DPS or EHP, an unmeasured jewel socket). */
+  note?: string;
   /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
   suggestedMods?: SuggestedMod[];
-  /** PoB's trade query generator could not weigh mods for the slot (a refusal, or a failure of the generator). */
+  /** PoB's trade query generator could not weigh mods for the slot (a slot or item it does not support, a refusal, or a failure of the generator). */
   modsError?: string;
   /** The slot could not be measured (refused as input); its contributions are 0. */
   error?: string;
@@ -3637,6 +3738,18 @@ export interface UpgradeSuggestion {
 /** Slots that get suggested mods by default (PoB's trade query takes ~0.4-1 s a slot). */
 export const DEFAULT_MOD_SLOTS = 3;
 export const DEFAULT_MODS_PER_SLOT = 6;
+/** Passive-tree jewel sockets suggest_upgrades measures per call (each is a probe fallback, ~0.3-0.5 s). */
+export const MAX_SUGGEST_TREE_JEWELS = 16;
+
+/** Why PoB's trade query generator gives a suggest_upgrades slot no suggested mods, or undefined when it can. */
+function modsUnsupported(row: UpgradeSlot, empty: boolean): string | undefined {
+  if (row.kind === 'treeGated') return 'Path of Building\'s trade query generator does not support this slot';
+  if (row.kind === 'flask' && row.tincture) return 'Path of Building\'s trade query generator has no tincture category';
+  if (row.kind === 'flask' && empty) {
+    return 'Empty flask slot: generate_trade_search with flaskType weighs mods for the kind of flask you want';
+  }
+  return undefined;
+}
 
 function computeUpgradePriority(dpsLoss: number, ehpLoss: number, baseline: Stats): number {
   const dpsBase = toNumber(baseline.CombinedDPS) || 1;

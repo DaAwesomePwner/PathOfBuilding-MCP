@@ -6,6 +6,7 @@ import {
   BuildSession,
   ComparisonResult,
   DEFAULT_MOD_SLOTS,
+  MAX_SUGGEST_TREE_JEWELS,
   computeDiff,
   EquippedItem,
   ItemModLine,
@@ -348,6 +349,7 @@ function summarizeComparison(result: ComparisonResult): unknown {
       ...(result.flaskSlotActive !== undefined ? { slotActive: result.flaskSlotActive } : {}),
     },
     ...(result.activated ? { activated: true, note: 'The slot is inactive in the build; the candidates were evaluated with it active (the baseline is the build as it is).' } : {}),
+    ...(result.note !== undefined ? { note: result.note } : {}),
     candidates: result.candidates.map((c) => ({
       index: c.index,
       error: c.error,
@@ -1054,27 +1056,30 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   'suggest_upgrades',
   {
     description:
-      "Rank equipment slots by upgrade priority. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
-      `The first modSlots slots (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods Path of Building's own weighted trade query generator weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
-      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (highest priority first; empty slots come first): slot, currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), suggestedMods / modsError; ' +
+      "Rank item slots by upgrade priority: gear of the weapon set in use (Ring 3 while Path of Building shows it), flask slots, allocated passive-tree jewel sockets, abyssal sockets the item in their slot has, and the tree-gated slots (Wickerman, grafts) while shown. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
+      `An inactive flask slot, or a flask that adds nothing to DPS or EHP (recovery and movement speed are part of neither), is listed unranked (priority null, with a note); at most ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured per call (each takes a full recalculation, ~0.3-0.5 s), the others are listed unmeasured (priority and contributions null, with a note). ` +
+      `The first modSlots slots Path of Building's trade query generator supports (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods it weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
+      'Slots it does not support (Wickerman, grafts, tinctures, empty flask slots) get a modsError instead. ' +
+      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (ranked slots first, highest priority first, empty slots before equipped ones; then unranked slots; then errors): slot, kind (gear / flask / treeJewel / abyssal / treeGated), parentSlot (abyssal), active (flask), currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), note, suggestedMods / modsError; ' +
       'list_equipped_items / get_item_in_slot give the items themselves, generate_trade_search the full weighted search, stat_weights the worth of any mod line.',
     inputSchema: {
-      slot: z.string().optional().describe('Focus on a specific slot (e.g. "Body Armour"). Omit for all slots.'),
+      slot: z.string().optional().describe('Focus on one slot (e.g. "Body Armour", "Flask 2", "Jewel 26725", "Belt Abyssal Socket 1"). Omit for all slots.'),
       modSlots: z.number().int().min(0).max(10).optional()
-        .describe(`How many of the highest-priority slots get suggestedMods (default ${DEFAULT_MOD_SLOTS}, 0 for none, 10 for all; each takes about 0.5-1 s).`),
+        .describe(`How many of the highest-priority supported slots get suggestedMods (default ${DEFAULT_MOD_SLOTS}, 0 for none, at most 10; each takes about 0.5-1 s).`),
     },
   },
   async ({ slot, modSlots }, session) => {
     const suggestions = await session.suggestUpgrades(slot, { modSlots });
-    const tried = suggestions.filter((s) => s.suggestedMods !== undefined || s.modsError !== undefined).length;
+    const tried = suggestions.filter((s) => s.suggestedMods !== undefined).length +
+      suggestions.filter((s) => s.modsError !== undefined && s.error === undefined).length;
     const measured = suggestions.filter((s) => s.error === undefined).length;
     let modsNote: string | undefined;
     if (measured < suggestions.length) {
       modsNote = 'slots that could not be measured (error) get no suggestedMods';
     }
     if (tried < measured) {
-      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for the first ${tried} measured slot(s) only; ` +
-        'pass slot, or a larger modSlots, for the others';
+      modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for the first ` +
+        `${suggestions.filter((s) => s.suggestedMods !== undefined).length} supported slot(s) only; pass slot, or a larger modSlots, for the others`;
     }
     return {
       suggestions: suggestions.map(({ currentItem: _item, ...rest }) => rest),

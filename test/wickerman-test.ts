@@ -189,9 +189,17 @@ async function main(): Promise<void> {
     await session.swapItemWithDiff('Graft 1', GRAFT);
     const graft327 = (await session.listEquippedItems()).find((i) => i.slot === 'Graft 1');
     assert(graft327 && graft327.baseName === 'Battering Uulgraft' && !graft327.hidden, `Graft 1 on 3_27: ${JSON.stringify(graft327)}`);
+    // suggest_upgrades lists shown grafts (measured), with no trade-generator mods.
+    const up327 = await session.suggestUpgrades(undefined, { modSlots: 0 });
+    const g1 = up327.find((s) => s.slot === 'Graft 1');
+    const g2 = up327.find((s) => s.slot === 'Graft 2');
+    assert(g1?.kind === 'treeGated' && !g1.empty && typeof g1.priority === 'number' && /does not support this slot/.test(g1.modsError ?? '')
+      && g2?.empty === true, `suggest_upgrades grafts on 3_27: ${JSON.stringify([g1 && { ...g1, currentItem: undefined }, g2])}`);
+    assert(!up327.some((s) => WICKERMAN.includes(s.slot)), 'no hidden Wickerman slots in suggest_upgrades on 3_27');
     const xml326 = (await session.exportBuild('xml')).replace(/treeVersion="3_27"/g, 'treeVersion="3_26"');
     await session.loadBuild(xml326);
     assert(!(await session.getValidSlots()).some((s) => s.slot === 'Graft 1'), 'Graft 1 not listed on 3_26');
+    assert(!(await session.suggestUpgrades(undefined, { modSlots: 0 })).some((s) => /^Graft/.test(s.slot)), 'hidden grafts left out of suggest_upgrades');
     const graft326 = (await session.listEquippedItems()).find((i) => i.slot === 'Graft 1');
     assert(graft326 && graft326.hidden === true && /3\.27/.test(graft326.note ?? '') && /ignores/.test(graft326.note ?? ''),
       `hidden graft on 3_26: ${JSON.stringify({ hidden: graft326?.hidden, note: graft326?.note })}`);
@@ -235,7 +243,12 @@ async function main(): Promise<void> {
     await session.swapItemWithDiff('Arm', VISCERA_ARM);
     const cmp = await session.compareItems('Arm', [VISCERA_ARM, VISCERA_HEAD]);
     assert(cmp.candidates[0].error === null && cmp.candidates[1].error !== null, `compare: ${JSON.stringify(cmp.candidates.map((c) => c.error))}`);
-    log('PASS: listed, Viscera equipped from game text, stats recomputed, wrong slot refused');
+    const up330 = await session.suggestUpgrades(undefined, { modSlots: 0 });
+    const headRow = up330.find((s) => s.slot === 'Head');
+    assert(WICKERMAN.every((w) => up330.find((s) => s.slot === w)?.kind === 'treeGated') && headRow && !headRow.empty
+      && typeof headRow.priority === 'number' && /does not support this slot/.test(headRow.modsError ?? ''),
+    `suggest_upgrades Wickerman rows on 3.30: ${JSON.stringify(headRow && { ...headRow, currentItem: undefined })}`);
+    log('PASS: listed, Viscera equipped from game text, stats recomputed, wrong slot refused, suggest_upgrades rows');
 
     log('Test 3b: export round-trip and undo');
     const statsEquipped = await session.getStats();

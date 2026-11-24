@@ -7,7 +7,7 @@ import { z } from 'zod';
 import type { ToolRegistrar } from './tool-registry.js';
 import { tradeQueryCommand } from './trade-search-command.js';
 import { buildTradeSearch } from './trade-search-response.js';
-import { JEWEL_TYPE_TEXT, JEWEL_TYPES, tradeSearchSchema, type TradeSearchArgs } from './trade-search-schema.js';
+import { FLASK_TYPE_TEXT, FLASK_TYPES, JEWEL_TYPE_TEXT, JEWEL_TYPES, tradeSearchSchema, type TradeSearchArgs } from './trade-search-schema.js';
 
 export type { TradeModsResult, TradeQueryRaw, TradeSearchArgs } from './trade-search-schema.js';
 
@@ -20,6 +20,8 @@ export function registerTradeTools(tools: ToolRegistrar): void {
         'trade query generator (each mod is simulated on the build to get its weight). Returns a ready-to-open URL sorted by weighted sum ' +
         '(highest first) plus the filters and weights so you can adjust them (weightAdjustments, requiredMods, minWeightedSum) and call again. ' +
         'Jewel sockets search jewels of `jewelType` (tree sockets; abyssal sockets search abyss jewels); an unallocated tree socket is refused (its weights would all be 0: allocate it first with allocate_nodes). ' +
+        'Flask slots search flasks of `flaskType` (default: the equipped flask\'s kind; required for an empty slot); an inactive flask slot is evaluated active for the call (evaluatedActive: true; the build is unchanged); tinctures are refused (no tincture category in PoB\'s generator). ' +
+        'A weapon slot of the weapon set the build does not use (e.g. "Weapon 1 Swap" while the first set is in use), or an abyssal socket on one, is refused: PoB ignores it, so every weight would be 0. ' +
         'Read-only: the build is unchanged. Takes a few seconds (longer on heavy builds). No network access.',
       inputSchema: tradeSearchSchema,
     },
@@ -29,7 +31,10 @@ export function registerTradeTools(tools: ToolRegistrar): void {
     },
   );
 
-  tools.engine<{ slot: string; query: string; limit?: number; jewelType?: (typeof JEWEL_TYPES)[number] }>(
+  tools.engine<{
+    slot: string; query: string; limit?: number;
+    jewelType?: (typeof JEWEL_TYPES)[number]; flaskType?: (typeof FLASK_TYPES)[number];
+  }>(
     'search_trade_mods',
     {
       description:
@@ -43,10 +48,11 @@ export function registerTradeTools(tools: ToolRegistrar): void {
         query: z.string().trim().min(1).max(100).describe('Text to look for, e.g. "life" or "fire resistance".'),
         limit: z.number().int().min(1).max(100).optional().describe('Maximum results (default 25).'),
         jewelType: z.enum(JEWEL_TYPES).optional().describe(`${JEWEL_TYPE_TEXT} Lists the mods of that jewel type, as generate_trade_search weighs them.`),
+        flaskType: z.enum(FLASK_TYPES).optional().describe(`${FLASK_TYPE_TEXT} Every kind lists the same flask mods; an empty flask slot needs none here.`),
       },
     },
-    async ({ slot, query, limit, jewelType }, session) => {
-      const result = await session.searchTradeMods(slot, query, limit ?? 25, jewelType);
+    async ({ slot, query, limit, jewelType, flaskType }, session) => {
+      const result = await session.searchTradeMods(slot, query, limit ?? 25, jewelType, flaskType);
       return { slot, query, ...result, returned: result.mods.length };
     },
   );

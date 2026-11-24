@@ -56,6 +56,8 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
     slot: args.slot,
     // The bridge checks it against the slot (tree socket / abyssal socket / other) and picks the default.
     ...(args.jewelType !== undefined ? { jewelType: args.jewelType } : {}),
+    // The bridge checks it against the slot (flask slots only) and the item there.
+    ...(args.flaskType !== undefined ? { flaskType: args.flaskType } : {}),
     statWeights: weights,
     tradeIds: [...(args.requiredMods ?? []), ...(args.weightAdjustments ?? [])].map((m) => m.tradeId),
     // The bridge refuses weights on stats PoB leaves out of the weights; weight 0 adds no filter, so it is a no-op there.

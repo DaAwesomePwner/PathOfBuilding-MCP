@@ -1095,6 +1095,92 @@ function slotChecks.inactiveFlaskText(slotName, remedy)
 		.. "and charges-related stats stay off) and the comparison would show next to no difference. %s", slotName, remedy)
 end
 
+-- The weapon set (1 or 2) of a weapon slot, or of an abyssal socket on one,
+-- when the build does not use that set, else nil. PoB's CalcSetup skips
+-- such a slot: an item there counts for nothing.
+function slotChecks.inactiveWeaponSet(slot)
+	local set = slot.weaponSet or (slot.parentSlot and slot.parentSlot.weaponSet)
+	local itemSet = build.itemsTab.activeItemSet
+	if set and set ~= ((itemSet and itemSet.useSecondWeaponSet) and 2 or 1) then return set end
+	return nil
+end
+
+function slotChecks.inactiveWeaponSetText(slotName, set)
+	return string.format("%s belongs to weapon set %d, which the build does not use (it uses weapon set %d), so Path of "
+		.. "Building ignores an item there", slotName, set, set == 1 and 2 or 1)
+end
+
+-- Flask slots in trade searches. PoB's TradeHelpers maps every flask slot to
+-- the "flask" trade category and the generator's "Flask" mod list, which
+-- holds every flask mod (its LifeFlask / ManaFlask lists hold a handful of
+-- other mods), so every flask kind is weighed from that list; the kind only
+-- decides the flask the mods are tried on. PoB has no tincture category.
+slotChecks.FLASK_SUBTYPES = { life = "Life", mana = "Mana", hybrid = "Hybrid", utility = "Utility" }
+-- The flask a search of that kind tries mods on when the slot holds no flask
+-- of that kind (the highest-level base of the kind when one is missing).
+slotChecks.FLASK_STAND_INS = { life = "Divine Life Flask", mana = "Divine Mana Flask",
+	hybrid = "Hallowed Hybrid Flask", utility = "Quicksilver Flask" }
+
+-- "life" / "mana" / "hybrid" / "utility" for a flask, "tincture", else nil.
+function slotChecks.flaskKind(item)
+	if not item then return nil end
+	local base = item.base or { }
+	local itemType = item.type or base.type
+	if itemType == "Tincture" then return "tincture" end
+	if itemType ~= "Flask" then return nil end
+	for kind, subType in pairs(slotChecks.FLASK_SUBTYPES) do
+		if base.subType == subType then return kind end
+	end
+	local flask = base.flask or { }
+	if flask.life and flask.mana then return "hybrid" end
+	return flask.life and "life" or flask.mana and "mana" or "utility"
+end
+
+-- The one refusal of tinctures in trade searches (lift it here once PoB's
+-- generator has a tincture category).
+function slotChecks.tinctureTradeRefusal(slotName, why)
+	userError("Cannot build a trade search for " .. tostring(slotName) .. ": " .. why .. ", and Path of Building's trade "
+		.. "query generator has no tincture category (it would weigh flask mods). Pass flaskType \"life\", \"mana\", "
+		.. "\"hybrid\" or \"utility\" to search flasks for the slot instead")
+end
+
+-- A trade search into flask slot `slot` holding `item`: the flask kind
+-- searched (`flaskType`, else the equipped flask's) and, when the slot holds
+-- no flask of that kind, the base to try the mods on instead. With
+-- `forMods` (search_trade_mods: the mod list is the same for every kind) an
+-- empty slot needs no flaskType (nil, nil).
+function slotChecks.tradeFlask(slot, item, flaskType, forMods)
+	if flaskType ~= nil and flaskType ~= "tincture" and not slotChecks.FLASK_SUBTYPES[flaskType] then
+		userError("flaskType must be \"life\", \"mana\", \"hybrid\" or \"utility\"")
+	end
+	if flaskType == "tincture" then slotChecks.tinctureTradeRefusal(slot.slotName, "flaskType \"tincture\" was asked for") end
+	local current = slotChecks.flaskKind(item)
+	if flaskType == nil and current == "tincture" then
+		slotChecks.tinctureTradeRefusal(slot.slotName, "the slot holds a tincture")
+	end
+	local kind = flaskType or current
+	if kind == nil then
+		if forMods then return nil, nil end
+		userError("Cannot build a trade search for " .. slot.slotName .. ": the slot is empty, so pass flaskType "
+			.. "(\"life\", \"mana\", \"hybrid\" or \"utility\") to say which flask to search for")
+	end
+	if kind == current then return kind, nil end
+	local baseName = slotChecks.FLASK_STAND_INS[kind]
+	if not data.itemBases[baseName] then
+		baseName = nil
+		local best = -1
+		for name, base in pairs(data.itemBases) do
+			local level = base.req and base.req.level or 0
+			if base.type == "Flask" and base.subType == slotChecks.FLASK_SUBTYPES[kind] and not base.hidden
+				and (level > best or (level == best and name < baseName)) then
+				baseName, best = name, level
+			end
+		end
+		if not baseName then error("Path of Building has no " .. kind .. " flask base", 0) end
+	end
+	return kind, baseName
+end
+
 -- PoB 2.68 split object construction into `new("X"):X(args)` and rejects
 -- `new("X", args)`; older PoB only has the latter. Detected once by asking `new`
 -- about a class that does not exist: only the new `new` complains about the
@@ -4405,12 +4491,30 @@ end
 -- options.jewelType). `jewelType` ("base" / "abyss" / "any" or nil) applies
 -- to passive-tree sockets (default: "abyss" when an abyss jewel is socketed
 -- there, else "base"); abyssal sockets take only "abyss"; other slots none.
-local function tradeSlotOrError(slotName, helpers, jewelType)
+-- `flaskType` applies to flask slots only (slotChecks.tradeFlask; its result
+-- is returned last as { kind, standIn }). A weapon slot of the weapon set
+-- the build does not use, or an abyssal socket on one, is refused (PoB weighs
+-- every mod there at 0), except with `forMods` (search_trade_mods lists mods).
+local function tradeSlotOrError(slotName, helpers, jewelType, flaskType, forMods)
 	local slot = type(slotName) == "string" and build.itemsTab.slots[slotName] or nil
 	local index, count, parent = nil, 0, nil
 	if slot then index, count, parent = slotChecks.abyssalSocket(slot) end
 	local item = slot and build.itemsTab.items[slot.selItemId or 0]
 	local what = "Cannot build a trade search for " .. tostring(slotName) .. ": "
+	if flaskType ~= nil and not (slot and slotChecks.isFlaskSlot(slot)) then
+		userError("flaskType only applies to flask slots (Flask 1 to Flask 5), not " .. tostring(slotName))
+	end
+	local weaponSet = slot and not forMods and slotChecks.inactiveWeaponSet(slot)
+	if weaponSet then
+		userError(what .. slotChecks.inactiveWeaponSetText(slotName, weaponSet) .. " and weighs every mod at 0. "
+			.. "Search the slot of the weapon set in use instead")
+	end
+	if slot and slotChecks.isFlaskSlot(slot) then
+		if jewelType ~= nil then userError("jewelType only applies to jewel sockets, not " .. slotName) end
+		local kind, standIn = slotChecks.tradeFlask(slot, item, flaskType, forMods)
+		local queryStr, category = helpers.getTradeCategory(slotName, item)
+		return slot, queryStr, category, nil, { kind = kind, standIn = standIn }
+	end
 	if slot and slot.nodeId then
 		local nodeId = slotChecks.unallocatedSocket(slot)
 		if nodeId then
@@ -4505,6 +4609,13 @@ end
 -- its WeightedRatioOutputs call; from the start when that is missing) and
 -- removed as soon as the local is set.
 local tradeCompat = { }
+function tradeCompat.fingerprintDiff(a, b)
+	for i = 1, math.max(#a, #b) do
+		if a[i] ~= b[i] then return tostring(a[i]) .. " -> " .. tostring(b[i]) end
+	end
+	return nil
+end
+
 function tradeCompat.liftFilterCap(finishQuery)
 	local maxIdx, maxOrig = findUpvalue(finishQuery, "MAX_FILTERS")
 	if maxIdx then
@@ -4574,7 +4685,7 @@ end
 
 local function runTradeQuery(cmd)
 	local st = tradeStateOrError()
-	local slot, queryStr, category, jewelType = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType)
+	local slot, queryStr, category, jewelType, flask = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType, cmd.flaskType)
 	local statWeights = tradeStatWeights(cmd.statWeights)
 	local idTexts = tradeIdTexts(st, cmd.tradeIds)
 	-- A weight on a stat PoB leaves out of the weights would count it twice
@@ -4593,6 +4704,19 @@ local function runTradeQuery(cmd)
 	for i, t in ipairs(TRADE_TYPES) do if t == o.tradeType then tradeTypeIndex = i end end
 	if not tradeTypeIndex then userError("Unknown tradeType '" .. tostring(o.tradeType) .. "'") end
 	local item = build.itemsTab.items[slot.selItemId]
+	local committedItem = item
+	-- A flask search for a kind the slot does not hold tries the mods on a
+	-- blank flask of that kind: the generator reads the slot's item through
+	-- itemsTab.items[slot.selItemId], so it gets read-only views holding the
+	-- stand-in (nothing is added to the build).
+	local querySlot, queryItemsTab = slot, build.itemsTab
+	if flask and flask.standIn then
+		item = construct("Item", "Rarity: RARE\nStat Tester\n" .. flask.standIn)
+		local standInId = -1
+		querySlot = setmetatable({ selItemId = standInId }, { __index = slot })
+		queryItemsTab = setmetatable({ items = setmetatable({ [standInId] = item }, { __index = build.itemsTab.items }) },
+			{ __index = build.itemsTab })
+	end
 	local influences = o.influences or { }
 	local options = {
 		statWeights = statWeights,
@@ -4618,8 +4742,8 @@ local function runTradeQuery(cmd)
 	if slot.slotName == "Amulet" then options.includeTalisman = o.includeTalisman == true end
 
 	local gen = st.gen
-	gen.itemsTab = build.itemsTab
-	gen.queryTab = { itemsTab = build.itemsTab }
+	gen.itemsTab = queryItemsTab
+	gen.queryTab = { itemsTab = queryItemsTab }
 	gen.lastMaxPrice, gen.lastMaxPriceTypeIndex, gen.lastMaxLevel = nil, nil, nil
 	gen.tradeTypeIndex = tradeTypeIndex
 	gen.calcContext = { }
@@ -4641,9 +4765,27 @@ local function runTradeQuery(cmd)
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
 	local capLifted = false
+	-- An inactive flask slot counts for nothing in PoB's calculations (every
+	-- weight would be 0): it is evaluated active for the call (with a
+	-- calculator built for that state, as PoB builds one after every full
+	-- recalculation, so the base output includes the flask), then its exact
+	-- flags, the committed calculator and the calculator cache are put back
+	-- and the committed state is checked by value.
+	local activated, unactivate, fpBefore, savedCache = false, nil, nil, nil
+	local savedMisc = build.calcsTab.miscCalculator
+	if flask and not slot.active then
+		fpBefore = tradeCompat.fingerprint()
+		local cache = GlobalCache.cachedData.CALCULATOR
+		savedCache = { }
+		for k, v in pairs(cache) do savedCache[k] = v end
+		local entry = build.itemsTab.activeItemSet[slot.slotName]
+		unactivate = slotChecks.setFlaskFlags(slot, true, entry and entry.active)
+		activated = true
+	end
 	local started = os.clock()
 	local ok, err = pcall(function()
-		gen:StartQuery(slot, options)
+		if activated then build.calcsTab.miscCalculator = { build.calcsTab.calcs.getMiscCalculator(build) } end
+		gen:StartQuery(querySlot, options)
 		local co = gen.calcContext.co
 		if not co then
 			userError("Path of Building cannot build a weighted trade search for the item in " .. slot.slotName)
@@ -4664,6 +4806,20 @@ local function runTradeQuery(cmd)
 	main.OpenPopup, main.ClosePopup = openOrig, closeOrig
 	gen.calcContext = { }
 	gen.requesterCallback = nil
+	gen.itemsTab, gen.queryTab = build.itemsTab, { itemsTab = build.itemsTab }
+	if activated then
+		unactivate()
+		build.calcsTab.miscCalculator = savedMisc
+		local cache = GlobalCache.cachedData.CALCULATOR
+		wipeTable(cache)
+		for k, v in pairs(savedCache) do cache[k] = v end
+		local diff = tradeCompat.fingerprintDiff(fpBefore, tradeCompat.fingerprint())
+		if diff then
+			error("the trade search left the build different from the committed one (" .. diff .. ")"
+				.. (ok and "" or ("; the search itself failed: " .. tostring(err):gsub("^" .. USER_ERROR_PREFIX, "")))
+				.. "; call reset_build", 0)
+		end
+	end
 	if not ok then error(err, 0) end
 	if captured then captured.json = tradeCompat.normaliseQuery(captured.json, influenceIds) end
 	if not captured or type(captured.json) ~= "string" then
@@ -4682,7 +4838,10 @@ local function runTradeQuery(cmd)
 		capLifted = capLifted,
 		itemCategory = category or dkjson.null,
 		categoryQuery = queryStr or dkjson.null,
-		currentItem = item and (item.title or item.name) or dkjson.null,
+		currentItem = committedItem and (committedItem.title or committedItem.name) or dkjson.null,
+		flaskType = flask and flask.kind or nil,
+		testBase = flask and flask.standIn or nil,
+		evaluatedActive = activated or nil,
 		statWeights = used,
 		texts = idTexts,
 		pseudoMap = (function()
@@ -4700,7 +4859,7 @@ end
 local function searchTradeMods(cmd)
 	local st = tradeStateOrError()
 	-- The category as PoB's popup lists mods (jewel sockets: by jewel type).
-	local _, _, category = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType)
+	local _, _, category = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType, cmd.flaskType, true)
 	local needle = tostring(cmd.query or ""):lower()
 	local found, seen = { }, { }
 	local preferredPseudo = { }
@@ -4976,6 +5135,46 @@ local DISPATCH = {
 	getValidSlots = {
 		handler = function(_cmd) return { slots = getValidSlots() } end,
 	},
+	-- suggest_upgrades: every item slot PoB's calculations use, in PoB's slot
+	-- order: gear of the weapon set in use (`Ring 3` only while PoB shows
+	-- it), flask slots (`active`; `tincture` when one is there), allocated
+	-- passive-tree jewel sockets, abyssal sockets the parent's item has (of
+	-- the weapon set in use), tree-gated slots while PoB shows them. Each row:
+	-- slot, kind (gear / flask / treeJewel / abyssal / treeGated), occupied.
+	upgradeSlots = {
+		handler = function(_cmd)
+			local tab = build.itemsTab
+			local out = { }
+			for _, slot in ipairs(tab and tab.orderedSlots or { }) do
+				local name = slot.slotName
+				if name and not slotChecks.inactiveWeaponSet(slot) and not slotChecks.hiddenReason(slot) then
+					local item = tab.items[slot.selItemId or 0]
+					local index, count, parent = slotChecks.abyssalSocket(slot)
+					local row = nil
+					if slot.nodeId then
+						if not slotChecks.unallocatedSocket(slot) then row = { kind = "treeJewel" } end
+					elseif parent then
+						if index <= count then row = { kind = "abyssal", parentSlot = parent.slotName } end
+					elseif slotChecks.isFlaskSlot(slot) then
+						row = { kind = "flask", active = slot.active == true,
+							tincture = slotChecks.flaskKind(item) == "tincture" or nil }
+					elseif slotChecks.treeGated[name] then
+						row = { kind = "treeGated" }
+					elseif name == "Ring 3" then
+						local okShown, shown = pcall(function() return slot.shown == nil or slot:shown() end)
+						if okShown and shown then row = { kind = "gear" } end
+					else
+						row = { kind = "gear" }
+					end
+					if row then
+						row.slot, row.occupied = name, item ~= nil
+						out[#out + 1] = row
+					end
+				end
+			end
+			return { slots = out }
+		end,
+	},
 	equipItem = {
 		handler = function(cmd)
 			equipItemInSlot(cmd.slot, cmd.itemText or "")
@@ -5023,6 +5222,13 @@ local DISPATCH = {
 					.. "active, or turn the slot on first with set_flask_active"))
 			end
 			if isFlask then return { flaskActive = slot.active == true } end
+			-- Not refused (the comparison is still what PoB computes), but
+			-- an item there counts for nothing: compare_items says so.
+			local weaponSet = cmd.whatIf and slotChecks.inactiveWeaponSet(slot)
+			if weaponSet then
+				return { note = slotChecks.inactiveWeaponSetText(cmd.slot, weaponSet)
+					.. ": the candidates show no difference until the build uses that weapon set" }
+			end
 			return { }
 		end,
 	},
@@ -5469,6 +5675,8 @@ do
 			return res
 		end,
 	}
+	-- The committed state by value, for the trade search's flask activation.
+	tradeCompat.fingerprint = function() return probe.probe({ fingerprint = true }).fingerprint end
 	DISPATCH.probeCommit = { handler = function(cmd) return probe.probeCommit(cmd) end }
 	-- apply_changes: one probe variant applied for real and kept.
 	DISPATCH.applyChanges = { handler = function(cmd) return probe.applyChanges(cmd) end }

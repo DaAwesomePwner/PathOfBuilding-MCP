@@ -32,6 +32,13 @@ export function buildTradeSearch(args: TradeSearchArgs, raw: TradeQueryRaw): Rec
     slot: args.slot,
     itemCategory: raw.itemCategory,
     currentItem: raw.currentItem,
+    ...(raw.flaskType !== undefined ? { flaskType: raw.flaskType } : {}),
+    ...(raw.testBase !== undefined ? { testBase: raw.testBase } : {}),
+    ...(raw.evaluatedActive ? {
+      evaluatedActive: true,
+      activeNote: 'The flask slot is inactive in the build (Path of Building would weigh every mod at 0 there), so the weights were ' +
+        'computed with it active; the build is unchanged. set_flask_active turns it on.',
+    } : {}),
     statWeights: raw.statWeights,
     minWeightedSum,
     pobDefaultMinWeightedSum: round(pobDefaultMin, 6),

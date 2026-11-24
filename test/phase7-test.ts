@@ -56,7 +56,9 @@ interface UpgradeResp {
     empty: boolean;
     dpsContribution: number;
     ehpContribution: number;
-    priority: number;
+    priority: number | null;
+    note?: string;
+    kind?: string;
     suggestedMods?: Array<{ mod: string; weight: number }>;
     modsError?: string;
     currentItemName: string | null;
@@ -137,7 +139,7 @@ async function main(): Promise<void> {
     assert(sugAll.suggestions.some((s) => s.dpsContribution > 0), 'no slot contributes DPS');
     for (const s of sugAll.suggestions) {
       assert(typeof s.slot === 'string', 'slot string');
-      assert(typeof s.priority === 'number', 'priority number');
+      assert(typeof s.priority === 'number' || (s.priority === null && typeof s.note === 'string'), 'priority number, or null with a note');
       if (s.suggestedMods !== undefined) {
         assert(s.suggestedMods.every((m) => typeof m.mod === 'string' && typeof m.weight === 'number' && m.weight > 0), 'suggestedMods are {mod, weight}');
       }
@@ -146,9 +148,10 @@ async function main(): Promise<void> {
     assert(withMods.length === 3 && withMods.every((s, i) => s === sugAll.suggestions[i]), 'the 3 highest-priority slots get PoB-weighted mods');
     assert(typeof sugAll.modsNote === 'string', 'modsNote names the slots without suggested mods');
     log(`  suggested mods for ${withMods.map((s) => s.slot).join(', ')}`);
-    const sugRanked = sugAll.suggestions.filter((s) => !s.empty);
+    const sugRanked = sugAll.suggestions.filter((s) => !s.empty && s.priority !== null);
+    assert(['gear', 'flask', 'treeJewel'].every((k) => sugAll.suggestions.some((s) => s.kind === k)), 'gear, flask and tree jewel slots are listed');
     for (let i = 1; i < sugRanked.length; i++) {
-      assert(sugRanked[i - 1].priority >= sugRanked[i].priority, 'suggest_upgrades is not sorted by priority (highest first)');
+      assert(sugRanked[i - 1].priority! >= sugRanked[i].priority!, 'suggest_upgrades is not sorted by priority (highest first)');
     }
     const afterSug = await getKeyStats(client);
     assert(approxEq(afterSug.Life, baseline.Life), 'Life restored after suggest_upgrades');
