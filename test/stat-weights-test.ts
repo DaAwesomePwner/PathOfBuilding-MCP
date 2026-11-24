@@ -140,14 +140,18 @@ async function test9SlotKinds(session: BuildSession, state: () => Promise<string
   await session.undoLastChange();
   await session.undoLastChange();
 
-  // Tinctures and empty flask slots get a modsError (and use none of the modSlots budget).
+  // Empty flask slots get a modsError (and use none of the modSlots budget); tinctures are weighed from PoB's tincture mods.
   const tincture = await session.readItemData<{ text: string }>({ cmd: 'itemText', base: 'Oakbranch Tincture' });
   await session.swapItemWithDiff('Flask 4', tincture.text);
   await session.unequipItemWithDiff('Flask 5');
   const odd = await session.suggestUpgrades(undefined, { modSlots: 3 });
   const tin = odd.find((r) => r.slot === 'Flask 4')!;
   const empty = odd.find((r) => r.slot === 'Flask 5')!;
-  assert(tin.suggestedMods === undefined && /no tincture category/.test(tin.modsError ?? ''), `tincture: ${JSON.stringify({ ...tin, currentItem: undefined })}`);
+  assert(tin.modsError === undefined, `tincture: ${JSON.stringify({ ...tin, currentItem: undefined })}`);
+  // Asked for: queried (this spell build gains nothing from Oakbranch's melee mods, so the list may be empty).
+  const tinOne = (await session.suggestUpgrades('Flask 4'))[0];
+  assert(tinOne.modsError === undefined && tinOne.modsQueried === true && Array.isArray(tinOne.suggestedMods),
+    `slot Flask 4 (tincture) is queried: ${JSON.stringify({ ...tinOne, currentItem: undefined })}`);
   assert(empty.empty && empty.kind === 'flask' && empty.suggestedMods === undefined && /Empty flask slot: generate_trade_search with flaskType/.test(empty.modsError ?? ''),
     `empty flask slot: ${JSON.stringify(empty)}`);
   assert(odd.filter((r) => (r.suggestedMods?.length ?? 0) > 0).length === 3, 'unsupported slots use none of the 3 mod slots');

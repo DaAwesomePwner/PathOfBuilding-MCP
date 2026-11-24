@@ -119,6 +119,12 @@ A call that was running when the engine stopped fails with *"The Path of Buildin
 
 Not covered: essences, eldritch implicits (pass them as `implicits` lines), fossils, harvest and veiled mods.
 
+## "Cannot build a trade search for Graft 1: the slot is empty" / "… Viscera parts have fixed implicits and no affixes"
+
+**Cause:** Path of Building's trade data has no graft or Viscera category. A graft search weighs the graft mods that can roll on the base of the graft in the slot (the base decides its skill and its mods) and filters the search by that base type, so it needs a graft there; `sockets`, `links` and `influences` do not apply to grafts. Viscera parts (Wickerman slots) have fixed implicits and no mods, so there is nothing to weigh: `generate_trade_search` on `Head`/`Body`/`Arm`/`Leg` ranks the Viscera parts that fit the slot instead (no trade link; options that would shape a trade query are refused), and `search_trade_mods` has no mods to list there.
+
+**Fix:** equip the graft you want to improve (`get_item_text` / `build_item` make one) and search again; for Wickerman slots read the ranked `candidates` (`compare_items` / `swap_item` take their `itemText`) and look the part up on the trade site by name.
+
 ## "Cannot equip an item in Head: Path of Building shows the Wickerman slots … only on 3.30 passive trees"
 
 The Wickerman slots (`Head`, `Body`, `Arm`, `Leg`) are shown only on 3.30 passive trees, and `Graft 1`/`Graft 2` only on 3.27 trees, as in PoB's UI. On other trees `list_valid_slots` leaves them out and nothing can be equipped in them.
@@ -142,11 +148,11 @@ An item already in a hidden slot is still listed by `list_equipped_items` (with 
 
 **Fix:** turn the slot on with `set_flask_active({ slot, active: true })` (undoable), or evaluate it on without committing: `compare_items` with `activate: true`, or `flasks: [{ slot, active: true }]` in the same `evaluate_changes` / `apply_changes` variant. Equip a flask first (`swap_item`, or the same variant's `items`) before toggling an empty slot. `swap_item` itself still equips into an inactive slot and says so in its `note`. The `flasks` alias of `toggle_buffs` / `set_config` / scenarios is a different thing: it sets the "while using a flask" condition (`conditionUsingFlask`), not a slot's active state.
 
-## "Cannot build a trade search for Flask N: …" (empty slot, tincture) / "flaskType only applies to flask slots"
+## "Cannot build a trade search for Flask N: …" (empty slot) / "Cannot build a tincture trade search …" / "flaskType only applies to flask slots"
 
-**Cause:** a weighted trade search tries each mod on the flask in the slot. An empty flask slot has none, so `generate_trade_search` needs `flaskType` (`life`, `mana`, `hybrid` or `utility`) to know which flask to search for (`search_trade_mods` does not: every kind lists the same flask mods). Path of Building's trade query generator has no tincture category, so a slot holding a tincture, or `flaskType: "tincture"`, is refused. `flaskType` on a slot other than `Flask 1`-`Flask 5` is refused.
+**Cause:** a weighted trade search tries each mod on the flask in the slot. An empty flask slot has none, so `generate_trade_search` needs `flaskType` (`life`, `mana`, `hybrid` or `utility`) to know which flask to search for (`search_trade_mods` does not: every kind lists the same flask mods). A tincture search (`flaskType: "tincture"`, the default when a tincture is equipped) weighs the tincture in the slot: Path of Building's trade data has no tincture category, so the search is filtered by that tincture's base type and its mods come from PoB's tincture mods that can roll on it; `flaskType: "tincture"` on a slot holding a flask or nothing is refused. `flaskType` on a slot other than `Flask 1`-`Flask 5` is refused.
 
-**Fix:** pass `flaskType`; for a slot holding a tincture, `flaskType` searches flasks for it instead. Every kind is weighed from PoB's flask mod list and searched in the trade site's `flask` category (PoB's data has no life / mana sub-category), so the results can include other kinds of flask. An inactive flask slot is not refused: the weights are computed with it active and the reply says `evaluatedActive: true` (the build is unchanged).
+**Fix:** pass `flaskType`; equip the tincture you want to improve before a tincture search; for a slot holding a tincture, another `flaskType` searches flasks for it instead. Every kind is weighed from PoB's flask mod list and searched in the trade site's `flask` category (PoB's data has no life / mana sub-category), so the results can include other kinds of flask. An inactive flask slot is not refused: the weights are computed with it active and the reply says `evaluatedActive: true` (the build is unchanged).
 
 ## "Cannot build a trade search for Weapon 1 Swap: Weapon 1 Swap belongs to weapon set 2, which the build does not use"
 

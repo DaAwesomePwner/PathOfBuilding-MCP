@@ -114,10 +114,18 @@ return function(ctx)
 	end
 
 	-- Numbers, strings and booleans only; anything else (or missing) is null.
+	-- "Minion:<stat>" reads output.Minion[<stat>] (trade scores add minion
+	-- damage as PoB's power stats do).
 	local function readStats(output, keys, nullFullDPS)
 		local stats = { }
 		for _, key in ipairs(keys) do
-			local value = ctx.copyValue(output[key])
+			local minion = key:match("^Minion:(.+)$")
+			local value
+			if minion then
+				value = ctx.copyValue(type(output.Minion) == "table" and output.Minion[minion] or nil)
+			else
+				value = ctx.copyValue(output[key])
+			end
 			if nullFullDPS and (key == "FullDPS" or key == "FullDotDPS") then value = nil end
 			if value == nil then value = jsonNull end
 			stats[key] = value

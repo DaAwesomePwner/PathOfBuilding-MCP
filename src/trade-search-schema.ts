@@ -16,6 +16,10 @@ export interface TradeQueryRaw {
   calcSeconds: number;
   /** Flask slots: the flask kind searched (flaskType, else the equipped flask's). */
   flaskType?: string;
+  /** Grafts and tinctures (no trade category in PoB's data): the base type the search is filtered by. */
+  baseType?: string;
+  /** Grafts and tinctures: mod lines (numbers as #) PoB's mod processing found no trade stat for, so they are not weighed (an empty list may come as {}). */
+  unmatchedMods?: string[] | Record<string, never>;
   /** Flask slots holding no flask of that kind: the blank base the mods were tried on. */
   testBase?: string;
   /** The flask slot is inactive in the build and was evaluated active for the call. */
@@ -25,6 +29,37 @@ export interface TradeQueryRaw {
   /** The slot the search ran against (null: a Megalomaniac search on a build without a usable socket). */
   slot?: string | null;
 }
+
+/** One Viscera part ranked for a Wickerman slot (BuildSession.rankViscera). */
+export interface VisceraCandidate {
+  name: string;
+  baseName: string;
+  /** (PoB's WeightedRatioOutputs of the build with the part - of the build as it is) x 1000; 0 = no change. */
+  score: number;
+  /** CombinedDPS / TotalEHP / Life with the part in the slot (compare_items' numbers for itemText). */
+  stats: Record<string, number>;
+  /** Those stats minus the build's. */
+  change: Record<string, number>;
+  /** PoB's text of the part, for compare_items / swap_item. */
+  itemText: string;
+}
+
+export interface VisceraRanking {
+  slot: string;
+  currentItem: string | null;
+  statWeights: { stat: string; label: string; weight: number }[];
+  /** Parts that fit the slot (all were evaluated). */
+  total: number;
+  /** The best `limit` parts, highest score first. */
+  candidates: VisceraCandidate[];
+  /** Parts the probe could not evaluate. */
+  errors: { name: string; error: string }[];
+}
+
+/** The Wickerman slots (3.30 trees), which hold Viscera parts. */
+export const WICKERMAN_SLOTS = new Set(['Head', 'Body', 'Arm', 'Leg']);
+/** Graft slots (3.27 trees). */
+export const GRAFT_SLOT_RE = /^Graft \d$/;
 
 export interface TradeModsResult {
   itemCategory: string | null;
@@ -60,13 +95,14 @@ export const UNIQUE_TEXT = 'Search for one of the uniques Path of Building\'s tr
   'socket is allocated). The search requires ' +
   'the unique by name and always excludes mirrored items (as PoB). Not with influences, sockets, links, jewelType (Watcher\'s Eye: ' +
   'only "any"), flaskType, includeMirrored true, includeTalisman true or includeEldritch "keep...".';
-/** "tincture" is accepted only to be refused (PoB's generator has no tincture category); the refusal lives in the bridge. */
+/** "tincture" searches the tincture in the slot (the bridge refuses it when there is none: slotChecks.tinctureTradeRefusal). */
 export const FLASK_TYPES = ['life', 'mana', 'hybrid', 'utility', 'tincture'] as const;
-export const FLASK_TYPE_TEXT = 'Flask slots only: which flask to search for, "life", "mana", "hybrid" or "utility" (default: the kind of the ' +
+export const FLASK_TYPE_TEXT = 'Flask slots only: which flask to search for, "life", "mana", "hybrid", "utility" or "tincture" (default: the kind of the ' +
   'flask equipped there; needed for an empty slot). Every kind is weighed from Path of Building\'s flask mod list and searched in the ' +
   'trade site\'s "flask" category (PoB has no life/mana sub-category), so results may include other kinds of flask; the kind decides ' +
   'the flask the mods are tried on (the equipped one, else a blank base of that kind, reported as testBase, with a default minimum ' +
-  'weighted sum of 0). A tincture (equipped, or "tincture") is refused: PoB\'s trade generator has no tincture category.';
+  'weighted sum of 0). "tincture" (the default when a tincture is equipped) weighs PoB\'s tincture mods that can roll on the tincture in the ' +
+  'slot and filters the search by its base type (PoB has no tincture trade category); it needs a tincture in the slot.';
 /** Passive-tree jewel sockets ("Jewel <nodeId>") and abyssal sockets ("<slot> Abyssal Socket N"). */
 export const JEWEL_SLOT_RE = /^Jewel \d+$|Abyssal Socket \d+$/;
 /** Up to two `|` suffixes: option stats (one) and Pearl of Tsoatha's support filters (`explicit.stat_4089743927|<slot>|<support>`). */
@@ -104,7 +140,7 @@ export interface TradeSearchArgs {
 }
 
 export const tradeSearchSchema = {
-  slot: z.string().min(1).optional().describe('Gear or flask slot ("Helmet", "Ring 1", "Weapon 1", "Flask 1"), an abyssal socket the item in its slot has ("Belt Abyssal Socket 1") or an allocated passive-tree jewel socket ("Jewel 26725"); see list_valid_slots. Required, except for unique "Megalomaniac".'),
+  slot: z.string().min(1).optional().describe('Gear or flask slot ("Helmet", "Ring 1", "Weapon 1", "Flask 1"), an abyssal socket the item in its slot has ("Belt Abyssal Socket 1"), an allocated passive-tree jewel socket ("Jewel 26725"), a graft slot holding a graft ("Graft 1", 3.27 trees) or a Wickerman slot ("Head", 3.30 trees: ranks Viscera parts instead); see list_valid_slots. Required, except for unique "Megalomaniac".'),
   league: z.string().describe('Trade league name exactly as on the trade site, e.g. "Standard" or the current challenge league.'),
   realm: z.enum(['pc', 'xbox', 'sony']).optional().describe('Platform (default "pc").'),
   statWeights: z.array(z.object({ stat: z.string().min(1).max(64), weight: z.number().gt(0).lte(10) })).min(1).max(20).optional()

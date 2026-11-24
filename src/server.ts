@@ -16,6 +16,7 @@ import {
   StatDiffResult,
   TreeEditNode,
   TreeEditResult,
+  unrankedSlotOnly,
 } from './build-session.js';
 import { registerBuildEditTools } from './build-edit-tools.js';
 import { registerCompareBuilds } from './compare-builds.js';
@@ -1057,10 +1058,10 @@ tools.engine<{ slot?: string; modSlots?: number }>(
   {
     description:
       "Rank item slots by upgrade priority: gear of the weapon set in use (Ring 3 while Path of Building shows it), flask slots, allocated passive-tree jewel sockets, abyssal sockets the item in their slot has, and the tree-gated slots (Wickerman, grafts) while shown. Each equipped slot's DPS/EHP contribution is measured by emptying it as unequip_item would, through Path of Building's own calculator without changing the build; lowest contributors are flagged for replacement. " +
-      `An inactive flask slot, or a flask that adds nothing to DPS or EHP (recovery and movement speed are part of neither), is listed unranked (priority null, with a note); at most ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured per call (each takes a full recalculation, ~0.3-0.5 s), the others are listed unmeasured (priority and contributions null, with a note). Empty jewel and abyssal sockets are listed unranked after the measured slots (priority null, with a note) and get suggestedMods only when asked for with \`slot\`; empty gear and flask slots lead the ranking. ` +
+      `An inactive flask slot, or a flask that adds nothing to DPS or EHP (recovery and movement speed are part of neither), is listed unranked (priority null, with a note); at most ${MAX_SUGGEST_TREE_JEWELS} passive-tree jewel sockets are measured per call (each takes a full recalculation, ~0.3-0.5 s), the others are listed unmeasured (priority and contributions null, with a note). Empty jewel and abyssal sockets and empty Wickerman slots are listed unranked after the measured slots (priority null, with a note) and get suggestedMods / suggestedViscera only when asked for with \`slot\`; empty gear and flask slots lead the ranking. ` +
       `The first modSlots slots Path of Building's trade query generator supports (default ${DEFAULT_MOD_SLOTS}; the given slot when \`slot\` is set) get suggestedMods: the mods it weighs highest for that slot on this build ({mod, weight}: weight = stat-score gain per 1 point of the mod, FullDPS 1 + TotalEHP 0.5; listed by a typical roll's gain), about 0.5-1 s a slot. ` +
-      'Slots it does not support (Wickerman, grafts, tinctures, empty flask slots) get a modsError instead. ' +
-      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (ranked slots first, highest priority first, empty gear / flask slots before equipped ones; then unranked equipped slots; then empty jewel / abyssal sockets; then errors): slot, kind (gear / flask / treeJewel / abyssal / treeGated), parentSlot (abyssal), active (flask), currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), note, suggestedMods / modsError; ' +
+      'Grafts and tinctures are weighed from Path of Building\'s graft / tincture mods (its trade data has no category for them); Wickerman slots get suggestedViscera instead ({name, score}: the best Viscera parts for the slot, as generate_trade_search ranks them, about 2 s). Empty flask and graft slots get a modsError instead. ' +
+      'A slot that cannot be measured is listed last with an `error`. Returns `suggestions` (ranked slots first, highest priority first, empty gear / flask slots before equipped ones; then unranked equipped slots; then empty jewel / abyssal sockets; then errors): slot, kind (gear / flask / treeJewel / abyssal / treeGated), parentSlot (abyssal), active (flask), currentItemName, empty, dpsContribution, ehpContribution, priority (0-100), note, suggestedMods / suggestedViscera / modsError; ' +
       'list_equipped_items / get_item_in_slot give the items themselves, generate_trade_search the full weighted search, stat_weights the worth of any mod line.',
     inputSchema: {
       slot: z.string().optional().describe('Focus on one slot (e.g. "Body Armour", "Flask 2", "Jewel 26725", "Belt Abyssal Socket 1"). Omit for all slots.'),
@@ -1073,11 +1074,14 @@ tools.engine<{ slot?: string; modSlots?: number }>(
     // Slots the trade generator was run for, and supported slots it was not
     // (unsupported ones carry their modsError without a query): the ones a
     // larger modSlots reaches, and empty or unmeasured jewel / abyssal sockets
-    // (priority null), which get suggestedMods only when asked for with `slot`.
+    // and empty Wickerman slots (priority null), which get suggestedMods /
+    // suggestedViscera only when asked for with `slot`.
     const queried = suggestions.filter((s) => s.modsQueried).length;
     const notQueried = suggestions.filter((s) => s.error === undefined && !s.modsQueried && s.modsError === undefined);
-    const socketsOnly = notQueried.filter((s) => s.priority === null && (s.kind === 'treeJewel' || s.kind === 'abyssal')).length;
-    const reachable = notQueried.length - socketsOnly;
+    const slotOnly = notQueried.filter(unrankedSlotOnly);
+    const wickermanOnly = slotOnly.filter((s) => s.kind === 'treeGated').length;
+    const socketsOnly = slotOnly.length - wickermanOnly;
+    const reachable = notQueried.length - slotOnly.length;
     let modsNote: string | undefined;
     if (suggestions.some((s) => s.error !== undefined)) {
       modsNote = 'slots that could not be measured (error) get no suggestedMods';
@@ -1086,6 +1090,7 @@ tools.engine<{ slot?: string; modSlots?: number }>(
       const how = [
         ...(reachable > 0 ? [`pass a larger modSlots (or slot) for the other ${reachable} ranked or listed slot(s)`] : []),
         ...(socketsOnly > 0 ? [`pass slot for the ${socketsOnly} empty or unmeasured jewel / abyssal socket(s), which modSlots never reaches`] : []),
+        ...(wickermanOnly > 0 ? [`pass slot for the ${wickermanOnly} empty Wickerman slot(s) (suggestedViscera), which modSlots never reaches`] : []),
       ];
       modsNote = `${modsNote ? `${modsNote}; ` : ''}suggestedMods were computed for ${queried} supported slot(s) only; ${how.join('; ')}`;
     }

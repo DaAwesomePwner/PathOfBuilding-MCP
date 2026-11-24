@@ -1,6 +1,8 @@
 /** generate_trade_search: checks the bridge cannot do and the bridge's `tradeQuery` command. */
 import { UserError } from './validation.js';
-import { DEFAULT_STAT_WEIGHTS, ELDRITCH, ELDRITCH_SLOTS, JEWEL_SLOT_RE, TRADE_ID_RE, type TradeSearchArgs } from './trade-search-schema.js';
+import {
+  DEFAULT_STAT_WEIGHTS, ELDRITCH, ELDRITCH_SLOTS, GRAFT_SLOT_RE, JEWEL_SLOT_RE, TRADE_ID_RE, WICKERMAN_SLOTS, type TradeSearchArgs,
+} from './trade-search-schema.js';
 
 export function validateLeague(raw: string): string {
   const league = raw.trim();
@@ -45,6 +47,34 @@ function checkUniqueOptions(args: TradeSearchArgs, unique: NonNullable<TradeSear
   if (args.includeEldritch?.startsWith('keep')) refuse(`includeEldritch "${args.includeEldritch}"`);
 }
 
+/**
+ * A Wickerman slot ranks Viscera parts instead of building a search: the options that would shape a trade query
+ * are refused (they would change nothing); league, realm, tradeType and the include* defaults are accepted.
+ * Returns the stat weights to rank by.
+ */
+export function visceraRankArgs(args: TradeSearchArgs): { slot: string; statWeights: { stat: string; weight: number }[] } {
+  validateLeague(args.league);
+  const slot = args.slot ?? '';
+  const refused = ([
+    ['unique', args.unique !== undefined], ['jewelType', args.jewelType !== undefined], ['flaskType', args.flaskType !== undefined],
+    ['requiredMods', (args.requiredMods?.length ?? 0) > 0], ['weightAdjustments', (args.weightAdjustments?.length ?? 0) > 0],
+    ['minWeightedSum', args.minWeightedSum !== undefined], ['influences', (args.influences?.length ?? 0) > 0],
+    ['sockets', args.sockets !== undefined], ['links', args.links !== undefined], ['maxPrice', args.maxPrice !== undefined],
+    ['maxLevel', args.maxLevel !== undefined], ['includeTalisman true', args.includeTalisman === true],
+    ['includeEldritch "keep..."', args.includeEldritch?.startsWith('keep') === true],
+  ] as const).filter(([, given]) => given).map(([name]) => name);
+  if (refused.length > 0) {
+    throw new UserError(`${refused.join(', ')} ${refused.length > 1 ? 'do' : 'does'} not apply to ${slot}: Viscera parts have fixed ` +
+      'implicits and no affixes, so generate_trade_search ranks the Viscera parts that fit the slot (by statWeights) instead of building a trade search');
+  }
+  const statWeights = args.statWeights ?? DEFAULT_STAT_WEIGHTS;
+  if (new Set(statWeights.map((w) => w.stat)).size !== statWeights.length) throw new UserError('statWeights lists a stat more than once');
+  return { slot, statWeights };
+}
+
+/** True for a Wickerman slot (Viscera parts: ranked, not searched). */
+export const isWickermanSlot = (slot: string | undefined): boolean => slot !== undefined && WICKERMAN_SLOTS.has(slot);
+
 /** Validates arguments the bridge cannot check and builds the bridge command. */
 export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown> {
   const league = validateLeague(args.league);
@@ -57,6 +87,15 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
   checkTradeIds((args.requiredMods ?? []).map((m) => m.tradeId), 'requiredMods');
   checkTradeIds((args.weightAdjustments ?? []).map((m) => m.tradeId), 'weightAdjustments');
   const jewelSlot = JEWEL_SLOT_RE.test(slot);
+  // Grafts have no sockets and cannot be influenced.
+  if (GRAFT_SLOT_RE.test(slot)) {
+    for (const [name, given] of [['sockets', args.sockets !== undefined], ['links', args.links !== undefined],
+      ['influences', (args.influences?.length ?? 0) > 0]] as const) {
+      if (given) {
+        throw new UserError(`${name} ${name === 'influences' ? 'do' : 'does'} not apply to graft slots like ${slot}: grafts have no sockets and cannot be influenced`);
+      }
+    }
+  }
   if (args.sockets !== undefined && /Flask/.test(slot)) throw new UserError('sockets is not available for flask slots');
   if (args.sockets !== undefined && jewelSlot) throw new UserError('sockets is not available for jewel sockets');
   if (args.links !== undefined && (jewelSlot || /Flask|Belt|Ring|Amulet/.test(slot))) throw new UserError(`links is not available for ${slot}`);
@@ -98,6 +137,8 @@ export function tradeQueryCommand(args: TradeSearchArgs): Record<string, unknown
       includeCorrupted: args.includeCorrupted,
       includeMirrored: args.unique !== undefined ? false : args.includeMirrored ?? true,
       includeScourge: !jewelSlot && (args.includeScourge ?? /^(Standard|Hardcore)$/.test(league)),
+      // Asked for explicitly: the bridge refuses it for grafts and tinctures (no scourge mods), where the default is ignored.
+      scourgeRequested: args.includeScourge === true,
       includeTalisman: args.includeTalisman ?? false,
       eldritchIndex: ELDRITCH.indexOf(args.includeEldritch ?? 'copyCurrent') + 1,
       influences: args.influences ?? [],

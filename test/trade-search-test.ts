@@ -5,7 +5,8 @@
  * the installed TradeQueryGenerator.lua, the build left unchanged, then jewel
  * sockets (tree sockets by jewelType, abyssal sockets the item has) and refusals,
  * flask slots, weapon swap slots, the special uniques (Watcher's Eye, Pearl of
- * Tsoatha, Megalomaniac) and the faults around a flask slot's activation.
+ * Tsoatha, Megalomaniac), the faults around a flask slot's activation, and
+ * grafts and tinctures (weighed from PoB's own mod lists, filtered by base type).
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -165,7 +166,8 @@ type SlotRow = { slot: string; active?: boolean };
  * Silver, Flask 4 Quicksilver, Flask 5 Divine Mana): every kind is weighed
  * from PoB's flask mod list in the "flask" category; flaskType picks the flask
  * the mods are tried on; an inactive slot is evaluated active (build, slot
- * state and export unchanged); tinctures and misplaced flaskType are refused.
+ * state and export unchanged); a tincture search without a tincture in the
+ * slot and misplaced flaskType are refused.
  */
 async function test12Flasks(category: (s: Search) => string, weighted: (s: Search) => number): Promise<void> {
   log('Test 12: flask slots (kinds, flaskType, inactive slot, tinctures)');
@@ -207,17 +209,101 @@ async function test12Flasks(category: (s: Search) => string, weighted: (s: Searc
   assert(hybrid.flaskType === 'hybrid' && /Hybrid Flask$/.test(hybrid.testBase ?? ''), `hybrid stand-in: ${hybrid.testBase}`);
   assert((await ok<{ mods: TradeMod[] }>('search_trade_mods', { slot: 'Flask 4', query: 'duration' })).mods.length > 0, 'mods for an empty flask slot');
 
-  // Tinctures: no tincture category in PoB's generator (equipped, or asked for).
+  // A tincture search weighs the tincture in the slot (test 19): one asked for over a flask or an empty slot is refused.
+  await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', flaskType: 'tincture' },
+    /tincture trade search for Flask 1: the slot holds a flask, not a tincture.*no tincture category.*equip the tincture/);
+  await userError('generate_trade_search', { slot: 'Flask 4', league: 'Standard', flaskType: 'tincture' }, /Flask 4: the slot is empty\..*equip the tincture/);
+  const tinctureMods = await ok<{ itemCategory: string; total: number }>('search_trade_mods', { slot: 'Flask 4', query: 'melee', flaskType: 'tincture' });
+  assert(tinctureMods.itemCategory === 'Tincture' && tinctureMods.total > 0, `every tincture mod for an empty slot: ${JSON.stringify(tinctureMods).slice(0, 200)}`);
   const tincture = await ok<{ text: string }>('get_item_text', { base: 'Oakbranch Tincture' });
   assert(!(await call('swap_item', { slot: 'Flask 4', itemText: tincture.text })).isError, 'tincture into Flask 4');
-  await userError('generate_trade_search', { slot: 'Flask 4', league: 'Standard' }, /holds a tincture.*no tincture category/);
-  await userError('search_trade_mods', { slot: 'Flask 4', query: 'life' }, /holds a tincture.*no tincture category/);
-  await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', flaskType: 'tincture' }, /"tincture" was asked for.*no tincture category/);
+  const oakMods = await ok<{ itemCategory: string; mods: TradeMod[] }>('search_trade_mods', { slot: 'Flask 4', query: 'melee weapon' });
+  assert(oakMods.itemCategory === 'Tincture' && oakMods.mods.length > 0, 'the tincture\'s mods by default');
   assert((await flaskSearch({ slot: 'Flask 4', flaskType: 'utility' })).testBase === 'Quicksilver Flask', 'a flask search over a tincture with flaskType');
   // flaskType is for flask slots only.
   await userError('generate_trade_search', { slot: 'Helmet', league: 'Standard', flaskType: 'life' }, /flaskType only applies to flask slots/);
   await userError('search_trade_mods', { slot: 'Ring 1', query: 'life', flaskType: 'mana' }, /flaskType only applies to flask slots/);
   await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', jewelType: 'base' }, /jewelType only applies to jewel sockets/);
+  log('PASS');
+}
+
+interface CustomSearch extends Search {
+  baseType?: string; baseTypeNote?: string; flaskType?: string; evaluatedActive?: boolean;
+  unmatchedMods?: { count: number; lines: string[] }; unmatchedNote?: string;
+}
+const GRAFT = 'Rarity: NORMAL\nBattering Uulgraft\nItem Level: 80\nImplicits: 1\n8% reduced Enemy Stun Threshold';
+
+/**
+ * Grafts (3.27 trees): no trade category in PoB's data, so the graft mods that
+ * can roll on the equipped graft's base go through PoB's own ProcessMod and
+ * the search filters by that base type; refusals (empty slot, hidden slot,
+ * sockets / links / influences); search_trade_mods lists graft mods; the
+ * build and its export are unchanged.
+ */
+async function test18Grafts(xml: string): Promise<void> {
+  log('Test 18: graft slots (3.27 tree)');
+  await userError('generate_trade_search', { slot: 'Graft 1', league: 'Standard' }, /Graft slots only on 3\.27 passive trees.*no tree conversion/);
+  await ok('load_build', { source: xml.replace(/treeVersion="3_13"/g, 'treeVersion="3_27"') });
+  await userError('generate_trade_search', { slot: 'Graft 1', league: 'Standard' }, /Graft 1: the slot is empty.*equip the graft/);
+  const allGraftMods = await ok<{ itemCategory: string; total: number }>('search_trade_mods', { slot: 'Graft 1', query: 'damage' });
+  assert(!(await call('swap_item', { slot: 'Graft 1', itemText: GRAFT })).isError, 'graft into Graft 1');
+  const before = await keyState();
+  const graft = await ok<CustomSearch>('generate_trade_search', { slot: 'Graft 1', league: 'Standard' });
+  const q = decodeQuery(graft.url, STANDARD_PREFIX);
+  const query = q.query as unknown as { type?: string; filters: { type_filters: { filters: Record<string, { option: string }> } } };
+  assert(graft.itemCategory === 'Graft' && graft.baseType === 'Battering Uulgraft' && query.type === 'Battering Uulgraft'
+    && query.filters.type_filters.filters.category === undefined && query.filters.type_filters.filters.rarity.option === 'nonunique'
+    && /no graft category/.test(graft.baseTypeNote ?? ''), `graft search filtered by base type: ${JSON.stringify({ ...graft, url: undefined })}`);
+  assert(graft.filters.length > 0 && graft.filters.every((f) => f.weight > 0), `weighted graft mods: ${JSON.stringify(graft.filters)}`);
+  // Uul-Netol's mods only: the base's spawn tags decide (no Xoph fire mods on an Uulgraft).
+  const mods = await ok<{ itemCategory: string; total: number; mods: TradeMod[] }>('search_trade_mods', { slot: 'Graft 1', query: 'damage', limit: 100 });
+  assert(mods.itemCategory === 'Graft' && mods.total > 0 && mods.total < allGraftMods.total && !mods.mods.some((m) => m.type === 'Explicit' && /Fire Damage/.test(m.text)),
+    `graft mods of the base (${mods.total}) vs every graft mod (${allGraftMods.total}): ${mods.mods.map((m) => `${m.type}: ${m.text}`).join(' | ')}`);
+  const life = await ok<CustomSearch>('generate_trade_search', { slot: 'Graft 1', league: 'Standard', statWeights: [{ stat: 'Life', weight: 1 }] });
+  assert(life.filters.some((f) => /maximum Life/.test(f.text)), `Life weights a life graft mod: ${JSON.stringify(life.filters)}`);
+  for (const [opt, value] of [['sockets', 2], ['links', 2], ['influences', ['shaper']]] as const) {
+    await userError('generate_trade_search', { slot: 'Graft 1', league: 'Standard', [opt]: value }, /not apply to graft slots like Graft 1/);
+  }
+  // Grafts have no scourge mods: true is refused, false (and the Standard default) accepted.
+  await userError('generate_trade_search', { slot: 'Graft 1', league: 'Standard', includeScourge: true }, /includeScourge true does not apply to grafts.*Graft 1/);
+  assert((await ok<CustomSearch>('generate_trade_search', { slot: 'Graft 1', league: 'Standard', includeScourge: false })).url === graft.url, 'includeScourge false changes nothing');
+  assert((await keyState()) === before, 'graft searches changed the build');
+  // Mod lines PoB's processing found no trade stat for are reported, never dropped silently (Xophgraft's skill mods have none).
+  const xoph = await ok<{ text: string }>('get_item_text', { base: 'Molten Xophgraft' });
+  assert(!(await call('swap_item', { slot: 'Graft 2', itemText: xoph.text })).isError, 'Xophgraft into Graft 2');
+  const xophSearch = await ok<CustomSearch>('generate_trade_search', { slot: 'Graft 2', league: 'Standard', statWeights: [{ stat: 'TotalEHP', weight: 1 }] });
+  const unmatched = xophSearch.unmatchedMods;
+  assert(unmatched !== undefined && unmatched.count > 0 && unmatched.lines.length === Math.min(10, unmatched.count)
+    && unmatched.lines.every((l) => !/\d/.test(l)) && /cannot weigh them/.test(xophSearch.unmatchedNote ?? ''),
+  `unmatched graft lines reported: ${JSON.stringify({ unmatched, note: xophSearch.unmatchedNote })}`);
+  log('PASS');
+}
+
+/**
+ * Tinctures: PoB's tincture mods on a melee build (blank Duelist with a foil and
+ * a Rosethorn Tincture in an inactive slot, evaluated active), filtered by the
+ * tincture's base type; suggest_upgrades gets suggestedMods for it.
+ */
+async function test19Tinctures(): Promise<void> {
+  log('Test 19: tinctures on a melee build');
+  await ok('new_build', { className: 'Duelist', level: 90 });
+  const foil = await ok<{ text: string }>('get_item_text', { base: 'Jewelled Foil' });
+  const rosethorn = await ok<{ text: string }>('get_item_text', { base: 'Rosethorn Tincture' });
+  assert(!(await call('swap_item', { slot: 'Weapon 1', itemText: foil.text })).isError, 'foil');
+  assert(!(await call('swap_item', { slot: 'Flask 1', itemText: rosethorn.text })).isError, 'tincture into Flask 1');
+  const before = await keyState();
+  const t = await ok<CustomSearch>('generate_trade_search', { slot: 'Flask 1', league: 'Standard' });
+  const query = decodeQuery(t.url, STANDARD_PREFIX).query as unknown as { type?: string; filters: { type_filters: { filters: Record<string, unknown> } } };
+  assert(t.itemCategory === 'Tincture' && t.flaskType === 'tincture' && t.baseType === 'Rosethorn Tincture' && query.type === 'Rosethorn Tincture'
+    && query.filters.type_filters.filters.category === undefined && t.evaluatedActive === true,
+  `tincture search: ${JSON.stringify({ ...t, url: undefined })}`);
+  assert(t.filters.some((f) => /Melee Weapon Attack Speed/.test(f.text)) && t.filters.every((f) => f.weight > 0), `tincture mods weighed: ${JSON.stringify(t.filters)}`);
+  assert((await ok<CustomSearch>('generate_trade_search', { slot: 'Flask 1', league: 'Standard', flaskType: 'tincture' })).url === t.url, 'flaskType tincture is the default');
+  await userError('generate_trade_search', { slot: 'Flask 1', league: 'Standard', includeScourge: true }, /includeScourge true does not apply to tinctures.*Flask 1/);
+  const up = await ok<{ suggestions: { slot: string; suggestedMods?: { mod: string }[]; modsError?: string }[] }>('suggest_upgrades', { slot: 'Flask 1' });
+  const row = up.suggestions.find((s) => s.slot === 'Flask 1');
+  assert(row && row.modsError === undefined && (row.suggestedMods?.length ?? 0) > 0, `suggest_upgrades tincture row: ${JSON.stringify(row)}`);
+  assert((await keyState()) === before, 'tincture searches changed the build');
   log('PASS');
 }
 
@@ -413,9 +499,10 @@ async function test16Megalomaniac(paths: TestPaths, xml: string): Promise<void> 
     await rejectsWith(megaSearch(), /every allocated passive-tree jewel socket holds a cluster jewel/);
     // No allocated socket at all: PoB's nil slot.
     await session.newBuild({ className: 'Witch' });
-    const blank = await megaSearch().catch((e: Error) => e);
-    assert(blank instanceof Error ? /found no cluster notables/.test(blank.message) : blank.slot === null,
-      `no socket: slot null (${blank instanceof Error ? blank.message : blank.slot})`);
+    const blank = await megaSearch();
+    assert(blank.slot === null && blank.currentItem === null && blank.minWeightedSum === 0 && blank.filters.length > 0
+      && blank.filters.every((f) => f.weight > 0 && f.notable !== undefined),
+      `no socket: PoB's nil slot, notables weighed against the whole build: ${JSON.stringify({ ...blank, url: undefined }).slice(0, 300)}`);
   } finally {
     await bridge.dispose();
   }
@@ -432,34 +519,74 @@ async function rejectsWith(p: Promise<unknown>, expect: RegExp): Promise<void> {
   throw new Error(`expected a rejection matching ${expect}`);
 }
 
+const MIRROR_PREFIX = 'pob-mcp-nospecial-';
+const STALE_MIRROR_MS = 60 * 60 * 1000;
+
+/**
+ * Removes a mirror made by test17 without ever following a link: each link
+ * (junction / symlink) is removed itself, folders are emptied entry by entry.
+ * Returns false (and leaves the rest in place) when a link cannot be removed.
+ */
+function removeMirror(dir: string): boolean {
+  for (const name of readdirSync(dir)) {
+    const entry = path.join(dir, name);
+    const stat = lstatSync(entry);
+    if (stat.isSymbolicLink()) {
+      try {
+        unlinkSync(entry);
+      } catch {
+        try { rmdirSync(entry); } catch { return false; }
+      }
+    } else if (stat.isDirectory()) {
+      if (!removeMirror(entry)) return false;
+    } else {
+      unlinkSync(entry);
+    }
+  }
+  rmdirSync(dir);
+  return true;
+}
+
 /**
  * Feature detection: a temporary mirror of the PoB install (small folders
  * copied, the large data folders linked, nothing written into the install)
  * whose TradeQueryGenerator.lua lacks the special searches. Each unique is a
- * user error naming the missing search; a normal search still works.
+ * user error naming the missing search; a normal search still works. Mirrors
+ * a killed earlier run left behind (over an hour old) are swept first.
  */
 async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<void> {
   log('Test 17: a trade generator without the special unique searches');
-  const mirror = mkdtempSync(path.join(os.tmpdir(), 'pob-mcp-nospecial-'));
-  const links: string[] = [];
-  // Mirrors `from` into `to`, descending along `into` (the folders holding the generator); other folders are linked.
+  // Only mirrors older than an hour: other worktrees may be running this test right now, and a live
+  // bridge's working directory cannot be removed on Windows (EBUSY).
+  for (const name of readdirSync(os.tmpdir())) {
+    if (!name.startsWith(MIRROR_PREFIX)) continue;
+    const stale = path.join(os.tmpdir(), name);
+    try {
+      const stat = lstatSync(stale);
+      if (!stat.isDirectory() || Date.now() - stat.mtimeMs < STALE_MIRROR_MS) continue;
+      if (!removeMirror(stale)) console.error(`left ${stale} in place: a link could not be removed safely`);
+    } catch (e) {
+      console.error(`left ${stale} in place: ${(e as Error).message}`);
+    }
+  }
+  const mirror = mkdtempSync(path.join(os.tmpdir(), MIRROR_PREFIX));
+  // Mirrors `from` into `to`, descending along `into` (the folders holding the generator, copied with links
+  // dereferenced); other folders are linked, files copied.
   const build = (from: string, to: string, into: string[]): void => {
     mkdirSync(to, { recursive: true });
     for (const entry of readdirSync(from, { withFileTypes: true })) {
       const src = path.join(from, entry.name);
       const dst = path.join(to, entry.name);
       if (entry.isDirectory() && entry.name === into[0]) {
-        if (into.length === 1) cpSync(src, dst, { recursive: true });
+        if (into.length === 1) cpSync(src, dst, { recursive: true, dereference: true });
         else build(src, dst, into.slice(1));
       } else if (entry.isDirectory()) {
         symlinkSync(src, dst, 'junction');
-        links.push(dst);
       } else if (entry.isFile()) {
         copyFileSync(src, dst);
       }
     }
   };
-  let removable = true;
   try {
     const into = existsSync(path.join(paths.pobPath, 'src', 'Classes', 'TradeQueryGenerator.lua')) ? ['src', 'Classes'] : ['Classes'];
     build(paths.pobPath, mirror, into);
@@ -473,7 +600,9 @@ async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<vo
       assert(source.includes(from), `the installed generator no longer has: ${from}`);
       source = source.replace(from, to);
     }
-    writeFileSync(genFile, source);
+    // A new file in the mirror: never a write through a link into the install.
+    unlinkSync(genFile);
+    writeFileSync(genFile, source, { flag: 'wx' });
 
     const bridge = new LuaBridge({ ...paths, pobPath: mirror }, 120_000);
     try {
@@ -491,17 +620,12 @@ async function test17FeatureDetection(paths: TestPaths, xml: string): Promise<vo
       await bridge.dispose();
     }
   } finally {
-    // Remove each link itself (never what it points at) before the copied files.
-    for (const link of links) {
-      try {
-        if (!lstatSync(link).isSymbolicLink()) { removable = false; continue; }
-        try { unlinkSync(link); } catch { rmdirSync(link); }
-      } catch {
-        removable = false;
-      }
+    // A cleanup failure never masks the test's own error.
+    try {
+      if (!removeMirror(mirror)) console.error(`left ${mirror} in place: a link could not be removed safely`);
+    } catch (e) {
+      console.error(`left ${mirror} in place: ${(e as Error).message}`);
     }
-    if (removable) rmSync(mirror, { recursive: true, force: true });
-    else console.error(`left ${mirror} in place: a link could not be removed safely`);
   }
   log('PASS');
 }
@@ -914,6 +1038,8 @@ async function main(): Promise<void> {
     await test14FlaskFaults(paths, readFileSync(fixturePath, 'utf8'));
     await test16Megalomaniac(paths, readFileSync(fixturePath, 'utf8'));
     await test17FeatureDetection(paths, readFileSync(fixturePath, 'utf8'));
+    await test18Grafts(readFileSync(fixturePath, 'utf8'));
+    await test19Tinctures();
     log('ALL TRADE SEARCH TESTS PASSED');
   } finally {
     await client.close().catch(() => undefined);

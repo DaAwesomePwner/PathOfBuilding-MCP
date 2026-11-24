@@ -14,6 +14,11 @@
 //      from game text goes into its slot, stats recompute, a Viscera item in
 //      the wrong Wickerman slot is refused, undo restores the export exactly,
 //      and the build round-trips through export_build code / xml.
+//   3c. generate_trade_search on a Wickerman slot ranks the Viscera parts that
+//      fit it (BuildSession.rankViscera): every part fits the slot, scores
+//      sorted, compare_items parity for the top part, a hidden slot and trade
+//      options refused, the bridge's trade search / mod list refuse the slot,
+//      suggest_upgrades gives suggestedViscera; the export is unchanged.
 //   4. A build holding Viscera items on a tree that hides the slots keeps them
 //      exactly: export, a what-if probe, and swap + undo leave the hidden
 //      <Slot> entries unchanged. list_equipped_items shows them as hidden
@@ -22,6 +27,8 @@
 import { readFileSync } from 'fs';
 import { BuildSession } from '../src/build-session.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
+import { tradeQueryCommand, visceraRankArgs } from '../src/trade-search-command.js';
+import { buildVisceraRanking } from '../src/trade-search-response.js';
 import { UserError, validateItemText } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
@@ -162,6 +169,10 @@ async function main(): Promise<void> {
     await expectUserError('compare_items in Graft 2', () => session.compareItems('Graft 2', [GRAFT, GRAFT]), /Graft 2.*3\.27/);
     await expectUserError('compare_items in Leg', () => session.compareItems('Leg', [VISCERA_HEAD, VISCERA_ARM]), hidden('Leg'));
     await expectUserError('compare_items in an unknown slot', () => session.compareItems('Tail', [RING, RING]), /Unknown slot/);
+    if (hasWickerman) {
+      await expectUserError('Viscera ranking in a hidden slot', () => session.rankViscera('Head', [{ stat: 'Life', weight: 1 }], 5),
+        /Head.*3\.30.*convert_tree_to_latest/);
+    }
     // Probe what-ifs (evaluate_changes, suggest_upgrades, ...) refuse a hidden slot per variant, as swap_item does.
     const probed = await session.probe({ variants: [{ items: [{ slot: 'Graft 1', itemText: GRAFT }] }] });
     assert(probed.results[0].userError === true && /Graft 1.*3\.27/.test(probed.results[0].error ?? ''),
@@ -189,12 +200,15 @@ async function main(): Promise<void> {
     await session.swapItemWithDiff('Graft 1', GRAFT);
     const graft327 = (await session.listEquippedItems()).find((i) => i.slot === 'Graft 1');
     assert(graft327 && graft327.baseName === 'Battering Uulgraft' && !graft327.hidden, `Graft 1 on 3_27: ${JSON.stringify(graft327)}`);
-    // suggest_upgrades lists shown grafts (measured), with no trade-generator mods.
+    // suggest_upgrades lists shown grafts (measured); an equipped one gets PoB-weighted graft mods, an empty one a modsError.
     const up327 = await session.suggestUpgrades(undefined, { modSlots: 0 });
     const g1 = up327.find((s) => s.slot === 'Graft 1');
     const g2 = up327.find((s) => s.slot === 'Graft 2');
-    assert(g1?.kind === 'treeGated' && !g1.empty && typeof g1.priority === 'number' && /does not support this slot/.test(g1.modsError ?? '')
-      && g2?.empty === true, `suggest_upgrades grafts on 3_27: ${JSON.stringify([g1 && { ...g1, currentItem: undefined }, g2])}`);
+    assert(g1?.kind === 'treeGated' && !g1.empty && typeof g1.priority === 'number' && g1.modsError === undefined
+      && g2?.empty === true && /Empty graft slot/.test(g2.modsError ?? ''),
+    `suggest_upgrades grafts on 3_27: ${JSON.stringify([g1 && { ...g1, currentItem: undefined }, g2])}`);
+    const g1Mods = (await session.suggestUpgrades('Graft 1'))[0];
+    assert(g1Mods.modsError === undefined && (g1Mods.suggestedMods?.length ?? 0) > 0, `Graft 1 suggestedMods: ${JSON.stringify(g1Mods.suggestedMods ?? g1Mods.modsError)}`);
     assert(!up327.some((s) => WICKERMAN.includes(s.slot)), 'no hidden Wickerman slots in suggest_upgrades on 3_27');
     const xml326 = (await session.exportBuild('xml')).replace(/treeVersion="3_27"/g, 'treeVersion="3_26"');
     await session.loadBuild(xml326);
@@ -223,6 +237,21 @@ async function main(): Promise<void> {
       const s = slots330.find((x) => x.slot === w);
       assert(s && !s.occupied, `${w} should be listed and empty: ${JSON.stringify(s)}`);
     }
+    // A geared 3.30 build without Viscera: the empty Wickerman slots are listed unranked and never spend the
+    // default modSlots budget, which goes to the ranked slots.
+    const upEmpty = await session.suggestUpgrades();
+    for (const w of WICKERMAN) {
+      const row = upEmpty.find((s) => s.slot === w);
+      assert(row && row.empty && row.priority === null && /empty Wickerman slot/.test(row.note ?? '') && row.suggestedViscera === undefined
+        && row.modsQueried === undefined && row.modsError === undefined, `empty ${w} row: ${JSON.stringify(row)}`);
+    }
+    const queried = upEmpty.filter((s) => s.modsQueried);
+    assert(queried.length === 3 && queried.every((s) => s.kind !== 'treeGated' && (s.suggestedMods?.length ?? 0) > 0),
+      `default budget spent on ranked slots: ${JSON.stringify(queried.map((s) => [s.slot, s.kind, s.suggestedMods?.length, s.modsError]))}`);
+    const lastRanked = Math.max(...upEmpty.map((s, i) => (s.priority !== null ? i : -1)));
+    assert(WICKERMAN.every((w) => upEmpty.findIndex((s) => s.slot === w) > lastRanked), 'empty Wickerman slots sort after the ranked slots');
+    const headAsked = (await session.suggestUpgrades('Head'))[0];
+    assert(headAsked.empty && (headAsked.suggestedViscera?.length ?? 0) > 0, `an empty Wickerman slot asked for with slot: ${JSON.stringify(headAsked)}`);
     const xmlConverted = await session.exportBuild('xml');
     const before = await session.getStats();
     // evaluate_changes / probe variants take Viscera game text too, BOM or not, with swap_item's numbers.
@@ -246,9 +275,55 @@ async function main(): Promise<void> {
     const up330 = await session.suggestUpgrades(undefined, { modSlots: 0 });
     const headRow = up330.find((s) => s.slot === 'Head');
     assert(WICKERMAN.every((w) => up330.find((s) => s.slot === w)?.kind === 'treeGated') && headRow && !headRow.empty
-      && typeof headRow.priority === 'number' && /does not support this slot/.test(headRow.modsError ?? ''),
+      && typeof headRow.priority === 'number' && headRow.modsError === undefined,
     `suggest_upgrades Wickerman rows on 3.30: ${JSON.stringify(headRow && { ...headRow, currentItem: undefined })}`);
     log('PASS: listed, Viscera equipped from game text, stats recomputed, wrong slot refused, suggest_upgrades rows');
+
+    log('Test 3c: Viscera parts ranked for a Wickerman slot');
+    const xmlRank = await session.exportBuild('xml');
+    const weights = [{ stat: 'FullDPS', weight: 1 }, { stat: 'TotalEHP', weight: 0.5 }];
+    const legs = await session.rankViscera('Leg', weights, 500);
+    assert(legs.total > 10 && legs.candidates.length === legs.total - legs.errors.length && legs.currentItem === null,
+      `every leg part evaluated: ${legs.total}, ${legs.candidates.length}, errors ${JSON.stringify(legs.errors)}`);
+    for (let i = 1; i < legs.candidates.length; i++) {
+      assert(legs.candidates[i - 1].score >= legs.candidates[i].score, `sorted by score at ${i}`);
+    }
+    assert(legs.candidates[0].score > 0 && legs.candidates.some((c) => c.score === 0), 'some parts help, some change nothing');
+    const arms = await session.rankViscera('Arm', weights, 500);
+    const legNames = new Set(legs.candidates.map((c) => c.name));
+    assert(arms.currentItem === "King Crab's Claw" && arms.candidates.every((c) => !legNames.has(c.name)), 'arm and leg parts are different parts');
+    // Every listed part fits its slot (PoB's IsItemValidForSlot): one arm part goes in Leg as an error.
+    const wrong = await session.compareItems('Leg', [arms.candidates[0].itemText]);
+    assert(wrong.candidates[0].error !== null, 'an arm part does not fit Leg');
+    // compare_items gives the same numbers as the ranking (the probe engine, read-only).
+    const top = legs.candidates.slice(0, 3);
+    const cmpLegs = await session.compareItems('Leg', top.map((c) => c.itemText));
+    top.forEach((c, i) => {
+      for (const key of ['CombinedDPS', 'TotalEHP', 'Life']) {
+        assert(cmpLegs.candidates[i].stats?.[key] === c.stats[key], `${c.name} ${key}: compare_items ${cmpLegs.candidates[i].stats?.[key]} vs ranking ${c.stats[key]}`);
+      }
+    });
+    const ehpOnly = await session.rankViscera('Leg', [{ stat: 'TotalEHP', weight: 1 }], 3);
+    assert(ehpOnly.candidates.length === 3 && ehpOnly.candidates[0].change.TotalEHP > 0 && ehpOnly.candidates[0].change.TotalEHP >= Math.max(...legs.candidates.map((c) => c.change.TotalEHP ?? 0)),
+      `TotalEHP weights rank the part adding the most EHP first: ${JSON.stringify(ehpOnly.candidates[0])}`);
+    // The tool's argument checks and response.
+    const ranked = buildVisceraRanking({ slot: 'Leg', league: 'Standard' }, legs);
+    assert(ranked.url === null && ranked.itemCategory === 'Viscera' && /no Viscera category/.test(String(ranked.note)), 'response shape');
+    assert(visceraRankArgs({ slot: 'Leg', league: 'Standard', tradeType: 'any' }).statWeights.length === 2, 'tradeType accepted, default weights');
+    for (const extra of [{ requiredMods: [{ tradeId: 'explicit.stat_3299347043' }] }, { maxPrice: { amount: 5 } }, { influences: ['shaper' as const] }]) {
+      let caught: unknown;
+      try { visceraRankArgs({ slot: 'Leg', league: 'Standard', ...extra }); } catch (err) { caught = err; }
+      assert(caught instanceof UserError && /not apply to Leg: Viscera parts have fixed implicits/.test(caught.message), `refused: ${JSON.stringify(extra)}`);
+    }
+    await expectUserError('a weighted search in a Wickerman slot', () => session.generateTradeQuery(tradeQueryCommand({ slot: 'Arm', league: 'Standard' })),
+      /Arm: Viscera parts have fixed implicits and no affixes/);
+    await expectUserError('trade mods of a Wickerman slot', () => session.searchTradeMods('Arm', 'life', 5), /Viscera parts have fixed implicits/);
+    await expectUserError('Viscera ranking in a graft slot', () => session.rankViscera('Graft 1', weights, 5), /not a Wickerman slot/);
+    const headUp = (await session.suggestUpgrades('Head'))[0];
+    assert(headUp.modsError === undefined && (headUp.suggestedViscera?.length ?? 0) > 0 && headUp.suggestedMods === undefined,
+      `suggest_upgrades Head: ${JSON.stringify({ ...headUp, currentItem: undefined })}`);
+    assert((await session.exportBuild('xml')) === xmlRank, 'Viscera rankings leave the export unchanged');
+    log(`PASS: ${legs.total} leg parts ranked (top ${legs.candidates[0].name}, score ${legs.candidates[0].score}), compare_items parity`);
 
     log('Test 3b: export round-trip and undo');
     const statsEquipped = await session.getStats();
