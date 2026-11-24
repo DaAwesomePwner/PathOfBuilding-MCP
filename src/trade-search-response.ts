@@ -1,7 +1,7 @@
 /** generate_trade_search: the offline trade-site URL and the tool response. */
 import { validateLeague } from './trade-search-command.js';
 import { applyWeightFilters, round } from './trade-search-filters.js';
-import type { TradeQueryRaw, TradeSearchArgs } from './trade-search-schema.js';
+import type { TradeQueryRaw, TradeSearchArgs, VisceraRanking } from './trade-search-schema.js';
 
 /** PoB's urlEncode (Modules/Common.lua): every byte outside [A-Za-z0-9_.~-] as %XX. */
 function pobUrlEncode(text: string): string {
@@ -38,6 +38,14 @@ export function buildTradeSearch(args: TradeSearchArgs, raw: TradeQueryRaw): Rec
     currentItem: raw.currentItem,
     ...(raw.flaskType !== undefined ? { flaskType: raw.flaskType } : {}),
     ...(raw.testBase !== undefined ? { testBase: raw.testBase } : {}),
+    ...(raw.baseType !== undefined ? {
+      baseType: raw.baseType,
+      baseTypeNote: `Path of Building's trade data has no ${raw.itemCategory === 'Graft' ? 'graft' : 'tincture'} category, so the search ` +
+        `is filtered by the base type of the item in the slot (${raw.baseType}) instead; its mods are weighed from Path of Building's ` +
+        (raw.itemCategory === 'Graft'
+          ? 'graft mods that can roll on that base (graft base implicits have no mod data in Path of Building and are not weighed).'
+          : 'tincture mods that can roll on that base and the base\'s implicit.'),
+    } : {}),
     ...(raw.evaluatedActive ? {
       evaluatedActive: true,
       activeNote: 'The flask slot is inactive in the build (Path of Building would weigh every mod at 0 there), so the weights were ' +
@@ -71,5 +79,25 @@ export function buildTradeSearch(args: TradeSearchArgs, raw: TradeQueryRaw): Rec
         'results are sorted by weighted sum, highest first, and must reach minWeightedSum. ' +
         'PoB scores stats already capped (e.g. resistances) as 0: add weightAdjustments for what the replaced item provided.',
     calcSeconds: round(raw.calcSeconds, 3),
+  };
+}
+
+/** generate_trade_search for a Wickerman slot: the ranked Viscera parts (no trade link). */
+export function buildVisceraRanking(args: TradeSearchArgs, ranking: VisceraRanking): Record<string, unknown> {
+  return {
+    url: null,
+    league: validateLeague(args.league),
+    slot: ranking.slot,
+    itemCategory: 'Viscera',
+    currentItem: ranking.currentItem,
+    statWeights: ranking.statWeights,
+    evaluated: ranking.total,
+    returned: ranking.candidates.length,
+    candidates: ranking.candidates.map((c, i) => ({ rank: i + 1, ...c })),
+    ...(ranking.errors.length > 0 ? { errors: ranking.errors } : {}),
+    note: 'Viscera parts have fixed implicits and no affixes, so there is no mod search: every Viscera part in Path of Building\'s list that ' +
+      'fits the slot was put in it and measured (read-only; compare_items gives the same numbers for its itemText), ranked by score = ' +
+      '(sum of statWeights x relative stat change) x 1000, 0 = no change from the build as it is. No trade link: Path of Building\'s ' +
+      'trade data has no Viscera category or stats, so search the part\'s name on the trade site yourself; swap_item with itemText equips one.',
   };
 }

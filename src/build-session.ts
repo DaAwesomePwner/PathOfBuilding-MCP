@@ -28,6 +28,7 @@ import {
 import { topTradeMods, type ModLineCheck, type SuggestedMod } from './stat-weights.js';
 import type { ItemDataCommand } from './item-data.js';
 import type { TradeModsResult, TradeQueryRaw } from './trade-search.js';
+import { DEFAULT_STAT_WEIGHTS, WICKERMAN_SLOTS, type VisceraCandidate, type VisceraRanking } from './trade-search-schema.js';
 import { tradeQueryCommand } from './trade-search-command.js';
 import { UserError, normalizeItemText } from './validation.js';
 
@@ -1152,6 +1153,55 @@ export class BuildSession {
       );
       return result;
     });
+  }
+
+  /**
+   * Viscera parts for a Wickerman slot (generate_trade_search there): the
+   * bridge's list of PoB's Viscera parts that fit the slot, each probed in the
+   * slot as compare_items does (read-only; a skill-granting part takes the
+   * probe's fallback), scored by PoB's own WeightedRatioOutputs with
+   * `statWeights` (the bridge's tradeScores) and ranked. Changes nothing.
+   */
+  async rankViscera(slot: string, statWeights: { stat: string; weight: number }[], limit: number): Promise<VisceraRanking> {
+    return this.withLock(() => this.rankVisceraUnlocked(slot, statWeights, limit));
+  }
+
+  private async rankVisceraUnlocked(slot: string, statWeights: { stat: string; weight: number }[], limit: number): Promise<VisceraRanking> {
+    const list = await this.bridge.send<{
+      ok: true; statKeys: string[]; currentItem: string | null; statWeights: VisceraRanking['statWeights'];
+      candidates: { name: string; baseName: string; itemText: string }[];
+    }>({ cmd: 'visceraCandidates', slot, statWeights });
+    const probed = list.candidates.length > 0
+      ? await this.probeUnlocked({ stats: list.statKeys, variants: list.candidates.map((c) => ({ items: [{ slot, itemText: c.itemText }] })) })
+      : { base: {}, results: [] };
+    const evaluated: number[] = [];
+    const errors: VisceraRanking['errors'] = [];
+    probed.results.forEach((r, i) => {
+      if (r.error === undefined) evaluated.push(i);
+      else if (r.userError) errors.push({ name: list.candidates[i].name, error: r.error });
+      else throw new Error(`Viscera ranking: ${list.candidates[i].name}: ${r.error}`);
+    });
+    const { scores } = await this.bridge.send<{ ok: true; scores: number[] }>({
+      cmd: 'tradeScores', statWeights, base: probed.base, results: evaluated.map((i) => probed.results[i].stats),
+    });
+    const shown = ['CombinedDPS', 'TotalEHP', 'Life'];
+    const ranked: VisceraCandidate[] = evaluated.map((i, k) => {
+      const stats: Record<string, number> = {};
+      const change: Record<string, number> = {};
+      for (const key of shown) {
+        const v = probed.results[i].stats[key];
+        if (typeof v !== 'number') continue;
+        stats[key] = v;
+        change[key] = Number((v - toNumber(probed.base[key])).toPrecision(6));
+      }
+      const c = list.candidates[i];
+      return { name: c.name, baseName: c.baseName, score: Number(scores[k].toPrecision(6)), stats, change, itemText: c.itemText };
+    });
+    ranked.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+    return {
+      slot, currentItem: list.currentItem, statWeights: list.statWeights,
+      total: list.candidates.length, candidates: ranked.slice(0, limit), errors,
+    };
   }
 
   async searchTradeMods(
@@ -2732,8 +2782,10 @@ export class BuildSession {
    * target slot when one is given) get `suggestedMods`: the mods Path of
    * Building's own weighted trade query generator weighs highest for that slot
    * (topTradeMods; ~0.4-1 s a slot on the OccVortex fixture, so not every slot
-   * by default); slots it cannot weigh (tree-gated slots, tinctures, empty
-   * flask slots) get a `modsError` instead. Order: ranked slots (empty gear
+   * by default; grafts and tinctures from the bridge's own mod lists), and
+   * Wickerman slots get `suggestedViscera` instead (the best Viscera parts by
+   * rankViscera, FullDPS 1 + TotalEHP 0.5; ~2 s); slots it cannot weigh (empty
+   * flask and graft slots) get a `modsError` instead. Order: ranked slots (empty gear
    * and flask slots first, then by priority), unranked occupied ones, empty
    * jewel / abyssal sockets (unranked, no suggestedMods unless asked for with
    * `slot`), then slots that could not be measured (error). An engine error
@@ -2891,6 +2943,11 @@ export class BuildSession {
       for (const s of eligible.slice(0, modSlots)) {
         s.modsQueried = true;
         try {
+          if (WICKERMAN_SLOTS.has(s.slot)) {
+            const ranking = await this.rankVisceraUnlocked(s.slot, DEFAULT_STAT_WEIGHTS, modsPerSlot);
+            s.suggestedViscera = ranking.candidates.map((c) => ({ name: c.name, score: c.score }));
+            continue;
+          }
           const command = tradeQueryCommand({ slot: s.slot, league: 'Standard', includeScourge: false, includeCorrupted: false });
           const raw = await this.bridge.send<{ ok: true } & TradeQueryRaw>(command, TRADE_QUERY_TIMEOUT_MS);
           s.suggestedMods = topTradeMods(raw, modsPerSlot);
@@ -3747,6 +3804,8 @@ export interface UpgradeSuggestion {
   note?: string;
   /** Only on the slots mods were computed for (see suggestUpgrades): PoB's highest-weighted trade mods. */
   suggestedMods?: SuggestedMod[];
+  /** Wickerman slots, instead of suggestedMods: the best Viscera parts (generate_trade_search's ranking; score as there). */
+  suggestedViscera?: { name: string; score: number }[];
   /** PoB's trade query generator could not weigh mods for the slot (a slot or item it does not support, a refusal, or a failure of the generator). */
   modsError?: string;
   /** Internal (left out of the tool reply): the trade query generator was run for the slot. */
@@ -3763,8 +3822,9 @@ export const MAX_SUGGEST_TREE_JEWELS = 16;
 
 /** Why PoB's trade query generator gives a suggest_upgrades slot no suggested mods, or undefined when it can. */
 function modsUnsupported(row: UpgradeSlot, empty: boolean): string | undefined {
-  if (row.kind === 'treeGated') return 'Path of Building\'s trade query generator does not support this slot';
-  if (row.kind === 'flask' && row.tincture) return 'Path of Building\'s trade query generator has no tincture category';
+  if (row.kind === 'treeGated' && empty && !WICKERMAN_SLOTS.has(row.slot)) {
+    return 'Empty graft slot: a graft search weighs the mods the graft in the slot can roll (its base decides them), so equip a graft first';
+  }
   if (row.kind === 'flask' && empty) {
     return 'Empty flask slot: generate_trade_search with flaskType weighs mods for the kind of flask you want';
   }

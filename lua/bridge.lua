@@ -1114,7 +1114,8 @@ end
 -- the "flask" trade category and the generator's "Flask" mod list, which
 -- holds every flask mod (its LifeFlask / ManaFlask lists hold a handful of
 -- other mods), so every flask kind is weighed from that list; the kind only
--- decides the flask the mods are tried on. PoB has no tincture category.
+-- decides the flask the mods are tried on. PoB has no tincture category: a
+-- tincture search weighs PoB's tincture mods itself (tradeCompat.customModData).
 slotChecks.FLASK_SUBTYPES = { life = "Life", mana = "Mana", hybrid = "Hybrid", utility = "Utility" }
 -- The flask a search of that kind tries mods on when the slot holds no flask
 -- of that kind (the highest-level base of the kind when one is missing).
@@ -1136,27 +1137,35 @@ function slotChecks.flaskKind(item)
 	return flask.life and "life" or flask.mana and "mana" or "utility"
 end
 
--- The one refusal of tinctures in trade searches (lift it here once PoB's
--- generator has a tincture category).
+-- The one refusal of tinctures in trade searches: a tincture search weighs
+-- the tincture in the slot (its base decides its implicit and the search's
+-- base type filter), so it needs one there.
+slotChecks.VISCERA_TRADE_TEXT = "Viscera parts have fixed implicits and no affixes, so there are no mods to weigh; "
+	.. "generate_trade_search ranks the Viscera parts that fit the slot instead"
+
 function slotChecks.tinctureTradeRefusal(slotName, why)
-	userError("Cannot build a trade search for " .. tostring(slotName) .. ": " .. why .. ", and Path of Building's trade "
-		.. "query generator has no tincture category (it would weigh flask mods). Pass flaskType \"life\", \"mana\", "
-		.. "\"hybrid\" or \"utility\" to search flasks for the slot instead")
+	userError("Cannot build a tincture trade search for " .. tostring(slotName) .. ": " .. why .. ". A tincture search weighs "
+		.. "the mods of the tincture in the slot (its base decides its implicit, and the trade search is filtered by that base "
+		.. "type, as Path of Building's trade data has no tincture category), so equip the tincture you want to improve first, "
+		.. "or pass flaskType \"life\", \"mana\", \"hybrid\" or \"utility\" to search flasks for the slot instead")
 end
 
 -- A trade search into flask slot `slot` holding `item`: the flask kind
 -- searched (`flaskType`, else the equipped flask's) and, when the slot holds
--- no flask of that kind, the base to try the mods on instead. With
--- `forMods` (search_trade_mods: the mod list is the same for every kind) an
--- empty slot needs no flaskType (nil, nil).
+-- no flask of that kind, the base to try the mods on instead. "tincture"
+-- (flaskType, or the item in the slot) needs a tincture there, except with
+-- `forMods` (search_trade_mods: the mod list is the same for every kind; an
+-- empty slot needs no flaskType: nil, nil).
 function slotChecks.tradeFlask(slot, item, flaskType, forMods)
 	if flaskType ~= nil and flaskType ~= "tincture" and not slotChecks.FLASK_SUBTYPES[flaskType] then
-		userError("flaskType must be \"life\", \"mana\", \"hybrid\" or \"utility\"")
+		userError("flaskType must be \"life\", \"mana\", \"hybrid\", \"utility\" or \"tincture\"")
 	end
-	if flaskType == "tincture" then slotChecks.tinctureTradeRefusal(slot.slotName, "flaskType \"tincture\" was asked for") end
 	local current = slotChecks.flaskKind(item)
-	if flaskType == nil and current == "tincture" then
-		slotChecks.tinctureTradeRefusal(slot.slotName, "the slot holds a tincture")
+	if flaskType == "tincture" or (flaskType == nil and current == "tincture") then
+		if current ~= "tincture" and not forMods then
+			slotChecks.tinctureTradeRefusal(slot.slotName, item and "the slot holds a flask, not a tincture" or "the slot is empty")
+		end
+		return "tincture", nil
 	end
 	local kind = flaskType or current
 	if kind == nil then
@@ -4512,8 +4521,26 @@ local function tradeSlotOrError(slotName, helpers, jewelType, flaskType, forMods
 	if slot and slotChecks.isFlaskSlot(slot) then
 		if jewelType ~= nil then userError("jewelType only applies to jewel sockets, not " .. slotName) end
 		local kind, standIn = slotChecks.tradeFlask(slot, item, flaskType, forMods)
+		-- Tinctures: PoB's tincture mods under a "Tincture" category of the bridge's own (no trade category).
+		if kind == "tincture" then return slot, nil, "Tincture", nil, { kind = kind } end
 		local queryStr, category = helpers.getTradeCategory(slotName, item)
 		return slot, queryStr, category, nil, { kind = kind, standIn = standIn }
+	end
+	-- Tree-gated slots: grafts are weighed from PoB's graft mods under a
+	-- "Graft" category of the bridge's own (tradeCompat.customModData);
+	-- Wickerman parts have no mods (generate_trade_search ranks Viscera).
+	local gate = slot and slotChecks.treeGated[slotName]
+	if gate then
+		local hidden = slotChecks.hiddenReason(slot)
+		if hidden then userError(what .. hidden .. "; " .. gate.remedy) end
+		if not slotName:match("^Graft %d$") then userError(what .. slotChecks.VISCERA_TRADE_TEXT) end
+		if jewelType ~= nil then userError("jewelType only applies to jewel sockets, not " .. slotName) end
+		if not item and not forMods then
+			userError(what .. "the slot is empty. A graft search weighs the mods the graft in the slot can roll (its base "
+				.. "decides its skill and which mods it can have, and the trade search is filtered by that base type, as Path "
+				.. "of Building's trade data has no graft category), so equip the graft you want to improve first")
+		end
+		return slot, nil, "Graft", nil
 	end
 	if slot and slot.nodeId then
 		local nodeId = slotChecks.unallocatedSocket(slot)
@@ -4549,7 +4576,8 @@ local function tradeSlotOrError(slotName, helpers, jewelType, flaskType, forMods
 	if not slot or not listContains(supported, slotName) then
 		userError("Unsupported slot for a trade search: " .. tostring(slotName)
 			.. ". Supported slots: " .. table.concat(supported, ", ")
-			.. ", abyssal sockets the item in their slot has and allocated passive tree jewel sockets (see list_valid_slots)")
+			.. ", abyssal sockets the item in their slot has, allocated passive tree jewel sockets and, on the passive trees "
+			.. "that show them, Graft 1/2 and the Wickerman slots (see list_valid_slots)")
 	end
 	if jewelType ~= nil then
 		userError("jewelType only applies to jewel sockets, not " .. slotName)
@@ -4844,6 +4872,49 @@ function tradeCompat.megalomaniacMissing(gen)
 	return missing
 end
 
+-- Grafts and tinctures: PoB's generator has no category for them (TradeHelpers
+-- maps none, and its InitMods skips graft bases, whose implicits have no mod
+-- data). Their affixes (data.itemMods.Graft / .Tincture, only those PoB's
+-- spawn weights let roll on `item`'s base when one is given) and the base's
+-- implicits that have mod data go through the generator's own ProcessMod under
+-- a category of that name, into a separate mod list (the generator's own list
+-- is never changed); lines the trade stat list lacks are skipped by ProcessMod
+-- as for every other slot. The trade search filters by the base type instead
+-- of a trade category (runTradeQuery). Cached per base.
+tradeCompat.customCache = { }
+function tradeCompat.customModData(gen, category, item)
+	local mods = data.itemMods[category]
+	if type(gen.ProcessMod) ~= "function" or type(mods) ~= "table" then
+		userError("This Path of Building version cannot weigh " .. category:lower() .. " mods (its trade query generator has no "
+			.. "ProcessMod, or it has no " .. category:lower() .. " mod data); update Path of Building")
+	end
+	local base = item and item.base
+	local key = category .. "|" .. (base and item.baseName or "")
+	if tradeCompat.customCache[key] then return tradeCompat.customCache[key] end
+	local md = { Explicit = { }, Implicit = { }, Corrupted = { }, Enchant = { }, Scourge = { }, Eater = { }, Exarch = { } }
+	local tester = base and construct("Item", "Rarity: RARE\nStat Tester\n" .. item.baseName)
+	local saved = gen.modData
+	gen.modData = md
+	local ok, err = pcall(function()
+		local mask = { [category] = true }
+		for modId, mod in pairsSortByKey(mods) do
+			if not tester or tester:GetModSpawnWeight(mod) > 0 then gen:ProcessMod(modId, mod, nil, nil, mask) end
+		end
+		for _, id in ipairs(base and base.implicitIds or { }) do
+			local mod = data.itemMods.ItemExclusive[id]
+			if mod and mod.group and mod.statOrder then
+				local implicit = copyTable(mod)
+				implicit.type = "Implicit"
+				gen:ProcessMod("", implicit, nil, nil, mask)
+			end
+		end
+	end)
+	gen.modData = saved
+	if not ok then error(err, 0) end
+	tradeCompat.customCache[key] = md
+	return md
+end
+
 local function runTradeQuery(cmd)
 	local st = tradeStateOrError()
 	local unique = cmd.unique
@@ -4877,6 +4948,9 @@ local function runTradeQuery(cmd)
 				.. (#totals > 1 and "those" or "that") .. " instead (it is still valid in requiredMods)")
 		end
 	end
+	-- Grafts and tinctures: the mods of the item in the slot, filtered by its base type.
+	local custom = (category == "Graft" or category == "Tincture") and slot and build.itemsTab.items[slot.selItemId or 0]
+	local customMd = custom and tradeCompat.customModData(st.gen, category, custom) or nil
 	local o = cmd.options or { }
 	local tradeTypeIndex = nil
 	for i, t in ipairs(TRADE_TYPES) do if t == o.tradeType then tradeTypeIndex = i end end
@@ -4924,6 +4998,10 @@ local function runTradeQuery(cmd)
 		options.includeScourge = false
 		if unique == "Megalomaniac" then options.includeCorrupted = false
 		elseif o.includeCorrupted == nil then options.includeCorrupted = true end
+	elseif customMd then
+		-- StartQuery's special branch builds the test item from the slot's item without a trade category
+		-- (an unknown name sets no flag); the category and filters are set on its context below.
+		options.special = { itemName = category }
 	elseif ELDRITCH_SLOTS[slot.slotName] then
 		options.includeEldritch = ELDRITCH_OPTIONS[tonumber(o.eldritchIndex) or 1] or ELDRITCH_OPTIONS[1]
 	end
@@ -4963,6 +5041,7 @@ local function runTradeQuery(cmd)
 	main.OpenPopup = function() return { } end
 	main.ClosePopup = function() end
 	local capLifted = false
+	local savedModData = gen.modData
 	local activated, unactivate, savedCache = false, nil, nil
 	local savedMisc = build.calcsTab.miscCalculator
 	local started = os.clock()
@@ -4985,6 +5064,16 @@ local function runTradeQuery(cmd)
 		end
 		gen:StartQuery(querySlot, options)
 		local co = gen.calcContext.co
+		if customMd and co then
+			gen.calcContext.itemCategory, gen.calcContext.itemCategoryQueryStr = category, nil
+			gen.calcContext.special = {
+				queryFilters = { type_filters = { filters = { rarity = { option = "nonunique" } } } },
+				queryExtra = { type = custom.baseName },
+			}
+			gen.modData = customMd
+		elseif customMd then
+			userError("This Path of Building version's trade query generator cannot run a " .. category:lower() .. " search; update Path of Building")
+		end
 		local flag = unique and tradeCompat.UNIQUES[unique].flag
 		if flag and not (type(gen.calcContext.special) == "table" and gen.calcContext.special[flag]) then
 			userError("This Path of Building version's trade query generator has no " .. unique .. " search; update Path of Building")
@@ -5005,6 +5094,7 @@ local function runTradeQuery(cmd)
 		if not finished then error(finishErr, 0) end
 	end)
 	local elapsed = os.clock() - started
+	gen.modData = savedModData
 	main.OpenPopup, main.ClosePopup = openOrig, closeOrig
 	gen.calcContext = { }
 	gen.requesterCallback = nil
@@ -5049,6 +5139,7 @@ local function runTradeQuery(cmd)
 		unique = unique,
 		slot = slot and slot.slotName or dkjson.null,
 		flaskType = flask and flask.kind or nil,
+		baseType = customMd and custom.baseName or nil,
 		testBase = flask and flask.standIn or nil,
 		evaluatedActive = activated or nil,
 		statWeights = used,
@@ -5083,6 +5174,13 @@ local function searchTradeMods(cmd)
 		local _
 		_, _, category = tradeSlotOrError(cmd.slot, st.helpers, cmd.jewelType, cmd.flaskType, true)
 	end
+	-- Grafts and tinctures: the bridge's own mod lists (every graft / tincture mod for an empty slot).
+	local modData = st.gen.modData
+	if category == "Graft" or category == "Tincture" then
+		local item = build.itemsTab.items[build.itemsTab.slots[cmd.slot].selItemId or 0]
+		local own = item and item.base and item.base.type == category and item or nil
+		modData = tradeCompat.customModData(st.gen, category, own)
+	end
 	local needle = tostring(cmd.query or ""):lower()
 	local found, seen = { }, { }
 	local preferredPseudo = { }
@@ -5107,7 +5205,7 @@ local function searchTradeMods(cmd)
 		end
 	end
 	for _, kind in ipairs(kinds) do
-		for _, md in pairs(st.gen.modData[kind] or { }) do
+		for _, md in pairs(modData[kind] or { }) do
 			-- Megalomaniac's notables have no item category (its search weighs every one).
 			if (kind == "PassiveNode" or (category and md[category] ~= nil)) and md.tradeMod and type(md.tradeMod.id) == "string" then
 				add(md.tradeMod.id, tostring(md.tradeMod.text), (kind == "WatchersEye" or kind == "PassiveNode") and "Explicit" or kind)
@@ -5135,6 +5233,78 @@ local function searchTradeMods(cmd)
 	local mods = { }
 	for i = 1, math.min(limit, #found) do mods[i] = found[i] end
 	return { itemCategory = category or dkjson.null, total = #found, mods = mods }
+end
+
+-- Wickerman slots (3.30 trees): Viscera parts have fixed implicits and no
+-- affixes, so generate_trade_search ranks PoB's Viscera list instead: every
+-- entry of data.viscera, made as PoB's Viscera database makes it (a RARE
+-- item from the raw text, BuildAndParseRaw), that PoB's IsItemValidForSlot
+-- lets into the slot. BuildSession probes each candidate's text and scores
+-- the results with tradeScores. `statKeys`: the output keys the scores read
+-- (each weighted stat and its minion value; Full DPS also the stats PoB's
+-- WeightedRatioOutputs falls back on) plus the stats shown per candidate.
+function tradeCompat.visceraCandidates(cmd)
+	local slotName = cmd.slot
+	local slot = type(slotName) == "string" and build.itemsTab.slots[slotName] or nil
+	local gate = slot and slotChecks.treeGated[slotName]
+	if not gate or slotName:match("^Graft") then
+		userError(tostring(slotName) .. " is not a Wickerman slot (Head, Body, Arm or Leg)")
+	end
+	local hidden = slotChecks.hiddenReason(slot)
+	if hidden then userError("Cannot rank Viscera parts for " .. slotName .. ": " .. hidden .. "; " .. gate.remedy) end
+	if type(data.viscera) ~= "table" then
+		userError("This Path of Building version has no Viscera list (Data/Viscera.lua); update Path of Building")
+	end
+	local weights = tradeStatWeights(cmd.statWeights)
+	local keys, seen = { }, { }
+	local function key(k) if not seen[k] then seen[k] = true keys[#keys + 1] = k end end
+	for _, w in ipairs(weights) do
+		local stats = w.stat == "FullDPS" and { "FullDPS", "TotalDPS", "TotalDotDPS", "CombinedDPS" } or { w.stat }
+		for _, stat in ipairs(stats) do key(stat) key("Minion:" .. stat) end
+	end
+	for _, stat in ipairs({ "CombinedDPS", "TotalEHP", "Life" }) do key(stat) end
+	local candidates = { }
+	for _, raw in ipairs(data.viscera) do
+		local ok, item = pcall(construct, "Item", raw, "RARE", true)
+		if ok and item and item.base then
+			item:BuildAndParseRaw()
+			if build.itemsTab:IsItemValidForSlot(item, slotName) then
+				candidates[#candidates + 1] = { name = item.title or item.name, baseName = item.baseName, itemText = item:BuildRaw() }
+			end
+		end
+	end
+	local current = build.itemsTab.items[slot.selItemId or 0]
+	local used = { }
+	for _, w in ipairs(weights) do used[#used + 1] = { stat = w.stat, label = w.label, weight = w.weightMult } end
+	return { candidates = candidates, statKeys = keys, statWeights = used,
+		currentItem = current and (current.title or current.name) or dkjson.null }
+end
+
+-- Scores of probe results by PoB's own WeightedRatioOutputs (what the trade
+-- generator weighs mods with): (score(base, result) - score(base, base)) x
+-- 1000. `base` / `results` are probe stats; "Minion:<stat>" keys become
+-- output.Minion[<stat>].
+function tradeCompat.tradeScores(cmd)
+	local ratio = tradeStateOrError().gen.WeightedRatioOutputs
+	if type(ratio) ~= "function" then
+		userError("This Path of Building version's trade query generator has no WeightedRatioOutputs; update Path of Building")
+	end
+	local weights = tradeStatWeights(cmd.statWeights)
+	local function output(stats)
+		local out = { Minion = { } }
+		for k, v in pairs(type(stats) == "table" and stats or { }) do
+			if type(v) == "number" then
+				local minion = k:match("^Minion:(.+)$")
+				if minion then out.Minion[minion] = v else out[k] = v end
+			end
+		end
+		return out
+	end
+	local base = output(cmd.base)
+	local baseScore = ratio(base, base, weights)
+	local scores = { }
+	for i, stats in ipairs(cmd.results or { }) do scores[i] = (ratio(base, output(stats), weights) - baseScore) * 1000 end
+	return { scores = scores }
 end
 
 -- Commands that do not need a loaded build (everything else requires PoB to
@@ -5727,6 +5897,12 @@ local DISPATCH = {
 	},
 	searchTradeMods = {
 		handler = function(cmd) return searchTradeMods(cmd) end,
+	},
+	visceraCandidates = {
+		handler = function(cmd) return tradeCompat.visceraCandidates(cmd) end,
+	},
+	tradeScores = {
+		handler = function(cmd) return tradeCompat.tradeScores(cmd) end,
 	},
 
 	-- Utility
