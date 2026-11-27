@@ -6162,10 +6162,18 @@ do
 			end
 			local items = { }
 			local tab = build.itemsTab
+			-- `itemText`: each item's PoB "Copy item" text (BuildRaw), as
+			-- swap_item takes it; left out when BuildRaw fails on an item.
+			local function itemText(item)
+				if not cmd.itemText then return nil end
+				local ok, text = pcall(item.BuildRaw, item)
+				return ok and type(text) == "string" and text or nil
+			end
 			local function addItem(slotName, itemId, flags)
 				local item = itemId and itemId ~= 0 and tab.items[itemId]
 				if not item then return end
 				items[#items + 1] = {
+					text = itemText(item),
 					slot = slotName,
 					name = item.title or item.name,
 					base = item.baseName,
