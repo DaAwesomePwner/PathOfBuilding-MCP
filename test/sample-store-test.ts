@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { rename as realRename } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -13,16 +14,17 @@ import {
   sampleSlug,
   type SampleBuild,
   type SampleFile,
+  type SampleStoreFsOps,
 } from '../src/sample-store.js';
 import { UserError } from '../src/validation.js';
 
 /** Unit tests for the community sample store; no PoB or LuaJIT needed. */
 
 const tmpDirs: string[] = [];
-function freshStore(): { store: SampleStore; dir: string; root: string } {
+function freshStore(ops?: Partial<SampleStoreFsOps>): { store: SampleStore; dir: string; root: string } {
   const root = mkdtempSync(path.join(os.tmpdir(), 'pob-samples-'));
   tmpDirs.push(root);
-  const store = new SampleStore({ ...process.env, POB_MCP_CONFIG_DIR: root });
+  const store = new SampleStore({ ...process.env, POB_MCP_CONFIG_DIR: root }, ops);
   return { store, dir: path.join(root, 'samples'), root };
 }
 
@@ -210,6 +212,136 @@ async function main(): Promise<void> {
       /boom/
     );
     assert.equal((await store.get('Race')).builds.length, 31);
+  }
+
+  // ---- early sample-count refusal: the callback never runs
+  {
+    const { store } = freshStore();
+    for (let i = 0; i < MAX_SAMPLES; i++) await store.update(`s${i}`, () => ({ file: emptyFile(`s${i}`), result: 0 }), { create: true });
+    let called = false;
+    await rejects(
+      store.update(
+        'late',
+        () => {
+          called = true;
+          return { file: emptyFile('late'), result: 0 };
+        },
+        { create: true }
+      ),
+      /At most 100 samples/
+    );
+    assert.equal(called, false, 'callback not invoked for a new sample past the cap');
+  }
+
+  // ---- hand-edited files refused on read: too large, too many builds, bad ids
+  {
+    const { store, dir } = freshStore();
+    mkdirSync(dir, { recursive: true });
+    const tooMany = { ...emptyFile('Toomany'), builds: Array.from({ length: MAX_SAMPLE_BUILDS + 1 }, (_, i) => build(hexId(i))) };
+    const cases: Array<[string, Buffer | string, RegExp]> = [
+      ['huge', Buffer.alloc(MAX_SAMPLE_FILE_BYTES + 1, 0x20), /larger than/],
+      ['toomany', JSON.stringify(tooMany), /not a valid sample/],
+      ['upper', JSON.stringify({ ...emptyFile('Upper'), builds: [build('ABCDEF012345')] }), /not a valid sample/],
+      ['short', JSON.stringify({ ...emptyFile('Short'), builds: [build('abc')] }), /not a valid sample/],
+    ];
+    for (const [name, content, re] of cases) {
+      const file = path.join(dir, `${name}.json`);
+      writeFileSync(file, content);
+      const before = readFileSync(file);
+      const e = await rejects(store.get(name), re);
+      assert.ok(e.message.includes(file), `${name}: error names the path`);
+      await rejects(store.update(name, (f) => ({ file: f, result: 0 }), { create: true }), re);
+      assert.ok(before.equals(readFileSync(file)), `${name}: bytes unchanged`);
+    }
+  }
+
+  // ---- write-side schema check: a caller bug throws a plain Error and writes nothing
+  {
+    const { store, dir } = freshStore();
+    await add(store, 'Valid', build('aaaaaaaaaaaa'));
+    const file = path.join(dir, 'valid.json');
+    const before = readFileSync(file);
+    const plainError = (e: unknown): boolean => e instanceof Error && !(e instanceof UserError);
+    const bugs: Array<[string, (f: SampleFile) => SampleFile]> = [
+      ['bad id', (f) => ({ ...f, builds: [build('NOT-HEX')] })],
+      ['bad source', (f) => ({ ...f, builds: [{ ...build('bbbbbbbbbbbb'), source: 'poe.ninja' as SampleBuild['source'] }] })],
+      ['duplicate ids', (f) => ({ ...f, builds: [build('bbbbbbbbbbbb'), build('bbbbbbbbbbbb')] })],
+      ['wrong version', (f) => ({ ...f, version: 2 as unknown as 1 })],
+    ];
+    for (const [what, mutate] of bugs) {
+      await assert.rejects(store.update('Valid', (f) => ({ file: mutate(f!), result: 0 })), plainError, `${what}: plain Error`);
+      assert.ok(before.equals(readFileSync(file)), `${what}: file unchanged`);
+    }
+    await assert.rejects(
+      store.update('Brand New', () => ({ file: { ...emptyFile('Brand New'), builds: [build('zz')] }, result: 0 }), { create: true }),
+      plainError
+    );
+    assert.deepEqual(readdirSync(dir), ['valid.json'], 'nothing written for a new sample either');
+  }
+
+  // ---- a write that fails after its tmp file exists leaves no tmp file; the target stays as it was
+  {
+    const diskFull: SampleStoreFsOps['rename'] = async () => {
+      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    };
+    const failing = freshStore({ rename: diskFull });
+    await assert.rejects(add(failing.store, 'Doomed', build('aaaaaaaaaaaa')), /disk full/);
+    assert.deepEqual(existsSync(failing.dir) ? readdirSync(failing.dir) : [], [], 'failed rename leaves no tmp');
+
+    const { store, dir, root } = freshStore();
+    await add(store, 'Keep', build('aaaaaaaaaaaa'));
+    const before = readFileSync(path.join(dir, 'keep.json'));
+    const failing2 = new SampleStore({ ...process.env, POB_MCP_CONFIG_DIR: root }, { rename: diskFull });
+    await assert.rejects(add(failing2, 'Keep', build('bbbbbbbbbbbb')), /disk full/);
+    assert.ok(before.equals(readFileSync(path.join(dir, 'keep.json'))), 'old bytes kept');
+    assert.deepEqual(readdirSync(dir), ['keep.json']);
+  }
+
+  // ---- rename retry: transient EPERM / EBUSY is retried, a persistent one fails and cleans up
+  {
+    let calls = 0;
+    const flaky = freshStore({
+      rename: (async (from: string, to: string) => {
+        calls++;
+        if (calls <= 2) throw Object.assign(new Error('busy'), { code: calls === 1 ? 'EPERM' : 'EBUSY' });
+        return realRename(from, to);
+      }) as SampleStoreFsOps['rename'],
+    });
+    await add(flaky.store, 'Flaky', build('aaaaaaaaaaaa'));
+    assert.equal(calls, 3, 'two retries then success');
+    assert.equal((await flaky.store.get('Flaky')).builds.length, 1);
+    assert.deepEqual(readdirSync(flaky.dir), ['flaky.json']);
+
+    let attempts = 0;
+    const stuck = freshStore({
+      rename: async () => {
+        attempts++;
+        throw Object.assign(new Error('locked'), { code: 'EPERM' });
+      },
+    });
+    await assert.rejects(add(stuck.store, 'Stuck', build('aaaaaaaaaaaa')), /locked/);
+    assert.equal(attempts, 5, 'gives up after 5 attempts');
+    assert.deepEqual(readdirSync(stuck.dir), [], 'no tmp left');
+  }
+
+  // ---- stale tmp cleanup on first touch
+  {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'pob-samples-'));
+    tmpDirs.push(root);
+    const dir = path.join(root, 'samples');
+    mkdirSync(dir, { recursive: true });
+    const stale = path.join(dir, 'old.json.tmp-123-4');
+    const fresh = path.join(dir, 'new.json.tmp-123-5');
+    const other = path.join(dir, 'notes.txt');
+    for (const f of [stale, fresh, other]) writeFileSync(f, 'x');
+    const old = new Date(Date.now() - 20 * 60 * 1000);
+    utimesSync(stale, old, old);
+    utimesSync(other, old, old);
+    const store = new SampleStore({ ...process.env, POB_MCP_CONFIG_DIR: root });
+    assert.deepEqual(await store.list(), []);
+    assert.ok(!existsSync(stale), 'stale tmp removed');
+    assert.ok(existsSync(fresh), 'recent tmp kept (a writer may still be running)');
+    assert.ok(existsSync(other), 'unrelated files untouched');
   }
 
   console.log('sample-store tests passed');

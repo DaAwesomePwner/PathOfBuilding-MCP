@@ -44,8 +44,11 @@ export interface SampleFile {
   builds: SampleBuild[];
 }
 
+/** `buildIdFor`'s output shape. */
+const BUILD_ID_RE = /^[0-9a-f]{12}$/;
+
 const buildSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().regex(BUILD_ID_RE, 'build id must be 12 lower-case hex characters'),
   label: z.string().optional(),
   source: z.enum(['code', 'xml', 'pobb.in', 'pastebin']),
   url: z.string().optional(),
@@ -58,7 +61,7 @@ const fileSchema = z.object({
   name: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
-  builds: z.array(buildSchema),
+  builds: z.array(buildSchema).max(MAX_SAMPLE_BUILDS, `more than ${MAX_SAMPLE_BUILDS} builds`),
 });
 
 const NAME_RE = /^[A-Za-z0-9 \-_.'()+]+$/;
@@ -101,19 +104,56 @@ export interface SampleListEntry {
  */
 const chains = new Map<string, Promise<unknown>>();
 let tmpCounter = 0;
+/** Directories whose stale tmp files were already swept by this process. */
+const sweptDirs = new Set<string>();
+/** A tmp file this old belongs to a writer that died before its rename. */
+const STALE_TMP_MS = 10 * 60 * 1000;
+const TMP_NAME_RE = /^[a-z0-9-]+\.json\.tmp-\d+-\d+$/;
 
+/** File operations the store uses; tests replace `rename` to exercise write failures and retries. */
+export interface SampleStoreFsOps {
+  rename: typeof rename;
+}
+
+/**
+ * Every method (reads too) runs under one in-process mutex shared by all
+ * instances on the same directory. The lock is not re-entrant: calling any
+ * store method from inside an `update` callback waits for itself and deadlocks.
+ */
 export class SampleStore {
   readonly dir: string;
+  private readonly ops: SampleStoreFsOps;
 
-  constructor(env: NodeJS.ProcessEnv = process.env) {
+  constructor(env: NodeJS.ProcessEnv = process.env, ops: Partial<SampleStoreFsOps> = {}) {
+    this.ops = { rename, ...ops };
     this.dir = path.join(configDir(env), 'samples');
   }
 
   private run<T>(fn: () => Promise<T>): Promise<T> {
     const prev = chains.get(this.dir) ?? Promise.resolve();
-    const next = prev.then(fn, fn);
+    const next = prev.then(() => this.sweepStaleTmp()).then(fn, fn);
     chains.set(this.dir, next.catch(() => undefined));
     return next;
+  }
+
+  /** Once per process and directory: removes tmp files left by a writer that died mid-write. Best effort. */
+  private async sweepStaleTmp(): Promise<void> {
+    if (sweptDirs.has(this.dir)) return;
+    sweptDirs.add(this.dir);
+    try {
+      const cutoff = Date.now() - STALE_TMP_MS;
+      for (const f of await readdir(this.dir)) {
+        if (!TMP_NAME_RE.test(f)) continue;
+        const full = path.join(this.dir, f);
+        try {
+          if ((await stat(full)).mtimeMs < cutoff) await unlink(full);
+        } catch {
+          /* best effort */
+        }
+      }
+    } catch {
+      /* no directory yet, or unreadable: nothing to sweep */
+    }
   }
 
   private fileFor(slug: string): string {
@@ -180,6 +220,12 @@ export class SampleStore {
     return { slug, file, data };
   }
 
+  private async checkSampleCount(): Promise<void> {
+    if ((await this.slugsOnDisk()).length >= MAX_SAMPLES) {
+      throw new UserError(`At most ${MAX_SAMPLES} samples can be saved; remove one first.`);
+    }
+  }
+
   private async missing(name: string): Promise<UserError> {
     const slugs = await this.slugsOnDisk();
     const shown = slugs.slice(0, MAX_LISTED_NAMES);
@@ -226,7 +272,8 @@ export class SampleStore {
    * Read-modify-write under the mutex. `fn` gets the current file (null when
    * absent and `create` is set) and returns the new file (the store stamps
    * `updatedAt`) or null to delete the sample. Caps are checked before anything
-   * is written, so a refusal leaves the file as it was.
+   * is written, so a refusal leaves the file as it was. Not re-entrant: `fn`
+   * must not call any store method (it would wait on the lock it holds).
    */
   update<T>(
     name: string,
@@ -236,15 +283,15 @@ export class SampleStore {
     return this.run(async () => {
       const { slug, file, data } = await this.load(name);
       if (!data && !opts.create) throw await this.missing(name);
+      // Refuse before `fn` runs, so a caller doing expensive work in it learns early.
+      if (!data) await this.checkSampleCount();
       const { file: next, result } = await fn(data);
       if (next === null) {
         if (data) await unlink(file).catch((e) => { if (e?.code !== 'ENOENT') throw e; });
         return result;
       }
       if (next.name !== name.trim()) throw new Error(`sample-store: update() must keep the sample name "${name.trim()}"`);
-      if (!data && (await this.slugsOnDisk()).length >= MAX_SAMPLES) {
-        throw new UserError(`At most ${MAX_SAMPLES} samples can be saved; remove one first.`);
-      }
+      if (!data) await this.checkSampleCount();
       if (next.builds.length > MAX_SAMPLE_BUILDS) {
         throw new UserError(`A sample holds at most ${MAX_SAMPLE_BUILDS} builds; it would have ${next.builds.length}.`);
       }
@@ -253,6 +300,9 @@ export class SampleStore {
         updatedAt: new Date().toISOString(),
         builds: next.builds.map((b) => (b.label !== undefined && b.label.length > MAX_SAMPLE_LABEL ? { ...b, label: b.label.slice(0, MAX_SAMPLE_LABEL) } : b)),
       };
+      // The same schema as a read: a file this store would later refuse never reaches the disk.
+      const check = fileSchema.safeParse(toWrite);
+      if (!check.success) throw new Error(`sample-store: refusing to write an invalid sample: ${check.error.issues[0]?.message}`);
       if (new Set(toWrite.builds.map((b) => b.id)).size !== toWrite.builds.length) {
         throw new Error('sample-store: duplicate build ids');
       }
@@ -292,7 +342,7 @@ export class SampleStore {
       await writeFile(tmp, text, 'utf8');
       for (let attempt = 0; ; attempt++) {
         try {
-          await rename(tmp, file);
+          await this.ops.rename(tmp, file);
           return;
         } catch (e) {
           // Windows reports EPERM/EBUSY while antivirus or an indexer briefly holds the target.
