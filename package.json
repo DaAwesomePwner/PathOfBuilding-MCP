@@ -25,6 +25,7 @@
     "dev": "tsx src/server.ts",
     "prepublishOnly": "npm run build",
     "test:paths": "tsx test/paths-test.ts",
+    "test:sample-store": "tsx test/sample-store-test.ts",
     "test:bridge": "tsx test/bridge-test.ts",
     "test:session": "tsx test/session-test.ts",
     "test:server": "tsx test/server-test.ts",
