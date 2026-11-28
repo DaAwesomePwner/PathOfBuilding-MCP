@@ -92,6 +92,10 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   stat_weights: READ_ONLY,
   // Reads another build (may fetch a pastebin / pobb.in link) in a short-lived second engine.
   compare_builds: { ...READ_ONLY, openWorldHint: true },
+  // Community samples (saved in the config dir; read in a short-lived second engine, never the loaded build).
+  add_sample_builds: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  list_samples: READ_ONLY,
+  remove_sample_builds: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   // PoB's item data: items are built in the engine, never added to the build.
   search_items: READ_ONLY,
   get_item_text: READ_ONLY,

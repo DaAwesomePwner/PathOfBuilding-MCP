@@ -198,8 +198,10 @@ variants; past that, remaining candidates are unmeasured with
 ## Bridge change
 
 `compareSnapshot` takes `itemText: true` and then adds each item's PoB
-"Copy item" text (`text`, the same text `get_item_in_slot` returns) to its
-`items` entries. Without the flag the reply is unchanged (compare_builds).
+"Copy item" text (`text`: `item:BuildRaw()`, as PoB's Copy item writes it and
+`swap_item` takes it; when BuildRaw fails on an item, the text PoB parsed it
+from, `item.raw`, which `get_item_in_slot` returns) to its `items` entries.
+Without the flag the reply is unchanged (compare_builds).
 
 ## Invariants this keeps
 
