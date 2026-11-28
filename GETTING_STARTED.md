@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   54 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   62 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -23,7 +23,7 @@ Three layers, three responsibilities:
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
 | **Probe engine** | `lua/probe.lua`, `src/probe.ts` | Evaluates what-if variants through PoB's own calculator (the one its tooltips use) without changing or recalculating the build; `src/tree-search.ts`, `src/link-search.ts` and `src/evaluate-changes.ts` build the node searches, the link search and `evaluate_changes` on it. |
-| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 54 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
+| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 62 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -147,7 +147,7 @@ To run the server in your MCP client, add this to `claude_desktop_config.json` (
 
 `POB_PATH` is optional. Paths resolve as **env var → saved config → auto-detect** (standard install folder, the installer's registry entry, common LuaJIT locations, `PATH`). If nothing is found the server still starts: just tell Claude where PoB is installed and it calls `configure_pob_path`, which saves the path to `%APPDATA%\pob-mcp-server\config.json` (macOS `~/Library/Application Support/pob-mcp-server/`, Linux `~/.config/pob-mcp-server/`).
 
-Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 37 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
+Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 62 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
 
 ### Environment variables
 
@@ -287,18 +287,20 @@ add_sample_builds({ sample: "RF Chieftain", builds: [
 load_build({ source: <your build> })
 community_gap_report({ sample: "RF Chieftain", minShare: 0.5 })
 // -> { sample: { size: 3, used: 3, mainSkillMatched: 3, ... }, rankBy: "CombinedDPS", base: {...},
-//      gear: [{ kind: "item", name: "Rise of the Phoenix", slot: "Weapon 2", share: 0.67, count: 2, measured: true, delta: 41230, pct: 8.4,
-//               best: { delta: 41230, from: { build: "3fa91c0b72de", label: "ninja #1", slot: "Weapon 2" }, replaces: "Redblade Tower Shield" } }, ...],
+//      gear: [{ kind: "item", name: "Doomsower", slot: "Weapon 1", share: 0.67, count: 2, measured: true, delta: 41230, pct: 8.4,
+//               best: { delta: 41230, from: { build: "3fa91c0b72de", label: "ninja #1", slot: "Weapon 1" }, replaces: "Corroded Blade", offHand: "Rise of the Phoenix" },
+//               median: 38900, note: "The delta includes the source build's off-hand (Rise of the Phoenix) in Weapon 2: copy both with list_samples ..." }, ...],
 //      tree: [{ kind: "notable", name: "Heart of Flame", share: 1, measured: true, delta: 5120, points: 2, perPoint: 2560, apply: { allocate: [...] } }, ...],
 //      gems: [{ kind: "support", name: "Increased Duration", share: 1, measured: true, delta: 9800, best: { delta: 9800, replaces: "Swift Affliction" },
 //               apply: { gems: [{ op: "set", group: 1, index: 3, name: "Increased Duration", level: 20, quality: 20 }] } }, ...],
 //      settings: [...], more: {...}, uncommon: {...}, notes: [...] }
 apply_changes({ variant: <the tree or gems row's apply> })      // one undoable step
-list_samples({ sample: "RF Chieftain", build: "3fa91c0b72de", slot: "Weapon 2" })   // -> item.itemText
-swap_item({ slot: "Weapon 2", itemText: <item.itemText> })
+list_samples({ sample: "RF Chieftain", build: "3fa91c0b72de", slot: "Weapon 1" })   // -> item.itemText (best.from.slot)
+list_samples({ sample: "RF Chieftain", build: "3fa91c0b72de", slot: "Weapon 2" })   // the off-hand the row's note names
+apply_changes({ variant: { items: [{ slot: "Weapon 1", itemText: <Weapon 1 text> }, { slot: "Weapon 2", itemText: <Weapon 2 text> }] } })
 ```
 
-Rows are ranked by the change of `rankBy` (default `CombinedDPS`; `objective` ranks by a weighted score, with `delta` then the score), tree rows by gain per passive point. A gap is measured as if you took the sample's version: gear is tried as up to 5 copies from the sample in that slot (`median` is over the copies, `best.from` says which build and slot to read the text from), supports replace each support of your main group, tree nodes come with their path. Nothing is applied, so the build stays as loaded until you commit a row. `filter: { ascendancy: "Chieftain", minLevel: 95 }` narrows the sample first; `uncommon` lists what you use that fewer than 10% of the sample does. `list_samples` / `remove_sample_builds` manage the saved samples; the same build added twice (same XML) is reported under `duplicates`.
+A Weapon 1 row is measured together with its build's off-hand (`best.offHand`; `"empty"` means Weapon 2 was emptied), so copy both slots as above; the row's `slot` is the slot as your build names it (`Weapon 1 Swap` while weapon set 2 is in use). Rows are ranked by the change of `rankBy` (default `CombinedDPS`; `objective` ranks by a weighted score, with `delta` then the score), tree rows by gain per passive point. A gap is measured as if you took the sample's version: gear is tried as up to 5 copies from the sample in that slot (`median` is over the copies, `best.from` says which build and slot to read the text from), supports replace each support of your main group, tree nodes come with their path. Nothing is applied, so the build stays as loaded until you commit a row. `filter: { ascendancy: "Chieftain", minLevel: 95 }` narrows the sample first; `uncommon` lists what you use that fewer than 10% of the sample does. `list_samples` / `remove_sample_builds` manage the saved samples; the same build added twice (same XML) is reported under `duplicates`.
 
 ## Creating a build from scratch
 
@@ -352,4 +354,4 @@ Full troubleshooting guide: [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md)
 - **Tune performance**: set `POB_TIMING=1` and inspect the per-command histogram. `bridge.getStats` and `bridge.exportXML` dominate; everything else is sub-100ms typically.
 - **Pull upstream PoB updates**: `git fetch upstream && git merge upstream/dev`. `bridge.lua` only depends on stable PoB internals (`build.itemsTab`, `build.spec:CountAllocNodes`, etc.), so upstream churn rarely breaks anything.
 
-That's the whole picture: 37 tools, three layers, deterministic state, and a real PoB engine behind every number.
+That's the whole picture: 62 tools, three layers, deterministic state, and a real PoB engine behind every number.
