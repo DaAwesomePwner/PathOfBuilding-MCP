@@ -15,10 +15,14 @@
 //      compareSnapshot without itemText has no item text.
 //   4. freshSampleSnapshots: stale snapshots (other pobVersion / format) are
 //      re-read in one temporary engine and saved; a build PoB now refuses is
-//      dropped from the result but kept in the file.
+//      dropped from the result but kept in the file. Builds another call adds
+//      during the refresh are in `builds` (current snapshot) or `dropped`.
 //   5. A temporary engine that crashes or times out fails add_sample_builds
 //      with nothing saved; the live engine keeps working with no strike.
 //      With the live crash breaker open the call is refused naming the tool.
+//   5b. Two concurrent adds to one sample lose no build; two racing past the
+//      50-build cap: one is added, the other is refused ("Nothing was added");
+//      a sample file that would pass 8 MB is refused before any engine start.
 //   6. remove_sample_builds: unknown id refused with nothing changed, ids
 //      removed, deleteSample removes the file.
 //   7. Over MCP: the three tools are reachable and reply compact JSON.
@@ -111,6 +115,8 @@ async function main(): Promise<void> {
   const itemSetsXml = readFileSync(path.join(path.dirname(fixturePath), 'OccVortexItemSets.xml'), 'utf8').trim();
 
   const temp: Array<{ bridge: LuaBridge; pid?: number }> = [];
+  // Runs once, right after the next temporary engine started (a write by "another call" mid-refresh).
+  let onTemporaryStart: (() => Promise<void>) | null = null;
   const engine = new EngineManager({
     temporaryBridgeFactory: (p, o) => {
       const bridge = new LuaBridge(p, o.timeoutMs, { testFaults: o.testFaults });
@@ -123,6 +129,9 @@ async function main(): Promise<void> {
         } finally {
           rec.pid = bridge.getPid() ?? rec.pid;
         }
+        const hook = onTemporaryStart;
+        onTemporaryStart = null;
+        if (hook) await hook();
       };
       return bridge;
     },
@@ -290,6 +299,35 @@ async function main(): Promise<void> {
     await removeSampleBuilds(store, { sample: SAMPLE, ids: [badId] });
     const quiet = await run(() => freshSampleSnapshots(engine, store, SAMPLE));
     assert(quiet.builds.length === 3 && quiet.dropped.length === 0 && temp.length === created + 2, 'nothing stale: no temporary engine');
+    // Builds another call adds while the refresh runs: one with a current
+    // snapshot is used, one without is dropped with a reason; none is silent.
+    const cur = JSON.parse(readFileSync(sampleFile, 'utf8')) as typeof before;
+    cur.builds[0].snapshot!.pobVersion = '0.0.1-old';
+    writeFileSync(sampleFile, JSON.stringify(cur));
+    const currentId = 'cccccccccccc';
+    const lateId = 'dddddddddddd';
+    onTemporaryStart = async () => {
+      await store.update(SAMPLE, (f) => ({
+        file: {
+          ...f!,
+          builds: [
+            ...f!.builds,
+            { ...f!.builds[1], id: currentId, label: 'added meanwhile' },
+            { id: lateId, source: 'code' as const, code: f!.builds[1].code, addedAt: f!.builds[1].addedAt },
+          ],
+        },
+        result: null,
+      }));
+    };
+    const raced = await run(() => freshSampleSnapshots(engine, store, SAMPLE));
+    assert(raced.builds.map((b) => b.id).join() === [rowA.id, rowB.id, rowC.id, currentId].join(), `raced builds: ${raced.builds.map((b) => b.id)}`);
+    assert(raced.dropped.length === 1 && raced.dropped[0].id === lateId && /added or changed while the sample was being refreshed; retry/.test(raced.dropped[0].error),
+      `raced dropped: ${JSON.stringify(raced.dropped)}`);
+    assert(raced.file.builds.length === 5, `raced file: ${raced.file.builds.length} builds`);
+    const racedDisk = JSON.parse(readFileSync(sampleFile, 'utf8')) as typeof before;
+    assert(racedDisk.builds.length === 5 && racedDisk.builds[0].snapshot!.pobVersion === version && racedDisk.builds[4].snapshot === undefined,
+      'raced refresh saved the stale build and kept the added ones');
+    await removeSampleBuilds(store, { sample: SAMPLE, ids: [currentId, lateId] });
     log('PASS');
 
     log('Test 5: the temporary engine crashes or hangs; breaker open');
@@ -329,6 +367,36 @@ async function main(): Promise<void> {
       }
     });
     assert(temp.length === createdBefore, 'the breaker refusal started a temporary engine');
+    log('PASS');
+
+    log('Test 5b: concurrent adds, a race past the build cap, the file size estimate');
+    const fakeBuilds = (n: number, code = 'x') =>
+      Array.from({ length: n }, (_, i) => ({ id: (0xf00000000000 + i).toString(16), source: 'code' as const, code, addedAt: '2026-01-01T00:00:00.000Z' }));
+    const seed = (name: string, builds: ReturnType<typeof fakeBuilds>) =>
+      store.update(name, () => ({
+        file: { version: 1 as const, name, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', builds },
+        result: null,
+      }), { create: true });
+    const racing = await Promise.all([add({ sample: 'Race', builds: [{ source: fixtureXml }] }), add({ sample: 'Race', builds: [{ source: codeB }] })]);
+    assert(racing.every((r) => r.added.length === 1 && r.failed.length === 0) && racing.map((r) => r.count).sort().join() === '1,2', `racing adds: ${JSON.stringify(racing)}`);
+    const raceIds = ((await list({ sample: 'Race' })) as { builds: BuildRow[] }).builds.map((b) => b.id).sort();
+    assert(raceIds.join() === [rowA.id, rowB.id].sort().join(), `racing adds lost a build: ${raceIds}`);
+    await seed('Cap Race', fakeBuilds(49));
+    const capRace = await Promise.allSettled([add({ sample: 'Cap Race', builds: [{ source: fixtureXml }] }), add({ sample: 'Cap Race', builds: [{ source: codeB }] })]);
+    const ok = capRace.filter((r) => r.status === 'fulfilled') as Array<PromiseFulfilledResult<AddResult>>;
+    const bad = capRace.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    assert(ok.length === 1 && ok[0].value.count === 50 && bad.length === 1, `cap race: ${JSON.stringify(capRace.map((r) => r.status))}`);
+    const capError = bad[0].reason as Error;
+    assert(capError instanceof UserError && /^Nothing was added: sample "Cap Race" would exceed 50 builds \(now 50, this call adds 1;/.test(capError.message),
+      `cap race message: ${capError.message}`);
+    assert(((await list({ sample: 'Cap Race' })) as { count: number }).count === 50, 'cap race file');
+    const beforeBig = temp.length;
+    // One stored build of ~8 MB: the file is under the limit, a new build's estimate is not.
+    await seed('Big', fakeBuilds(1, 'x'.repeat(8_360_000)));
+    await expectError(add({ sample: 'Big', builds: [{ source: codeB }] }), UserError, /would grow past its 8 MB file limit.*Nothing was added/, 'file size estimate');
+    assert(temp.length === beforeBig, 'the size estimate refusal started a temporary engine');
+    for (const name of ['Race', 'Cap Race', 'Big']) await removeSampleBuilds(store, { sample: name, deleteSample: true });
+    assert((await liveState()) === stateBefore, 'concurrent adds changed the live build');
     log('PASS');
 
     log('Test 6: remove_sample_builds');

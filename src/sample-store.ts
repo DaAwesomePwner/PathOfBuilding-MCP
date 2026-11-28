@@ -245,19 +245,37 @@ export class SampleStore {
   }
 
   list(): Promise<SampleListEntry[]> {
+    return this.listWith(() => undefined).then((rows) => rows.map(({ summary: _summary, ...entry }) => entry));
+  }
+
+  /**
+   * `list()` plus `summarize(file)` per readable sample, each file read once
+   * and dropped after its summary (memory stays one file at a time).
+   */
+  listWith<T>(summarize: (file: SampleFile) => T): Promise<Array<SampleListEntry & { summary?: T }>> {
     return this.run(async () => {
-      const out: SampleListEntry[] = [];
+      const out: Array<SampleListEntry & { summary?: T }> = [];
       for (const slug of await this.slugsOnDisk()) {
         const file = this.fileFor(slug);
         try {
           const data = await this.readFile(file, slug);
-          if (data) out.push({ name: data.name, count: data.builds.length, updatedAt: data.updatedAt, file });
+          if (data) out.push({ name: data.name, count: data.builds.length, updatedAt: data.updatedAt, file, summary: summarize(data) });
         } catch (e) {
           out.push({ name: slug, count: 0, updatedAt: '', file, error: (e as Error).message });
         }
       }
       return out;
     });
+  }
+
+  /** Number of sample files on disk (no file is read). */
+  sampleCount(): Promise<number> {
+    return this.run(async () => (await this.slugsOnDisk()).length);
+  }
+
+  /** The sample, or null when it does not exist; a bad file or a name clash is a UserError as in `get`. */
+  find(name: string): Promise<SampleFile | null> {
+    return this.run(async () => (await this.load(name)).data);
   }
 
   get(name: string): Promise<SampleFile> {

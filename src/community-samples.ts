@@ -7,7 +7,6 @@
  * Builds come only from what the caller supplies; nothing contacts poe.ninja
  * (validateBuildSource refuses its links).
  */
-import path from 'node:path';
 import { z } from 'zod';
 import { decodeBuildCode, encodeBuildCode } from './build-source.js';
 import {
@@ -25,6 +24,7 @@ import type { EngineManager, TemporaryEngineOptions } from './engine-manager.js'
 import {
   buildIdFor,
   MAX_SAMPLE_BUILDS,
+  MAX_SAMPLE_FILE_BYTES,
   MAX_SAMPLE_LABEL,
   MAX_SAMPLES,
   SAMPLE_SNAPSHOT_FORMAT,
@@ -43,6 +43,14 @@ const UNKNOWN_VERSION = 'unknown';
 const PURPOSE = 'the sample builds';
 const LOAD_NAME = 'sample build';
 const TOP_N = 3;
+/**
+ * Bytes a new build is assumed to add to its sample file, per character of its
+ * build code (the code plus its snapshot with item text). Measured on the test
+ * fixtures at 3.2-3.9 (an 8-11 KB code gives a 33-35 KB entry); 5 leaves room
+ * for builds with more items per code byte. Only an early refusal: the store
+ * checks the real size before writing.
+ */
+const ENTRY_BYTES_PER_CODE_CHAR = 5;
 
 // ---------------------------------------------------------------------------
 // Snapshots: reading, staleness, summaries
@@ -182,22 +190,24 @@ export async function freshSampleSnapshots(
   }
   let saved = file;
   if (fresh.size) {
+    // update() without `create` refuses a sample removed meanwhile before calling back, so `cur` is set.
     saved = await store.update(sampleName, (cur) => {
-      if (!cur) throw new UserError(`Sample "${sampleName.trim()}" was removed while it was being read.`);
       const next: SampleFile = {
-        ...cur,
-        builds: cur.builds.map((b) => (fresh.has(b.id) ? { ...b, snapshot: snapshotRecord(fresh.get(b.id)!, version) } : b)),
+        ...cur!,
+        builds: cur!.builds.map((b) => (fresh.has(b.id) ? { ...b, snapshot: snapshotRecord(fresh.get(b.id)!, version) } : b)),
       };
       return { file: next, result: next };
     });
   }
-  const present = new Set(saved.builds.map((b) => b.id));
+  // Every build of the saved file is in `builds` or `dropped`: one another call
+  // added during the refresh is used when its snapshot is current.
   const droppedIds = new Set(dropped.map((d) => d.id));
   const builds: FreshSampleBuild[] = [];
-  for (const b of file.builds) {
-    if (!present.has(b.id) || droppedIds.has(b.id)) continue;
-    const snapshot = fresh.get(b.id) ?? storedSnapshot(b);
+  for (const b of saved.builds) {
+    if (droppedIds.has(b.id)) continue;
+    const snapshot = fresh.get(b.id) ?? (isStale(b, version) ? null : storedSnapshot(b));
     if (snapshot) builds.push({ id: b.id, ...withLabel(b.label), snapshot });
+    else dropped.push({ id: b.id, ...withLabel(b.label), error: 'added or changed while the sample was being refreshed; retry' });
   }
   return { file: saved, builds, dropped };
 }
@@ -213,16 +223,14 @@ export interface AddSampleBuildsArgs {
 
 /** The sample's file when it exists; null when it does not and one more may be created. */
 async function existingSample(store: SampleStore, name: string): Promise<SampleFile | null> {
-  const slug = sampleSlug(name);
-  const entries = await store.list();
-  const entry = entries.find((e) => path.basename(e.file) === `${slug}.json`);
-  if (!entry) {
-    if (entries.length >= MAX_SAMPLES) throw new UserError(`At most ${MAX_SAMPLES} samples can be saved; remove one first (remove_sample_builds deleteSample).`);
-    return null;
+  const file = await store.find(name);
+  if (!file && (await store.sampleCount()) >= MAX_SAMPLES) {
+    throw new UserError(`At most ${MAX_SAMPLES} samples can be saved; remove one first (remove_sample_builds deleteSample).`);
   }
-  if (entry.error) throw new UserError(entry.error);
-  return store.get(name);
+  return file;
 }
+
+const fileBytes = (file: SampleFile): number => Buffer.byteLength(`${JSON.stringify(file)}\n`, 'utf8');
 
 /**
  * Decode, deduplicate and read new builds (one temporary engine), then save
@@ -261,7 +269,7 @@ export async function addSampleBuilds(
   );
   const failed: Array<{ index: number; label?: string; error: string }> = [];
   const duplicates: Array<{ id: string; label?: string }> = [];
-  const fresh: Array<(typeof inputs)[number] & { xml: string; id: string }> = [];
+  const fresh: Array<(typeof inputs)[number] & { xml: string; id: string; code: string }> = [];
   const known = new Set(existing?.builds.map((b) => b.id) ?? []);
   for (const r of resolved) {
     if ('error' in r) {
@@ -274,7 +282,7 @@ export async function addSampleBuilds(
       continue;
     }
     known.add(id);
-    fresh.push({ ...r, id });
+    fresh.push({ ...r, id, code: encodeBuildCode(r.xml) });
   }
   const count = existing?.builds.length ?? 0;
   if (count + fresh.length > MAX_SAMPLE_BUILDS) {
@@ -282,6 +290,16 @@ export async function addSampleBuilds(
       `A sample holds at most ${MAX_SAMPLE_BUILDS} builds: "${name}" has ${count} and this call adds ${fresh.length} new ones. ` +
         'Remove builds first (remove_sample_builds) or add fewer. Nothing was added.',
     );
+  }
+  if (fresh.length) {
+    const estimate =
+      (existing ? fileBytes(existing) : 1024) + fresh.reduce((n, b) => n + b.code.length * ENTRY_BYTES_PER_CODE_CHAR, 0);
+    if (estimate > MAX_SAMPLE_FILE_BYTES) {
+      throw new UserError(
+        `Sample "${name}" would grow past its ${MAX_SAMPLE_FILE_BYTES / (1024 * 1024)} MB file limit with these builds (about ${Math.ceil(estimate / 1024)} KB). ` +
+          'Remove builds first (remove_sample_builds), add fewer, or start another sample. Nothing was added.',
+      );
+    }
   }
   const reply = (finalCount: number, added: SampleBuild[]): Record<string, unknown> => ({
     sample: name,
@@ -302,29 +320,45 @@ export async function addSampleBuilds(
       failed.push({ index: b.index, ...withLabel(b.label), error: r.error.message });
       return;
     }
-    readOk.push({ id: b.id, ...withLabel(b.label), ...sourceOf(b.source), code: encodeBuildCode(b.xml), addedAt: now, snapshot: snapshotRecord(r.snapshot, version) });
+    readOk.push({ id: b.id, ...withLabel(b.label), ...sourceOf(b.source), code: b.code, addedAt: now, snapshot: snapshotRecord(r.snapshot, version) });
   });
   if (!readOk.length) return reply(count, []);
 
-  const saved = await store.update(
-    name,
-    (cur) => {
-      const base: SampleFile = cur ?? { version: 1, name, createdAt: now, updatedAt: now, builds: [] };
-      const ids = new Set(base.builds.map((b) => b.id));
-      const added: SampleBuild[] = [];
-      for (const b of readOk) {
-        // Added by another call in the meantime.
-        if (ids.has(b.id)) duplicates.push({ id: b.id, ...withLabel(b.label) });
-        else {
-          ids.add(b.id);
-          added.push(b);
+  // Another call may have added builds since the checks above: the cap is checked again on the file as it is now.
+  const lateDuplicates: typeof duplicates = [];
+  let saved: { count: number; added: SampleBuild[] };
+  try {
+    saved = await store.update(
+      name,
+      (cur) => {
+        const base: SampleFile = cur ?? { version: 1, name, createdAt: now, updatedAt: now, builds: [] };
+        const ids = new Set(base.builds.map((b) => b.id));
+        const added: SampleBuild[] = [];
+        for (const b of readOk) {
+          // Added by another call in the meantime.
+          if (ids.has(b.id)) lateDuplicates.push({ id: b.id, ...withLabel(b.label) });
+          else {
+            ids.add(b.id);
+            added.push(b);
+          }
         }
-      }
-      const builds = [...base.builds, ...added];
-      return { file: { ...base, builds }, result: { count: builds.length, added } };
-    },
-    { create: true },
-  );
+        if (base.builds.length + added.length > MAX_SAMPLE_BUILDS) {
+          throw new UserError(
+            `Nothing was added: sample "${name}" would exceed ${MAX_SAMPLE_BUILDS} builds (now ${base.builds.length}, this call adds ${added.length}; ` +
+              'another call added builds meanwhile). Remove builds first (remove_sample_builds) or add fewer.',
+          );
+        }
+        const builds = [...base.builds, ...added];
+        return { file: { ...base, builds }, result: { count: builds.length, added } };
+      },
+      { create: true },
+    );
+  } catch (e) {
+    // The store's own refusals (file size, sample count), raised before anything is written.
+    if (e instanceof UserError && !e.message.startsWith('Nothing was added')) throw new UserError(`Nothing was added: ${e.message}`);
+    throw e;
+  }
+  duplicates.push(...lateDuplicates);
   return reply(saved.count, saved.added);
 }
 
@@ -375,29 +409,14 @@ export async function listSamples(engine: EngineManager, store: SampleStore, arg
   if (args.slot !== undefined && args.build === undefined) throw new UserError('`slot` needs `sample` and `build`.');
   const version = engine.pobVersion();
   if (args.sample === undefined) {
-    const samples: Array<Record<string, unknown>> = [];
-    for (const entry of await store.list()) {
-      if (entry.error) {
-        samples.push({ name: entry.name, error: entry.error });
-        continue;
-      }
-      let file: SampleFile;
-      try {
-        file = await store.get(entry.name);
-      } catch (e) {
-        if (!(e instanceof UserError)) throw e;
-        samples.push({ name: entry.name, error: e.message });
-        continue;
-      }
+    // Each file is read once, and only its summary is kept.
+    const rows = await store.listWith((file) => {
       const sums = file.builds.map((b) => summary(storedSnapshot(b)));
-      samples.push({
-        name: file.name,
-        count: file.builds.length,
-        updatedAt: file.updatedAt,
-        ascendancies: top(sums.map((s) => s.ascendancy ?? s.class)),
-        mainSkills: top(sums.map((s) => s.mainSkill)),
-      });
-    }
+      return { ascendancies: top(sums.map((s) => s.ascendancy ?? s.class)), mainSkills: top(sums.map((s) => s.mainSkill)) };
+    });
+    const samples = rows.map((r) =>
+      r.error !== undefined ? { name: r.name, error: r.error } : { name: r.name, count: r.count, updatedAt: r.updatedAt, ...r.summary },
+    );
     return { samples };
   }
 
@@ -436,7 +455,7 @@ export async function listSamples(engine: EngineManager, store: SampleStore, arg
       );
     }
     if (typeof item.text !== 'string') {
-      throw new UserError(`The saved snapshot of build ${b.id} has no item text for "${item.slot}"; the next community_gap_report reads the build again.`);
+      throw new UserError(`Path of Building gave no item text for "${item.slot}" of build ${b.id}, so it cannot be copied from the sample.`);
     }
     const tree = /^Tree jewel (\d+)$/.exec(item.slot);
     out.item = {
