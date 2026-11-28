@@ -8,27 +8,22 @@
  * snapshots are re-read first (freshSampleSnapshots: one temporary engine).
  */
 import { z } from 'zod';
-import type { BuildSession, NamedProbeVariant, SlotInfo } from './build-session.js';
+import type { BuildSession } from './build-session.js';
+import { clip, loadedContext, planRow, type Probe, type Row, treeVariant } from './community-gaps-plan.js';
 import { freshSampleSnapshots } from './community-samples.js';
 import {
   GAP_CATEGORIES,
-  type GapCandidate,
   type GapCategory,
   type GapFilter,
   filterSample,
-  type ItemCopy,
-  mainGroupIndex,
-  type SampleEntry,
   sampleShares,
   sampleSummary,
-  activeSlot,
   type UncommonEntry,
 } from './community-gaps-shares.js';
-import { type BuildSnapshot, normalizeSnapshot, type RawSnapshot } from './compare-builds.js';
 import type { EngineManager } from './engine-manager.js';
 import { type EvaluateObjective, makeScorer, roundStat, validateObjectiveInput } from './evaluate-changes.js';
 import type { Stats } from './lua-bridge.js';
-import { PROBE_CHUNK, type ProbeGemChange, type ProbeVariantResult } from './probe.js';
+import { PROBE_CHUNK } from './probe.js';
 import { SampleStore } from './sample-store.js';
 import type { ToolRegistrar } from './tool-registry.js';
 import { UserError } from './validation.js';
@@ -40,9 +35,6 @@ export const DEFAULT_MIN_SHARE = 0.3;
 export const DEFAULT_MAX_PER_CATEGORY = 10;
 export const MAX_PER_CATEGORY = 30;
 const MAX_UNCOMMON = 10;
-const MAX_NOTE = 300;
-const MAX_GEM_LEVEL = 20;
-const MAX_SOCKETED_GEMS = 6;
 const REPORT_STATS = ['CombinedDPS', 'TotalEHP', 'Life', 'EnergyShield'];
 const DELTA_STATS = ['CombinedDPS', 'TotalEHP', 'Life'];
 const BUDGET_NOTE = 'not measured: budget';
@@ -64,171 +56,7 @@ export interface CommunityGapArgs {
   maxPerCategory?: number;
 }
 
-interface Probe {
-  row: Row;
-  variant: NamedProbeVariant;
-  /** Jewel in a passive-tree socket: always a full recalculation. */
-  predictedFallback: boolean;
-  copy?: ItemCopy;
-  slot?: string;
-  replaces?: string;
-  /** Flask slot turned on for the what-if. */
-  activated?: boolean;
-  result?: ProbeVariantResult;
-  budget?: boolean;
-}
-
-interface Row {
-  c: GapCandidate;
-  probes: Probe[];
-  /** Set when the row cannot be measured (before probing). */
-  note?: string;
-  /** Tree: retried by the sample's node id after an ambiguous name. */
-  retried?: boolean;
-}
-
-const clip = (s: string): string => (s.length > MAX_NOTE ? `${s.slice(0, MAX_NOTE - 1)}…` : s);
 const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
-
-// ---------------------------------------------------------------------------
-// The loaded build: what the what-ifs need
-// ---------------------------------------------------------------------------
-
-interface LoadedContext {
-  snapshot: BuildSnapshot;
-  /** Items by their actual slot name. */
-  bySlot: Map<string, string>;
-  /** "Weapon 1" / "Weapon 2" as the build's weapon set in use names them. */
-  weaponSlot: (slot: 'Weapon 1' | 'Weapon 2') => string;
-  flaskSlots: SlotInfo[];
-  /** First empty allocated passive-tree socket, by node id. */
-  treeSocket?: string;
-  /** First empty abyssal socket the build's items have. */
-  abyssSocket?: string;
-}
-
-async function loadedContext(session: BuildSession): Promise<LoadedContext> {
-  const snapshot = normalizeSnapshot(await session.compareSnapshot<RawSnapshot>(['Life']));
-  const slots = await session.getValidSlots();
-  const usesSwap = snapshot.items.some((i) => i.swap && !i.inactive);
-  const bySlot = new Map(snapshot.items.map((i) => [i.slot, i.name ?? i.base ?? '?']));
-  const treeSockets = slots
-    .filter((s) => /^Jewel \d+$/.test(s.slot) && s.allocated === true && !s.occupied)
-    .sort((a, b) => Number(a.slot.slice(6)) - Number(b.slot.slice(6)));
-  // Abyssal sockets of the weapon set not in use count for nothing.
-  const inUse = (parent: string): boolean => !parent.startsWith('Weapon') || parent.includes(' Swap') === usesSwap;
-  const abyss = slots.find((s) => s.parentSlot !== undefined && !s.occupied && inUse(s.parentSlot));
-  return {
-    snapshot,
-    bySlot,
-    weaponSlot: (slot) => (usesSwap ? `${slot} Swap` : slot),
-    flaskSlots: slots.filter((s) => /^Flask [1-5]$/.test(s.slot)),
-    ...(treeSockets[0] ? { treeSocket: treeSockets[0].slot } : {}),
-    ...(abyss ? { abyssSocket: abyss.slot } : {}),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Variants per gap
-// ---------------------------------------------------------------------------
-
-function itemProbes(row: Row, ctx: LoadedContext, samples: Map<string, SampleEntry>): void {
-  const { c } = row;
-  const copies = c.copies ?? [];
-  const add = (p: Omit<Probe, 'row'>): void => {
-    row.probes.push({ row, ...p });
-  };
-  if (c.kind === 'item') {
-    const slots = c.slot === 'Ring' ? ['Ring 1', 'Ring 2'] : [c.slot === 'Weapon 1' || c.slot === 'Weapon 2' ? ctx.weaponSlot(c.slot) : c.slot!];
-    for (const copy of copies) {
-      for (const slot of slots) {
-        const items: NonNullable<NamedProbeVariant['items']> = [{ slot, itemText: copy.text }];
-        if (c.slot === 'Weapon 1') {
-          // Keep two-handers and off-hands coherent: the source build's off-hand comes along.
-          const offSlot = ctx.weaponSlot('Weapon 2');
-          const off = samples.get(copy.from.build)?.snapshot.items.find((i) => activeSlot(i) === 'Weapon 2' && typeof i.text === 'string');
-          if (off) items.push({ slot: offSlot, itemText: off.text! });
-          else if (ctx.bySlot.has(offSlot)) items.push({ slot: offSlot, unequip: true });
-        }
-        add({ variant: { items }, predictedFallback: false, copy, slot, ...(ctx.bySlot.has(slot) ? { replaces: ctx.bySlot.get(slot) } : {}) });
-      }
-    }
-  } else if (c.kind === 'flask') {
-    if (ctx.flaskSlots.length === 0) row.note = 'not measured: the build has no flask slots';
-    for (const copy of copies) {
-      for (const s of ctx.flaskSlots) {
-        const activate = s.active === false;
-        add({
-          variant: { items: [{ slot: s.slot, itemText: copy.text }], ...(activate ? { flasks: [{ slot: s.slot, active: true }] } : {}) },
-          predictedFallback: false,
-          copy,
-          slot: s.slot,
-          ...(ctx.bySlot.has(s.slot) ? { replaces: ctx.bySlot.get(s.slot) } : {}),
-          ...(activate ? { activated: true } : {}),
-        });
-      }
-    }
-  } else {
-    const socket = ctx.treeSocket ?? (c.abyss ? ctx.abyssSocket : undefined);
-    if (!socket) {
-      row.note = c.abyss
-        ? 'not measured: the build has no empty allocated passive-tree jewel socket or empty abyssal socket'
-        : 'not measured: the build has no empty allocated passive-tree jewel socket';
-      return;
-    }
-    for (const copy of copies) {
-      add({ variant: { items: [{ slot: socket, itemText: copy.text }] }, predictedFallback: socket.startsWith('Jewel '), copy, slot: socket });
-    }
-  }
-}
-
-async function supportProbes(row: Row, ctx: LoadedContext, session: BuildSession): Promise<void> {
-  const mi = mainGroupIndex(ctx.snapshot);
-  const main = ctx.snapshot.groups[mi];
-  if (!main) {
-    row.note = 'not measured: the build has no main skill group';
-    return;
-  }
-  let cap = MAX_GEM_LEVEL;
-  try {
-    const gem = await session.getGemByName(row.c.name);
-    if (!gem) throw new UserError(`gem "${row.c.name}" not found`);
-    cap = Math.min(MAX_GEM_LEVEL, gem.naturalMaxLevel ?? MAX_GEM_LEVEL);
-  } catch (e) {
-    if (!(e instanceof UserError)) throw e;
-    row.note = clip(e.message);
-    return;
-  }
-  const level = Math.max(1, Math.min(row.c.gem?.level ?? MAX_GEM_LEVEL, cap));
-  const quality = Math.max(0, Math.min(row.c.gem?.quality ?? 0, 40));
-  const group = mi + 1;
-  main.gems.forEach((g, j) => {
-    if (!g.support) return;
-    const op: ProbeGemChange = { op: 'set', group, index: j + 1, name: row.c.name, level, quality };
-    row.probes.push({ row, variant: { gems: [op] }, predictedFallback: false, replaces: g.name });
-  });
-  if (main.gems.length < MAX_SOCKETED_GEMS) {
-    row.probes.push({ row, variant: { gems: [{ op: 'add', group, name: row.c.name, level, quality }] }, predictedFallback: false });
-  }
-}
-
-function treeVariant(c: GapCandidate, byId: boolean): NamedProbeVariant {
-  const id = c.nodeIds?.[0];
-  if (c.mastery) return { masteries: [{ node: byId && id !== undefined ? id : c.mastery.name, effect: c.mastery.effect }] };
-  return { allocate: [byId && id !== undefined ? id : c.name] };
-}
-
-async function planRow(row: Row, ctx: LoadedContext, session: BuildSession, samples: Map<string, SampleEntry>): Promise<void> {
-  const { c } = row;
-  if (c.unmeasured) {
-    row.note = c.unmeasured;
-    return;
-  }
-  if (c.kind === 'item' || c.kind === 'flask' || c.kind === 'jewel') itemProbes(row, ctx, samples);
-  else if (c.kind === 'support') await supportProbes(row, ctx, session);
-  else if (c.kind === 'config') row.probes.push({ row, variant: { config: { [c.config!.key]: c.config!.value as string | number | boolean } }, predictedFallback: false });
-  else row.probes.push({ row, variant: treeVariant(c, false), predictedFallback: false });
-}
 
 // ---------------------------------------------------------------------------
 // Running the probes within the budget
@@ -248,45 +76,46 @@ class ProbeRunner {
     this.fallbacksLeft = limits.maxFallbacks ?? MAX_GAP_FALLBACKS;
   }
 
-  /** Reserve whole rows (all their variants) in order while the variant budget lasts; the rest are budget-limited. */
-  reserve(rows: Row[], fallbackCap = Number.POSITIVE_INFINITY): Probe[] {
-    const out: Probe[] = [];
-    let fallbacks = 0;
-    for (const row of rows) {
-      const n = row.probes.length;
-      if (n === 0) continue;
-      if (n > this.variantsLeft || fallbacks + n > fallbackCap) {
-        for (const p of row.probes) p.budget = true;
+  /**
+   * Measure rows in order, each row whole or not at all. Every variant is
+   * classified first (classifyProbe: nothing runs): a refused one keeps its
+   * user error, and a row runs only when all its other variants fit the
+   * variant budget and its full recalculations fit that budget; otherwise
+   * none of it runs (`budget`), and later rows that fit still run. Any probe
+   * failure but a user error fails the call.
+   */
+  async measure(rows: Row[]): Promise<void> {
+    const pending = rows.filter((r) => r.note === undefined && r.probes.length > 0);
+    const all = pending.flatMap((r) => r.probes);
+    if (all.length === 0) return;
+    const classes = await this.session.classifyProbe(all.map((p) => p.variant));
+    all.forEach((p, i) => {
+      const k = classes[i];
+      if (k.error === undefined) p.fallback = k.fallback;
+      else if (k.userError) p.result = { stats: {}, error: k.error, userError: true };
+      else throw new Error(`community_gap_report: checking "${p.row.c.name}" failed: ${k.error}`);
+    });
+    const accepted: Probe[] = [];
+    for (const row of pending) {
+      const toRun = row.probes.filter((p) => !p.result);
+      if (toRun.length === 0) continue;
+      const fallbacks = toRun.filter((p) => p.fallback).length;
+      if (toRun.length > this.variantsLeft || fallbacks > this.fallbacksLeft) {
+        row.budget = true;
         continue;
       }
-      this.variantsLeft -= n;
-      if (fallbackCap !== Number.POSITIVE_INFINITY) fallbacks += n;
-      out.push(...row.probes);
+      this.variantsLeft -= toRun.length;
+      this.fallbacksLeft -= fallbacks;
+      accepted.push(...toRun);
     }
-    return out;
-  }
-
-  /**
-   * Probe in chunks no larger than the full-recalculation budget left, so the
-   * call never passes it whatever the chunk holds; once it is used up the
-   * remaining probes are budget-limited. A refused variant keeps its user
-   * error; any other failure fails the call.
-   */
-  async run(probes: Probe[]): Promise<void> {
-    for (let i = 0; i < probes.length; ) {
-      if (this.fallbacksLeft <= 0) {
-        for (const p of probes.slice(i)) p.budget = true;
-        return;
-      }
-      const chunk = probes.slice(i, i + Math.min(PROBE_CHUNK, this.fallbacksLeft));
+    for (let i = 0; i < accepted.length; i += PROBE_CHUNK) {
+      const chunk = accepted.slice(i, i + PROBE_CHUNK);
       const res = await this.session.probeNamed({ stats: this.stats, variants: chunk.map((p) => p.variant) });
       this.base ??= res.base;
       res.results.forEach((r, j) => {
         if (r.error !== undefined && !r.userError) throw new Error(`community_gap_report: evaluating "${chunk[j].row.c.name}" failed: ${r.error}`);
         chunk[j].result = r;
-        if (r.fallback) this.fallbacksLeft--;
       });
-      i += chunk.length;
     }
   }
 }
@@ -346,10 +175,10 @@ function buildRow(row: Row, rank: Ranking, base: Stats): BuiltRow {
     head.yours = c.config.yours;
     if (c.config.assumption) head.assumption = true;
   }
-  const ok = row.probes.filter((p) => p.result && p.result.error === undefined);
+  const ok = row.budget ? [] : row.probes.filter((p) => p.result && p.result.error === undefined);
   if (row.note !== undefined || ok.length === 0) {
     const refused = row.probes.find((p) => p.result?.error !== undefined);
-    const note = row.note ?? (refused ? clip(refused.result!.error!) : BUDGET_NOTE);
+    const note = row.note ?? (row.budget || !refused ? BUDGET_NOTE : clip(refused.result!.error!));
     return { out: { ...head, measured: false, note }, category: c.category, measured: false, sortKey: null, share: c.share };
   }
   const scored = ok.map((p) => ({ p, v: rank.score(p.result!.stats) }));
@@ -377,12 +206,13 @@ function buildRow(row: Row, rank: Ranking, base: Stats): BuiltRow {
   for (const k of DELTA_STATS) deltas[k] = num(base[k]) && num(stats[k]) ? roundStat((stats[k] as number) - (base[k] as number)) : null;
   out.deltas = deltas;
   if (isItemKind(c.kind)) {
-    if (best.p.slot && c.kind !== 'item') out.slot = best.p.slot;
-    else if (c.slot === 'Ring') out.slot = best.p.slot;
+    if (best.p.slot) out.slot = best.p.slot;
+    const from = best.p.copy!.from;
     out.best = {
       delta: best.v === null ? null : roundStat(best.v),
-      from: best.p.copy!.from,
+      from,
       ...(best.p.replaces !== undefined ? { replaces: best.p.replaces } : {}),
+      ...(best.p.offHand ? { offHand: best.p.offHand.name } : {}),
     };
     // Each copy's best slot, then the median over the copies.
     const perCopy = new Map<string, number>();
@@ -395,6 +225,13 @@ function buildRow(row: Row, rank: Ranking, base: Stats): BuiltRow {
     if (m !== null) out.median = roundStat(m);
     if (best.p.activated) {
       out.note = `${best.p.slot} is not active in your build; measured with it turned on (set_flask_active, or flasks [{slot, active: true}] in apply_changes).`;
+    }
+    const off = best.p.offHand;
+    if (off) {
+      const offSlot = best.p.slot!.replace('Weapon 1', 'Weapon 2');
+      out.note = off.slot
+        ? `The delta includes the source build's off-hand (${off.name}) in ${offSlot}: copy both with list_samples {sample, build: "${from.build}", slot: "${from.slot}"} and slot "${off.slot}".`
+        : `The delta includes ${offSlot} left empty, as in the source build (its Weapon 1 is list_samples {sample, build: "${from.build}", slot: "${from.slot}"}; unequip_item ${offSlot}).`;
     }
   } else {
     if (c.kind === 'support') {
@@ -471,25 +308,21 @@ export async function communityGapReport(
   const rankStats = args.objective ? Object.keys(args.objective.weights) : [args.rankBy ?? 'CombinedDPS'];
   const stats = [...new Set([...rankStats, ...REPORT_STATS])];
   const runner = new ProbeRunner(session, stats, limits);
-  // Calculator variants first, then (with what the budget leaves) jewels in tree sockets, which each need a full recalculation.
-  const fast = rows.filter((r) => r.probes.length && !r.probes.some((p) => p.predictedFallback));
-  const slow = rows.filter((r) => r.probes.some((p) => p.predictedFallback));
-  await runner.run(runner.reserve(fast));
+  await runner.measure(rows);
   // Tree names several nodes share: measured again by the node id the sample uses.
   const retry: Row[] = [];
   for (const row of rows) {
     const r = row.probes[0]?.result;
     if (row.c.category === 'tree' && row.probes.length === 1 && r?.error && AMBIGUOUS_RE.test(r.error) && row.c.nodeIds?.length) {
-      row.probes = [{ row, variant: treeVariant(row.c, true), predictedFallback: false }];
+      row.probes = [{ row, variant: treeVariant(row.c, true) }];
       row.retried = true;
       retry.push(row);
     }
   }
-  await runner.run(runner.reserve(retry));
-  await runner.run(runner.reserve(slow, runner.fallbacksLeft));
+  await runner.measure(retry);
   for (const row of retry) {
     // A refused retry reports the retry's error; keep the ambiguity in the note.
-    if (row.probes[0].result?.error) row.retried = false;
+    if (row.budget || row.probes[0].result?.error) row.retried = false;
   }
 
   const base = runner.base ?? (await session.probe({ stats, variants: [] })).base;
@@ -554,7 +387,8 @@ export function registerCommunityGaps(tools: ToolRegistrar, engine: EngineManage
         '`gems` (supports of the main skill, share among the builds with the same main skill (`mainSkillMatched`); active skills outside the main group, listed unmeasured), ' +
         '`tree` (keystones, notables, mastery effects; ascendancy notables only from builds of your ascendancy; ranked per passive point), ' +
         '`settings` (bandit, pantheon and other config options: the most common value when it differs from yours; `assumption: true` for enemy / combat / effective-DPS options). ' +
-        'Gear gaps try up to 5 sample copies in the slot (Weapon 1 brings its build\'s off-hand), flasks up to 3 copies in each flask slot, jewels in your first empty allocated tree socket (abyss jewels also an empty abyssal socket); ' +
+        'Gear gaps try up to 5 sample copies in the slot (a Weapon 1 copy brings its build\'s off-hand, or empties Weapon 2: `best.offHand`), flasks up to 3 copies in each flask slot (an inactive slot turned on), ' +
+        'jewels in one empty socket that takes them (abyss jewels an empty abyssal socket first, cluster jewels only a cluster socket of their size, else your first empty allocated tree socket); ' +
         'supports replace each support of your main group (and are added when it has fewer than 6 gems) at the sample\'s usual level / quality. ' +
         'Ranking: `rankBy` (stat key, default CombinedDPS) or `objective` {weights, mode} as evaluate_changes (not both). `filter` {ascendancy, mainSkill, minLevel} narrows the sample first. ' +
         `At most ${MAX_GAP_VARIANTS} what-ifs (${MAX_GAP_FALLBACKS} full recalculations) per call; gaps past that are listed unmeasured (note "${BUDGET_NOTE}"). ` +
@@ -562,7 +396,7 @@ export function registerCommunityGaps(tools: ToolRegistrar, engine: EngineManage
         'Returns { sample: {name, size, used, filter, mainSkillMatched, ascendancies, mainSkills, levelMedian}, rankBy | objective, base, gear, tree, gems, settings, more (rows cut by maxPerCategory), ' +
         'uncommon: {gear, tree, gems} (yours, used by < 10% of the sample), notes }. ' +
         'Each row: { kind, name, slot, share, count, measured, delta (rankBy change, or the objective score), pct, deltas {CombinedDPS, TotalEHP, Life}, points / perPoint (tree), ' +
-        'best {delta, from {build, label, slot}, replaces}, median (gear), value / yours / assumption (settings), apply (the exact apply_changes variant: tree, gems, settings), note }; ' +
+        'best {delta, from {build, label, slot}, replaces, offHand}, median (gear), value / yours / assumption (settings), apply (the exact apply_changes variant: tree, gems, settings), note }; ' +
         'unmeasured rows (`measured: false`, `note` says why) come after the measured ones. Gear item text: list_samples {sample, build, slot} with best.from.',
       inputSchema: {
         sample: z.string().min(1).max(80).describe('Sample name (list_samples).'),

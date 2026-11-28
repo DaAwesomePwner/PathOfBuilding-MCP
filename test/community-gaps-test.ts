@@ -3,10 +3,12 @@
 // planted gap is known.
 //
 //   A = the fixture as loaded (level 99).
-//   B = A + an Amethyst Ring in Ring 1, Elemental Focus in place of Swift
+//   B = A + an Opal Sceptre in Weapon 1 with Weapon 2 emptied, a Murderous
+//       Eye Jewel in tree socket 41263, an Amethyst Ring in Ring 1, Elemental Focus in place of Swift
 //       Affliction (main group), a cheap unique notable, usePowerCharges,
 //       a Ruby Flask in Flask 5, a Crimson Jewel in tree socket 61419; level 100.
-//   C = B + Herald of Ice in the Flame Dash group (another skill).
+//   C = B + Herald of Ice in the Flame Dash group (another skill) and another
+//       Crimson Jewel.
 //
 //   1. Planted gaps found in every category with share 2/3 (Herald of Ice
 //      1/3); deltas equal an evaluate_changes run of the same variant
@@ -25,6 +27,16 @@
 //   8. No build loaded: a UserError naming load_build.
 //  10. A mastery effect gap (3.24 masteries fixture): measured, parity with
 //      evaluate_changes, build unchanged.
+//  11. chooseJewelSocket rules (unit); then, on the loaded build with an
+//      empty tree socket, an abyssal socket and every flask slot off: the
+//      Crimson Jewel in the tree socket (two copies, median), the abyss jewel
+//      in the abyssal socket, the Ruby Flask with its slot turned on (note),
+//      all at evaluate_changes parity; with one full recalculation left the
+//      Crimson row (two) is unmeasured "budget" with no best / median while
+//      the calculator rows still run.
+//  12. compareSnapshot gapContext reads the weapon set in use (1, then 2 on
+//      the fixture switched to its second set): the Weapon 1 gap is measured
+//      in Weapon 1 Swap, its note naming Weapon 2 Swap.
 //   9. Over MCP: the tool is listed read-only and replies compact JSON.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -33,6 +45,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type { BuildSession } from '../src/build-session.js';
+import { chooseJewelSocket } from '../src/community-gaps-plan.js';
 import { communityGapReport, type CommunityGapArgs, type GapLimits } from '../src/community-gaps.js';
 import { addSampleBuilds, listSamples } from '../src/community-samples.js';
 import { EngineManager } from '../src/engine-manager.js';
@@ -81,6 +94,33 @@ Item Level: 80
 Implicits: 0
 +10% to Fire Resistance
 7% increased maximum Life`;
+const JEWEL_C = `Rarity: RARE
+Gap Jewel C
+Crimson Jewel
+Item Level: 80
+Implicits: 0
++12% to Cold Resistance
+6% increased maximum Life`;
+const EYE = `Rarity: RARE
+Gap Eye
+Murderous Eye Jewel
+Item Level: 84
++40 to maximum Life
++20% to Cold Resistance`;
+const SCEPTRE = `Rarity: RARE
+Gap Sceptre
+Opal Sceptre
+Item Level: 80
+Implicits: 1
+40% increased Elemental Damage
+50% increased Spell Damage
++1 to Level of all Cold Spell Skill Gems`;
+const ABYSS_HELMET = `Rarity: RARE
+Gap Abyss Helmet
+Hubris Circlet
+Item Level: 84
+Has 1 Abyssal Socket
++70 to maximum Life`;
 const SAMPLE = 'Vortex Gaps';
 const MAIN_GROUP = 5;
 const SWIFT_INDEX = 3;
@@ -88,7 +128,7 @@ const SWIFT_INDEX = 3;
 type Row = {
   kind: string; name: string; slot?: string; share: number; count: number; measured: boolean;
   delta?: number; pct?: number; perPoint?: number; points?: number; deltas?: Record<string, number | null>;
-  best?: { delta: number | null; from?: { build: string; label?: string; slot: string }; replaces?: string };
+  best?: { delta: number | null; from?: { build: string; label?: string; slot: string }; replaces?: string; offHand?: string };
   median?: number; value?: unknown; yours?: unknown; assumption?: boolean; apply?: Record<string, unknown>; note?: string;
 };
 type Report = {
@@ -140,14 +180,17 @@ async function main(): Promise<void> {
       assert(pick, 'no unique reachable notable');
       notable = pick.name;
       await s.applyChanges({
-        items: [{ slot: 'Ring 1', itemText: RING }, { slot: 'Flask 5', itemText: FLASK }, { slot: 'Jewel 61419', itemText: JEWEL }],
+        items: [
+          { slot: 'Ring 1', itemText: RING }, { slot: 'Flask 5', itemText: FLASK }, { slot: 'Jewel 61419', itemText: JEWEL },
+          { slot: 'Jewel 41263', itemText: EYE }, { slot: 'Weapon 1', itemText: SCEPTRE }, { slot: 'Weapon 2', unequip: true },
+        ],
         gems: [{ op: 'set', group: MAIN_GROUP, index: SWIFT_INDEX, name: 'Elemental Focus' }],
         allocate: [notable],
         config: { usePowerCharges: true },
       });
       await s.setCharacterLevel(100);
       const codeB = await s.exportBuild('code');
-      await s.applyChanges({ gems: [{ op: 'add', group: 1, name: 'Herald of Ice' }] });
+      await s.applyChanges({ gems: [{ op: 'add', group: 1, name: 'Herald of Ice' }], items: [{ slot: 'Jewel 61419', itemText: JEWEL_C }] });
       const codeC = await s.exportBuild('code');
       for (let i = 0; i < 3; i++) await s.undoLastChange();
       return [codeA, codeB, codeC];
@@ -172,9 +215,13 @@ async function main(): Promise<void> {
     const skill = find(r1.gems, 'skill', 'Herald of Ice');
     const node = find(r1.tree, 'notable', notable);
     const config = find(r1.settings, 'config', 'usePowerCharges');
+    const sceptre = find(r1.gear, 'item', 'Opal Sceptre');
+    const eye = find(r1.gear, 'jewel', 'Murderous Eye Jewel');
     for (const [r, share, count] of [[ring, 0.67, 2], [flask, 0.67, 2], [jewel, 0.67, 2], [support, 0.67, 2], [skill, 0.33, 1], [node, 0.67, 2], [config, 0.67, 2]] as const) {
       assert(r.share === share && r.count === count, `${r.name}: share ${r.share} count ${r.count}`);
     }
+    assert(sceptre.measured && sceptre.slot === 'Weapon 1' && sceptre.best?.offHand === 'empty' && /Weapon 2 left empty/.test(sceptre.note ?? ''), `sceptre row: ${JSON.stringify(sceptre)}`);
+    assert(!eye.measured && /no empty abyssal socket or empty allocated passive-tree jewel socket/.test(eye.note ?? ''), `eye row: ${JSON.stringify(eye)}`);
     for (const r of [ring, flask, support, node, config]) assert(r.measured && typeof r.delta === 'number' && r.deltas, `${r.name} not measured: ${JSON.stringify(r)}`);
     assert(!skill.measured && /create_socket_group/.test(skill.note ?? ''), `skill row: ${JSON.stringify(skill)}`);
     assert(!jewel.measured && /no empty allocated passive-tree jewel socket/.test(jewel.note ?? ''), `jewel row: ${JSON.stringify(jewel)}`);
@@ -198,11 +245,12 @@ async function main(): Promise<void> {
           { label: 'support', ...support.apply },
           { label: 'node', ...node.apply },
           { label: 'config', ...config.apply },
+          { label: 'sceptre', items: [{ slot: 'Weapon 1', itemText: SCEPTRE }, { slot: 'Weapon 2', unequip: true }] },
         ],
         stats: ['CombinedDPS', 'TotalEHP', 'Life'],
       }),
     );
-    for (const [label, row, delta] of [['ring', ring, ring.best!.delta], ['flask', flask, flask.best!.delta], ['support', support, support.delta], ['node', node, node.delta], ['config', config, config.delta]] as const) {
+    for (const [label, row, delta] of [['ring', ring, ring.best!.delta], ['flask', flask, flask.best!.delta], ['support', support, support.delta], ['node', node, node.delta], ['config', config, config.delta], ['sceptre', sceptre, sceptre.best!.delta]] as const) {
       const er = ev.results.find((x) => x.label === label)!;
       assert(er.error === undefined, `${label}: evaluate_changes refused: ${er.error}`);
       assert(er.delta!.CombinedDPS === delta && er.delta!.CombinedDPS === row.delta, `${label}: gap delta ${delta} / ${row.delta} vs evaluate_changes ${er.delta!.CombinedDPS}`);
@@ -264,6 +312,78 @@ async function main(): Promise<void> {
     assert(budgeted.length > 0 && all6.filter((r) => r.measured).length > 0, `budget rows: ${JSON.stringify(all6.map((r) => [r.name, r.measured, r.note]))}`);
     for (const cat of ['tree', 'settings', 'gems'] as const) checkOrder(r6[cat], `budget ${cat}`);
     assert(r6.notes.some((n) => /not measured: at most 3 what-ifs/.test(n)), `budget note: ${JSON.stringify(r6.notes)}`);
+    log('PASS');
+
+    log('Test 11: jewel sockets, inactive flask slots, the full-recalculation budget');
+    const unitSockets = [{ id: 5, occupied: false, expansion: 1 }, { id: 9, occupied: false }, { id: 3, occupied: true }, { id: 7, occupied: false, expansion: 2 }, { id: 2, occupied: false, charm: true }];
+    const choice = (j: { abyss?: boolean; base?: string }, abyssSocket?: string): string => JSON.stringify(chooseJewelSocket(j, unitSockets, abyssSocket));
+    assert(choice({ abyss: true, base: 'Murderous Eye Jewel' }, 'Belt Abyssal Socket 1') === '{"slot":"Belt Abyssal Socket 1"}', 'abyss jewel: abyssal socket first');
+    assert(choice({ abyss: true, base: 'Murderous Eye Jewel' }) === '{"slot":"Jewel 9"}', 'abyss jewel: else a plain tree socket');
+    assert(choice({ base: 'Cobalt Jewel' }) === '{"slot":"Jewel 9"}', 'plain jewel: plain socket first');
+    assert(choice({ base: 'Large Cluster Jewel' }) === '{"slot":"Jewel 7"}' && choice({ base: 'Medium Cluster Jewel' }) === '{"slot":"Jewel 5"}', 'cluster sizes');
+    assert(/cluster jewel socket that takes a Large Cluster Jewel/.test(JSON.stringify(chooseJewelSocket({ base: 'Large Cluster Jewel' }, unitSockets.filter((x) => x.id !== 7), undefined))), 'no large socket');
+    assert(/no empty allocated passive-tree jewel socket/.test(JSON.stringify(chooseJewelSocket({ base: 'Cobalt Jewel' }, [unitSockets[4]], undefined))), 'charm socket refused');
+    const modState = await run((s) => s.exportXML());
+    await run(async (s) => {
+      await s.unequipItemWithDiff('Jewel 61419');
+      await s.swapItemWithDiff('Helmet', ABYSS_HELMET);
+      for (let i = 1; i <= 5; i++) await s.setFlaskActive(`Flask ${i}`, false);
+    });
+    try {
+      const r11 = await report({ categories: ['gear'] });
+      const crimson = find(r11.gear, 'jewel', 'Crimson Jewel');
+      const eye11 = find(r11.gear, 'jewel', 'Murderous Eye Jewel');
+      const ruby = find(r11.gear, 'flask', 'Ruby Flask');
+      assert(crimson.measured && crimson.slot === 'Jewel 61419' && typeof crimson.median === 'number', `crimson: ${JSON.stringify(crimson)}`);
+      assert(eye11.measured && eye11.slot === 'Helmet Abyssal Socket 1', `eye: ${JSON.stringify(eye11)}`);
+      assert(ruby.measured && /not active in your build/.test(ruby.note ?? ''), `ruby: ${JSON.stringify(ruby)}`);
+      const textOf = async (r: Row): Promise<string> =>
+        ((await listSamples(engine, store, { sample: SAMPLE, build: r.best!.from!.build, slot: r.best!.from!.slot })) as { item: { itemText: string } }).item.itemText;
+      const texts = { crimson: await textOf(crimson), eye: await textOf(eye11), ruby: await textOf(ruby) };
+      const ev11 = await run((s) => evaluateChanges(s, {
+        variants: [
+          { label: 'crimson', items: [{ slot: crimson.slot!, itemText: texts.crimson }] },
+          { label: 'eye', items: [{ slot: eye11.slot!, itemText: texts.eye }] },
+          { label: 'ruby', items: [{ slot: ruby.slot!, itemText: texts.ruby }], flasks: [{ slot: ruby.slot!, active: true }] },
+        ],
+        stats: ['CombinedDPS', 'TotalEHP', 'Life'],
+      }));
+      for (const [label, row] of [['crimson', crimson], ['eye', eye11], ['ruby', ruby]] as const) {
+        const er = ev11.results.find((x) => x.label === label)!;
+        assert(er.error === undefined && er.delta!.CombinedDPS === row.best!.delta && er.delta!.TotalEHP === row.deltas!.TotalEHP, `${label} parity: ${JSON.stringify([row, er])}`);
+      }
+      // Two Crimson copies, each a full recalculation: with one left none of that row runs; later calculator rows still do.
+      const r11b = await report({ categories: ['gear'] }, { maxFallbacks: 1 });
+      const crimsonB = find(r11b.gear, 'jewel', 'Crimson Jewel');
+      assert(!crimsonB.measured && crimsonB.note === 'not measured: budget' && crimsonB.best === undefined && crimsonB.median === undefined, `crimson on budget: ${JSON.stringify(crimsonB)}`);
+      for (const name of ['Ruby Flask', 'Amethyst Ring', 'Opal Sceptre']) assert(r11b.gear.find((r) => r.name === name)?.measured, `${name} not measured with the full recalculations used up`);
+      assert(r11b.notes.some((n) => /\(1 needing a full recalculation\)/.test(n)), `budget note: ${JSON.stringify(r11b.notes)}`);
+      checkOrder(r11b.gear, 'gear on budget');
+    } finally {
+      await run(async (s) => {
+        for (let i = 0; i < 7; i++) await s.undoLastChange();
+      });
+    }
+    assert((await run((s) => s.exportXML())) === modState, 'undoing the loaded-build changes of test 11');
+    log('PASS');
+
+    log('Test 12: the weapon set in use is read from PoB');
+    const swapXml = fixtureXml
+      .replace('<Items activeItemSet="1" useSecondWeaponSet="false">', '<Items activeItemSet="1" useSecondWeaponSet="true">')
+      .replace('<ItemSet useSecondWeaponSet="false" id="1">', '<ItemSet useSecondWeaponSet="true" id="1">');
+    assert(swapXml !== fixtureXml, 'fixture weapon-set attributes not found');
+    const set1 = await run((s) => s.compareSnapshot<{ weaponSet: number; sockets: Array<{ id: number; occupied: boolean }> }>(['Life'], { gapContext: true }));
+    assert(set1.weaponSet === 1 && set1.sockets.some((x) => x.id === 36634 && x.occupied), `weapon set 1 / sockets: ${JSON.stringify(set1.sockets)}`);
+    await run((s) => s.loadBuild(swapXml));
+    const set2 = await run((s) => s.compareSnapshot<{ weaponSet: number }>(['Life'], { gapContext: true }));
+    assert(set2.weaponSet === 2, `weapon set: ${set2.weaponSet}`);
+    const r12 = await report({ categories: ['gear'] });
+    const sceptre12 = find(r12.gear, 'item', 'Opal Sceptre');
+    assert(sceptre12.measured && sceptre12.slot === 'Weapon 1 Swap' && /Weapon 2 Swap/.test(sceptre12.note ?? ''), `sceptre on the second set: ${JSON.stringify(sceptre12)}`);
+    await run(async (s) => {
+      await s.loadBuild(fixtureXml);
+      await s.loadBuild(await s.exportXML());
+    });
     log('PASS');
 
     log('Test 7: stale snapshot refreshed');

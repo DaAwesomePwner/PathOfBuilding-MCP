@@ -55,6 +55,8 @@ export interface GapCandidate {
   copies?: ItemCopy[];
   /** jewel: an abyss jewel (fits abyssal sockets too). */
   abyss?: boolean;
+  /** item / flask / jewel: the base type (a unique's too). */
+  base?: string;
   /** support: the sample's most common level and quality for it. */
   gem?: { level: number; quality: number };
   /** tree: node ids the sample has it on, most common first. */
@@ -186,6 +188,7 @@ interface ItemTally {
   builds: Set<string>;
   copies: Map<string, ItemCopy & { uses: number }>;
   abyss: boolean;
+  base?: string;
 }
 
 function tallyItems(builds: SampleEntry[]): Map<string, ItemTally> {
@@ -198,7 +201,7 @@ function tallyItems(builds: SampleEntry[]): Map<string, ItemTally> {
       const id = `${groupId(group)}|${key}`;
       let t = tallies.get(id);
       if (!t) {
-        t = { group, key, builds: new Set(), copies: new Map(), abyss: ABYSS_RE.test(item.base ?? '') };
+        t = { group, key, builds: new Set(), copies: new Map(), abyss: ABYSS_RE.test(item.base ?? ''), ...(item.base ? { base: item.base } : {}) };
         tallies.set(id, t);
       }
       t.builds.add(b.id);
@@ -362,6 +365,7 @@ export function sampleShares(loaded: BuildSnapshot, builds: SampleEntry[], opts:
         count: t.builds.size,
         copies,
         ...(t.group.kind === 'jewel' && t.abyss ? { abyss: true } : {}),
+        ...(t.base ? { base: t.base } : {}),
         ...(copies.length === 0 ? { unmeasured: 'not measured: the sample has no item text for it' } : {}),
       });
     }

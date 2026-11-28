@@ -6,6 +6,7 @@ import {
   checkVariant,
   committedFingerprint,
   fingerprintDiff,
+  PROBE_CHUNK,
   runProbe,
   withoutNulls,
   type ProbeGemChange,
@@ -129,6 +130,17 @@ function ambiguousName(ref: string, matches: NodeMatch[]): UserError {
     `Passive node name "${ref}" matches ${matches.length} nodes: ` +
       `${listed.join(', ')}${more}. Pass the node id instead.`,
   );
+}
+
+/** A probe variant with its passive node names resolved to ids (probeNamed, classifyProbe). */
+async function resolveNamedVariant(resolver: NodeNameResolver, named: NamedProbeVariant): Promise<ProbeVariant> {
+  const { allocate, deallocate, ...rest } = named;
+  const variant: ProbeVariant = { ...rest };
+  const allocIds = allocate && (await resolver.resolveAll(allocate, 'allocate'));
+  const deallocIds = deallocate && (await resolver.resolveAll(deallocate, 'deallocate'));
+  if (allocIds !== undefined) variant.allocate = allocIds;
+  if (deallocIds !== undefined) variant.deallocate = deallocIds;
+  return variant;
 }
 
 /**
@@ -583,9 +595,11 @@ export class BuildSession {
    * `compareSnapshot`): build info, the given stat keys, allocated nodes,
    * items by slot, socket groups and the config input.
    */
-  async compareSnapshot<T>(stats: string[]): Promise<T> {
+  async compareSnapshot<T>(stats: string[], options: { gapContext?: boolean } = {}): Promise<T> {
     if (!this.buildInfo) throw new UserError('No build loaded — call load_build first, or pass `against` to compare two other builds');
-    return this.withLock(() => this.bridge.send<T>({ cmd: 'compareSnapshot', stats }));
+    // `gapContext` (community_gap_report): also the weapon set in use and the allocated passive-tree sockets' kinds.
+    const cmd = options.gapContext ? { cmd: 'compareSnapshot', stats, gapContext: true } : { cmd: 'compareSnapshot', stats };
+    return this.withLock(() => this.bridge.send<T>(cmd));
   }
 
   // ------------------------------------------------------------------
@@ -957,14 +971,8 @@ export class BuildSession {
       const toRun: number[] = [];
       const resolved: ProbeVariant[] = [];
       for (let i = 0; i < request.variants.length; i++) {
-        const { allocate, deallocate, ...rest } = request.variants[i];
         try {
-          const variant: ProbeVariant = { ...rest };
-          const allocIds = allocate && (await resolver.resolveAll(allocate, 'allocate'));
-          const deallocIds = deallocate && (await resolver.resolveAll(deallocate, 'deallocate'));
-          if (allocIds !== undefined) variant.allocate = allocIds;
-          if (deallocIds !== undefined) variant.deallocate = deallocIds;
-          resolved.push(variant);
+          resolved.push(await resolveNamedVariant(resolver, request.variants[i]));
           toRun.push(i);
         } catch (error) {
           if (!(error instanceof UserError)) throw error;
@@ -977,6 +985,46 @@ export class BuildSession {
         results[index] = probed.results[j];
       });
       return { base: probed.base, results: results.map((r) => r ?? { stats: {}, error: 'variant was not run' }) };
+    });
+  }
+
+  /**
+   * How probe() would run each variant, without running any (the bridge's
+   * `probe` classifyOnly pass: validation only, nothing computed or changed):
+   * `fallback` (a full recalculation) or refused (`error`, `userError`).
+   * Names resolve as in probeNamed. community_gap_report budgets its full
+   * recalculations with it.
+   */
+  async classifyProbe(variants: NamedProbeVariant[]): Promise<Array<{ fallback: boolean; error?: string; userError?: boolean }>> {
+    return this.withLock(async () => {
+      const resolver = new NodeNameResolver((command) => this.bridge.send(command));
+      const out: Array<{ fallback: boolean; error?: string; userError?: boolean }> = new Array(variants.length);
+      const toEngine: number[] = [];
+      const checked: ProbeVariant[] = [];
+      for (let i = 0; i < variants.length; i++) {
+        try {
+          const v = await resolveNamedVariant(resolver, variants[i]);
+          checked.push(await checkVariant({ validateConfig: (o) => this.validateConfigOptionsUnlocked(o) }, v));
+          toEngine.push(i);
+        } catch (error) {
+          if (!(error instanceof UserError)) throw error;
+          out[i] = { fallback: false, error: error.message, userError: true };
+        }
+      }
+      for (let start = 0; start < toEngine.length; start += PROBE_CHUNK) {
+        const chunk = toEngine.slice(start, start + PROBE_CHUNK);
+        const res = await this.bridge.send<{ ok: true; results: Array<{ fallback?: boolean; error?: string; userError?: boolean }> }>({
+          cmd: 'probe',
+          classifyOnly: true,
+          stats: [],
+          variants: chunk.map((_, j) => checked[start + j]),
+        });
+        chunk.forEach((i, j) => {
+          const raw = res.results?.[j] ?? {};
+          out[i] = raw.error !== undefined ? { fallback: false, error: raw.error, userError: raw.userError === true } : { fallback: raw.fallback === true };
+        });
+      }
+      return out;
     });
   }
 
