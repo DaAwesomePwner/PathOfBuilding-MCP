@@ -913,11 +913,13 @@ local slotChecks = { }
 -- on 3.30, grafts on 3.27). Only these follow PoB's visibility here; weapon
 -- swap, Ring 3 and abyssal sockets are listed and accepted as before.
 -- `counted` says whether PoB's CalcSetup still uses an item left in the slot
--- while it is hidden: grafts are skipped off 3.27, but its Wickerman check
--- (`^Wickerman `) matches no slot name, so Viscera items keep counting.
+-- while it is hidden: grafts are skipped off 3.27. Up to PoB 2.68 its
+-- Wickerman check (`slotName:match("^Wickerman ")`) matches no slot name, so
+-- Viscera items keep counting; PoB 2.69 checks the real slot names and skips
+-- them off 3.30. `slotChecks.hiddenCounted` reads which one this PoB has.
 do
 	local wickerman = {
-		what = "the Wickerman slots (Head, Body, Arm, Leg)", tree = "3.30", counted = true,
+		what = "the Wickerman slots (Head, Body, Arm, Leg)", tree = "3.30", counted = "detect",
 		remedy = "convert_tree_to_latest moves the build to the latest passive tree, where they are shown",
 	}
 	local graft = {
@@ -928,6 +930,19 @@ do
 		Head = wickerman, Body = wickerman, Arm = wickerman, Leg = wickerman,
 		["Graft 1"] = graft, ["Graft 2"] = graft,
 	}
+end
+
+-- Whether PoB's calculations count an item in a slot hidden by `gate`.
+-- "detect" (Wickerman) is decided once from CalcSetup's source (read only):
+-- counted while it still has the `^Wickerman ` slot-name check.
+function slotChecks.hiddenCounted(gate)
+	if gate.counted == "detect" then
+		local f = io.open(SCRIPT_PATH .. "/Modules/CalcSetup.lua", "rb")
+		local src = f and f:read("*a") or ""
+		if f then f:close() end
+		gate.counted = src:find('slotName:match("^Wickerman ")', 1, true) ~= nil
+	end
+	return gate.counted
 end
 
 -- The tree gate of `slot` when PoB currently hides it, else nil. A slot
@@ -3605,7 +3620,7 @@ local function listEquippedItems()
 					local gate = slotChecks.hiddenGate(slot)
 					local note
 					if gate then
-						note = slotChecks.hiddenReason(slot) .. (gate.counted
+						note = slotChecks.hiddenReason(slot) .. (slotChecks.hiddenCounted(gate)
 							and "; Path of Building still counts this item in its calculations. unequip_item removes it"
 							or "; Path of Building ignores this item in its calculations on this tree. unequip_item removes it")
 					end

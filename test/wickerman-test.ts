@@ -1,4 +1,4 @@
-// Wickerman (PoE 3.30) item slots, as Path of Building 2.68.1's UI handles them:
+// Wickerman (PoE 3.30) item slots, as Path of Building (2.68.1+) handles them:
 //
 //   1. validateItemText accepts Viscera text copied from the game (first line
 //      "Item Class: Viscera", no Rarity line) and still refuses any other text
@@ -21,10 +21,15 @@
 //      suggest_upgrades gives suggestedViscera; the export is unchanged.
 //   4. A build holding Viscera items on a tree that hides the slots keeps them
 //      exactly: export, a what-if probe, and swap + undo leave the hidden
-//      <Slot> entries unchanged. list_equipped_items shows them as hidden
-//      (PoB still counts them), and unequip_item removes one (stats change,
-//      undo restores the export).
-import { readFileSync } from 'fs';
+//      <Slot> entries unchanged. list_equipped_items shows them as hidden,
+//      and unequip_item removes one (undo restores the export). Whether PoB
+//      counts them differs by version and is read as the bridge reads it
+//      (wickermanHiddenCounted): PoB 2.68 still counts them (the note says so
+//      and unequipping changes Life), PoB 2.69 ignores them (the note says so
+//      and unequipping leaves the stats unchanged).
+import { existsSync, readFileSync } from 'fs';
+import path from 'path';
+import type { ResolvedPaths } from '../src/paths.js';
 import { BuildSession } from '../src/build-session.js';
 import { LuaBridge, Stats } from '../src/lua-bridge.js';
 import { tradeQueryCommand, visceraRankArgs } from '../src/trade-search-command.js';
@@ -33,6 +38,19 @@ import { UserError, validateItemText } from '../src/validation.js';
 import { setupTestEnv } from './_skip.js';
 
 const WICKERMAN = ['Head', 'Body', 'Arm', 'Leg'];
+
+/**
+ * Whether this PoB counts Viscera items in Wickerman slots its tree hides: the
+ * same read of CalcSetup's source as `slotChecks.hiddenCounted` in
+ * lua/bridge.lua (PoB up to 2.68 checks `slotName:match("^Wickerman ")`, which
+ * matches no slot, so they count; 2.69 checks the slot names and skips them).
+ */
+function wickermanHiddenCounted(paths: ResolvedPaths): boolean {
+  const flat = existsSync(path.join(paths.pobPath, 'Launch.lua'))
+    && existsSync(path.join(paths.pobPath, 'Modules', 'Build.lua'));
+  const scripts = flat ? paths.pobPath : path.join(paths.pobPath, 'src');
+  return readFileSync(path.join(scripts, 'Modules', 'CalcSetup.lua'), 'utf8').includes('slotName:match("^Wickerman ")');
+}
 
 // Game "Copy item" text for a Viscera item: no Rarity line.
 const VISCERA_HEAD = `Item Class: Viscera
@@ -366,8 +384,11 @@ async function main(): Promise<void> {
     const hiddenItems = (await session.listEquippedItems()).filter((i) => WICKERMAN.includes(i.slot));
     assert(hiddenItems.map((i) => i.slot).sort().join() === 'Arm,Head',
       `hidden occupied slots listed: ${hiddenItems.map((i) => i.slot)}`);
+    const counted = wickermanHiddenCounted(paths);
+    log(`  this PoB ${counted ? 'counts' : 'ignores'} Viscera items in hidden Wickerman slots`);
     for (const i of hiddenItems) {
-      assert(i.hidden === true && /3\.30/.test(i.note ?? '') && /still counts/.test(i.note ?? ''),
+      assert(i.hidden === true && /3\.30/.test(i.note ?? '')
+        && (counted ? /still counts this item/ : /ignores this item/).test(i.note ?? ''),
         `${i.slot}: ${JSON.stringify(i.note)}`);
     }
     log(`  note: ${hiddenItems[0].note}`);
@@ -381,8 +402,13 @@ async function main(): Promise<void> {
     assert((await session.exportBuild('xml')) === xmlHidden, 'swap + undo keeps hidden slots exactly');
     assert(sameStats(await session.getStats(), hiddenStats), 'stats unchanged after probe and undo');
     const unequipped = await session.unequipItemWithDiff('Head');
-    assert(unequipped.diff.Life && Number(unequipped.after.Life) < Number(hiddenStats.Life),
-      `removing the hidden Head changes Life: ${JSON.stringify(unequipped.diff)}`);
+    if (counted) {
+      assert(unequipped.diff.Life && Number(unequipped.after.Life) < Number(hiddenStats.Life),
+        `removing the hidden Head changes Life: ${JSON.stringify(unequipped.diff)}`);
+    } else {
+      assert(sameStats(await session.getStats(), hiddenStats),
+        `removing the hidden Head leaves the stats unchanged: ${JSON.stringify(unequipped.diff)}`);
+    }
     assert(slotIds(await session.exportBuild('xml')).get('Head') === '0', 'Head emptied');
     await session.undoLastChange();
     assert((await session.exportBuild('xml')) === xmlHidden, 'undo of the hidden unequip restores the export');
