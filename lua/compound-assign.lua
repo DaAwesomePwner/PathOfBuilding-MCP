@@ -366,6 +366,8 @@ local NAV_RECEIVER = "__pobmcp_r"
 --- source and the number of `?.` rewritten. Left alone (the file keeps its parse error):
 --- `a:m?.(x)`, a `...` in the chain, and a chain assigned to.
 function M.rewriteNav(src)
+	-- No `?.` anywhere (2.68 files with only `+=`): skip the tokenizer.
+	if not src:find("?.", 1, true) then return src, 0 end
 	local count, skip = 0, 0
 	while true do
 		local toks, match = tokenize(src)
