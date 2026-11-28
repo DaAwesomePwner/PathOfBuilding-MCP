@@ -356,6 +356,19 @@ const cases: Case[] = [
     run: 'OK:1|1|1|7|str|1|AB|1|1|1',
   },
   {
+    // src/Export/statdesc.lua:611 and :526 in PoB 2.69.0 (receivers that end in a method call / a field).
+    name: 'nav-receiver-is-a-method-call',
+    src: [
+      'local stats = { rows = { a = { IsScalable = true } } }',
+      'function stats:GetRow(k, v) return self.rows[v] end',
+      'local g = { ActiveSkill = { DisplayName = "Frost" } }',
+      'return stats:GetRow("Id", "a")?.IsScalable or false, stats:GetRow("Id", "b")?.IsScalable or false,',
+      '  g.ActiveSkill?.DisplayName, g.None?.DisplayName, "end"',
+    ].join('\n'),
+    count: 4,
+    run: 'OK:true|false|Frost|nil|end',
+  },
+  {
     // Upstream LuaJIT gives a `?.` chain one value here too.
     name: 'nav-final-call-gives-one-value',
     src: 'local t = { f = function() return 1, 2, 3 end }\nreturn t?.f(), select("#", t.f?.()), #{ t?.f() }',

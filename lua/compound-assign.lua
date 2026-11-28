@@ -305,10 +305,10 @@ local function receiverStart(toks, match, k)
 			j = j - 1 -- string call argument
 		elseif t == "name" then
 			local before = toks[j - 1] and toks[j - 1].t
-			if before == "." then
-				j = j - 2
-			elseif before == ":" then
+			if before == ":" and j == k - 1 then
 				return nil -- `a:m?.(x)` nil-checks a method: not handled
+			elseif before == "." or before == ":" then -- a field or a method call
+				j = j - 2
 			else
 				return j
 			end

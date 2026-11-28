@@ -16,7 +16,7 @@ concurrency:
 
 env:
   # Path of Building Community release the integration tests run against.
-  POB_TAG: v2.68.1
+  POB_TAG: v2.69.0
   # LuaJIT commit built from source on Windows (rolling v2.1 branch). Later
   # v2.1 commits (from c41d727, 2026-10-20) only skip a `#!` first line, and
   # PoB's Launch.lua starts with `#@`, so stay on the commit before that.
