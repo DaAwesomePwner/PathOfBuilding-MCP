@@ -96,6 +96,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   add_sample_builds: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   list_samples: READ_ONLY,
   remove_sample_builds: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  // Measured on the probe engine; stale sample snapshots are re-read and saved, but the loaded build never changes.
+  community_gap_report: READ_ONLY,
   // PoB's item data: items are built in the engine, never added to the build.
   search_items: READ_ONLY,
   get_item_text: READ_ONLY,

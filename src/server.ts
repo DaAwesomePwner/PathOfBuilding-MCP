@@ -19,6 +19,7 @@ import {
   unrankedSlotOnly,
 } from './build-session.js';
 import { registerBuildEditTools } from './build-edit-tools.js';
+import { registerCommunityGaps } from './community-gaps.js';
 import { registerCommunitySamples } from './community-samples.js';
 import { registerCompareBuilds } from './compare-builds.js';
 import { masteriesSchema, registerEvaluateChanges } from './evaluate-changes.js';
@@ -146,6 +147,7 @@ registerItemDataTools(tools);
 registerTreePlanTools(tools);
 registerCompareBuilds(tools, engine);
 registerCommunitySamples(tools, engine);
+registerCommunityGaps(tools, engine);
 
 tools.engine<{ source: string }>(
   'load_build',
