@@ -25,7 +25,7 @@ ls "$POB_PATH/src/Modules/Build.lua"
 
 If neither exists, your install is incomplete. Re-run the Path of Building Community installer, or clone <https://github.com/PathOfBuildingCommunity/PathOfBuilding>.
 
-A source clone is run read-only (the server switches PoB's dev-mode autosave off). The default branch can use Lua syntax only PoB's patched LuaJIT parses (e.g. `count += 1`); the bridge rewrites it on load (`lua/compound-assign.lua`), but a release tag (`git clone --branch v2.68.1 --depth 1 <repo>`) is the safest choice. To check a clone, run `POB_SOURCE_PATH=<clone> npm run test:source-clone`.
+A source clone is run read-only (the server switches PoB's dev-mode autosave off). The default branch can use Lua syntax only PoB's patched LuaJIT parses (e.g. `count += 1`); the bridge rewrites it on load (`lua/compound-assign.lua`), but a release tag (`git clone --branch v2.69.0 --depth 1 <repo>`) is the safest choice. To check a clone, run `POB_SOURCE_PATH=<clone> npm run test:source-clone`.
 
 ## "… is Path of Building for Path of Exile 2"
 
@@ -57,7 +57,7 @@ PoB's updater replaces files in place. While `Update/manifest.xml` (or `Update/o
 **Causes & fixes:**
 - The wrong `luajit` (e.g. a PUC Lua 5.3/5.4 binary). Point `luajitPath` / `LUAJIT_PATH` at a LuaJIT binary.
 - Wrong PoB folder: see the sections above, then `configure_pob_path`.
-- `'=' expected near '+'` (or near another operator) while loading a PoB module such as `Modules/Main.lua`: PoB 2.68+ uses compound assignment (`count += 1`), which only PoB's own LuaJIT parses. Update pob-mcp-server; current versions translate it for stock LuaJIT. If a current server still shows a syntax error in a PoB file, that PoB release uses other syntax the server does not translate yet: report it.
+- `'=' expected near '+'` (or near another operator), or `unexpected symbol near '?'`, while loading a PoB module such as `Modules/Main.lua` or `Classes/CompareBuySimilar.lua`: PoB 2.68 uses compound assignment (`count += 1`) and PoB 2.69 safe navigation (`name?.:lower()`), which only PoB's own (newer) LuaJIT parses. Update pob-mcp-server; current versions translate it for stock LuaJIT. If a current server still shows a syntax error in a PoB file, that PoB release uses other syntax the server does not translate yet: report it.
 - Corrupted PoB install. Re-run the PoB Community installer, or if you're using a source clone, run `git clean -xdf` inside it.
 
 ## "Lua engine has crashed N times — refusing to restart"
