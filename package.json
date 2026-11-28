@@ -25,6 +25,7 @@
     "dev": "tsx src/server.ts",
     "prepublishOnly": "npm run build",
     "test:paths": "tsx test/paths-test.ts",
+    "test:sample-store": "tsx test/sample-store-test.ts",
     "test:bridge": "tsx test/bridge-test.ts",
     "test:session": "tsx test/session-test.ts",
     "test:server": "tsx test/server-test.ts",
@@ -59,6 +60,8 @@
     "test:stats": "tsx test/stats-diagnostics-test.ts",
     "test:stat-weights": "tsx test/stat-weights-test.ts",
     "test:compare": "tsx test/compare-builds-test.ts",
+    "test:community-samples": "tsx test/community-samples-test.ts",
+    "test:community-gaps": "tsx test/community-gaps-test.ts",
     "test:tree-plan": "tsx test/tree-plan-test.ts",
     "test:item-data": "tsx test/item-data-test.ts"
   },

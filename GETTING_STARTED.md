@@ -9,7 +9,7 @@ A long-lived process that lets Claude (or any MCP-compatible client) read and mu
 ```
 ┌─────────────────┐   stdio (MCP)    ┌─────────────────┐   stdio (JSON-lines) ┌──────────────────┐
 │  Claude Desktop │ ◄──────────────► │  pob-mcp (Node) │ ◄──────────────────► │  bridge.lua      │
-│   (or any MCP   │   54 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
+│   (or any MCP   │   62 tools       │  TypeScript     │   ~50 commands       │  (LuaJIT, runs   │
 │    client)      │                  │  BuildSession   │                      │   the real PoB   │
 └─────────────────┘                  └─────────────────┘                      │   engine)        │
                                                                                └──────────────────┘
@@ -23,7 +23,7 @@ Three layers, three responsibilities:
 | **BuildSession** | `src/build-session.ts` | TypeScript class that owns the LuaJIT subprocess. Provides snapshot/restore, undo stack, `withTemporaryChange`, async mutex (PoB is a singleton — never two ops at once), build-code/URL/XML loading, and all higher-level workflows like `compareItems`, `findOptimalLinks`, `suggestUpgrades`. |
 | **Engine manager** | `src/engine-manager.ts` | Resolves the PoB/LuaJIT paths (env → saved config → auto-detect, see `src/paths.ts`), boots the engine in the background, records the PoB version from `manifest.xml`, detects when PoB updates on disk, and handles `configure_pob_path` / `reload_engine`. |
 | **Probe engine** | `lua/probe.lua`, `src/probe.ts` | Evaluates what-if variants through PoB's own calculator (the one its tooltips use) without changing or recalculating the build; `src/tree-search.ts`, `src/link-search.ts` and `src/evaluate-changes.ts` build the node searches, the link search and `evaluate_changes` on it. |
-| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 54 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
+| **MCP server** | `src/server.ts`, `src/tool-registry.ts` | Registers 62 tools via `@modelcontextprotocol/sdk` (each with MCP annotations such as `readOnlyHint`), validates inputs with Zod + a custom `UserError` class, formats responses as compact JSON. This is what Claude actually talks to. |
 
 ### Key design choices
 
@@ -36,7 +36,7 @@ Three layers, three responsibilities:
 - **Three-strike crash circuit breaker.** If the LuaJIT process dies unexpectedly, hangs past its timeout or fails to start 3 times, the server refuses further restarts until you restart the whole MCP server, or update Path of Building and then call `reload_engine`. Prevents silent respawn loops eating your session. Before that, a crashed engine is restarted by the next tool call with your build as of the last committed change; that call tells you so (and that undo history was cleared) instead of running.
 - **Heuristic-based error classification.** User-input errors (bad slot name, unknown gem, etc.) are surfaced verbatim. Anything else becomes "Internal error: … try `reset_build`".
 
-## The 58 tools
+## The 62 tools
 
 ### Engine setup (3)
 - `configure_pob_path` — `{ pobPath, luajitPath? }`: validates the folder (rejects the PoE2 edition), (re)starts the engine, returns the PoB version, and saves the path for next time. A loaded build is carried over. Arguments are taken literally (no `%VAR%` expansion), and `luajitPath` — which the server executes — must be an existing file named like `luajit` (`luajit.exe` on Windows).
@@ -110,6 +110,13 @@ Three layers, three responsibilities:
 - `undo_last_change` — pops the undo stack (works for swap_item/unequip_item/set_config/allocate_nodes/deallocate_nodes/apply_changes/create_socket_group/delete_socket_group/set_main_skill/set_character_level/set_ascendancy/set_flask_active/convert_tree_to_latest; what-if tools push nothing).
 - `reset_build` — discard everything, return to the originally loaded state.
 
+### Community samples (4)
+Builds come only from what you give the server (a PoB code, XML, pobb.in or pastebin link: anything `load_build` takes). It never contacts poe.ninja, whose API page says its builds and Path of Building endpoints are internal and not for third-party use; copy a build's code with poe.ninja's "Path of Building" button and paste it in. Samples are saved as `<config dir>/samples/<name>.json` (see README for the folder), so they survive restarts. None of these tools changes the loaded build or its undo history.
+- `add_sample_builds` — `{ sample, builds: [{ source, label? }] }` (1-20 per call): add builds to a named sample (created if missing). Each new build is read by PoB in a short-lived second engine (a few seconds). Returns `added` (id, class, ascendancy, main skill, level), `duplicates` (already in the sample) and `failed` (a build PoB refuses or that does not download, with the reason; the others are still added). Limits: 50 builds per sample, 100 samples, 8 MB per file.
+- `list_samples` — no argument: every sample; `{ sample }`: its builds (`stale` when read with another PoB version); `{ sample, build }`: that build's items by slot; plus `slot`: that item's PoB text, ready for `swap_item` / `compare_items` / `apply_changes`.
+- `remove_sample_builds` — `{ sample, ids }` or `{ sample, deleteSample: true }`. An unknown id is refused and nothing is removed.
+- `community_gap_report` — `{ sample, categories?, minShare? (0.3), rankBy? | objective?, filter?, maxPerCategory? }`: what at least `minShare` of the sample has that your loaded build lacks (gear, main-skill supports and other skills, keystones / notables / mastery effects, config), each measured on your build with PoB's calculator and ranked by its gain. Read-only; see the example below.
+
 ### Trade searches (2)
 - `generate_trade_search` — PoB's "weighted search" for a gear or flask slot (`flaskType` picks the kind of flask; an inactive flask slot is evaluated active), a jewel or abyssal socket: every candidate mod is simulated on the build to get a weight, and you get a pathofexile.com trade URL sorted by weighted sum (highest first). Options mirror PoB's dialog (trade type, corrupted/eldritch/scourge/talisman mods, influences, max price/level, sockets/links); `weightAdjustments` replace/add/remove weights (pinned against the 36-filter cap), `requiredMods` are hard minimums, `minWeightedSum` overrides PoB's default. `unique: "Watcher's Eye" | "Pearl of Tsoatha" | "Megalomaniac"` searches those uniques as PoB's "Other trades" rows do (Megalomaniac weighs cluster notables as passive nodes). Grafts (3.27 trees) and tinctures are searched by the base type of the item in the slot (PoB's trade data has no category for them); a Wickerman slot (3.30 trees) returns the Viscera parts that fit it, ranked by `statWeights`, instead of a URL; cluster jewels have no weighted search. Read-only, takes a few seconds.
 - `search_trade_mods` — find trade stat ids for a slot by text (`"life"`, `"fire resistance"`), for use in `requiredMods` / `weightAdjustments`; with `unique` it lists Watcher's Eye mods, Megalomaniac notables or Pearl of Tsoatha's support filters.
@@ -140,7 +147,7 @@ To run the server in your MCP client, add this to `claude_desktop_config.json` (
 
 `POB_PATH` is optional. Paths resolve as **env var → saved config → auto-detect** (standard install folder, the installer's registry entry, common LuaJIT locations, `PATH`). If nothing is found the server still starts: just tell Claude where PoB is installed and it calls `configure_pob_path`, which saves the path to `%APPDATA%\pob-mcp-server\config.json` (macOS `~/Library/Application Support/pob-mcp-server/`, Linux `~/.config/pob-mcp-server/`).
 
-Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 37 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
+Restart Claude Desktop. You should see `pob` appear in the MCP tools indicator and 62 tools become callable. Ask *"which Path of Building version are you using?"* — Claude calls `get_engine_info`.
 
 ### Environment variables
 
@@ -268,6 +275,33 @@ To shop for an upgrade on the trade site:
 2. PoB scores already-capped stats as 0, so if the current helmet carries 40% fire resistance the search would happily replace it with none. Claude finds the id with `search_trade_mods({ slot: "Helmet", query: "fire resistance" })` and calls again with `weightAdjustments: [{ tradeId: "pseudo.pseudo_total_fire_resistance", weight: 2 }]`, or makes it a hard requirement with `requiredMods: [{ tradeId: "pseudo.pseudo_total_fire_resistance", min: 35 }]`.
 3. The user opens the returned URL; results are sorted by weighted sum, best first.
 
+To see what the community does differently, collect a few builds first (copy each one's PoB code, for poe.ninja with its "Path of Building" button), then compare:
+
+```
+add_sample_builds({ sample: "RF Chieftain", builds: [
+  { source: "eNrtW...", label: "ninja #1" },
+  { source: "https://pobb.in/abc123", label: "guide build" },
+  { source: "eNqVV...", label: "ninja #3" } ] })
+// -> { sample: "RF Chieftain", count: 3, added: [{ id: "3fa91c0b72de", label: "ninja #1", class: "Marauder", ascendancy: "Chieftain",
+//      mainSkill: "Righteous Fire", level: 97 }, ...], duplicates: [], failed: [] }
+load_build({ source: <your build> })
+community_gap_report({ sample: "RF Chieftain", minShare: 0.5 })
+// -> { sample: { size: 3, used: 3, mainSkillMatched: 3, ... }, rankBy: "CombinedDPS", base: {...},
+//      gear: [{ kind: "item", name: "Doomsower", slot: "Weapon 1", share: 0.67, count: 2, measured: true, delta: 41230, pct: 8.4,
+//               best: { delta: 41230, from: { build: "3fa91c0b72de", label: "ninja #1", slot: "Weapon 1" }, replaces: "Corroded Blade", offHand: "Rise of the Phoenix" },
+//               median: 38900, note: "The delta includes the source build's off-hand (Rise of the Phoenix) in Weapon 2: copy both with list_samples ..." }, ...],
+//      tree: [{ kind: "notable", name: "Heart of Flame", share: 1, measured: true, delta: 5120, points: 2, perPoint: 2560, apply: { allocate: [...] } }, ...],
+//      gems: [{ kind: "support", name: "Increased Duration", share: 1, measured: true, delta: 9800, best: { delta: 9800, replaces: "Swift Affliction" },
+//               apply: { gems: [{ op: "set", group: 1, index: 3, name: "Increased Duration", level: 20, quality: 20 }] } }, ...],
+//      settings: [...], more: {...}, uncommon: {...}, notes: [...] }
+apply_changes({ variant: <the tree or gems row's apply> })      // one undoable step
+list_samples({ sample: "RF Chieftain", build: "3fa91c0b72de", slot: "Weapon 1" })   // -> item.itemText (best.from.slot)
+list_samples({ sample: "RF Chieftain", build: "3fa91c0b72de", slot: "Weapon 2" })   // the off-hand the row's note names
+apply_changes({ variant: { items: [{ slot: "Weapon 1", itemText: <Weapon 1 text> }, { slot: "Weapon 2", itemText: <Weapon 2 text> }] } })
+```
+
+A Weapon 1 row is measured together with its build's off-hand (`best.offHand`; `"empty"` means Weapon 2 was emptied), so copy both slots as above; the row's `slot` is the slot as your build names it (`Weapon 1 Swap` while weapon set 2 is in use). Rows are ranked by the change of `rankBy` (default `CombinedDPS`; `objective` ranks by a weighted score, with `delta` then the score), tree rows by gain per passive point. A gap is measured as if you took the sample's version: gear is tried as up to 5 copies from the sample in that slot (`median` is over the copies, `best.from` says which build and slot to read the text from), supports replace each support of your main group, tree nodes come with their path. Nothing is applied, so the build stays as loaded until you commit a row. `filter: { ascendancy: "Chieftain", minLevel: 95 }` narrows the sample first; `uncommon` lists what you use that fewer than 10% of the sample does. `list_samples` / `remove_sample_builds` manage the saved samples; the same build added twice (same XML) is reported under `duplicates`.
+
 ## Creating a build from scratch
 
 With no build to load, Claude can start from a blank one and build it up with the committed tools (each undoable, and kept by `export_build`):
@@ -320,4 +354,4 @@ Full troubleshooting guide: [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md)
 - **Tune performance**: set `POB_TIMING=1` and inspect the per-command histogram. `bridge.getStats` and `bridge.exportXML` dominate; everything else is sub-100ms typically.
 - **Pull upstream PoB updates**: `git fetch upstream && git merge upstream/dev`. `bridge.lua` only depends on stable PoB internals (`build.itemsTab`, `build.spec:CountAllocNodes`, etc.), so upstream churn rarely breaks anything.
 
-That's the whole picture: 37 tools, three layers, deterministic state, and a real PoB engine behind every number.
+That's the whole picture: 62 tools, three layers, deterministic state, and a real PoB engine behind every number.

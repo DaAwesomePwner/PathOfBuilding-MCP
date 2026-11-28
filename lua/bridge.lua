@@ -6177,10 +6177,20 @@ do
 			end
 			local items = { }
 			local tab = build.itemsTab
+			-- `itemText`: each item's PoB "Copy item" text (BuildRaw), as
+			-- swap_item takes it; the text PoB parsed it from (`raw`) when
+			-- BuildRaw fails on an item.
+			local function itemText(item)
+				if not cmd.itemText then return nil end
+				local ok, text = pcall(item.BuildRaw, item)
+				if ok and type(text) == "string" then return text end
+				return type(item.raw) == "string" and item.raw or nil
+			end
 			local function addItem(slotName, itemId, flags)
 				local item = itemId and itemId ~= 0 and tab.items[itemId]
 				if not item then return end
 				items[#items + 1] = {
+					text = itemText(item),
 					slot = slotName,
 					name = item.title or item.name,
 					base = item.baseName,
@@ -6256,7 +6266,7 @@ do
 					gems = gems,
 				}
 			end
-			return {
+			local result = {
 				info = getBuildInfo(),
 				stats = stats,
 				tree = { points = points, ascendancyPoints = ascPoints, nodes = nodes },
@@ -6264,6 +6274,30 @@ do
 				groups = groups,
 				config = ConfigTables.fullInput(),
 			}
+			-- `gapContext` (community_gap_report, the loaded build only): the
+			-- weapon set in use and every allocated passive-tree socket with
+			-- what PoB's IsItemValidForSlot reads from it: `expansion` (the
+			-- cluster size it takes: 0 small, 1 medium, 2 large and any) and
+			-- `charm` (charm-only).
+			if cmd.gapContext then
+				result.weaponSet = useSecond and 2 or 1
+				local sockets = { }
+				for _, slot in ipairs(tab and tab.orderedSlots or { }) do
+					local id = slot.nodeId
+					if id and spec and spec.allocNodes and spec.allocNodes[id] then
+						local node = (spec.tree and spec.tree.nodes and spec.tree.nodes[id]) or (spec.nodes and spec.nodes[id])
+						sockets[#sockets + 1] = {
+							id = id,
+							occupied = (slot.selItemId or 0) ~= 0,
+							expansion = node and node.expansionJewel and node.expansionJewel.size or nil,
+							charm = node and node.charmSocket and true or nil,
+						}
+					end
+				end
+				table.sort(sockets, function(a, b) return a.id < b.id end)
+				result.sockets = sockets
+			end
+			return result
 		end,
 	}
 end

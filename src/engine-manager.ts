@@ -378,6 +378,16 @@ export class EngineManager {
     }
   }
 
+  /**
+   * Path of Building version the engines run (temporary ones too, on the live
+   * engine's paths): the version recorded when the live engine started, else
+   * the install's on disk; null when unknown or unconfigured. Never starts anything.
+   */
+  pobVersion(): string | null {
+    if (this.startFingerprint) return this.startFingerprint.version;
+    return this.paths ? fingerprintInstall(this.paths.pobPath).version : null;
+  }
+
   /** Number of temporary engines alive right now (tests, diagnostics). */
   temporaryEngineCount(): number {
     return this.temporary.size;

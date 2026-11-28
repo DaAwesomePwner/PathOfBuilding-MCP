@@ -45,6 +45,8 @@ export interface SnapshotItem {
   flaskActive?: boolean;
   /** Active mod lines: {enchant}, {scourge}, {implicit}, then explicits ({crafted} / {fractured} marked). */
   mods: string[];
+  /** PoB's "Copy item" text (as swap_item takes it): only when read with `itemText`. */
+  text?: string;
 }
 
 export interface SnapshotGem {
@@ -469,10 +471,10 @@ export interface CompareBuildsArgs {
   against?: string;
 }
 
-type RawSnapshot = Omit<BuildSnapshot, 'config'> & { config: Record<string, unknown> | unknown[] };
+export type RawSnapshot = Omit<BuildSnapshot, 'config'> & { config: Record<string, unknown> | unknown[] };
 
 /** dkjson sends an empty Lua table as `[]`. */
-function normalize(raw: RawSnapshot): BuildSnapshot {
+export function normalizeSnapshot(raw: RawSnapshot): BuildSnapshot {
   const obj = <T>(v: T | unknown[] | undefined | null): T => (Array.isArray(v) || v == null ? ({} as T) : (v as T));
   const arr = <T>(v: T[] | Record<string, never> | undefined | null): T[] => (Array.isArray(v) ? v : []);
   return {
@@ -512,12 +514,16 @@ function temporaryDetail(message: string): string {
 const UNAFFECTED =
   'It was discarded and is not restarted; this is not a crash of the main engine and does not count towards its crash limit; the loaded build and the main engine are unaffected.';
 
-/** What went wrong in the temporary engine, as an error of this call. */
-function temporaryFailure(e: unknown, bridge: LuaBridge, step: string, label: string): Error {
+/**
+ * What went wrong in the temporary engine, as an error of this call. A
+ * UserError (not a TemporaryEngineError) means Path of Building refused that
+ * one build and the temporary engine is still fine.
+ */
+function temporaryFailure(e: unknown, bridge: LuaBridge, step: string, label: string, purpose: string): Error {
   const message = e instanceof Error ? e.message : String(e);
   if (!bridge.isRunning()) {
     return new TemporaryEngineError(
-      `The temporary Path of Building engine started for this comparison stopped while ${step} the ${label} build (${temporaryDetail(message)}). ` +
+      `The temporary Path of Building engine started for ${purpose} stopped while ${step} the ${label} build (${temporaryDetail(message)}). ` +
         `${UNAFFECTED} Retry the call, or check that the build opens in Path of Building.`,
     );
   }
@@ -527,31 +533,62 @@ function temporaryFailure(e: unknown, bridge: LuaBridge, step: string, label: st
   }
   if (e instanceof UserError) return new UserError(`The ${label} build: ${message}`);
   return new TemporaryEngineError(
-    `Reading the ${label} build in the temporary Path of Building engine started for this comparison failed: ${temporaryDetail(message)}. ` +
+    `Reading the ${label} build in the temporary Path of Building engine started for ${purpose} failed: ${temporaryDetail(message)}. ` +
       'The loaded build and the main engine are unaffected.',
   );
 }
 
-/** Load each build into one temporary engine in turn and read it. */
-async function readInTemporaryEngine(
+export interface TemporaryReadOptions {
+  /** Who the engine is for, in error text ("started for <purpose>"). Default: "this comparison". */
+  purpose?: string;
+  /** Name prefix of each loaded build (the bridge's `loadXML` `name`). Default: "compare_builds". */
+  loadName?: string;
+  /** Read each item's PoB "Copy item" text (`compareSnapshot` `itemText`). */
+  itemText?: boolean;
+  /**
+   * Keep going when Path of Building refuses one build (load or read user
+   * error, the engine still alive): its entry holds the error. Otherwise the
+   * first refusal is thrown.
+   */
+  collectRefusals?: boolean;
+}
+
+export type TemporaryRead = { snapshot: BuildSnapshot } | { error: UserError };
+
+/**
+ * Load each build into one temporary engine in turn and read it. A crash,
+ * timeout or failed start is a TemporaryEngineError (never the live engine's
+ * crash wording); a build PoB refuses is a UserError (thrown, or kept per
+ * build with `collectRefusals`).
+ */
+export async function readInTemporaryEngine(
   engine: EngineManager,
   builds: Array<{ label: string; xml: string }>,
   stats: string[],
   options: TemporaryEngineOptions,
-): Promise<BuildSnapshot[]> {
+  read: TemporaryReadOptions = {},
+): Promise<TemporaryRead[]> {
+  const purpose = read.purpose ?? 'this comparison';
+  const loadName = read.loadName ?? 'compare_builds';
   try {
     return await engine.withTemporaryEngine(async (bridge) => {
-      const out: BuildSnapshot[] = [];
+      const out: TemporaryRead[] = [];
+      const refused = (e: Error): void => {
+        if (read.collectRefusals && e instanceof UserError && !(e instanceof TemporaryEngineError)) out.push({ error: e });
+        else throw e;
+      };
       for (const { label, xml } of builds) {
         try {
-          await bridge.send({ cmd: 'loadXML', xml, name: `compare_builds ${label}` });
+          await bridge.send({ cmd: 'loadXML', xml, name: `${loadName} ${label}` });
         } catch (e) {
-          throw temporaryFailure(e, bridge, 'loading', label);
+          refused(temporaryFailure(e, bridge, 'loading', label, purpose));
+          continue;
         }
         try {
-          out.push(normalize(await bridge.send<RawSnapshot>({ cmd: 'compareSnapshot', stats })));
+          const cmd = read.itemText ? { cmd: 'compareSnapshot', stats, itemText: true } : { cmd: 'compareSnapshot', stats };
+          out.push({ snapshot: normalizeSnapshot(await bridge.send<RawSnapshot>(cmd)) });
         } catch (e) {
-          throw temporaryFailure(e, bridge, 'reading', label);
+          refused(temporaryFailure(e, bridge, 'reading', label, purpose));
         }
       }
       return out;
@@ -559,12 +596,26 @@ async function readInTemporaryEngine(
   } catch (e) {
     if (e instanceof UserError) throw e;
     throw new TemporaryEngineError(
-      `The temporary Path of Building engine for this comparison could not start (${temporaryDetail((e as Error).message)}). ${UNAFFECTED}`,
+      `The temporary Path of Building engine for ${purpose} could not start (${temporaryDetail((e as Error).message)}). ${UNAFFECTED}`,
     );
   }
 }
 
-function checkedSource(value: string, arg: string): string {
+/** compare_builds' read: every build or the first error. */
+async function readSnapshots(
+  engine: EngineManager,
+  builds: Array<{ label: string; xml: string }>,
+  stats: string[],
+  options: TemporaryEngineOptions,
+): Promise<BuildSnapshot[]> {
+  return (await readInTemporaryEngine(engine, builds, stats, options)).map((r) => {
+    if ('error' in r) throw r.error;
+    return r.snapshot;
+  });
+}
+
+/** validateBuildSource, its UserError prefixed with the argument name. */
+export function checkedSource(value: string, arg: string): string {
   try {
     return validateBuildSource(value);
   } catch (e) {
@@ -573,7 +624,8 @@ function checkedSource(value: string, arg: string): string {
   }
 }
 
-async function resolvedSource(value: string, arg: string): Promise<string> {
+/** resolveBuildSource (downloads, decoding), its UserError prefixed with the argument name. */
+export async function resolvedSource(value: string, arg: string): Promise<string> {
   try {
     return await resolveBuildSource(value);
   } catch (e) {
@@ -606,10 +658,10 @@ export async function compareBuilds(
   let a: BuildSnapshot;
   let b: BuildSnapshot;
   if (xmlA === null) {
-    a = normalize(await session.compareSnapshot<RawSnapshot>(stats));
-    [b] = await readInTemporaryEngine(engine, [{ label: 'source', xml: xmlB }], stats, options);
+    a = normalizeSnapshot(await session.compareSnapshot<RawSnapshot>(stats));
+    [b] = await readSnapshots(engine, [{ label: 'source', xml: xmlB }], stats, options);
   } else {
-    [a, b] = await readInTemporaryEngine(engine, [{ label: 'against', xml: xmlA }, { label: 'source', xml: xmlB }], stats, options);
+    [a, b] = await readSnapshots(engine, [{ label: 'against', xml: xmlA }, { label: 'source', xml: xmlB }], stats, options);
   }
   return {
     a: xmlA === null ? 'loaded build' : 'against',

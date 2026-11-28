@@ -90,9 +90,15 @@ Raised by reviewers on 2026-11-13 (merged up to `c9b63635`) and left for later.
 
 ## Robustness and security
 
-- **poe.ninja build links unsupported.** `load_build` accepts only pobb.in and
-  pastebin links (`parseBuildURL` in `src/validation.ts`); poe.ninja links are
-  refused with a UserError.
+- ~~**poe.ninja build links unsupported.**~~ **Decided: not to be implemented.**
+  `load_build` accepts only pobb.in and pastebin links (`parseBuildURL` in
+  `src/validation.ts`); poe.ninja links are refused with a UserError, and stay
+  so. poe.ninja's API page (poe.ninja/docs/api) says its builds, character and
+  Path of Building endpoints are internal and not for third-party use, so the
+  server never contacts it. Comparing with what the community plays is done
+  with user-supplied samples instead (`add_sample_builds`,
+  `community_gap_report`): the user copies a build's code with poe.ninja's own
+  "Path of Building" button, or uses a pobb.in / pastebin link.
 - ~~**Swallowed errors give wrong answers (confirmed).**~~ **Fixed.** Empty
   `catch {}` in `compareSupports`, `suggestUpgrades`, `compareScenarios` turned
   failures into zero deltas. They now run on the probe engine: a variant PoB
